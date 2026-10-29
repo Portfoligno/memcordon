@@ -19,17 +19,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    CurrentLinuxOwnerProbe {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    CurrentLinuxSnapshotProbe {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     #[cfg(target_os = "windows")]
     ConsumerReadinessLoaderDiagnostic(
         memcordon_ci::release::original_native_components::loader_diagnostic::Args,
     ),
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     ConsumerReadinessNativeComponents(memcordon_ci::release::original_native_components::Args),
-    #[cfg(target_os = "linux")]
-    #[command(hide = true)]
-    ConsumerReadinessMalformedIngress(
-        memcordon_ci::release::linux_malformed_ingress::MalformedIngressArguments,
-    ),
     ConsumerReadinessCell(memcordon_ci::release::consumer_readiness_cell::CellArguments),
     ConsumerReadinessCleanup(memcordon_ci::release::consumer_readiness_cell::CellArguments),
     Ci {
@@ -254,6 +265,10 @@ fn run() -> Result<()> {
         .transpose()?;
     let current = std::env::current_dir()?;
     let root = match &cli.command {
+        #[cfg(target_os = "linux")]
+        Some(TopLevel::CurrentLinuxOwnerProbe { .. }) => current,
+        #[cfg(target_os = "linux")]
+        Some(TopLevel::CurrentLinuxSnapshotProbe { .. }) => current,
         Some(TopLevel::ExternalConsumer { .. }) => current,
         Some(TopLevel::Release {
             command:
@@ -265,6 +280,14 @@ fn run() -> Result<()> {
         _ => workspace_root(&current)?,
     };
     let result = (|| match cli.command {
+        #[cfg(target_os = "linux")]
+        Some(TopLevel::CurrentLinuxOwnerProbe { input, output }) => {
+            memcordon_ci::release::linux_current_owner_cases::probe(&input, &output)
+        }
+        #[cfg(target_os = "linux")]
+        Some(TopLevel::CurrentLinuxSnapshotProbe { input, output }) => {
+            memcordon_ci::linux_snapshot_probe::run(&input, &output)
+        }
         #[cfg(target_os = "windows")]
         Some(TopLevel::ConsumerReadinessLoaderDiagnostic(arguments)) => {
             let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
@@ -309,10 +332,6 @@ fn run() -> Result<()> {
                 memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments),
             );
             memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
-        }
-        #[cfg(target_os = "linux")]
-        Some(TopLevel::ConsumerReadinessMalformedIngress(arguments)) => {
-            memcordon_ci::release::linux_malformed_ingress::execute(&arguments)
         }
         Some(TopLevel::ConsumerReadinessCleanup(arguments)) => {
             memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments)
@@ -499,42 +518,6 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::args_os().nth(1).as_deref()
-            == Some(std::ffi::OsStr::new(
-                memcordon_ci::release::linux_image_custodian::CHILD_ARGUMENT,
-            ))
-        {
-            let arguments = std::env::args_os()
-                .skip(2)
-                .take(memcordon_ci::release::linux_image_custodian::CHILD_ARGUMENT_COUNT + 1)
-                .map(|value| {
-                    if value.len()
-                        > memcordon_ci::release::linux_image_custodian::CHILD_ARGUMENT_BYTES
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "custody argument exceeds finite byte bound",
-                        ));
-                    }
-                    value.into_string().map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "custody argument is not UTF8",
-                        )
-                    })
-                })
-                .collect::<std::io::Result<Vec<_>>>();
-            if let Err(error) = arguments.and_then(|arguments| {
-                memcordon_ci::release::linux_image_custodian::run_child(&arguments)
-            }) {
-                eprintln!("memcordon-ci original image custodian: {error}");
-                std::process::exit(1);
-            }
-            return;
-        }
-    }
     match memcordon_ci::public_install_capture::run_if_wrapper() {
         Ok(Some(status)) => memcordon_ci::public_install_capture::exit_wrapper(status),
         Ok(None) => {}
@@ -555,9 +538,6 @@ fn main() {
         (Err(original), _) => Err(original),
         (Ok(()), cleanup) => cleanup.map_err(CiError::Io),
     };
-    #[cfg(target_os = "linux")]
-    let transferred_cleanup =
-        memcordon_ci::release::linux_image_custodian::observe_transferred_cleanup();
     if let Err(error) = result {
         eprintln!("memcordon-ci: {error}");
         let mut source = std::error::Error::source(&error);
@@ -565,15 +545,6 @@ fn main() {
             eprintln!("  caused by: {error}");
             source = error.source();
         }
-        #[cfg(target_os = "linux")]
-        if let Err(error) = transferred_cleanup {
-            eprintln!("  retained native cleanup: {error}");
-        }
-        std::process::exit(1);
-    }
-    #[cfg(target_os = "linux")]
-    if let Err(error) = transferred_cleanup {
-        eprintln!("memcordon-ci: {error}");
         std::process::exit(1);
     }
 }

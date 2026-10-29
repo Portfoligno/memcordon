@@ -50,7 +50,6 @@ Usage:
 
 Budgets and common options:
   --sealed                       Require sealed supervision; off
-  --workload-contract PATH        Require exact workload admission; needs --sealed
   --image-entrypoint ID           Select the authorized V3 image entrypoint; arguments follow --
   --expected-private-plan PATH    Require the saved private plan at launch
   --frozen-private-contract PATH  Test one-port tamper after an accepted private plan
@@ -299,7 +298,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-10 V1 or schema-11 private V2 JSON; unset
+  --report PATH                          Write current result-v3 JSON for sealed execution; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -309,8 +308,8 @@ Rules:
   with --quiet; quiet never suppresses required diagnostics or child streams.
 
 Utility JSON:
-  doctor --json    schema-6
-  plan --json      schema-9
+  doctor --json    memcordon.capabilities revision 3
+  plan --json      memcordon.plan revision 3
   clean --json     schema-2
 
 "#
@@ -330,8 +329,8 @@ Usage:
 
 Utilities:
   help      List topics or show one topic
-  doctor    Print the version and selected backend; JSON uses schema-6
-  plan      Resolve policy with launch proof false; JSON uses schema-9
+  doctor    Print the version and selected backend; JSON uses capabilities-v3
+  plan      Resolve policy with launch proof false; JSON uses plan-v3
   clean     Inspect or remove stale owned artifacts; JSON uses schema-2
   --version Print one version line
 
@@ -409,9 +408,14 @@ Options:
 
 Containment:
   --sealed                              Require sealed supervision; off
-  --workload-contract PATH               Strict workload declaration; requires --sealed
+  --workload-request PATH                Built-in runtime request; requires --sealed
+  --workload-input PATH                  Caller-packed Linux snapshot byte stream
+  --workload-output DIRECTORY            Caller-owned destination for selected Linux outputs
+  --workload-observation PATH            Persist original Linux attempt locator before input transfer
+  --workload-observation-directory PATH  Hold release until caller acknowledges exact prepared observation
+  --workload-cwd RELATIVE                Working directory beneath the private root; root
 
-  Sealed mode fails before target authorization when the complete contract is
+  Sealed mode fails before target release when the requested native boundary is
   unavailable and never falls back to standard supervision.
 
 Memory (requires +MEMORY):
@@ -478,7 +482,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write schema-10 V1 or schema-11 private V2 JSON; unset
+  --report PATH                          Write current result-v3 JSON for sealed execution; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -497,9 +501,9 @@ Utilities:
   clean [--dry-run] [--json]          Inspect or remove stale owned state
 
 Utility options:
-  doctor --json                       Write schema-6 JSON to stdout; off
+  doctor --json                       Write capabilities-v3 JSON to stdout; off
   doctor --require hard|watchdog|sealed Require the selected backend class; unset
-  plan --json                         Write schema-9 JSON to stdout; off
+  plan --json                         Write plan-v3 JSON to stdout; off
   clean --dry-run                     List without removing artifacts; off
   clean --json                        Write schema-2 JSON to stdout; off
 
@@ -531,7 +535,7 @@ Run memcordon help for topic-specific help.
 ];
 
 pub const DOCTOR_USAGE: &str = with_reference!(
-    "Inspect backend availability without launching a workload by default.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-contract PATH] [--probe-execution]\n\nOrdinary --json prints schema-6 capabilities, limitations, and authenticated\ncaller-filtered workload discovery. On macOS, explicit --probe-execution runs\na bounded helper/target/cleanup check. Its JSON is a separate schema-1\ndoctor-execution-probe envelope containing the ordinary doctor report.\nThe probe returns 125 when unsupported or unsuccessful; it does not certify\nhard or sealed enforcement.\n\nOptions (default):\n  --json                         Write schema-6 doctor JSON (probe: schema-1 envelope); off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  --workload-contract PATH       Resolve exact workload requirements; requires --require sealed\n  --probe-execution              Run the explicit macOS native execution probe; off\n  -h, --help                     Print this help\n\n"
+    "Inspect backend availability without launching a workload by default.\n\nUsage:\n  memcordon doctor [--json] [--capability-format capabilities-v3] [--require hard|watchdog|sealed] [--probe-execution]\n\nJSON uses memcordon.capabilities revision 3 and distinguishes supported,\ninstalled and currently available profiles. Discovery grants no launch authority.\nOn macOS, explicit --probe-execution runs a bounded native helper/target/cleanup\ncheck and emits a distinct capabilities-probe revision-2 envelope.\nThe probe returns 125 when unsupported or unsuccessful.\n\nOptions (default):\n  --json                         Write named current JSON; off\n  --capability-format capabilities-v3  Select the named current format\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  --probe-execution              Run the explicit macOS native execution probe; off\n  -h, --help                     Print this help\n\n"
 );
 
 pub const PLAN_USAGE: &str = with_reference!(
@@ -551,7 +555,8 @@ Budgets:
   +TIME      Elapsed-time deadline; decimal ms, s, m, or h
 
 Policy options (value; default):
-  --workload-contract PATH               Strict workload declaration; requires --sealed
+  --workload-request PATH                Built-in runtime request; requires --sealed
+  --plan-format plan-v3                  Explicit named current JSON format
   --sealed                              Require sealed supervision; off
   --enforcement auto|hard|watchdog       Backend requirement; auto
   --wait-for command|workload            Clean on direct-command exit or wait for workload empty; command
@@ -574,7 +579,7 @@ Policy options (value; default):
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
   --circuit-cooldown DURATION            Minimum circuit quarantine; unset
   --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
-  --json                                 Write schema-9 JSON to stdout; off
+  --json                                 Write plan-v3 JSON to stdout; off
   -h, --help                             Print this help
 
 Rules:
@@ -747,7 +752,7 @@ impl LimitToken {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyArgs {
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContract>,
+    pub workload_request: Option<memcordon_core::workload_request::WorkloadRequestV1>,
     pub boundary: BoundaryRequirement,
     pub enforcement: Enforcement,
     pub wait_for: Lifetime,
@@ -791,7 +796,7 @@ pub struct ExplicitPolicyOptions {
 impl Default for PolicyArgs {
     fn default() -> Self {
         Self {
-            workload_contract: None,
+            workload_request: None,
             boundary: BoundaryRequirement::Standard,
             enforcement: Enforcement::Auto,
             wait_for: Lifetime::Command,
@@ -820,38 +825,6 @@ impl Default for PolicyArgs {
 }
 
 impl PolicyArgs {
-    pub fn mixed_workload_contract(
-        &self,
-    ) -> Option<&memcordon_core::workload_contract_v3::WorkloadContractV3> {
-        match self.workload_contract.as_ref() {
-            Some(memcordon_core::workload_contract::WorkloadContract::V3(contract)) => {
-                Some(contract)
-            }
-            _ => None,
-        }
-    }
-    pub fn baseline_workload_contract(
-        &self,
-    ) -> Option<&memcordon_core::workload_contract::WorkloadContractV1> {
-        match self.workload_contract.as_ref() {
-            Some(memcordon_core::workload_contract::WorkloadContract::V1(contract)) => {
-                Some(contract)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn private_workload_contract(
-        &self,
-    ) -> Option<&memcordon_core::workload_contract::WorkloadContractV2> {
-        match self.workload_contract.as_ref() {
-            Some(memcordon_core::workload_contract::WorkloadContract::V2(contract)) => {
-                Some(contract)
-            }
-            _ => None,
-        }
-    }
-
     pub fn policy(&self, budgets: &BudgetSet) -> Policy {
         let mut policy = Policy::unbounded();
         policy.memory = budgets.memory;
@@ -868,10 +841,10 @@ impl PolicyArgs {
         policy.command_exit_grace = self.command_exit_grace;
         policy.limit_grace = self.limit_grace;
         policy.swap = self.swap;
-        if let Some(request) = self.baseline_workload_contract() {
+        if let Some(request) = &self.workload_request {
             policy = policy
-                .with_workload_contract(request.clone())
-                .expect("validated CLI workload contract remains valid");
+                .with_workload_request(request.clone())
+                .expect("validated CLI workload request remains valid");
         }
         policy
     }
@@ -883,13 +856,17 @@ pub struct OutputRequest {
     pub report_path: Option<PathBuf>,
     pub windows_terminal_observation: Option<PathBuf>,
     pub windows_request_observation: Option<PathBuf>,
-    pub mixed_observation_directory: Option<PathBuf>,
     pub summary: bool,
     pub quiet: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionArgs {
+    pub workload_cwd: Option<memcordon_core::workload_request::RootRelativePath>,
+    pub workload_input: Option<PathBuf>,
+    pub workload_output: Option<PathBuf>,
+    pub workload_observation: Option<PathBuf>,
+    pub workload_observation_directory: Option<PathBuf>,
     pub budgets: BudgetSet,
     pub policy: PolicyArgs,
     pub command: Vec<OsString>,
@@ -907,18 +884,13 @@ pub enum Requirement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorArgs {
-    pub operational_format: bool,
-    pub mixed_format: bool,
     pub json: bool,
     pub probe_execution: bool,
     pub requirement: Option<Requirement>,
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContract>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanArgs {
-    pub operational_format: bool,
-    pub mixed_format: bool,
     pub json: bool,
     pub budgets: BudgetSet,
     pub policy: PolicyArgs,
@@ -1152,13 +1124,17 @@ fn legacy(first: &OsStr) -> Option<(&'static str, &'static str)> {
 
 fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
     let mut policy = PolicyArgs::default();
+    let mut workload_input = None;
+    let mut workload_output = None;
+    let mut workload_observation = None;
+    let mut workload_observation_directory = None;
+    let mut workload_cwd = None;
     let mut report_path = None;
     let mut windows_terminal_observation = None;
     let mut windows_request_observation = None;
-    let mut mixed_observation_directory = None;
     let mut image_entrypoint = None;
     let mut explicit_boundary = false;
-    let mut report_format = memcordon_core::ReportFormat::Legacy;
+    let mut requested_report_format = None;
     let mut summary = false;
     let mut quiet = false;
     #[cfg(all(windows, feature = "test-support"))]
@@ -1192,6 +1168,46 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         }
         let (name, inline_value) = split_option(text);
         match name {
+            "--workload-cwd" => {
+                let value = option_value(argv, &mut index, inline_value, name)?;
+                let path = memcordon_core::workload_request::RootRelativePath::new(
+                    value
+                        .to_str()
+                        .ok_or_else(|| {
+                            CliError::new(
+                                "MCUSAGE-WORKLOAD-CWD",
+                                "private working directory must be UTF-8",
+                            )
+                        })?
+                        .to_owned(),
+                )
+                .map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CWD", error))?;
+                if workload_cwd.replace(path).is_some() {
+                    return Err(CliError::new(
+                        "MCUSAGE-WORKLOAD-CWD",
+                        "private working directory may be supplied once",
+                    ));
+                }
+            }
+            "--workload-input"
+            | "--workload-output"
+            | "--workload-observation"
+            | "--workload-observation-directory" => {
+                let value = option_value(argv, &mut index, inline_value, name)?;
+                let slot = match name {
+                    "--workload-input" => &mut workload_input,
+                    "--workload-output" => &mut workload_output,
+                    "--workload-observation" => &mut workload_observation,
+                    "--workload-observation-directory" => &mut workload_observation_directory,
+                    _ => unreachable!(),
+                };
+                if value == "-" || slot.replace(PathBuf::from(value)).is_some() {
+                    return Err(CliError::new(
+                        "MCUSAGE-WORKLOAD-IO",
+                        "workload input/output/observation requires one file or directory path",
+                    ));
+                }
+            }
             "--image-entrypoint" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
                 if image_entrypoint.replace(value).is_some() {
@@ -1205,12 +1221,11 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
             "--quiet" if inline_value.is_none() => quiet = true,
             "--report-format" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
-                report_format = match value.to_str() {
-                    Some("legacy") => memcordon_core::ReportFormat::Legacy,
-                    Some("result-v1") => memcordon_core::ReportFormat::ResultV1,
-                    Some("result-v2") => memcordon_core::ReportFormat::ResultV2,
+                requested_report_format = Some(match value.to_str() {
+                    Some("standard") => memcordon_core::ReportFormat::Standard,
+                    Some("result-v3") => memcordon_core::ReportFormat::ResultV3,
                     _ => return Err(invalid_value(name, &value.to_string_lossy())),
-                };
+                });
             }
             "--windows-terminal-observation" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
@@ -1237,20 +1252,6 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
                     ));
                 }
                 windows_request_observation = Some(PathBuf::from(value));
-            }
-            "--mixed-observation-directory" => {
-                let value = option_value(argv, &mut index, inline_value, name)?;
-                let path = PathBuf::from(value);
-                if !cfg!(target_os = "linux")
-                    || !path.is_absolute()
-                    || mixed_observation_directory.is_some()
-                {
-                    return Err(CliError::new(
-                        "MCCLI-MIXED-OBSERVATION",
-                        "one absolute owned Linux observation directory is required",
-                    ));
-                }
-                mixed_observation_directory = Some(path);
             }
             "--report" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
@@ -1289,6 +1290,47 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         ));
     }
     validate_policy_dependencies(&mut policy, &budgets)?;
+    let private_request = policy.workload_request.as_ref().is_some_and(|request| {
+        matches!(
+            request.runtime,
+            memcordon_core::workload_request::RuntimeRequestV1::LinuxPrivate { .. }
+        )
+    });
+    if private_request != workload_input.is_some()
+        || (!private_request
+            && (workload_output.is_some()
+                || workload_observation.is_some()
+                || workload_cwd.is_some()))
+        || (workload_observation_directory.is_some() && policy.workload_request.is_none())
+    {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-IO",
+            "Linux private requests require --workload-input; input/output mappings require that profile and prepared observations require a workload request",
+        ));
+    }
+    let report_format = requested_report_format.unwrap_or_else(|| {
+        if policy.boundary == BoundaryRequirement::Sealed {
+            memcordon_core::ReportFormat::ResultV3
+        } else {
+            memcordon_core::ReportFormat::Standard
+        }
+    });
+    if policy.boundary == BoundaryRequirement::Sealed
+        && report_format != memcordon_core::ReportFormat::ResultV3
+    {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
+            "sealed provider execution requires result-v3",
+        ));
+    }
+    if policy.boundary != BoundaryRequirement::Sealed
+        && report_format == memcordon_core::ReportFormat::ResultV3
+    {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
+            "result-v3 requires sealed provider execution",
+        ));
+    }
     let command = if let Some(entrypoint) = image_entrypoint {
         if !explicit_boundary {
             return Err(CliError::new(
@@ -1296,26 +1338,39 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
                 "image target arguments require an explicit -- boundary",
             ));
         }
-        let contract = policy.mixed_workload_contract().ok_or_else(|| {
+        let request = policy.workload_request.as_ref().ok_or_else(|| {
             CliError::new(
                 "MCCLI-IMAGE-ENTRYPOINT",
-                "image entrypoint requires an exact V3 workload contract",
+                "image entrypoint requires a Linux private workload request",
             )
         })?;
-        if entrypoint.to_str() != Some(contract.launch.entrypoint.as_str()) {
+        let memcordon_core::workload_request::RuntimeRequestV1::LinuxPrivate { inputs, .. } =
+            &request.runtime
+        else {
             return Err(CliError::new(
                 "MCCLI-IMAGE-ENTRYPOINT",
-                "image entrypoint must match the authorized contract id",
+                "image entrypoints require the Linux private profile",
+            ));
+        };
+        if entrypoint.to_str() != Some(inputs.entrypoint.as_str()) {
+            return Err(CliError::new(
+                "MCCLI-IMAGE-ENTRYPOINT",
+                "image entrypoint must match the requested snapshot entrypoint",
             ));
         }
         let mut command = vec![entrypoint];
         command.extend_from_slice(&argv[index..]);
         command
     } else {
-        if policy.mixed_workload_contract().is_some() {
+        if policy.workload_request.as_ref().is_some_and(|request| {
+            matches!(
+                request.runtime,
+                memcordon_core::workload_request::RuntimeRequestV1::LinuxPrivate { .. }
+            )
+        }) {
             return Err(CliError::new(
                 "MCCLI-IMAGE-ENTRYPOINT",
-                "V3 execution requires --image-entrypoint",
+                "Linux private execution requires --image-entrypoint",
             ));
         }
         argv[index..].to_vec()
@@ -1341,56 +1396,19 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
     }
     #[cfg(all(windows, feature = "test-support"))]
     if windows_stack_phases
-        && (policy.boundary != BoundaryRequirement::Sealed
-            || policy.baseline_workload_contract().is_none()
-            || report_path.is_none())
+        && (policy.boundary != BoundaryRequirement::Sealed || report_path.is_none())
     {
         return Err(CliError::new(
             "MCUSAGE-WINDOWS-STACK-PHASES",
-            "--windows-stack-phases requires --sealed, --workload-contract, and --report",
-        ));
-    }
-    if (policy.private_workload_contract().is_some()
-        || policy.baseline_workload_contract().is_some())
-        && report_path.is_some()
-        && report_format != memcordon_core::ReportFormat::ResultV1
-    {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "local runtime admission facts require --report-format result-v1 before launch",
-        ));
-    }
-    if policy.mixed_workload_contract().is_some()
-        && report_format != memcordon_core::ReportFormat::ResultV2
-    {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "combined image-only runtime requests require --report-format result-v2 before launch",
-        ));
-    }
-    if report_format == memcordon_core::ReportFormat::ResultV2
-        && policy.mixed_workload_contract().is_none()
-    {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "result-v2 requires a combined image-only workload contract",
-        ));
-    }
-    let legacy_observation = policy.boundary == BoundaryRequirement::Sealed
-        && policy.baseline_workload_contract().is_some_and(|contract| {
-            contract.authorized_profile
-                == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
-        });
-    if mixed_observation_directory.is_some()
-        && policy.mixed_workload_contract().is_none()
-        && !legacy_observation
-    {
-        return Err(CliError::new(
-            "MCCLI-MIXED-OBSERVATION",
-            "observer requires an exact V3 image-only or sealed Linux V1 Unix contract",
+            "--windows-stack-phases requires --sealed and --report",
         ));
     }
     Ok(ExecutionArgs {
+        workload_cwd,
+        workload_input,
+        workload_output,
+        workload_observation,
+        workload_observation_directory,
         budgets,
         policy,
         command,
@@ -1399,7 +1417,6 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
             report_path,
             windows_terminal_observation,
             windows_request_observation,
-            mixed_observation_directory,
             summary,
             quiet,
         },
@@ -1409,12 +1426,9 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
 }
 
 fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
-    let mut operational_format = false;
-    let mut mixed_format = false;
     let mut json = false;
     let mut probe_execution = false;
     let mut requirement = None;
-    let mut workload_policy = PolicyArgs::default();
     let mut index = 0;
     while index < argv.len() {
         let text = strict_text(&argv[index], "doctor option")?;
@@ -1426,19 +1440,13 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
             "--json" if inline_value.is_none() => json = true,
             "--capability-format" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
-                mixed_format = value.to_str() == Some("capabilities-v2");
-                operational_format = match value.to_str() {
-                    Some("legacy") => false,
-                    Some("capabilities-v1") => true,
-                    Some("capabilities-v2") => true,
+                match value.to_str() {
+                    Some("capabilities-v3") => (),
                     _ => return Err(invalid_value(name, &value.to_string_lossy())),
                 };
                 json = true;
             }
             "--probe-execution" if inline_value.is_none() => probe_execution = true,
-            "--workload-contract" => {
-                parse_policy_option(name, inline_value, argv, &mut index, &mut workload_policy)?
-            }
             "--require" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
                 requirement = Some(match value.to_str() {
@@ -1457,57 +1465,14 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
         }
         index += 1;
     }
-    if workload_policy.workload_contract.is_some() && requirement != Some(Requirement::Sealed) {
-        return Err(CliError::new(
-            "MCCLI-DOCTOR-REQUIRE",
-            "--workload-contract requires --require sealed",
-        ));
-    }
-    if workload_policy.workload_contract.is_some() && json && !operational_format {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "local runtime admission facts require --capability-format capabilities-v1",
-        ));
-    }
-    if workload_policy.mixed_workload_contract().is_some() && !mixed_format {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "V3 doctor requires --capability-format capabilities-v2",
-        ));
-    }
-    if mixed_format && probe_execution {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-PROBE",
-            "capabilities-v2 is advisory; execution requires an image-bound run",
-        ));
-    }
-    if mixed_format
-        && matches!(
-            workload_policy.workload_contract.as_ref(),
-            Some(
-                memcordon_core::workload_contract::WorkloadContract::V1(_)
-                    | memcordon_core::workload_contract::WorkloadContract::V2(_)
-            )
-        )
-    {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "capabilities-v2 does not reinterpret historical contracts",
-        ));
-    }
     Ok(Invocation::Doctor(DoctorArgs {
-        operational_format,
-        mixed_format,
         json,
         probe_execution,
         requirement,
-        workload_contract: workload_policy.workload_contract,
     }))
 }
 
 fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
-    let mut operational_format = false;
-    let mut mixed_format = false;
     let mut policy = PolicyArgs::default();
     let mut json = false;
     let mut index = 0;
@@ -1533,11 +1498,8 @@ fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
             json = true;
         } else if name == "--plan-format" {
             let value = option_value(argv, &mut index, inline_value, name)?;
-            mixed_format = value.to_str() == Some("plan-v2");
-            operational_format = match value.to_str() {
-                Some("legacy") => false,
-                Some("plan-v1") => true,
-                Some("plan-v2") => true,
+            match value.to_str() {
+                Some("plan-v3") => (),
                 _ => return Err(invalid_value(name, &value.to_string_lossy())),
             };
             json = true;
@@ -1547,21 +1509,7 @@ fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
         index += 1;
     }
     validate_policy_dependencies(&mut policy, &budgets)?;
-    if policy.workload_contract.is_some() && json && !operational_format {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "local runtime admission facts require --plan-format plan-v1",
-        ));
-    }
-    if policy.mixed_workload_contract().is_some() != mixed_format {
-        return Err(CliError::new(
-            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
-            "plan-v2 requires an exact V3 contract and V3 requires plan-v2",
-        ));
-    }
     Ok(Invocation::Plan(PlanArgs {
-        operational_format,
-        mixed_format,
         json,
         budgets,
         policy,
@@ -1572,6 +1520,12 @@ fn validate_policy_dependencies(
     policy: &mut PolicyArgs,
     budgets: &BudgetSet,
 ) -> Result<(), CliError> {
+    if policy.workload_request.is_some() && policy.boundary != BoundaryRequirement::Sealed {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-BOUNDARY",
+            "workload requests require --sealed",
+        ));
+    }
     if policy.explicit.command_exit_grace && policy.wait_for == Lifetime::Workload {
         return Err(CliError::new(
             "MCUSAGE-COMMAND-EXIT-GRACE",
@@ -1716,30 +1670,31 @@ fn parse_policy_option(
     index: &mut usize,
     policy: &mut PolicyArgs,
 ) -> Result<(), CliError> {
-    if name == "--workload-contract" {
+    if name == "--workload-request" {
         use std::io::Read;
-        if policy.workload_contract.is_some() {
+        if policy.workload_request.is_some() {
             return Err(CliError::new(
-                "MCUSAGE-WORKLOAD-CONTRACT",
-                "--workload-contract may be supplied once",
+                "MCUSAGE-WORKLOAD-REQUEST",
+                "one workload request may be supplied",
             ));
         }
-        let path = std::path::PathBuf::from(option_value(argv, index, inline_value, name)?);
+        let path = PathBuf::from(option_value(argv, index, inline_value, name)?);
         let read = || -> Result<_, String> {
-            let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+            let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
             let metadata = file.metadata().map_err(|error| error.to_string())?;
-            let limit = memcordon_core::workload_limits::CONTRACT_BYTES;
+            let limit = memcordon_core::workload_limits::REQUEST_BYTES;
             if !metadata.is_file() || metadata.len() > limit as u64 {
-                return Err("workload contract must be a bounded regular file".into());
+                return Err("workload request must be a bounded regular file".into());
             }
             let mut bytes = Vec::new();
             file.take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| error.to_string())?;
-            memcordon_core::workload_contract::WorkloadContract::parse(&bytes)
+            memcordon_core::workload_request::WorkloadRequestV1::parse(&bytes)
+                .map_err(|error| error.to_string())
         };
-        policy.workload_contract =
-            Some(read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))?);
+        policy.workload_request =
+            Some(read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-REQUEST", error))?);
         return Ok(());
     }
     if name == "--sealed" {

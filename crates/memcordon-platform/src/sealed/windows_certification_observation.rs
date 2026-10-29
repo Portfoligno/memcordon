@@ -1,8 +1,8 @@
 //! Test-support-only native certification routing. Never enabled by production
 //! launches, and never a public product readiness observation.
 use memcordon_core::{
-    WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsLaunchRequestV1, WindowsProcessIdentityV1,
-    WindowsProviderRequestV3, WindowsSealedFault, WindowsSealedMutant,
+    WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION, WindowsLaunchRequestV2, WindowsProcessIdentityV1,
+    WindowsProviderRequestV4, WindowsSealedFault, WindowsSealedMutant,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,7 +19,7 @@ pub enum WindowsCertificationSelection {
 #[serde(deny_unknown_fields)]
 pub struct WindowsCertificationObservation {
     pub selection: WindowsCertificationSelection,
-    pub launch: Option<WindowsLaunchRequestV1>,
+    pub launch: Option<WindowsLaunchRequestV2>,
     pub caller: Option<WindowsProcessIdentityV1>,
     pub attempt_id: Option<String>,
     pub request_sha256: Option<String>,
@@ -130,11 +130,11 @@ fn publish(observation: &WindowsCertificationObservation) -> Result<(), String> 
     })
 }
 
-pub(super) fn route(launch: WindowsLaunchRequestV1) -> Result<WindowsProviderRequestV3, String> {
+pub(super) fn route(launch: WindowsLaunchRequestV2) -> Result<WindowsProviderRequestV4, String> {
     ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
         let Some(observation) = active.as_mut() else {
-            return Ok(WindowsProviderRequestV3::Launch(launch));
+            return Ok(WindowsProviderRequestV4::Launch(launch));
         };
         if observation.launch.is_some() {
             return Err("native certification requires exactly one launch".into());
@@ -156,8 +156,8 @@ pub(super) fn route(launch: WindowsLaunchRequestV1) -> Result<WindowsProviderReq
         publish(observation)?;
         Ok(match observation.selection {
             WindowsCertificationSelection::Fault { fault } => {
-                WindowsProviderRequestV3::CertificationFault {
-                    schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+                WindowsProviderRequestV4::CertificationFault {
+                    schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
                     fault,
                     attempt_id: attempt,
                     request_sha256: digest,
@@ -166,8 +166,8 @@ pub(super) fn route(launch: WindowsLaunchRequestV1) -> Result<WindowsProviderReq
                 }
             }
             WindowsCertificationSelection::Mutant { mutant } => {
-                WindowsProviderRequestV3::CertificationMutant {
-                    schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+                WindowsProviderRequestV4::CertificationMutant {
+                    schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
                     mutant,
                     attempt_id: attempt,
                     request_sha256: digest,
@@ -321,7 +321,7 @@ pub(super) fn after_target_authorized(target_pid: u32) -> Result<bool, String> {
     if bytes.len() > 64 * 1024 {
         return Err("frontend descriptor exceeds bound".into());
     }
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
     let descriptor: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     if !descriptor
@@ -355,7 +355,7 @@ pub(super) fn after_target_authorized(target_pid: u32) -> Result<bool, String> {
                 if file.read_exact(&mut bytes).is_err() {
                     break;
                 }
-                memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
                 let event: serde_json::Value =
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
                 if event.get("sequence").and_then(serde_json::Value::as_u64) != Some(sequence)

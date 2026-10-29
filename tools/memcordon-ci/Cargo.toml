@@ -26,7 +26,7 @@ memcordon-platform = { path = "../../crates/memcordon-platform", version = "=0.5
 memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.8-dev" }
 memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.8-dev", features = ["test-support"] }
 memcordon-windows-loader-lab = { path = "../memcordon-windows-loader-lab", version = "=0.5.8-dev" }
-rustix = { version = "1.1.4", features = ["net", "process", "fs", "event", "pipe"] }
+rustix = { version = "1.1.4", features = ["net", "process", "fs", "event", "pipe", "time", "param"] }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -166,8 +166,147 @@ struct Failure {
     truncated: bool,
 }
 
+pub(super) fn root() -> std::path::PathBuf {
+    super::package::state_root()
+        .parent()
+        .expect("sealed state has parent")
+        .join("diagnostics")
+}
+
+pub(super) fn install() -> Result<(), String> {
+    super::package::create_secure_directory(
+        &root(),
+        &super::security::SecurityDescriptor::from_sddl(&super::security::state_bootstrap_sddl()?)?,
+        "startup diagnostic directory",
+    )
+}
+
+/// Exact current diagnostic bytes for package rollback. This contains no
+/// attempt records and cannot authorize a launch or establish retirement.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DiagnosticsSnapshot {
+    entries: Vec<(std::ffi::OsString, Vec<u8>)>,
+}
+
+impl DiagnosticsSnapshot {
+    pub(super) fn validate_for_restore(&self) -> Result<(), String> {
+        let mut names = std::collections::BTreeSet::new();
+        if self.entries.len() > 3 {
+            return Err("current diagnostic inventory exceeds ceiling".into());
+        }
+        for (name, bytes) in &self.entries {
+            if ![
+                FILE_NAME,
+                LAUNCHER_FILE_NAME,
+                "launcher-startup-failure.json.new",
+            ]
+            .iter()
+            .any(|expected| name == std::ffi::OsStr::new(expected))
+                || !names.insert(name)
+                || bytes.len() > RECORD_BYTES
+            {
+                return Err("invalid current diagnostic rollback object".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pin_root() -> Result<std::fs::File, String> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_WRITE};
+    let directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root())
+        .map_err(|error| error.to_string())?;
+    let metadata = directory.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("diagnostic directory is not a regular directory".into());
+    }
+    let _ = path()?;
+    Ok(directory)
+}
+
+pub(super) fn capture_current() -> Result<Option<DiagnosticsSnapshot>, String> {
+    match std::fs::symlink_metadata(root()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => {}
+    }
+    let _directory = pin_root()?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(root()).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if ![
+            FILE_NAME,
+            LAUNCHER_FILE_NAME,
+            "launcher-startup-failure.json.new",
+        ]
+        .iter()
+        .any(|expected| name == std::ffi::OsStr::new(expected))
+            || entries.len() >= 3
+        {
+            return Err("diagnostic directory contains unexpected or excessive entries".into());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(entry.path())
+            .map_err(|error| error.to_string())?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("current diagnostic is not a regular file".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(RECORD_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > RECORD_BYTES {
+            return Err("current diagnostic exceeds record ceiling".into());
+        }
+        entries.push((name, bytes));
+    }
+    Ok(Some(DiagnosticsSnapshot { entries }))
+}
+
+/// Call only after the service-owned attempt barrier and service removal.
+pub(super) fn remove_current() -> Result<(), String> {
+    let Some(snapshot) = capture_current()? else {
+        return Ok(());
+    };
+    let directory = pin_root()?;
+    for (name, _) in snapshot.entries {
+        std::fs::remove_file(root().join(name)).map_err(|error| error.to_string())?;
+    }
+    drop(directory);
+    std::fs::remove_dir(root()).map_err(|error| error.to_string())
+}
+
+pub(super) fn restore_current(snapshot: &DiagnosticsSnapshot) -> Result<(), String> {
+    snapshot.validate_for_restore()?;
+    install()?;
+    let _directory = pin_root()?;
+    for (name, bytes) in &snapshot.entries {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(root().join(name))
+            .map_err(|error| error.to_string())?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn path() -> Result<std::path::PathBuf, String> {
-    let root = super::policy_registry::root();
+    let root = root();
     super::package::reject_reparse_components(&root)?;
     super::security::SecurityDescriptor::from_sddl(&super::security::state_bootstrap_sddl()?)?
         .verify_path(&root)?;

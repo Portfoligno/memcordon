@@ -110,6 +110,8 @@ pub fn certify_windows_platform_mutant(
 
 #[derive(Clone, Debug)]
 pub struct SupervisorRequest {
+    #[cfg(target_os = "linux")]
+    pub workload_frontend: Option<std::sync::Arc<std::sync::Mutex<crate::WorkloadFrontendRequest>>>,
     pub policy: Policy,
     pub restart: RestartPolicy,
     pub command: CommandSpec,
@@ -430,15 +432,7 @@ pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Err
 fn validate_resolved_backend(
     request: &SupervisorRequest,
 ) -> Result<Option<BackendCapabilityReport>, Error> {
-    if request.policy.workload_contract().is_some()
-        && request.policy.boundary() != BoundaryRequirement::Sealed
-    {
-        return Err(Error::new(
-            ErrorCategory::Unsupported,
-            "MCWORKLOAD-SEALED-REQUIRED",
-            "a strict workload contract requires sealed supervision",
-        ));
-    }
+    crate::backend::validate_current_workload_policy(&request.policy)?;
     let Some(backend) = request.resolved_backend.clone() else {
         if request.policy.boundary() != BoundaryRequirement::Sealed {
             return Ok(None);
@@ -660,6 +654,26 @@ fn supervise_with_origin<I: InterruptionWait>(
         match result {
             Err(error) => {
                 let error = *error;
+                if let Some(cancellation) = &error.windows_preallocation_cancellation {
+                    cancellation.validate().map_err(|detail| {
+                        Error::new(
+                            ErrorCategory::Monitor,
+                            "MCSEALED-WINDOWS-CANCELLATION-EVIDENCE",
+                            detail,
+                        )
+                    })?;
+                    if error.target_released
+                        || error.target_pid.is_some()
+                        || error.workload_may_be_alive
+                    {
+                        return Err(Error::new(
+                            ErrorCategory::Monitor,
+                            "MCSEALED-WINDOWS-CANCELLATION-EVIDENCE",
+                            "preallocation cancellation conflicts with native target facts",
+                        ));
+                    }
+                    return Err(error);
+                }
                 if error.code == "MCSUPERVISION-DEADLINE-BEFORE-AUTHORIZATION"
                     || sealed_deadline_rejection_is_outside_attempt(
                         &request.policy,
@@ -695,11 +709,11 @@ fn supervise_with_origin<I: InterruptionWait>(
                 let number = history.total.checked_add(1).ok_or_else(counter_error)?;
                 let recovered_without_clock = error.target_released
                     && error.authorization_offset.is_none()
-                    && error.windows_provider_rejection_v2.as_ref().is_some_and(|rejection| {
+                    && error.windows_provider_rejection_v3.as_ref().is_some_and(|rejection| {
                         rejection.is_consistent()
                             && rejection.terminal_receipt().is_some_and(|receipt| matches!(
                                 receipt.payload,
-                                memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure { resume_attempted: true, .. }
+                                memcordon_core::WindowsTerminalPayloadV3::RecoveredClosure { resume_attempted: true, .. }
                             ))
                     });
                 if error.target_released != error.authorization_offset.is_some()
@@ -721,20 +735,17 @@ fn supervise_with_origin<I: InterruptionWait>(
                 history
                     .append(
                         AttemptRecord {
-                            operational_failure: memcordon_core::OperationalAttemptFailure::from_error(&error),
-                            private_execution: None,
+                            operational_failure:
+                                memcordon_core::OperationalAttemptFailure::from_error(&error),
                             runtime: error.runtime.clone(),
                             number,
-                            policy_enforcement: error.policy_enforcement.clone().unwrap_or_else(|| {
-                                request.policy.workload_contract().map_or_else(Default::default, |contract|
-                                    memcordon_core::workload_evidence::RuntimePolicyEnforcement::AuthorizationUncertain {
-                                        request: Some(memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract).expect("policy workload is validated")),
-                                        failure: memcordon_core::workload_evidence::AdmissionAvailabilityFailure::TerminalUnavailable,
-                                    })
-                            }),
                             kind,
                             phase: AttemptPhase::Failed,
-                            target_pid: error.target_pid.or_else(|| error.runtime.as_ref().and_then(|runtime| runtime.target_pid.map(std::num::NonZeroU32::get))),
+                            target_pid: error.target_pid.or_else(|| {
+                                error.runtime.as_ref().and_then(|runtime| {
+                                    runtime.target_pid.map(std::num::NonZeroU32::get)
+                                })
+                            }),
                             started_offset_ms: Some(millis(attempt_started)),
                             authorized_offset_ms: error
                                 .authorization_offset
@@ -915,12 +926,10 @@ fn supervise_with_origin<I: InterruptionWait>(
                     .append(
                         AttemptRecord {
                             operational_failure: None,
-                            private_execution: attempt.execution.private_execution,
                             runtime: attempt.execution.runtime,
                             number,
                             kind,
                             phase: AttemptPhase::Completed,
-                            policy_enforcement: attempt.execution.policy_enforcement,
                             target_pid: attempt.execution.child_pid.map(std::num::NonZeroU32::get),
                             started_offset_ms: Some(millis(attempt_started)),
                             authorized_offset_ms: attempt
@@ -1035,24 +1044,20 @@ fn run_unix_attempt(
 ) -> Result<AttemptExecution, Error> {
     #[cfg(target_os = "linux")]
     if request.policy.boundary() == BoundaryRequirement::Sealed {
-        if let Some(contract) = request.policy.mixed_workload_contract() {
+        if request.policy.workload_request().is_some() {
+            let io = request.workload_frontend.as_ref().ok_or_else(|| {
+                Error::new(
+                    ErrorCategory::Usage,
+                    "MCUSAGE-WORKLOAD-INPUT",
+                    "current private workloads require caller-held input and output selections",
+                )
+            })?;
+            let mut io = io.lock().expect("workload frontend owner was poisoned");
             return attempt_execution(
-                crate::sealed::client::mixed_backend_run(
+                crate::sealed::client::run_workload_backend(
+                    &mut io,
                     &request.policy,
                     &request.command,
-                    contract,
-                    context,
-                    signal,
-                )?,
-                &request.policy,
-            );
-        }
-        if let Some(contract) = request.policy.private_workload_contract() {
-            return attempt_execution(
-                crate::sealed::client::private_backend_run(
-                    &request.policy,
-                    &request.command,
-                    contract,
                     context,
                     signal,
                 )?,
@@ -1114,31 +1119,22 @@ fn attempt_execution(execution: Execution, policy: &Policy) -> Result<AttemptExe
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_backend_execution(execution: &Execution, policy: &Policy) -> Result<(), Error> {
-    let mixed_indeterminate = matches!(&execution.boundary_detail,memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(native) if matches!(&native.runtime.outcome,memcordon_core::result_v2::MixedRuntimeOutcomeV2::Indeterminate{..}));
-    let invalid = if mixed_indeterminate {
-        policy.boundary() != BoundaryRequirement::Sealed
-            || !crate::mixed_indeterminate::consistent(execution, policy.mixed_workload_contract())
-    } else {
-        execution.launch.target_released != execution.authorization_offset.is_some()
-            || (execution.launch.target_released && execution.child_pid.is_none())
-            || execution.runtime.as_ref().is_some_and(|runtime| {
-                !runtime.is_consistent()
-                    || runtime.target_pid != execution.child_pid
-                    || matches!(
-                        runtime.release,
-                        memcordon_core::ReleaseEvidence::Issued { .. }
-                    ) != execution.launch.target_released
-            })
-    };
-    if invalid {
-        return Err(authorization_evidence_failure(
-            match &execution.boundary_detail {
-                memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(native) => {
-                    Some(&native.runtime)
-                }
-                _ => None,
-            },
+fn validate_backend_execution(execution: &Execution, _policy: &Policy) -> Result<(), Error> {
+    if execution.launch.target_released != execution.authorization_offset.is_some()
+        || (execution.launch.target_released && execution.child_pid.is_none())
+        || execution.runtime.as_ref().is_some_and(|runtime| {
+            !runtime.is_consistent()
+                || runtime.target_pid != execution.child_pid
+                || matches!(
+                    runtime.release,
+                    memcordon_core::ReleaseEvidence::Issued { .. }
+                ) != execution.launch.target_released
+        })
+    {
+        return Err(Error::new(
+            ErrorCategory::Monitor,
+            "MCRESTART-AUTHORIZATION-EVIDENCE",
+            "backend release, target identity, and runtime evidence disagree",
         ));
     }
     if memcordon_core::boundary_evidence_is_consistent(
@@ -1154,48 +1150,6 @@ fn validate_backend_execution(execution: &Execution, policy: &Policy) -> Result<
             "backend returned contradictory launch or retirement evidence",
         ))
     }
-}
-
-fn authorization_evidence_failure(
-    carrier: Option<&memcordon_core::result_v2::MixedRuntimeCarrierV2>,
-) -> Error {
-    let mut detail = "backend release, target identity, and runtime evidence disagree".to_owned();
-    if let Some(carrier) = carrier.filter(|carrier| carrier.validate().is_ok()) {
-        if let memcordon_core::result_v2::MixedRuntimeOutcomeV2::Indeterminate {
-            attempt_id,
-            retained_obligations,
-            ..
-        } = &carrier.outcome
-        {
-            use std::fmt::Write;
-            let obligations = retained_obligations.obligations.as_slice();
-            let _ = write!(
-                detail,
-                "; native mixed indeterminate; attempt={}; authorization={:?}; obligations={}; omitted={}",
-                attempt_id.as_str(),
-                retained_obligations.authorization,
-                obligations.len(),
-                obligations.len().saturating_sub(6)
-            );
-            for (index, obligation) in obligations.iter().enumerate() {
-                if index < 4 || index >= obligations.len().saturating_sub(2) {
-                    let _ = write!(detail, "; obligation[{index}]={}", obligation.as_str());
-                }
-            }
-        }
-    }
-    Error::new(
-        ErrorCategory::Monitor,
-        "MCRESTART-AUTHORIZATION-EVIDENCE",
-        detail,
-    )
-}
-
-#[cfg(feature = "test-support")]
-pub fn test_authorization_evidence_failure(
-    carrier: Option<&memcordon_core::result_v2::MixedRuntimeCarrierV2>,
-) -> Error {
-    authorization_evidence_failure(carrier)
 }
 
 fn supervision_remaining(
@@ -1335,10 +1289,8 @@ fn finish_backend_selection_drift(
         .append(
             AttemptRecord {
                 operational_failure: None,
-                private_execution: attempt.execution.private_execution,
                 runtime: attempt.execution.runtime,
                 number,
-                policy_enforcement: attempt.execution.policy_enforcement,
                 kind,
                 phase: AttemptPhase::Failed,
                 target_pid: attempt.execution.child_pid.map(std::num::NonZeroU32::get),
@@ -1447,8 +1399,6 @@ pub(crate) fn test_backend_selection_drift_execution(
         metric,
         AttemptExecution {
             execution: Execution {
-                private_execution: None,
-                policy_enforcement: Default::default(),
                 outcome: RunOutcome::Exited {
                     child: memcordon_core::ChildTermination::ExitCode { code: 0 },
                     peak: None,
@@ -1605,11 +1555,11 @@ fn launch_from_error(
         .filter(|mechanism| !mechanism.is_empty())
         .unwrap_or_else(|| launch_mechanism().to_owned());
     let sealed = requested == BoundaryRequirement::Sealed;
-    if let (true, Some(memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(native))) =
+    if let (true, Some(memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV3(native))) =
         (sealed, windows_failed_execution_detail(error))
     {
         return LaunchEvidence {
-            mechanism: "windows-job-object-v2".into(),
+            mechanism: "windows-job-object-v3".into(),
             target_released: native.target_released,
             containment_verified_before_authorization: native.job_created
                 && native.job_limits_verified
@@ -1697,7 +1647,7 @@ fn windows_failed_execution_detail(
 ) -> Option<&memcordon_core::BoundaryMechanismEvidence> {
     let failure = memcordon_core::OperationalAttemptFailure::from_error(error)?;
     failure.validate().ok()?;
-    let rejection = error.windows_provider_rejection_v2.as_deref()?;
+    let rejection = error.windows_provider_rejection_v3.as_deref()?;
     if !rejection.is_consistent() {
         return None;
     }
@@ -1706,7 +1656,7 @@ fn windows_failed_execution_detail(
     if error.target_pid != Some(pid) || !error.target_released {
         return None;
     }
-    let memcordon_core::WindowsTerminalPayloadV2::Execution {
+    let memcordon_core::WindowsTerminalPayloadV3::Execution {
         authorization_offset_millis,
         ..
     } = &receipt.payload
@@ -1718,7 +1668,7 @@ fn windows_failed_execution_detail(
     }
     matches!(
         detail,
-        memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(_)
+        memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV3(_)
     )
     .then_some(detail)
 }

@@ -1,14 +1,13 @@
 #[path = "../src/bin/memcordon-sealed-agent/network_readiness.rs"]
 mod network_readiness;
 
-use memcordon_core::runtime_readiness::ReadinessObservation;
+use memcordon_core::native_readiness::ReadinessObservation;
 
 fn measured_fixture() -> ReadinessObservation {
     let mut observation = ReadinessObservation {
-        format: "memcordon.runtime-readiness".into(),
+        format: "memcordon.native-readiness".into(),
         revision: 1,
-        workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
-            .reference(),
+        probe_role: "credential-preserving".into(),
         workload_profile_probe_verified: true,
         version: env!("CARGO_PKG_VERSION").into(),
         mechanism: "linux-pid-namespace-cgroup-v2".into(),
@@ -19,9 +18,7 @@ fn measured_fixture() -> ReadinessObservation {
         success_child_status: Some(0),
         missing_target_child_status: Some(127),
         profile_child_status: Some(0),
-        caller_envelope_digest: Some(
-            memcordon_core::workload_codec::hash_bytes(b"caller envelope").into(),
-        ),
+        caller_envelope_digest: Some(memcordon_core::hash_bytes(b"caller envelope").into()),
         unified_cgroup_v2: true,
         private_cgroup_subtree: true,
         clone3: true,
@@ -57,7 +54,7 @@ fn measured_fixture() -> ReadinessObservation {
 fn network_fixture() -> ReadinessObservation {
     let mut observation = measured_fixture();
     observation.format = "memcordon.network-launcher-readiness".into();
-    observation.workload_profile = network_readiness::profile();
+    observation.probe_role = "private-network-launcher".into();
     observation.launcher_service_identity = "memcordon-sealed-network-launcher.service:v2".into();
     observation.observation_digest = observation.digest_facts().unwrap();
     observation
@@ -73,7 +70,7 @@ fn network_measurements_cannot_be_replayed_as_ordinary_readiness() {
     assert!(network_readiness::complete(&network));
     assert!(!network.complete());
     assert!(ReadinessObservation::parse(network.render().as_bytes()).is_err());
-    for field in ["format", "workload_profile", "launcher_service_identity"] {
+    for field in ["format", "probe_role", "launcher_service_identity"] {
         let mut value = serde_json::to_value(&network).unwrap();
         value[field] = serde_json::to_value(&ordinary).unwrap()[field].clone();
         let mut mutant: ReadinessObservation = serde_json::from_value(value).unwrap();
@@ -104,7 +101,7 @@ fn network_role_still_requires_every_native_fact_and_actual_profile_exit() {
     assert!(!network_readiness::complete(&failed));
     let mut copied = network;
     copied.caller_envelope_digest =
-        Some(memcordon_core::workload_codec::hash_bytes(b"substituted caller envelope").into());
+        Some(memcordon_core::hash_bytes(b"substituted caller envelope").into());
     assert!(
         !network_readiness::complete(&copied),
         "copied digest accepted"

@@ -540,8 +540,6 @@ pub(crate) fn run_attempt_in(
                     },
                 );
             return Ok(Execution {
-                private_execution: None,
-                policy_enforcement: Default::default(),
                 outcome: if !expired {
                     RunOutcome::Interrupted {
                         signal: Interruption {
@@ -1259,8 +1257,6 @@ pub(crate) fn run_attempt_in(
         );
     }
     Ok(Execution {
-        private_execution: None,
-        policy_enforcement: Default::default(),
         outcome,
         backend,
         child_pid: std::num::NonZeroU32::new(child_pid),

@@ -46,21 +46,12 @@ pub struct LaunchPolicyV2 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchRequestV2 {
     pub restart_attempt: u64,
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
     pub program: Vec<u8>,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
     pub policy: LaunchPolicyV2,
     /// Exact out-of-band descriptor purposes, in transfer order.
     pub descriptors: Vec<DescriptorPurpose>,
-}
-
-/// Inputs for held native target setup. This value grants no permission and
-/// has no wire decoder.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativePrivateLaunchInput {
-    pub contract: memcordon_core::workload_contract::WorkloadContractV2,
-    pub launch: LaunchRequestV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,18 +255,7 @@ pub fn encode_launch_request(request: &LaunchRequestV2) -> Result<Vec<u8>, Reque
     encoded.extend_from_slice(&request.policy.limit_grace_millis.to_be_bytes());
     put_count(&mut encoded, request.descriptors.len())?;
     encoded.extend(request.descriptors.iter().map(|purpose| *purpose as u8));
-    match &request.workload_contract {
-        None => encoded.push(0),
-        Some(contract) => {
-            contract
-                .validate()
-                .map_err(|_| RequestCodecError::InvalidValue)?;
-            encoded.push(1);
-            let bytes =
-                serde_json::to_vec(contract).map_err(|_| RequestCodecError::InvalidValue)?;
-            put_bytes(&mut encoded, &bytes)?;
-        }
-    }
+    encoded.push(0);
     Ok(encoded)
 }
 
@@ -340,20 +320,14 @@ pub fn decode_launch_request(payload: &[u8]) -> Result<LaunchRequestV2, RequestC
             _ => return Err(RequestCodecError::InvalidValue),
         });
     }
-    let workload_contract = match cursor.u8()? {
-        0 => None,
-        1 => Some(
-            memcordon_core::workload_contract::WorkloadContractV1::parse(&cursor.bytes()?)
-                .map_err(|_| RequestCodecError::InvalidValue)?,
-        ),
-        _ => return Err(RequestCodecError::InvalidValue),
-    };
+    if cursor.u8()? != 0 {
+        return Err(RequestCodecError::InvalidValue);
+    }
     if !cursor.is_empty() {
         return Err(RequestCodecError::TrailingBytes);
     }
     let request = LaunchRequestV2 {
         restart_attempt,
-        workload_contract,
         program,
         arguments,
         environment,

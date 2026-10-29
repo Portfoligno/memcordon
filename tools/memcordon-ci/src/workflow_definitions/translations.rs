@@ -4072,27 +4072,27 @@ pub(super) fn translate(command: &str, flavor: u8) -> Option<LiteralRun> {
             5,
         ) => Some(LiteralRun::R566),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             0,
         ) => Some(LiteralRun::R535),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             1,
         ) => Some(LiteralRun::R535),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             2,
         ) => Some(LiteralRun::R535),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             3,
         ) => Some(LiteralRun::R567),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             4,
         ) => Some(LiteralRun::R567),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             5,
         ) => Some(LiteralRun::R568),
         ("./target/ci/release/memcordon-ci ci aggregate-macos", 0) => Some(LiteralRun::R569),

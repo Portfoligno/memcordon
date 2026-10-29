@@ -126,10 +126,10 @@ fn assert_serialized_response_limit<T: WindowsResponseFrame + serde::Serialize>(
 
 #[test]
 fn response_framing_is_bound_to_the_serialized_protocol() {
-    use memcordon_core::{WindowsLauncherResponseV1, WindowsProviderResponseV1};
+    use memcordon_core::{WindowsLauncherResponseV4, WindowsProviderResponseV4};
 
-    let response = WindowsLauncherResponseV1::Probe {
-        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = WindowsLauncherResponseV4::Probe {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attestation: memcordon_core::WindowsServiceSelfAttestationV1 {
             schema_version: 1,
             challenge: "01".repeat(32),
@@ -154,16 +154,16 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
     assert!(bytes.len() > WINDOWS_RESPONSE_PREFIX_BYTES);
     let prefix = &bytes[..WINDOWS_RESPONSE_PREFIX_BYTES];
     assert_eq!(
-        WindowsLauncherResponseV1::frame_limit(prefix).unwrap(),
+        WindowsLauncherResponseV4::frame_limit(prefix).unwrap(),
         memcordon_core::WINDOWS_MAX_FRAME_BYTES
     );
     // Both response protocols use kind; their concrete payload schemas still differ.
-    assert!(serde_json::from_slice::<WindowsProviderResponseV1>(&bytes).is_err());
-    let decoded: WindowsLauncherResponseV1 = serde_json::from_slice(&bytes).unwrap();
+    assert!(serde_json::from_slice::<WindowsProviderResponseV4>(&bytes).is_err());
+    let decoded: WindowsLauncherResponseV4 = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 
-    let cleanup = WindowsProviderResponseV1::PackageCleanupResult {
-        schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let cleanup = WindowsProviderResponseV4::PackageCleanupResult {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         challenge: "04".repeat(32),
         status: memcordon_core::WindowsControlRequestStatusV1::Failed,
         attempts_empty: None,
@@ -171,28 +171,6 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
         detail: "cleanup did not converge".to_owned(),
     };
     assert_serialized_response_limit(&cleanup, memcordon_core::WINDOWS_MAX_FRAME_BYTES);
-    let discovery = memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
-        None,
-        &memcordon_core::workload_registry::CallerSelector::Linux { uid: 1000 },
-        memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
-        match &response {
-            WindowsLauncherResponseV1::Probe {
-                provider_binding, ..
-            } => provider_binding.clone(),
-            _ => unreachable!(),
-        },
-        BoundedText::new("boot-a").unwrap(),
-    )
-    .unwrap();
-    assert_serialized_response_limit(
-        &WindowsProviderResponseV1::WorkloadDiscovery {
-            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            challenge: memcordon_core::workload_contract::Nonce128([3; 16]),
-            discovery,
-        },
-        memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES,
-    );
-
     for (response, request, limit) in [
         (
             br#"{"kind":"attempt-retained"}"#.as_slice(),
@@ -216,15 +194,15 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
         ),
     ] {
         assert_eq!(
-            WindowsLauncherResponseV1::frame_limit(response).unwrap(),
+            WindowsLauncherResponseV4::frame_limit(response).unwrap(),
             limit
         );
         assert_eq!(
-            WindowsProviderResponseV1::frame_limit(response).unwrap(),
+            WindowsProviderResponseV4::frame_limit(response).unwrap(),
             limit
         );
-        assert!(WindowsLauncherResponseV1::frame_limit(request).is_err());
-        assert!(WindowsProviderResponseV1::frame_limit(request).is_err());
+        assert!(WindowsLauncherResponseV4::frame_limit(request).is_err());
+        assert!(WindowsProviderResponseV4::frame_limit(request).is_err());
     }
     for invalid in [
         br#"{"schema_version":2,"kind":"probe"}"#.as_slice(),
@@ -232,15 +210,15 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
         br#"{"kind":"pro\u0062e"}"#.as_slice(),
         br#"{"kind":"probe"#.as_slice(),
     ] {
-        assert!(WindowsLauncherResponseV1::frame_limit(invalid).is_err());
-        assert!(WindowsProviderResponseV1::frame_limit(invalid).is_err());
+        assert!(WindowsLauncherResponseV4::frame_limit(invalid).is_err());
+        assert!(WindowsProviderResponseV4::frame_limit(invalid).is_err());
     }
 }
 
 #[test]
 fn versioned_terminal_retirement_receipt_survives_the_256_byte_prefix() {
     use memcordon_core::{
-        WindowsAttemptTerminalDispositionV1, WindowsLauncherResponseV3, WindowsProviderResponseV3,
+        WindowsAttemptTerminalDispositionV1, WindowsLauncherResponseV4, WindowsProviderResponseV4,
         WindowsRetirementLedgerCompletionV1, WindowsTerminalRetiredV2,
     };
 
@@ -262,11 +240,11 @@ fn versioned_terminal_retirement_receipt_survives_the_256_byte_prefix() {
         completion: WindowsRetirementLedgerCompletionV1::RetirementComplete,
     };
     for bytes in [
-        serde_json::to_vec(&WindowsLauncherResponseV3::TerminalRetiredV2(
+        serde_json::to_vec(&WindowsLauncherResponseV4::TerminalRetiredV2(
             receipt.clone(),
         ))
         .unwrap(),
-        serde_json::to_vec(&WindowsProviderResponseV3::TerminalRetiredV2(receipt)).unwrap(),
+        serde_json::to_vec(&WindowsProviderResponseV4::TerminalRetiredV2(receipt)).unwrap(),
     ] {
         assert!(bytes.len() > WINDOWS_RESPONSE_PREFIX_BYTES);
         let prefix = &bytes[..WINDOWS_RESPONSE_PREFIX_BYTES];
@@ -278,8 +256,8 @@ fn versioned_terminal_retirement_receipt_survives_the_256_byte_prefix() {
             windows_response_frame_limit(prefix).unwrap(),
             memcordon_core::WINDOWS_MAX_FRAME_BYTES
         );
-        assert!(serde_json::from_slice::<WindowsLauncherResponseV3>(&bytes).is_ok());
-        assert!(serde_json::from_slice::<WindowsProviderResponseV3>(&bytes).is_ok());
+        assert!(serde_json::from_slice::<WindowsLauncherResponseV4>(&bytes).is_ok());
+        assert!(serde_json::from_slice::<WindowsProviderResponseV4>(&bytes).is_ok());
     }
 }
 
@@ -345,10 +323,10 @@ fn discriminator_terminator_must_fit_the_exact_prefix_window() {
             }
         }
         assert!(
-            serde_json::from_slice::<memcordon_core::WindowsProviderResponseV1>(&frame).is_err()
+            serde_json::from_slice::<memcordon_core::WindowsProviderResponseV4>(&frame).is_err()
         );
         assert!(
-            serde_json::from_slice::<memcordon_core::WindowsLauncherResponseV1>(&frame).is_err()
+            serde_json::from_slice::<memcordon_core::WindowsLauncherResponseV4>(&frame).is_err()
         );
     }
 }
@@ -412,7 +390,7 @@ fn fragmented_response_prefixes_keep_the_same_bounded_classification() {
 
 #[test]
 fn classified_duplicate_and_unknown_kinds_still_fail_full_decoding() {
-    use memcordon_core::{WindowsLauncherResponseV1, WindowsProviderResponseV1};
+    use memcordon_core::{WindowsLauncherResponseV4, WindowsProviderResponseV4};
 
     let deleted_public =
         br#"{"kind":"qualification-ready","schema_version":2,"qualification_lease":"lease"}"#;
@@ -420,9 +398,9 @@ fn classified_duplicate_and_unknown_kinds_still_fail_full_decoding() {
         br#"{"kind":"recovery-status","schema_version":2,"challenge":"observed","status":"ready","attempts_empty":true,"detail":"complete"}"#;
     let private =
         br#"{"kind":"certification-machine-restart","schema_version":2,"recovered":true}"#;
-    assert!(serde_json::from_slice::<WindowsProviderResponseV1>(deleted_public).is_err());
-    assert!(serde_json::from_slice::<WindowsProviderResponseV1>(public).is_ok());
-    assert!(serde_json::from_slice::<WindowsLauncherResponseV1>(private).is_ok());
+    assert!(serde_json::from_slice::<WindowsProviderResponseV4>(deleted_public).is_err());
+    assert!(serde_json::from_slice::<WindowsProviderResponseV4>(public).is_ok());
+    assert!(serde_json::from_slice::<WindowsLauncherResponseV4>(private).is_ok());
     for invalid in [
         br#"{"kind":"recovery-status","kind":"recovery-status","schema_version":2,"challenge":"observed","status":"ready","attempts_empty":true,"detail":"complete"}"#.as_slice(),
         br#"{"kind":"certification-machine-restart","kind":"certification-machine-restart","schema_version":2,"recovered":true}"#.as_slice(),
@@ -431,10 +409,10 @@ fn classified_duplicate_and_unknown_kinds_still_fail_full_decoding() {
     ] {
         assert!(windows_response_frame_limit(invalid).is_ok());
         assert!(windows_launcher_response_frame_limit(invalid).is_ok());
-        assert!(memcordon_core::workload_contract::reject_duplicate_json_keys(invalid).is_err()
+        assert!(memcordon_core::canonical_json::reject_duplicate_json_keys(invalid).is_err()
             || invalid == br#"{"kind":"not-a-response","schema_version":2}"#);
-        assert!(serde_json::from_slice::<WindowsProviderResponseV1>(invalid).is_err());
-        assert!(serde_json::from_slice::<WindowsLauncherResponseV1>(invalid).is_err());
+        assert!(serde_json::from_slice::<WindowsProviderResponseV4>(invalid).is_err());
+        assert!(serde_json::from_slice::<WindowsLauncherResponseV4>(invalid).is_err());
     }
 }
 
@@ -564,15 +542,15 @@ fn diagnostic_expiry_does_not_change_terminal_authority_or_ack_bytes() {
         &journal,
     )
     .unwrap();
-    let mut response = memcordon_core::WindowsProviderResponseV1::Reject {
-        schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let mut response = memcordon_core::WindowsProviderResponseV4::Reject {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         attempt_id: "02".repeat(32),
         nonce: "nonce".to_owned(),
         request_sha256: "03".repeat(32),
-        rejection: memcordon_core::ProviderRejectionEvidence {
+        rejection: memcordon_core::WindowsProviderRejectionV3 {
             provider_failure: Some(projection),
-            workload_admission: None,
-            schema_version: 1,
+            guardian_causal_receipt: None,
+            schema_version: 3,
             code: "MCSPAWN-FAILED".to_owned(),
             phase: memcordon_core::BoundarySetupPhase::TargetCreation,
             detail: "target creation failed".to_owned(),
@@ -582,14 +560,15 @@ fn diagnostic_expiry_does_not_change_terminal_authority_or_ack_bytes() {
             target_released: false,
             cleanup_attempted: false,
             restart_safety: memcordon_core::RestartSafetyProof::default(),
-            terminal_ack_required: false,
-            terminal_receipt: None,
+            disposition: memcordon_core::WindowsProviderRejectionDispositionV3::Preauthorization {
+                terminal_ack_required: false,
+            },
         },
     };
     assert_serialized_response_limit(&response, WINDOWS_MAX_TERMINAL_FRAME_BYTES);
     let authority = response.terminal_authority_json().unwrap();
     assert!(serde_json::to_value(&response).unwrap()["rejection"]["provider_failure"].is_object());
-    if let memcordon_core::WindowsProviderResponseV1::Reject { rejection, .. } = &mut response {
+    if let memcordon_core::WindowsProviderResponseV4::Reject { rejection, .. } = &mut response {
         rejection.provider_failure = None;
     }
     assert_eq!(authority, response.terminal_authority_json().unwrap());
@@ -622,10 +601,7 @@ fn response_prefix_selects_diagnostic_budget_before_payload_allocation() {
 
 #[test]
 fn eligible_diagnostic_changes_preserve_authority_and_receiptless_posttarget_refusal() {
-    use memcordon_core::{
-        WindowsAttemptTerminalDispositionV1, WindowsLauncherResponseV1, WindowsProviderResponseV1,
-        windows_terminal_outbox_is_bound,
-    };
+    use memcordon_core::{WindowsLauncherResponseV4, WindowsProviderResponseV4};
 
     let provider = PublicProviderBindingV1 {
         generation: BoundedText::new("test-provider").unwrap(),
@@ -666,15 +642,15 @@ fn eligible_diagnostic_changes_preserve_authority_and_receiptless_posttarget_ref
 
     let mut authority = None;
     for projection in projections {
-        let public = WindowsProviderResponseV1::Reject {
-            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        let public = WindowsProviderResponseV4::Reject {
+            schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt.clone(),
             nonce: "nonce".to_owned(),
             request_sha256: request.clone(),
-            rejection: memcordon_core::ProviderRejectionEvidence {
+            rejection: memcordon_core::WindowsProviderRejectionV3 {
                 provider_failure: projection,
-                workload_admission: None,
-                schema_version: 1,
+                guardian_causal_receipt: None,
+                schema_version: 3,
                 code: "MCSPAWN-FAILED".to_owned(),
                 phase: memcordon_core::BoundarySetupPhase::TargetCreation,
                 detail: "posttarget monitor failure without terminal authority".to_owned(),
@@ -684,22 +660,18 @@ fn eligible_diagnostic_changes_preserve_authority_and_receiptless_posttarget_ref
                 target_released: true,
                 cleanup_attempted: false,
                 restart_safety: memcordon_core::RestartSafetyProof::default(),
-                terminal_ack_required: false,
-                terminal_receipt: None,
+                disposition:
+                    memcordon_core::WindowsProviderRejectionDispositionV3::Preauthorization {
+                        terminal_ack_required: false,
+                    },
             },
         };
-        let private: WindowsLauncherResponseV1 =
+        let private: WindowsLauncherResponseV4 =
             serde_json::from_value(serde_json::to_value(&public).unwrap()).unwrap();
-        let WindowsLauncherResponseV1::Reject { rejection, .. } = &private else {
+        let WindowsLauncherResponseV4::Reject { rejection, .. } = &private else {
             panic!("fixture must remain a rejection");
         };
-        assert!(rejection.is_consistent());
-        assert!(!windows_terminal_outbox_is_bound(
-            &attempt,
-            &request,
-            Some(WindowsAttemptTerminalDispositionV1::Posttarget),
-            &private,
-        ));
+        assert!(!rejection.is_consistent());
         let bytes = public.terminal_authority_json().unwrap();
         assert_eq!(private.terminal_authority_json().unwrap(), bytes);
         assert_eq!(authority.get_or_insert_with(|| bytes.clone()), &bytes);
@@ -713,7 +685,7 @@ fn native_domains_preserve_bits_and_reject_unknown_fields() {
         NativeFailureCodeV1::NtStatus(0xc0000005),
         NativeFailureCodeV1::HResult(0x80070005),
         NativeFailureCodeV1::Winsock(-1),
-        NativeFailureCodeV1::LegacyUntyped(-1),
+        NativeFailureCodeV1::Unclassified(-1),
     ] {
         assert_eq!(
             serde_json::from_slice::<NativeFailureCodeV1>(&serde_json::to_vec(&native).unwrap())

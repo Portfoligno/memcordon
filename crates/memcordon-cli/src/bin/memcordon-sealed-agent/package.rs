@@ -5,16 +5,16 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-#[cfg(not(target_os = "windows"))]
-use crate::inspection_schema::ProviderPackageMetadataV4;
 use crate::inspection_schema::{
-    AgentInspectionFormat, AgentPackageInspection, InspectionRevision, InstalledInspectionFormat,
-    InstalledProviderInspection,
+    AgentInspectionFormat, AgentPackageInspectionV2, InspectionRevisionTwo,
+    InstalledProviderInspectionV2,
 };
+#[cfg(not(target_os = "windows"))]
+use crate::inspection_schema::{InstalledInspectionFormat, ProviderPackageMetadataV5};
 #[cfg(target_os = "linux")]
 use memcordon_core::{BoundedText, DiagnosticSha256};
 
-const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed memcordon/policy\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
 const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
@@ -176,23 +176,11 @@ const NETWORK_LAUNCHER_SOCKET_UNIT: &str =
 #[cfg(target_os = "linux")]
 const TMPFILES_FILE: &str = "/usr/lib/tmpfiles.d/memcordon.conf";
 #[cfg(target_os = "linux")]
-const LEGACY_PACKAGE_LEASE: &str = "/run/memcordon/sealed-package.lock";
 #[cfg(target_os = "linux")]
 const RUNTIME_DIRECTORY: &str = "/run/memcordon";
 #[cfg(target_os = "linux")]
-const PACKAGE_TRANSACTION_JOURNAL: &str = "/usr/libexec/.memcordon-package-transaction.json";
-#[cfg(target_os = "linux")]
-const PACKAGE_INSTALLATION_EPOCH: &str = "/usr/libexec/.memcordon-installation-epoch.json";
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PackageInstallationEpochV1 {
-    pub(crate) schema_version: u8,
-    pub(crate) counter: u64,
-    pub(crate) nonce_digest: DiagnosticSha256,
-}
-
+const PACKAGE_TRANSACTION_JOURNAL: &str =
+    "/usr/libexec/.memcordon-current-package-transaction.json";
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxSourceSnapshot {
     pub(crate) agent_bytes: Vec<u8>,
@@ -249,7 +237,8 @@ fn read_source_regular(path: &Path, maximum: u64, mode: u32) -> Result<Vec<u8>, 
 
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot, String> {
-    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+    use memcordon_core::runtime_components::RuntimeComponentRole;
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
     let parent = source.parent().ok_or("package source has no parent")?;
     let agent_bytes = read_source_regular(source, 128 * 1024 * 1024, 0o755)?;
     let manifest_bytes = crate::linux::runtime_manifest::source(source, &agent_bytes)?;
@@ -297,6 +286,12 @@ pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot
 }
 
 pub fn run(operation: &OsStr, json: bool) -> Result<(), String> {
+    if !["install", "upgrade", "inspect", "verify", "uninstall"]
+        .into_iter()
+        .any(|name| operation == name)
+    {
+        return Err("unknown package operation".into());
+    }
     if operation == "inspect" {
         return render_inspection(&inspect()?, json);
     }
@@ -323,12 +318,20 @@ pub fn run(operation: &OsStr, json: bool) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 pub fn uninstall_until(deadline: &OsStr) -> Result<(), String> {
+    mutation_until(OsStr::new("uninstall"), deadline)
+}
+#[cfg(target_os = "linux")]
+pub fn upgrade_until(deadline: &OsStr) -> Result<(), String> {
+    mutation_until(OsStr::new("upgrade"), deadline)
+}
+#[cfg(target_os = "linux")]
+fn mutation_until(operation: &OsStr, deadline: &OsStr) -> Result<(), String> {
     let cutoff = deadline
         .to_str()
         .and_then(|text| text.parse::<u64>().ok())
         .filter(|cutoff| *cutoff != 0)
         .ok_or_else(|| "invalid original package cleanup monotonic cutoff".to_owned())?;
-    linux_mutation(OsStr::new("uninstall"), Some(cutoff))
+    linux_mutation(operation, Some(cutoff))
 }
 
 #[cfg(target_os = "linux")]
@@ -339,7 +342,26 @@ pub(crate) fn verify() -> Result<(), String> {
     verify_compiled_metadata()?;
     #[cfg(target_os = "linux")]
     match std::fs::symlink_metadata(PACKAGE_TRANSACTION_JOURNAL) {
-        Ok(_) => return Err("package generation has an unrecovered transaction journal".into()),
+        Ok(_) => {
+            let bytes = crate::linux::protected_read::read_protected_absolute(
+                Path::new(PACKAGE_TRANSACTION_JOURNAL),
+                memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+                Some(0o600),
+            )?;
+            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
+            let journal: PackageJournal =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            validate_package_journal(&journal)?;
+            if journal.phase == PackageJournalPhase::Preparing {
+                return Err("package generation has an unrecovered transaction journal".into());
+            }
+            validate_package_postimages(&journal)?;
+            if journal.phase == PackageJournalPhase::Published {
+                validate_package_recovery_files(&journal)?;
+            } else {
+                validate_package_backup_retirement_files(&journal)?;
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
@@ -350,7 +372,7 @@ pub(crate) fn verify() -> Result<(), String> {
     Ok(())
 }
 
-fn render_inspection(inspection: &AgentPackageInspection, json: bool) -> Result<(), String> {
+fn render_inspection(inspection: &AgentPackageInspectionV2, json: bool) -> Result<(), String> {
     if json {
         println!(
             "{}",
@@ -368,7 +390,7 @@ fn render_inspection(inspection: &AgentPackageInspection, json: bool) -> Result<
 }
 
 fn render_installed_inspection(
-    inspection: &InstalledProviderInspection,
+    inspection: &InstalledProviderInspectionV2,
     json: bool,
 ) -> Result<(), String> {
     if json {
@@ -390,7 +412,7 @@ fn render_installed_inspection(
     Ok(())
 }
 
-pub(crate) fn inspect() -> Result<AgentPackageInspection, String> {
+pub(crate) fn inspect() -> Result<AgentPackageInspectionV2, String> {
     verify_compiled_metadata()?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("MCSEALED-PACKAGE-INSPECT: current executable: {error}"))?;
@@ -398,7 +420,7 @@ pub(crate) fn inspect() -> Result<AgentPackageInspection, String> {
     #[cfg(not(target_os = "windows"))]
     let (mechanism, platform) = (
         "linux-pid-namespace-cgroup-v2".to_owned(),
-        ProviderPackageMetadataV4::LinuxSystemd {
+        ProviderPackageMetadataV5::LinuxSystemd {
             control_service_sha256: sha256_bytes(SERVICE.as_bytes()),
             control_socket_sha256: sha256_bytes(SOCKET.as_bytes()),
             launcher_service_sha256: sha256_bytes(LAUNCHER_SERVICE.as_bytes()),
@@ -411,44 +433,67 @@ pub(crate) fn inspect() -> Result<AgentPackageInspection, String> {
         "windows-job-object-v2".to_owned(),
         crate::windows::package::compiled_metadata()?,
     );
-    Ok(AgentPackageInspection {
+    Ok(AgentPackageInspectionV2 {
         format: AgentInspectionFormat::Ordinary,
-        revision: InspectionRevision,
+        revision: InspectionRevisionTwo,
         native_protocols: if cfg!(target_os = "windows") {
-            memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
-                provider_contract: 3,
-                public_wire: 3,
-                private_wire: 3,
+            memcordon_core::runtime_components::NativeProviderProtocols::Windows {
+                provider_contract: 4,
+                public_wire: 4,
+                private_wire: 4,
             }
         } else {
-            memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+            memcordon_core::runtime_components::NativeProviderProtocols::Linux {
                 provider_contract: 3,
-                launch_wire: 3,
+                launch_wire: if cfg!(feature = "private-tcp") { 5 } else { 3 },
             }
         },
-        runtime_manifest_schema: 1,
-        workload_contract_schema: 1,
-        profile_catalog_sha256: memcordon_core::runtime_manifest::baseline_catalog_digest(cfg!(
-            target_os = "windows"
-        )),
+        runtime_manifest_revision: 2,
+        workload_request: memcordon_core::runtime_manifest_v2::WireVersion {
+            format: "memcordon.workload-request".into(),
+            revision: 1,
+        },
+        result: memcordon_core::runtime_manifest_v2::WireVersion {
+            format: "memcordon.result".into(),
+            revision: 3,
+        },
+        capabilities: memcordon_core::runtime_manifest_v2::WireVersion {
+            format: "memcordon.capabilities".into(),
+            revision: 3,
+        },
+        plan: memcordon_core::runtime_manifest_v2::WireVersion {
+            format: "memcordon.plan".into(),
+            revision: 3,
+        },
+        runtime_profile: if cfg!(target_os = "windows") {
+            "windows-sealed-current-token-v1"
+        } else if cfg!(feature = "private-tcp") {
+            "linux-private-workload-v1"
+        } else {
+            memcordon_core::workload_request::LINUX_CREDENTIAL_PRESERVING_PROFILE
+        }
+        .into(),
+        profile_revision: 1,
+        profile_supported: (cfg!(target_os = "linux")
+            && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")))
+            || (cfg!(target_os = "windows")
+                && cfg!(feature = "windows-sealed-runtime")
+                && cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         source_commit: crate::SOURCE_COMMIT.to_owned(),
         executable_sha256,
         provider_protocol: if cfg!(target_os = "windows") {
-            memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+            memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
         } else {
             u32::from(crate::protocol::PROTOCOL_VERSION)
         },
         mechanism,
-        execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
-        plan_report_schema: memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
-        doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
         platform,
         compiled_metadata_valid: true,
     })
 }
 
-fn installed_inspection() -> Result<InstalledProviderInspection, String> {
+fn installed_inspection() -> Result<InstalledProviderInspectionV2, String> {
     let agent = inspect()?;
     #[cfg(target_os = "linux")]
     {
@@ -457,24 +502,14 @@ fn installed_inspection() -> Result<InstalledProviderInspection, String> {
         let qualification = probe_provider().ok();
         let provider_reachable = qualification.is_some();
         let provider_identity = qualification.map(|value| value.provider_identity);
-        let policy = match crate::policy_registry::native::Lease::acquire()
-            .and_then(|lease| lease.read())
-        {
-            Ok(Some(activation)) => activation.inspection()?,
-            Ok(None) => {
-                memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unconfigured
-            }
-            Err(_) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
-        };
-        Ok(InstalledProviderInspection {
+        Ok(InstalledProviderInspectionV2 {
             format: InstalledInspectionFormat::Ordinary,
-            revision: InspectionRevision,
+            revision: InspectionRevisionTwo,
             agent,
             installed_executable_sha256,
             installed_artifacts_valid: true,
             provider_identity,
             provider_reachable,
-            policy,
         })
     }
     #[cfg(target_os = "windows")]
@@ -483,15 +518,14 @@ fn installed_inspection() -> Result<InstalledProviderInspection, String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        Ok(InstalledProviderInspection {
+        Ok(InstalledProviderInspectionV2 {
             format: InstalledInspectionFormat::Ordinary,
-            revision: InspectionRevision,
+            revision: InspectionRevisionTwo,
             agent,
             installed_executable_sha256: String::new(),
             installed_artifacts_valid: false,
             provider_identity: None,
             provider_reachable: false,
-            policy: memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
         })
     }
 }
@@ -565,7 +599,7 @@ fn verify_compiled_metadata() -> Result<(), String> {
     const CONTROL_CAPABILITY_BOUNDING_SET: &str =
         "CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE";
     const CONTROL_READ_WRITE_PATHS: &str =
-        "ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy";
+        "ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed";
     let control_capabilities = SERVICE
         .lines()
         .filter(|line| line.starts_with("CapabilityBoundingSet="))
@@ -689,22 +723,94 @@ pub(crate) fn verify_compiled_metadata_for_test() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn prepare_runtime_directory() -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     match std::fs::symlink_metadata("/run/memcordon") {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && metadata.uid() == 0
+                && metadata.mode() & 0o7777 == 0o750 =>
+        {
+            return Ok(());
+        }
         Ok(_) => return Err("provider runtime path is not a real directory".to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir("/run/memcordon").map_err(|error| error.to_string())?;
         }
         Err(error) => return Err(error.to_string()),
     }
-    std::fs::set_permissions("/run/memcordon", std::fs::Permissions::from_mode(0o750))
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/run/memcordon")
+        .map_err(|error| error.to_string())?;
+    held.set_permissions(std::fs::Permissions::from_mode(0o750))
         .map_err(|error| error.to_string())?;
     let metadata = std::fs::symlink_metadata("/run/memcordon")
         .map_err(|error| format!("provider runtime directory unavailable: {error}"))?;
-    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o7777 != 0o750 {
+    let pinned = held.metadata().map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o7777 != 0o750
+        || (metadata.dev(), metadata.ino()) != (pinned.dev(), pinned.ino())
+    {
         return Err("provider runtime directory identity or mode is unsafe".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_current_state_directory(
+    path: &Path,
+    current_owned: bool,
+    allowed: &[&str],
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) => metadata,
+    };
+    if !current_owned {
+        return Err(format!(
+            "unmanaged occupied current state directory: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("current state directory custody differs".into());
+    }
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let pinned = held.metadata().map_err(|error| error.to_string())?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        count += 1;
+        let name = entry.file_name();
+        let current_attempt = path == Path::new(RUNTIME_DIRECTORY)
+            && name.to_str().is_some_and(|name| {
+                name.strip_prefix("private-root-")
+                    .is_some_and(crate::linux::cgroup::valid_attempt_identity)
+            });
+        if count > allowed.len() + crate::linux::workload_attempt::MAX_RETAINED_ATTEMPTS
+            || (!current_attempt && !name.to_str().is_some_and(|name| allowed.contains(&name)))
+        {
+            return Err("unknown occupied current state entry; retained intact".into());
+        }
+    }
+    let after = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if (metadata.dev(), metadata.ino()) != (pinned.dev(), pinned.ino())
+        || (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
+    {
+        return Err("current state root replaced during inventory".into());
     }
     Ok(())
 }
@@ -973,7 +1079,7 @@ struct AppliedPackageFileChange {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PackageJournalEntry {
     pub(crate) path: std::path::PathBuf,
@@ -981,18 +1087,43 @@ pub(crate) struct PackageJournalEntry {
     pub(crate) old_sha256: Option<DiagnosticSha256>,
     pub(crate) old_device: Option<u64>,
     pub(crate) old_inode: Option<u64>,
+    pub(crate) stage: Option<PackageJournalFile>,
+    pub(crate) placeholder: Option<PackageJournalFile>,
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageJournalFile {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) mode: u32,
+    pub(crate) sha256: DiagnosticSha256,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PackageJournal {
-    pub(crate) schema_version: u8,
+    pub(crate) format: String,
+    pub(crate) revision: u8,
+    pub(crate) phase: PackageJournalPhase,
     pub(crate) entries: Vec<PackageJournalEntry>,
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PackageJournalPhase {
+    Preparing,
+    Published,
+    Retiring,
+}
+
+#[cfg(target_os = "linux")]
 struct PackageFileTransaction {
+    cutoff: std::time::Instant,
     applied: Vec<AppliedPackageFileChange>,
     directories: CreatedPackageDirectories,
     journal: PackageJournal,
@@ -1117,7 +1248,9 @@ fn protected_file_digest(path: &Path) -> Result<DiagnosticSha256, String> {
 #[cfg(target_os = "linux")]
 pub(crate) fn validate_package_journal(journal: &PackageJournal) -> Result<(), String> {
     let mut seen = std::collections::BTreeSet::new();
-    if journal.schema_version != 1
+    let mut temporary_paths = std::collections::BTreeSet::new();
+    if journal.format != "memcordon.current-package-transaction"
+        || journal.revision != 1
         || journal.entries.is_empty()
         || journal.entries.len() > PACKAGE_ARTIFACT_PATHS.len()
     {
@@ -1129,11 +1262,39 @@ pub(crate) fn validate_package_journal(journal: &PackageJournal) -> Result<(), S
             || entry.backup.is_some() != entry.old_sha256.is_some()
             || entry.backup.is_some() != entry.old_device.is_some()
             || entry.backup.is_some() != entry.old_inode.is_some()
+            || entry.backup.is_some() != entry.placeholder.is_some()
+            || entry.old_inode.is_some_and(|inode| inode == 0)
         {
             return Err("package transaction journal target differs".into());
         }
+        for (file, prefix) in [
+            (entry.stage.as_ref(), ".memcordon-stage-"),
+            (entry.placeholder.as_ref(), ".memcordon-backup-"),
+        ] {
+            if let Some(file) = file {
+                if file.path.parent() != entry.path.parent()
+                    || file.inode == 0
+                    || file.mode & !0o7777 != 0
+                    || file.mode & 0o022 != 0
+                    || !file
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
+                {
+                    return Err("current package temporary inode inventory differs".into());
+                }
+            }
+        }
+        if entry.placeholder.as_ref().is_some_and(|placeholder| {
+            Some(&placeholder.path) != entry.backup.as_ref()
+                || placeholder.mode != 0o600
+                || placeholder.sha256 != memcordon_core::hash_bytes(&[])
+        }) {
+            return Err("current package backup placeholder inventory differs".into());
+        }
         if let Some(backup) = &entry.backup {
-            if backup.parent() != entry.path.parent()
+            if !temporary_paths.insert(backup.clone())
+                || backup.parent() != entry.path.parent()
                 || !backup
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with(".memcordon-backup-"))
@@ -1141,19 +1302,36 @@ pub(crate) fn validate_package_journal(journal: &PackageJournal) -> Result<(), S
                 return Err("package transaction journal backup path differs".into());
             }
         }
+        if entry
+            .stage
+            .as_ref()
+            .is_some_and(|stage| !temporary_paths.insert(stage.path.clone()))
+        {
+            return Err("current package staging path is duplicated".into());
+        }
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn write_package_journal(journal: &PackageJournal) -> Result<(), String> {
+    write_package_journal_inner(journal, false)
+}
+#[cfg(target_os = "linux")]
+fn write_package_journal_inner(journal: &PackageJournal, replace: bool) -> Result<(), String> {
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     validate_package_journal(journal)?;
     let path = Path::new(PACKAGE_TRANSACTION_JOURNAL);
     match std::fs::symlink_metadata(path) {
-        Ok(_) => return Err("unrecovered package transaction journal exists".into()),
+        Ok(_) if !replace => return Err("unrecovered package transaction journal exists".into()),
+        Ok(_) => {}
+        Err(error) if replace && error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(
+                "owned current package journal disappeared before phase publication".into(),
+            );
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
@@ -1183,6 +1361,29 @@ fn write_package_journal(journal: &PackageJournal) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn advance_package_journal(
+    previous: &PackageJournal,
+    phase: PackageJournalPhase,
+) -> Result<PackageJournal, String> {
+    let bytes = crate::linux::protected_read::read_protected_absolute(
+        Path::new(PACKAGE_TRANSACTION_JOURNAL),
+        memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+        Some(0o600),
+    )?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
+    let current: PackageJournal =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if current != *previous {
+        return Err("current package journal changed before phase publication; retained".into());
+    }
+    validate_package_postimages(previous)?;
+    let mut next = previous.clone();
+    next.phase = phase;
+    write_package_journal_inner(&next, true)?;
+    Ok(next)
+}
+
+#[cfg(target_os = "linux")]
 fn clear_package_journal() -> Result<(), String> {
     let path = Path::new(PACKAGE_TRANSACTION_JOURNAL);
     crate::linux::protected_read::read_protected_absolute(
@@ -1195,100 +1396,138 @@ fn clear_package_journal() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_installation_epoch() -> Result<Option<(PackageInstallationEpochV1, Vec<u8>)>, String> {
-    let path = Path::new(PACKAGE_INSTALLATION_EPOCH);
-    let bytes = match std::fs::symlink_metadata(path) {
-        Ok(_) => crate::linux::protected_read::read_protected_absolute(
-            path,
-            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
-            Some(0o600),
-        )?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+fn package_file_present(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+#[cfg(target_os = "linux")]
+fn package_file_matches(path: &Path, file: &PackageJournalFile) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
     };
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
-    let epoch: PackageInstallationEpochV1 =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if epoch.schema_version != 1
-        || epoch.counter == 0
-        || epoch.nonce_digest == DiagnosticSha256::from_bytes([0; 32])
-        || serde_json::to_vec(&epoch).map_err(|error| error.to_string())? != bytes
-    {
-        return Err("package installation epoch differs from canonical record".into());
-    }
-    Ok(Some((epoch, bytes)))
+    Ok(metadata.is_file()
+        && metadata.uid() == 0
+        && metadata.nlink() == 1
+        && metadata.dev() == file.device
+        && metadata.ino() == file.inode
+        && metadata.mode() & 0o7777 == file.mode
+        && protected_file_digest(path)? == file.sha256)
 }
-
 #[cfg(target_os = "linux")]
-pub(crate) fn next_installation_epoch(
-    previous: Option<&PackageInstallationEpochV1>,
-    nonce: [u8; 32],
-) -> Result<PackageInstallationEpochV1, String> {
-    let counter = previous.map_or(Ok(1), |epoch| {
-        epoch.counter.checked_add(1).ok_or("package epoch overflow")
-    })?;
-    Ok(PackageInstallationEpochV1 {
-        schema_version: 1,
-        counter,
-        nonce_digest: memcordon_core::workload_codec::hash_bytes(&nonce),
-    })
-}
-
-/// Read the protected package-generation identity. Callers must
-/// retain a shared or exclusive package lease across this read and admission.
-#[cfg(target_os = "linux")]
-pub(crate) fn installed_generation_epoch() -> Result<DiagnosticSha256, String> {
-    let (_, bytes) = read_installation_epoch()?
-        .ok_or("protected package installation epoch is absent; re-install or upgrade")?;
-    Ok(memcordon_core::workload_codec::hash_bytes(&bytes))
-}
-
-#[cfg(target_os = "linux")]
-fn advance_installation_epoch() -> Result<DiagnosticSha256, String> {
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::PermissionsExt;
-
-    let previous = read_installation_epoch()?;
-    let mut nonce = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut nonce))
-        .map_err(|error| format!("package epoch entropy unavailable: {error}"))?;
-    let epoch = next_installation_epoch(previous.as_ref().map(|(epoch, _)| epoch), nonce)?;
-    let bytes = serde_json::to_vec(&epoch).map_err(|error| error.to_string())?;
-    let path = Path::new(PACKAGE_INSTALLATION_EPOCH);
-    let mut directories = CreatedPackageDirectories::default();
-    ensure_protected_package_parent(path, &mut directories)?;
-    let mut stage = tempfile::Builder::new()
-        .prefix(".memcordon-epoch-")
-        .tempfile_in(path.parent().expect("fixed epoch parent"))
-        .map_err(|error| error.to_string())?;
-    // SAFETY: the staged epoch descriptor remains live in this root installer.
-    if unsafe { libc::fchown(stage.as_file().as_raw_fd(), 0, 0) } == -1 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    stage.write_all(&bytes).map_err(|error| error.to_string())?;
-    stage
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
-    stage
-        .as_file()
-        .sync_all()
-        .map_err(|error| error.to_string())?;
-    std::fs::rename(stage.path(), path).map_err(|error| error.to_string())?;
-    sync_package_parent(path)?;
-    directories.keep = true;
-    let (_, readback) = read_installation_epoch()?.ok_or("package epoch vanished after write")?;
-    if readback != bytes {
-        return Err("package epoch changed during protected readback".into());
-    }
-    Ok(memcordon_core::workload_codec::hash_bytes(&bytes))
-}
-
-#[cfg(target_os = "linux")]
-fn recover_package_journal() -> Result<(), String> {
+fn package_original_matches(path: &Path, entry: &PackageJournalEntry) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(metadata.is_file()
+        && metadata.uid() == 0
+        && metadata.nlink() == 1
+        && metadata.mode() & 0o022 == 0
+        && Some(metadata.dev()) == entry.old_device
+        && Some(metadata.ino()) == entry.old_inode
+        && Some(protected_file_digest(path)?) == entry.old_sha256)
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_package_recovery_files(journal: &PackageJournal) -> Result<(), String> {
+    for entry in &journal.entries {
+        let old = package_original_matches(&entry.path, entry)?;
+        let post = entry
+            .stage
+            .as_ref()
+            .map(|stage| package_file_matches(&entry.path, stage))
+            .transpose()?
+            .unwrap_or(false);
+        if package_file_present(&entry.path)? && !old && !post {
+            return Err("occupied package artifact is neither exact original nor owned current postimage; retained".into());
+        }
+        if let Some(stage) = &entry.stage {
+            if package_file_present(&stage.path)? && !package_file_matches(&stage.path, stage)? {
+                return Err("current package staging inode was replaced; retained".into());
+            }
+        }
+        if let Some(backup) = &entry.backup {
+            let saved = package_original_matches(backup, entry)?;
+            let placeholder = entry
+                .placeholder
+                .as_ref()
+                .map(|file| package_file_matches(backup, file))
+                .transpose()?
+                .unwrap_or(false);
+            if package_file_present(backup)? && !saved && !placeholder {
+                return Err("current package backup inode was replaced; retained".into());
+            }
+            if !saved && !old {
+                return Err(
+                    "current package original artifact is absent or changed; retained".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_package_postimages(journal: &PackageJournal) -> Result<(), String> {
+    for entry in &journal.entries {
+        match &entry.stage {
+            Some(stage) if package_file_matches(&entry.path, stage)? => {}
+            None if !package_file_present(&entry.path)? => {}
+            _ => return Err("published current package postimage differs; retained".into()),
+        }
+        if let Some(stage) = &entry.stage {
+            if package_file_present(&stage.path)? {
+                return Err("published current package staging name remains allocated".into());
+            }
+        }
+    }
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn validate_package_backup_retirement_files(journal: &PackageJournal) -> Result<(), String> {
+    validate_package_postimages(journal)?;
+    for entry in &journal.entries {
+        if let Some(backup) = &entry.backup {
+            if package_file_present(backup)? && !package_original_matches(backup, entry)? {
+                return Err("current package retirement backup was replaced; retained".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn retire_package_backups(
+    journal: &PackageJournal,
+    cutoff: std::time::Instant,
+) -> Result<(), String> {
+    validate_package_backup_retirement_files(journal)?;
+    for entry in &journal.entries {
+        check_package_cutoff(cutoff)?;
+        if let Some(backup) = &entry.backup {
+            if package_file_present(backup)? {
+                if !package_original_matches(backup, entry)? {
+                    return Err("current package backup changed during retirement; retained".into());
+                }
+                std::fs::remove_file(backup).map_err(|error| error.to_string())?;
+                sync_package_parent(backup)?;
+            }
+        }
+    }
+    check_package_cutoff(cutoff)?;
+    clear_package_journal()
+}
+
+#[cfg(target_os = "linux")]
+fn recover_package_journal(cutoff: std::time::Instant) -> Result<(), String> {
+    check_package_cutoff(cutoff)?;
     let path = Path::new(PACKAGE_TRANSACTION_JOURNAL);
     let bytes = match std::fs::symlink_metadata(path) {
         Ok(_) => crate::linux::protected_read::read_protected_absolute(
@@ -1299,10 +1538,15 @@ fn recover_package_journal() -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
     let journal: PackageJournal =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     validate_package_journal(&journal)?;
+    if journal.phase == PackageJournalPhase::Retiring {
+        validate_package_postimages(&journal)?;
+    } else {
+        validate_package_recovery_files(&journal)?;
+    }
     for unit in [
         "memcordon-sealed-network-launcher.service",
         "memcordon-sealed-network-launcher.socket",
@@ -1311,49 +1555,97 @@ fn recover_package_journal() -> Result<(), String> {
         "memcordon-sealed-agent.socket",
         "memcordon-sealed-launcher.socket",
     ] {
-        stop_unit(unit)?;
+        stop_unit(unit, cutoff)?;
     }
-    ensure_recovery_idle("recover package transaction")?;
+    ensure_recovery_idle_until("recover package transaction", cutoff)?;
+    if journal.phase == PackageJournalPhase::Retiring {
+        retire_package_backups(&journal, cutoff)?;
+        return systemctl(cutoff, ["daemon-reload"]);
+    }
     for entry in journal.entries.iter().rev() {
-        if let (Some(backup), Some(old_sha256)) = (&entry.backup, &entry.old_sha256) {
-            let original_matches = |path: &Path| -> Result<bool, String> {
-                let metadata = match std::fs::symlink_metadata(path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                    Err(error) => return Err(error.to_string()),
-                };
-                Ok(metadata.is_file()
-                    && metadata.uid() == 0
-                    && metadata.nlink() == 1
-                    && Some(metadata.dev()) == entry.old_device
-                    && Some(metadata.ino()) == entry.old_inode
-                    && protected_file_digest(path)? == *old_sha256)
-            };
-            let backup_present = match std::fs::symlink_metadata(backup) {
-                Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error.to_string()),
-            };
-            if original_matches(backup)? {
+        check_package_cutoff(cutoff)?;
+        if let Some(backup) = &entry.backup {
+            if package_original_matches(backup, entry)? {
                 std::fs::rename(backup, &entry.path).map_err(|error| error.to_string())?;
-            } else if original_matches(&entry.path)? {
-                if backup_present {
+            } else if package_original_matches(&entry.path, entry)? {
+                if package_file_present(backup)? {
+                    if !package_file_matches(
+                        backup,
+                        entry
+                            .placeholder
+                            .as_ref()
+                            .ok_or("current backup placeholder identity absent")?,
+                    )? {
+                        return Err(
+                            "current package backup placeholder changed during recovery; retained"
+                                .into(),
+                        );
+                    }
                     std::fs::remove_file(backup).map_err(|error| error.to_string())?;
                 }
             } else {
                 return Err("package transaction backup and old artifact both differ".into());
             }
         } else {
-            match std::fs::remove_file(&entry.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+            if package_file_present(&entry.path)? {
+                if !entry
+                    .stage
+                    .as_ref()
+                    .map(|stage| package_file_matches(&entry.path, stage))
+                    .transpose()?
+                    .unwrap_or(false)
+                {
+                    return Err("current fresh postimage changed during recovery; retained".into());
+                }
+                std::fs::remove_file(&entry.path).map_err(|error| error.to_string())?;
+            }
+        }
+        if let Some(stage) = &entry.stage {
+            if package_file_present(&stage.path)? {
+                if !package_file_matches(&stage.path, stage)? {
+                    return Err("current staged inode changed during recovery; retained".into());
+                }
+                std::fs::remove_file(&stage.path).map_err(|error| error.to_string())?;
             }
         }
         sync_package_parent(&entry.path)?;
     }
-    systemctl(["daemon-reload"])?;
+    systemctl(cutoff, ["daemon-reload"])?;
+    check_package_cutoff(cutoff)?;
     clear_package_journal()
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_unowned_package_temporaries() -> Result<(), String> {
+    for parent in [
+        "/usr/libexec",
+        "/usr/lib/systemd/system",
+        "/usr/lib/tmpfiles.d",
+    ] {
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for (count, entry) in entries.enumerate() {
+            if count >= 16384 {
+                return Err("current package directory inventory exceeds bound".into());
+            }
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".memcordon-stage-")
+                || name.starts_with(".memcordon-backup-")
+                || name.starts_with(".memcordon-journal-")
+            {
+                return Err(format!(
+                    "unowned occupied current package temporary retained: {}",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1383,7 +1675,8 @@ pub(crate) fn ensure_install_preflight(
 
 #[cfg(target_os = "linux")]
 impl PackageFileTransaction {
-    fn apply(changes: Vec<PackageFileChange>) -> Result<Self, String> {
+    fn apply(changes: Vec<PackageFileChange>, cutoff: std::time::Instant) -> Result<Self, String> {
+        check_package_cutoff(cutoff)?;
         use std::io::Write;
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1391,11 +1684,14 @@ impl PackageFileTransaction {
         let mut staged = Vec::with_capacity(changes.len());
         let mut directories = CreatedPackageDirectories::default();
         for change in changes {
+            check_package_cutoff(cutoff)?;
             ensure_protected_package_parent(&change.path, &mut directories)?;
             let stage = if let Some(bytes) = &change.bytes {
                 let parent = change.path.parent().expect("protected parent");
-                let mut stage =
-                    tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+                let mut stage = tempfile::Builder::new()
+                    .prefix(".memcordon-stage-")
+                    .tempfile_in(parent)
+                    .map_err(|error| error.to_string())?;
                 // SAFETY: the temporary file descriptor remains live, and the
                 // installer is root under the exclusive package-generation lock.
                 if unsafe { libc::fchown(stage.as_file().as_raw_fd(), 0, 0) } == -1 {
@@ -1424,7 +1720,7 @@ impl PackageFileTransaction {
                         metadata.dev(),
                         metadata.ino(),
                         change.mode,
-                        memcordon_core::workload_codec::hash_bytes(
+                        memcordon_core::hash_bytes(
                             change.bytes.as_ref().expect("staged bytes are present"),
                         ),
                     ))
@@ -1471,11 +1767,40 @@ impl PackageFileTransaction {
                 old_sha256,
                 old_device,
                 old_inode,
+                stage: match (&stage, &identity) {
+                    (Some(stage), Some((device, inode, mode, sha256))) => {
+                        Some(PackageJournalFile {
+                            path: stage.path().to_path_buf(),
+                            device: *device,
+                            inode: *inode,
+                            mode: *mode,
+                            sha256: sha256.clone(),
+                        })
+                    }
+                    (None, None) => None,
+                    _ => return Err("current package staging identity missing".into()),
+                },
+                placeholder: match &backup {
+                    Some(backup) => {
+                        let metadata =
+                            std::fs::symlink_metadata(backup).map_err(|error| error.to_string())?;
+                        Some(PackageJournalFile {
+                            path: backup.to_path_buf(),
+                            device: metadata.dev(),
+                            inode: metadata.ino(),
+                            mode: metadata.mode() & 0o7777,
+                            sha256: protected_file_digest(backup)?,
+                        })
+                    }
+                    None => None,
+                },
             });
             prepared.push((path, stage, backup, identity));
         }
         let journal = PackageJournal {
-            schema_version: 1,
+            format: "memcordon.current-package-transaction".into(),
+            revision: 1,
+            phase: PackageJournalPhase::Preparing,
             entries: journal_entries,
         };
         if let Err(error) = write_package_journal(&journal) {
@@ -1495,6 +1820,7 @@ impl PackageFileTransaction {
             return Err(error);
         }
         let mut transaction = Self {
+            cutoff,
             applied: Vec::with_capacity(prepared.len()),
             directories,
             journal,
@@ -1502,6 +1828,10 @@ impl PackageFileTransaction {
             postimages: Vec::new(),
         };
         for (path, stage, backup, identity) in prepared {
+            if let Err(error) = check_package_cutoff(cutoff) {
+                transaction.retain_backups()?;
+                return Err(error);
+            }
             transaction.postimages.push(PackagePostimage {
                 path: path.clone(),
                 identity,
@@ -1550,40 +1880,16 @@ impl PackageFileTransaction {
                         }
                     }
                 }
-                // Publication removed the original journal. Restore authority
-                // comes only from this fresh, validated, durable transaction.
-                write_package_journal(&self.journal)
+                Ok::<(), String>(())
             })();
             if let Err(error) = compensation {
                 self.retain_backups()?;
                 return Err(format!("package compensation refused: {error}"));
             }
         }
-        let mut failures = Vec::new();
-        for applied in self.applied.drain(..).rev() {
-            match std::fs::remove_file(&applied.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => failures.push(error.to_string()),
-            }
-            if let Some(backup) = applied.backup {
-                if let Err(error) = std::fs::rename(&backup, &applied.path) {
-                    failures.push(error.to_string());
-                    if let Err(keep_error) = backup.keep() {
-                        failures.push(format!("could not retain rollback backup: {keep_error}"));
-                    }
-                }
-            }
-            if let Err(error) = sync_package_parent(&applied.path) {
-                failures.push(error);
-            }
-        }
-        if failures.is_empty() {
-            self.directories.cleanup()?;
-            clear_package_journal()
-        } else {
-            Err(failures.join("; "))
-        }
+        self.retain_backups()?;
+        recover_package_journal(self.cutoff)?;
+        self.directories.cleanup()
     }
 
     fn retain_backups(&mut self) -> Result<(), String> {
@@ -1634,9 +1940,14 @@ impl PackageFileTransaction {
     }
 
     fn publish(mut self) -> Result<Self, String> {
+        // The durable journal owns these names from this point onward. Rust
+        // unwinding or a failed phase publication must never unlink backups.
+        self.retain_backups()?;
+        check_package_cutoff(self.cutoff)?;
         let publish = (|| {
             self.verify_postimages()?;
-            clear_package_journal()
+            self.journal = advance_package_journal(&self.journal, PackageJournalPhase::Published)?;
+            Ok::<(), String>(())
         })();
         if let Err(error) = publish {
             self.retain_backups()?;
@@ -1652,18 +1963,75 @@ impl PackageFileTransaction {
             self = self.publish()?;
         }
         self.directories.keep = true;
-        for applied in self.applied.drain(..) {
-            drop(applied.backup);
-            sync_package_parent(&applied.path)?;
-        }
-        Ok(())
+        self.retain_backups()?;
+        check_package_cutoff(self.cutoff)?;
+        self.journal = advance_package_journal(&self.journal, PackageJournalPhase::Retiring)?;
+        retire_package_backups(&self.journal, self.cutoff)
     }
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct PackageDrainGuard<'a> {
+    current: &'a std::fs::File,
+}
+
+/// Exercise the real commit error path without mutating an installed package.
+/// The exhausted cutoff must preserve this already journal-owned backup even
+/// before any protected journal access can occur.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn expired_package_commit_with_backup_for_test(
+    backup: tempfile::TempPath,
+) -> Result<(), String> {
+    PackageFileTransaction {
+        cutoff: std::time::Instant::now(),
+        applied: vec![AppliedPackageFileChange {
+            path: std::path::PathBuf::from(BINARY),
+            backup: Some(backup),
+        }],
+        directories: CreatedPackageDirectories::default(),
+        journal: PackageJournal {
+            format: "memcordon.current-package-transaction".into(),
+            revision: 1,
+            phase: PackageJournalPhase::Published,
+            entries: Vec::new(),
+        },
+        published: true,
+        postimages: Vec::new(),
+    }
+    .commit()
+}
+#[cfg(target_os = "linux")]
+impl PackageDrainGuard<'_> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        for file in [self.current] {
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+            {
+                return Err("original exclusive package lease custody changed".into());
+            }
+        }
+        Ok(())
+    }
+}
+#[cfg(target_os = "linux")]
 fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), String> {
     use std::fs;
     use std::path::Path;
+    let account_started = std::time::Instant::now();
+    let account_allowance = match lease_deadline {
+        Some(deadline) => std::time::Duration::from_nanos(
+            deadline.saturating_sub(crate::linux::clock::monotonic_nanos()?),
+        ),
+        None => std::time::Duration::from_secs(30),
+    };
+    let account_cutoff = account_started
+        .checked_add(account_allowance)
+        .ok_or("package account operation cutoff exceeds native range")?;
+    let cutoff = account_cutoff;
 
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     if unsafe { libc::geteuid() } != 0 {
@@ -1681,22 +2049,12 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
     let _package_lease = acquire().map_err(|error| {
         format!("refusing package mutation while a sealed provider attempt is active: {error}")
     })?;
-    prepare_runtime_directory()?;
-    let acquire_legacy = || {
-        if let Some(deadline) = lease_deadline {
-            return crate::linux::service::acquire_legacy_package_lease_until(deadline);
-        }
-        crate::linux::service::acquire_legacy_package_lease()
+    let drain_guard = PackageDrainGuard {
+        current: &_package_lease,
     };
-    let _legacy_package_lease = acquire_legacy().map_err(|error| {
-        format!(
-            "refusing package mutation while a legacy sealed provider attempt is active: {error}"
-        )
-    })?;
-    // An already installed generation must not lose its epoch merely because
-    // a caller used install instead of the quiesced upgrade.
-    // A pending journal is a separate fail-closed state for install; upgrade
-    // and uninstall retain the locked recovery path below.
+    drain_guard.validate()?;
+    // Unknown occupied package state is never adopted by a fresh installer.
+    // Only the current transaction journal authorizes interrupted recovery.
     let journal_pending = match fs::symlink_metadata(PACKAGE_TRANSACTION_JOURNAL) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1708,6 +2066,59 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
         Err(error) => return Err(error.to_string()),
     };
     ensure_install_preflight(operation, journal_pending, installed_before_mutation)?;
+    if !installed_before_mutation && !journal_pending {
+        for path in PACKAGE_ARTIFACT_PATHS {
+            match fs::symlink_metadata(path) {
+                Ok(_) => return Err(format!("unmanaged occupied package path: {path}")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    if installed_before_mutation && !journal_pending {
+        crate::linux::runtime_manifest::installed_binding()
+            .map_err(|error| format!("incompatible occupied provider installation: {error}"))?;
+    }
+    if journal_pending {
+        let bytes = crate::linux::protected_read::read_protected_absolute(
+            Path::new(PACKAGE_TRANSACTION_JOURNAL),
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+            Some(0o600),
+        )?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
+        let journal: PackageJournal =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        validate_package_journal(&journal)?;
+    }
+    let current_account = if cfg!(feature = "private-tcp") {
+        crate::linux::workload_account::has_current_installation_state()?
+    } else {
+        false
+    };
+    let current_state_owned = installed_before_mutation || journal_pending || current_account;
+    validate_current_state_directory(
+        Path::new("/run/memcordon"),
+        current_state_owned,
+        &[
+            "sealed-agent.sock",
+            "sealed-launcher.sock",
+            "sealed-network-launcher.sock",
+            "sealed-startup-failure.json",
+        ],
+    )?;
+    validate_current_state_directory(
+        Path::new("/var/lib/memcordon"),
+        current_state_owned,
+        &[
+            "sealed",
+            "workload-account.json",
+            "workload-account.pending",
+            "workload-attempts",
+            "workload-inputs",
+            "workload-resources",
+        ],
+    )?;
+    prepare_runtime_directory()?;
     let preflight_source = if operation == "uninstall" {
         None
     } else {
@@ -1715,10 +2126,11 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
             &std::env::current_exe().map_err(|error| error.to_string())?,
         )?)
     };
-    recover_package_journal()?;
-    // This is intentionally outside the rollback set: an interrupted or
-    // byte-identical replacement may never resurrect an older detached run.
-    advance_installation_epoch()?;
+    recover_package_journal(cutoff)?;
+    ensure_no_unowned_package_temporaries()?;
+    if operation == "upgrade" || operation == "uninstall" {
+        crate::linux::workload_recovery::drain_for_package_until(&drain_guard, account_cutoff)?;
+    }
     let existing_installation = match fs::symlink_metadata(BINARY) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1727,24 +2139,23 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
     ensure_install_is_new(operation, existing_installation)?;
     let source_snapshot = preflight_source;
     if operation == "uninstall" {
-        ensure_recovery_idle("uninstall")?;
-        stop_unit("memcordon-sealed-network-launcher.service")?;
-        stop_unit("memcordon-sealed-network-launcher.socket")?;
-        disable_optional_network_launcher()?;
-        stop_unit("memcordon-sealed-agent.service")?;
-        stop_unit("memcordon-sealed-launcher.service")?;
-        stop_unit("memcordon-sealed-agent.socket")?;
-        stop_unit("memcordon-sealed-launcher.socket")?;
-        ensure_unit_inactive("memcordon-sealed-agent.service")?;
-        ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
-        ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
-        ensure_unit_inactive("memcordon-sealed-launcher.service")?;
-        ensure_unit_inactive("memcordon-sealed-agent.socket")?;
-        ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
-        ensure_recovery_idle("uninstall")?;
+        ensure_recovery_idle_until("uninstall", cutoff)?;
+        stop_unit("memcordon-sealed-network-launcher.service", cutoff)?;
+        stop_unit("memcordon-sealed-network-launcher.socket", cutoff)?;
+        disable_optional_network_launcher(cutoff)?;
+        stop_unit("memcordon-sealed-agent.service", cutoff)?;
+        stop_unit("memcordon-sealed-launcher.service", cutoff)?;
+        stop_unit("memcordon-sealed-agent.socket", cutoff)?;
+        stop_unit("memcordon-sealed-launcher.socket", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-agent.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.socket", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-launcher.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-agent.socket", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-launcher.socket", cutoff)?;
+        ensure_recovery_idle_until("uninstall", cutoff)?;
         // Unknown runtime outputs must refuse uninstall while the complete
         // installed provider is still available for their original recovery.
-        remove_uninstalled_file(LEGACY_PACKAGE_LEASE)?;
         crate::linux::startup::clear()?;
         for path in [crate::linux::CGROUP_ROOT, RUNTIME_DIRECTORY] {
             remove_uninstalled_directory(path)?;
@@ -1774,14 +2185,14 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
             }
         }
         let transaction = if !removals.is_empty() {
-            Some(PackageFileTransaction::apply(removals)?)
+            Some(PackageFileTransaction::apply(removals, cutoff)?)
         } else {
             None
         };
         uninstall_transaction::finish(
             transaction,
             || {
-                systemctl(["daemon-reload"])?;
+                systemctl(cutoff, ["daemon-reload"])?;
                 // Retain unrelated state rather than deleting nonempty directories.
                 match fs::read_dir(crate::linux::STATE_ROOT) {
                     Ok(mut entries) => {
@@ -1806,32 +2217,34 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
                     .transpose()
                     .map(|_| ())
             },
-            || systemctl(["daemon-reload"]),
+            || systemctl(cutoff, ["daemon-reload"]),
         )?;
-        // This is the final uninstall mutation. The open exclusive lease remains locked until
-        // return, while unlinking prevents the package lock itself becoming residual state.
-        remove_uninstalled_file(crate::linux::service::PACKAGE_LEASE)?;
+        if cfg!(feature = "private-tcp") {
+            crate::linux::workload_account::uninstall(account_cutoff)?;
+        }
+        // Keep one stable coordination inode across package generations. Unlinking
+        // a locked file would let a concurrent mutator acquire a different lock.
         return Ok(());
     }
     if operation == "upgrade" {
-        ensure_recovery_idle("upgrade")?;
-        stop_unit("memcordon-sealed-network-launcher.service")?;
-        stop_unit("memcordon-sealed-network-launcher.socket")?;
-        disable_optional_network_launcher()?;
-        stop_unit("memcordon-sealed-agent.service")?;
-        stop_unit("memcordon-sealed-launcher.service")?;
-        stop_unit("memcordon-sealed-agent.socket")?;
-        stop_unit("memcordon-sealed-launcher.socket")?;
-        ensure_unit_inactive("memcordon-sealed-agent.service")?;
-        ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
-        ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
-        ensure_unit_inactive("memcordon-sealed-launcher.service")?;
-        ensure_unit_inactive("memcordon-sealed-agent.socket")?;
-        ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
-        ensure_recovery_idle("upgrade")?;
+        ensure_recovery_idle_until("upgrade", cutoff)?;
+        stop_unit("memcordon-sealed-network-launcher.service", cutoff)?;
+        stop_unit("memcordon-sealed-network-launcher.socket", cutoff)?;
+        disable_optional_network_launcher(cutoff)?;
+        stop_unit("memcordon-sealed-agent.service", cutoff)?;
+        stop_unit("memcordon-sealed-launcher.service", cutoff)?;
+        stop_unit("memcordon-sealed-agent.socket", cutoff)?;
+        stop_unit("memcordon-sealed-launcher.socket", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-agent.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.socket", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-launcher.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-agent.socket", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-launcher.socket", cutoff)?;
+        ensure_recovery_idle_until("upgrade", cutoff)?;
     }
     verify_compiled_metadata()?;
-    let service_gid = ensure_service_group()?;
+    let service_gid = ensure_service_group(cutoff)?;
     // Already-loaded pre-transition units can remove their shared RuntimeDirectory while upgrade
     // quiesces both services. Re-establish the tmpfiles contract after all stop/recovery checks and
     // immediately before assigning the reviewed ownership. Successful uninstall returns above.
@@ -1892,8 +2305,11 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
             mode,
         });
     }
-    let transaction = PackageFileTransaction::apply(changes)?;
+    let transaction = PackageFileTransaction::apply(changes, cutoff)?;
     let prepared = (|| {
+        if cfg!(feature = "private-tcp") {
+            crate::linux::workload_account::install(account_cutoff, current_state_owned)?;
+        }
         verify_installed_package_against(&source_digest)?;
         let installed_snapshot = linux_source_snapshot(Path::new(BINARY))?;
         if installed_snapshot.manifest_bytes != source_snapshot.manifest_bytes
@@ -1901,30 +2317,33 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
         {
             return Err("installed runtime inventory or ARM32 helper differs from source".into());
         }
-        systemctl(["daemon-reload"])?;
-        disable_optional_network_launcher()?;
-        ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
-        ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
+        systemctl(cutoff, ["daemon-reload"])?;
+        disable_optional_network_launcher(cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.service", cutoff)?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.socket", cutoff)?;
         Ok::<(), String>(())
     })();
     if let Err(error) = prepared {
         let rollback = transaction.rollback();
-        let reload = systemctl(["daemon-reload"]);
+        let reload = systemctl(cutoff, ["daemon-reload"]);
         return Err(format!(
             "package install/upgrade failed: {error}; rollback: {rollback:?}; daemon reload: {reload:?}"
         ));
     }
-    // Runtime verification must see a durably published generation, never an
-    // in-progress journal. Retain old files for validated compensation until
-    // both readiness and ordinary-client access have succeeded.
+    // Publish exact current postimages before runtime verification. Keep the
+    // current journal and original inodes through verification and durable
+    // retirement so a controller crash cannot orphan backup authority.
     let transaction = activate_published_package(
         || transaction.publish(),
         || {
-            systemctl(["enable", "--now", "memcordon-sealed-launcher.socket"])?;
-            systemctl(["enable", "--now", "memcordon-sealed-agent.socket"])?;
-            systemctl(["restart", "memcordon-sealed-launcher.service"])?;
-            systemctl(["restart", "memcordon-sealed-agent.service"])?;
-            wait_provider_ready()?;
+            systemctl(
+                cutoff,
+                ["enable", "--now", "memcordon-sealed-launcher.socket"],
+            )?;
+            systemctl(cutoff, ["enable", "--now", "memcordon-sealed-agent.socket"])?;
+            systemctl(cutoff, ["restart", "memcordon-sealed-launcher.service"])?;
+            systemctl(cutoff, ["restart", "memcordon-sealed-agent.service"])?;
+            wait_provider_ready(cutoff)?;
             // Root deliberately bypasses ordinary directory and socket ACL checks.
             verify_client_access_configuration()
         },
@@ -1939,14 +2358,16 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
                     "memcordon-sealed-agent.socket",
                     "memcordon-sealed-launcher.socket",
                 ] {
-                    if let Err(error) = stop_unit(unit) {
+                    if let Err(error) = stop_unit(unit, cutoff) {
                         failures.push(error);
                     }
-                    if let Err(error) = ensure_unit_inactive(unit) {
+                    if let Err(error) = ensure_unit_inactive(unit, cutoff) {
                         failures.push(error);
                     }
                 }
-                if let Err(error) = ensure_recovery_idle("compensate package activation") {
+                if let Err(error) =
+                    ensure_recovery_idle_until("compensate package activation", cutoff)
+                {
                     failures.push(error);
                 }
                 if failures.is_empty() {
@@ -1960,12 +2381,14 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
                 return Err(format!("package compensation quiescence failed: {error}"));
             }
             transaction.rollback()?;
-            systemctl(["daemon-reload"])
+            systemctl(cutoff, ["daemon-reload"])
         },
     )?;
     transaction.commit().map_err(|error| {
         format!("package generation published and activated; backup cleanup failed: {error}")
-    })
+    })?;
+    if operation == "upgrade" {}
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2039,8 +2462,15 @@ fn remove_uninstalled_directory(path: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_recovery_idle(operation: &str) -> Result<(), String> {
-    let ambiguous = crate::linux::recovery::recover()?;
+pub(crate) fn ensure_recovery_idle(operation: &str) -> Result<(), String> {
+    ensure_recovery_idle_until(
+        operation,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+}
+#[cfg(target_os = "linux")]
+fn ensure_recovery_idle_until(operation: &str, cutoff: std::time::Instant) -> Result<(), String> {
+    let ambiguous = crate::linux::recovery::recover_until(cutoff)?;
     if !ambiguous.is_empty() {
         return Err(format!(
             "refusing to {operation} while sealed recovery is ambiguous: {}",
@@ -2096,20 +2526,125 @@ fn service_group_gid() -> Result<libc::gid_t, String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn probe_provider() -> Result<crate::linux::qualification::ReadinessObservation, String> {
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
+fn check_package_cutoff(cutoff: std::time::Instant) -> Result<(), String> {
+    if std::time::Instant::now() >= cutoff {
+        Err("original package operation cutoff exhausted; current custody retained".into())
+    } else {
+        Ok(())
+    }
+}
 
+#[cfg(target_os = "linux")]
+struct PackageDeadlineStream {
+    stream: std::os::unix::net::UnixStream,
+    cutoff: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+fn connect_package_probe_until(
+    cutoff: std::time::Instant,
+) -> Result<std::os::unix::net::UnixStream, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: scalar socket arguments request a fresh, nonblocking owned socket.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: successful socket creation transferred this descriptor to us.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: zero is a valid empty native sockaddr storage initialization.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path = c"/run/memcordon/sealed-agent.sock".to_bytes_with_nul();
+    for (target, source) in address.sun_path.iter_mut().zip(path) {
+        *target = *source as libc::c_char;
+    }
+    let length =
+        libc::socklen_t::try_from(std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len())
+            .map_err(|error| error.to_string())?;
+    loop {
+        check_package_cutoff(cutoff)?;
+        // SAFETY: address contains the exact bounded native pathname and fd is live.
+        if unsafe { libc::connect(fd.as_raw_fd(), (&raw const address).cast(), length) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EISCONN) => break,
+            Some(libc::EAGAIN | libc::EINPROGRESS | libc::EALREADY | libc::EINTR) => {
+                std::thread::sleep(
+                    std::time::Duration::from_millis(5)
+                        .min(cutoff.saturating_duration_since(std::time::Instant::now())),
+                )
+            }
+            _ => return Err(error.to_string()),
+        }
+    }
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    Ok(stream)
+}
+
+#[cfg(target_os = "linux")]
+impl std::io::Read for PackageDeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .cutoff
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "original package probe cutoff exhausted",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        std::io::Read::read(&mut self.stream, bytes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::io::Write for PackageDeadlineStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .cutoff
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "original package probe cutoff exhausted",
+            ));
+        }
+        self.stream.set_write_timeout(Some(remaining))?;
+        std::io::Write::write(&mut self.stream, bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.stream)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn probe_provider() -> Result<crate::linux::qualification::ReadinessObservation, String> {
+    probe_provider_until(std::time::Instant::now() + std::time::Duration::from_secs(60))
+}
+
+#[cfg(target_os = "linux")]
+fn probe_provider_until(
+    cutoff: std::time::Instant,
+) -> Result<crate::linux::qualification::ReadinessObservation, String> {
     use crate::protocol::{Frame, MessageKind, read_frame, write_frame};
 
-    let mut stream = UnixStream::connect("/run/memcordon/sealed-agent.sock")
-        .map_err(|error| readiness_error(&error.to_string()))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .map_err(|error| readiness_error(&error.to_string()))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(60)))
-        .map_err(|error| readiness_error(&error.to_string()))?;
+    check_package_cutoff(cutoff)?;
+    let stream = connect_package_probe_until(cutoff)
+        .map_err(|error| readiness_error(&error.to_string(), cutoff))?;
+    let mut stream = PackageDeadlineStream { stream, cutoff };
     let nonce = [0x52; 16];
     write_frame(
         &mut stream,
@@ -2120,30 +2655,34 @@ pub fn probe_provider() -> Result<crate::linux::qualification::ReadinessObservat
             payload: Vec::new(),
         },
     )
-    .map_err(|error| readiness_error(&error.to_string()))?;
-    let receipt = read_frame(&mut stream).map_err(|error| readiness_error(&error.to_string()))?;
+    .map_err(|error| readiness_error(&error.to_string(), cutoff))?;
+    let receipt =
+        read_frame(&mut stream).map_err(|error| readiness_error(&error.to_string(), cutoff))?;
+    check_package_cutoff(cutoff)?;
     if receipt.nonce != nonce || receipt.attempt_id != [0; 16] {
-        return Err(readiness_error("response identity mismatch"));
+        return Err(readiness_error("response identity mismatch", cutoff));
     }
     if receipt.kind == MessageKind::Rejected {
-        let reason = std::str::from_utf8(&receipt.payload)
-            .map_err(|error| readiness_error(&format!("invalid rejection payload: {error}")))?;
-        return Err(readiness_error(&format!(
-            "provider rejected probe: {reason}"
-        )));
+        let reason = std::str::from_utf8(&receipt.payload).map_err(|error| {
+            readiness_error(&format!("invalid rejection payload: {error}"), cutoff)
+        })?;
+        return Err(readiness_error(
+            &format!("provider rejected probe: {reason}"),
+            cutoff,
+        ));
     }
     if receipt.kind != MessageKind::ProbeReceipt {
-        return Err(readiness_error("unexpected response kind"));
+        return Err(readiness_error("unexpected response kind", cutoff));
     }
     crate::linux::qualification::ReadinessObservation::parse(&receipt.payload)
-        .map_err(|error| readiness_error(&error))
+        .map_err(|error| readiness_error(&error, cutoff))
 }
 
 #[cfg(target_os = "linux")]
-fn wait_provider_ready() -> Result<(), String> {
-    let _qualification = probe_provider()?;
+fn wait_provider_ready(cutoff: std::time::Instant) -> Result<(), String> {
+    let _qualification = probe_provider_until(cutoff)?;
     if live_attempt_exists()? {
-        return Err(readiness_error("provider is not idle"));
+        return Err(readiness_error("provider is not idle", cutoff));
     }
     Ok(())
 }
@@ -2165,7 +2704,7 @@ fn live_attempt_exists() -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_service_group() -> Result<libc::gid_t, String> {
+fn ensure_service_group(cutoff: std::time::Instant) -> Result<libc::gid_t, String> {
     let name = std::ffi::CString::new("memcordon").expect("static group name has no NUL");
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let group = unsafe { libc::getgrnam(name.as_ptr()) };
@@ -2173,12 +2712,13 @@ fn ensure_service_group() -> Result<libc::gid_t, String> {
         // SAFETY: getgrnam returned a live libc-managed group record.
         return Ok(unsafe { (*group).gr_gid });
     }
-    let status = std::process::Command::new("/usr/sbin/groupadd")
-        .args(["--system", "memcordon"])
-        .status()
+    let output = package_command_until("/usr/sbin/groupadd", &["--system", "memcordon"], cutoff)
         .map_err(|error| format!("could not create service group: {error}"))?;
-    if !status.success() {
-        return Err(format!("service group creation failed with {status}"));
+    if !output.status.success() {
+        return Err(format!(
+            "service group creation failed with {}",
+            output.status
+        ));
     }
     // SAFETY: groupadd succeeded and name remains a live NUL-terminated lookup key.
     let group = unsafe { libc::getgrnam(name.as_ptr()) };
@@ -2190,20 +2730,140 @@ fn ensure_service_group() -> Result<libc::gid_t, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn systemctl<const N: usize>(arguments: [&str; N]) -> Result<(), String> {
-    let status = std::process::Command::new("/usr/bin/systemctl")
-        .args(arguments)
-        .status()
-        .map_err(|error| error.to_string())?;
-    if status.success() {
+fn systemctl<const N: usize>(
+    cutoff: std::time::Instant,
+    arguments: [&str; N],
+) -> Result<(), String> {
+    let output = package_command_until("/usr/bin/systemctl", &arguments, cutoff)?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("systemctl failed with {status}"))
+        Err(format!(
+            "systemctl failed: {}",
+            systemctl_output_diagnostic(&output)
+        ))
     }
 }
 
+/// Capture a native child without letting its pipe buffers or process wait
+/// extend the original package operation. A timeout never claims restoration.
 #[cfg(target_os = "linux")]
-fn disable_optional_network_launcher() -> Result<(), String> {
+pub(crate) fn package_command_until(
+    program: &str,
+    arguments: &[&str],
+    cutoff: std::time::Instant,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    if Instant::now() >= cutoff {
+        return Err("original package command cutoff exhausted before spawn".into());
+    }
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdout = child.stdout.take().expect("requested stdout pipe");
+    let mut stderr = child.stderr.take().expect("requested stderr pipe");
+    let configure = |fd| {
+        // SAFETY: fd is an exclusively retained child output pipe.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            Err(std::io::Error::last_os_error().to_string())
+        } else {
+            Ok(())
+        }
+    };
+    let result = (|| {
+        configure(stdout.as_raw_fd())?;
+        configure(stderr.as_raw_fd())?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut out_closed = false;
+        let mut err_closed = false;
+        let mut status = None;
+        loop {
+            if Instant::now() >= cutoff {
+                return Err("original package command cutoff expired".to_owned());
+            }
+            for (reader, bytes, closed) in [
+                (&mut stdout as &mut dyn Read, &mut out, &mut out_closed),
+                (&mut stderr as &mut dyn Read, &mut err, &mut err_closed),
+            ] {
+                if *closed {
+                    continue;
+                }
+                let mut buffer = [0_u8; 4096];
+                match reader.read(&mut buffer) {
+                    Ok(0) => *closed = true,
+                    Ok(count) => {
+                        if bytes.len().saturating_add(count) > 64 * 1024 {
+                            return Err(
+                                "native package command output exceeds its finite bound".into()
+                            );
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            if status.is_none() {
+                status = child.try_wait().map_err(|error| error.to_string())?;
+            }
+            if let Some(status) = status {
+                if out_closed && err_closed {
+                    check_package_cutoff(cutoff)?;
+                    return Ok(std::process::Output {
+                        status,
+                        stdout: out,
+                        stderr: err,
+                    });
+                }
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(cutoff.saturating_duration_since(Instant::now())),
+            );
+        }
+    })();
+    if let Err(error) = result {
+        // This is a separate, once-formed child cleanup allowance. It cannot
+        // renew the package operation or authorize additional package mutation.
+        let cleanup_cutoff = Instant::now() + Duration::from_secs(5);
+        let termination = child.kill();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "{error}; child termination={termination:?}; actual wait={status}"
+                    ));
+                }
+                Ok(None) if Instant::now() < cleanup_cutoff => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                observation => {
+                    return Err(format!(
+                        "{error}; child termination={termination:?}; child pid={} cleanup observation={observation:?}; no cleanup completion claimed",
+                        child.id()
+                    ));
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn disable_optional_network_launcher(cutoff: std::time::Instant) -> Result<(), String> {
     for (unit, path) in [
         (
             "memcordon-sealed-network-launcher.socket",
@@ -2218,21 +2878,23 @@ fn disable_optional_network_launcher() -> Result<(), String> {
             .try_exists()
             .map_err(|error| error.to_string())?
         {
-            systemctl(["disable", "--now", unit])?;
-            ensure_unit_inactive(unit)?;
+            systemctl(cutoff, ["disable", "--now", unit])?;
+            ensure_unit_inactive(unit, cutoff)?;
         }
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_unit_inactive(unit: &str) -> Result<(), String> {
-    let output = std::process::Command::new("/usr/bin/systemctl")
-        .args(["show", "--property=ActiveState", "--value", unit])
-        .output()
-        .map_err(|error| format!("MCSEALED-PACKAGE-STOP-PROOF: {error}"))?;
+fn ensure_unit_inactive(unit: &str, cutoff: std::time::Instant) -> Result<(), String> {
+    let output = package_command_until(
+        "/usr/bin/systemctl",
+        &["show", "--property=ActiveState", "--value", unit],
+        cutoff,
+    )
+    .map_err(|error| format!("MCSEALED-PACKAGE-STOP-PROOF: {error}"))?;
     if !output.status.success() {
-        if unit_load_state(unit)? == "not-found" {
+        if unit_load_state(unit, cutoff)? == "not-found" {
             return Ok(());
         }
         return Err(format!(
@@ -2253,16 +2915,14 @@ fn ensure_unit_inactive(unit: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn stop_unit(unit: &str) -> Result<(), String> {
-    let output = std::process::Command::new("/usr/bin/systemctl")
-        .args(["stop", unit])
-        .output()
+fn stop_unit(unit: &str, cutoff: std::time::Instant) -> Result<(), String> {
+    let output = package_command_until("/usr/bin/systemctl", &["stop", unit], cutoff)
         .map_err(|error| format!("MCSEALED-PACKAGE-STOP: unit={unit}; invocation-error={error}"))?;
     if output.status.success() {
         return Ok(());
     }
     let diagnostic = systemctl_output_diagnostic(&output);
-    match unit_load_state(unit) {
+    match unit_load_state(unit, cutoff) {
         Ok(state) if state == "not-found" => Ok(()),
         Ok(state) => Err(format!(
             "MCSEALED-PACKAGE-STOP: unit={unit}; load-state={state}; systemctl-output={diagnostic}"
@@ -2315,18 +2975,20 @@ fn bounded_systemctl_stream(bytes: &[u8]) -> serde_json::Value {
 }
 
 #[cfg(target_os = "linux")]
-fn unit_load_state(unit: &str) -> Result<String, String> {
-    let output = std::process::Command::new("/usr/bin/systemctl")
-        .args(["show", "--property=LoadState", "--value", unit])
-        .output()
-        .map_err(|error| format!("MCSEALED-PACKAGE-STOP-PROOF: {error}"))?;
+fn unit_load_state(unit: &str, cutoff: std::time::Instant) -> Result<String, String> {
+    let output = package_command_until(
+        "/usr/bin/systemctl",
+        &["show", "--property=LoadState", "--value", unit],
+        cutoff,
+    )
+    .map_err(|error| format!("MCSEALED-PACKAGE-STOP-PROOF: {error}"))?;
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_owned())
         .map_err(|error| format!("MCSEALED-PACKAGE-STOP-PROOF: {error}"))
 }
 
 #[cfg(target_os = "linux")]
-fn readiness_error(cause: &str) -> String {
+fn readiness_error(cause: &str, cutoff: std::time::Instant) -> String {
     const MAX_SYSTEMD_BYTES: usize = 16 * 1024;
     const MAX_JOURNAL_BYTES: usize = 32 * 1024;
     let systemd = bounded_command_diagnostic(
@@ -2343,6 +3005,7 @@ fn readiness_error(cause: &str) -> String {
         ],
         MAX_SYSTEMD_BYTES,
         false,
+        cutoff,
     );
     let journal = bounded_command_diagnostic(
         "/usr/bin/journalctl",
@@ -2358,6 +3021,7 @@ fn readiness_error(cause: &str) -> String {
         ],
         MAX_JOURNAL_BYTES,
         true,
+        cutoff,
     );
     // A reset at the control plane only identifies a failed broker exchange.
     // Preserve the launcher's rejection/startup cause before rollback stops it.
@@ -2377,6 +3041,7 @@ fn readiness_error(cause: &str) -> String {
         ],
         MAX_SYSTEMD_BYTES,
         false,
+        cutoff,
     );
     let launcher_journal = bounded_command_diagnostic(
         "/usr/bin/journalctl",
@@ -2392,6 +3057,7 @@ fn readiness_error(cause: &str) -> String {
         ],
         MAX_JOURNAL_BYTES,
         true,
+        cutoff,
     );
     let startup = match crate::linux::startup::read() {
         Ok(Some(record)) => serde_json::to_value(record)
@@ -2415,8 +3081,9 @@ fn bounded_command_diagnostic(
     arguments: &[&str],
     maximum_bytes: usize,
     parse_json_lines: bool,
+    cutoff: std::time::Instant,
 ) -> serde_json::Value {
-    let output = std::process::Command::new(program).args(arguments).output();
+    let output = package_command_until(program, arguments, cutoff);
     match output {
         Ok(output) if output.stdout.len().saturating_add(output.stderr.len()) <= maximum_bytes => {
             let stdout = String::from_utf8_lossy(&output.stdout);

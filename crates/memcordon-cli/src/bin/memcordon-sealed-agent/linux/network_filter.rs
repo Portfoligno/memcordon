@@ -474,41 +474,7 @@ fn errno(value: i32) -> u32 {
 
 /// Compile the ABI-specific syscall catalogue and scalar argument checks.
 /// Validate the generated instruction structure before returning it to the installer.
-pub fn compile_initial_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
-    compile_closed_filter(abi, false)
-}
-
-/// Combined sockets are safe only after native private-root/descriptor closure.
-/// This deliberately inspects scalar socket arguments, never user pointers.
-pub fn compile_mixed_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
-    compile_closed_filter(abi, true)
-}
-
 pub fn compile_mixed_seqpacket_filter(abi: NativeAbi) -> Vec<sock_filter> {
-    compile_closed_filter_with_pairs(abi, true, true)
-}
-
-pub fn select_mixed_filter(abi: NativeAbi, expected: [u8; 32]) -> Result<Vec<sock_filter>, String> {
-    for program in [
-        compile_mixed_closed_filter(abi),
-        compile_mixed_seqpacket_filter(abi),
-    ] {
-        if filter_instruction_digest(&program).map_err(str::to_owned)? == expected {
-            return Ok(program);
-        }
-    }
-    Err("MCSEALED-PRIVATE-FILTER: unknown mixed instruction digest".into())
-}
-
-fn compile_closed_filter(abi: NativeAbi, mixed: bool) -> Vec<sock_filter> {
-    compile_closed_filter_with_pairs(abi, mixed, false)
-}
-
-fn compile_closed_filter_with_pairs(
-    abi: NativeAbi,
-    mixed: bool,
-    seqpacket_pair: bool,
-) -> Vec<sock_filter> {
     let numbers = abi.syscalls();
     let mut program = vec![
         load(ARCH_OFFSET),
@@ -520,16 +486,7 @@ fn compile_closed_filter_with_pairs(
         program.push(instruction(BPF_JMP_JSET_K, 0, 1, 0x4000_0000));
         program.push(return_action(SECCOMP_RET_KILL_PROCESS));
     }
-    for (number, result) in [
-        (numbers.clone3, errno(libc::ENOSYS)),
-        (
-            numbers.socketpair,
-            if mixed { 0 } else { errno(libc::EPERM) },
-        ),
-    ] {
-        if result == 0 {
-            continue;
-        }
+    for (number, result) in [(numbers.clone3, errno(libc::ENOSYS))] {
         program.push(jump_equal(number, 0, 1));
         program.push(return_action(result));
     }
@@ -624,8 +581,8 @@ fn compile_closed_filter_with_pairs(
         program.push(load(NR_OFFSET));
     }
 
-    if mixed {
-        let checks = unix_checks(seqpacket_pair);
+    {
+        let checks = unix_checks(true);
         program.push(jump_equal(numbers.socketpair, 1, 0));
         program.push(instruction(
             BPF_JMP_JA,
@@ -636,11 +593,7 @@ fn compile_closed_filter_with_pairs(
         program.extend(checks);
         program.push(load(NR_OFFSET));
     }
-    let socket_checks = if mixed {
-        mixed_socket_checks()
-    } else {
-        socket_checks()
-    };
+    let socket_checks = mixed_socket_checks();
     program.push(jump_equal(numbers.socket, 1, 0));
     program.push(instruction(
         BPF_JMP_JA,
@@ -654,7 +607,7 @@ fn compile_closed_filter_with_pairs(
         program.push(jump_equal(*number, 0, 1));
         program.push(return_action(SECCOMP_RET_ALLOW));
     }
-    if mixed {
+    {
         // Exact native sendmsg/recvmsg enable SCM_RIGHTS inside the fresh root.
         // No host/socket capability exists in the three entry descriptors.
         for number in match abi {
@@ -726,34 +679,22 @@ pub struct InstalledFilterProof {
 /// stub after exact identity/descriptor checks and before release. The successful
 /// seccomp result binds the compiled instruction bytes; `PR_GET_SECCOMP` alone
 /// cannot identify the installed program.
-pub fn install_gated_private_filter(
-    abi: NativeAbi,
-    expected_digest: [u8; 32],
-) -> Result<InstalledFilterProof, String> {
-    install_selected_filter(abi, expected_digest, false)
-}
-
 pub fn install_gated_mixed_filter(
     abi: NativeAbi,
     expected_digest: [u8; 32],
 ) -> Result<InstalledFilterProof, String> {
-    install_selected_filter(abi, expected_digest, true)
+    install_selected_filter(abi, expected_digest)
 }
 
 fn install_selected_filter(
     abi: NativeAbi,
     expected_digest: [u8; 32],
-    mixed: bool,
 ) -> Result<InstalledFilterProof, String> {
     let native_abi = native_abi()?;
     if abi != native_abi {
         return Err("MCSEALED-PRIVATE-FILTER: requested ABI is not native".into());
     }
-    let mut program = if mixed {
-        select_mixed_filter(abi, expected_digest)?
-    } else {
-        compile_closed_filter(abi, false)
-    };
+    let mut program = compile_mixed_seqpacket_filter(abi);
     let digest = filter_instruction_digest(&program)
         .map_err(|reason| format!("MCSEALED-PRIVATE-FILTER: invalid program: {reason}"))?;
     if digest != expected_digest {

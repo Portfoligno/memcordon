@@ -1,7 +1,4 @@
-use memcordon_core::{
-    PublicProviderBindingV1,
-    runtime_manifest::{RuntimeComponentRole, RuntimeManifest},
-};
+use memcordon_core::{PublicProviderBindingV1, runtime_components::RuntimeComponentRole};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -61,61 +58,46 @@ pub(super) fn installed_binding() -> Result<PublicProviderBindingV1, String> {
     file.take(memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    let manifest = RuntimeManifest::parse(&bytes)?;
-    let binding = manifest.public_binding(&bytes)?;
-    if manifest.version != env!("CARGO_PKG_VERSION") {
-        return Err("authenticated provider runtime binding differs".into());
-    }
+    current_binding(&bytes, false)
+}
+
+pub(super) fn installed_current_binding() -> Result<PublicProviderBindingV1, String> {
+    let file = protected(Path::new("/usr/libexec/memcordon-runtime-manifest.json"))?;
+    let mut bytes = Vec::new();
+    file.take(memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    current_binding(&bytes, true)
+}
+
+fn current_binding(bytes: &[u8], require_private: bool) -> Result<PublicProviderBindingV1, String> {
+    use memcordon_core::runtime_manifest_v2::{RuntimeManifestV2, SealedRuntimeV2};
+    let manifest = RuntimeManifestV2::parse(bytes)?;
     let target = match (std::env::consts::ARCH, cfg!(target_env = "musl")) {
         ("x86_64", false) => "x86_64-unknown-linux-gnu",
         ("aarch64", false) => "aarch64-unknown-linux-gnu",
         ("x86_64", true) => "x86_64-unknown-linux-musl",
         ("aarch64", true) => "aarch64-unknown-linux-musl",
-        _ => return Err("unsupported provider runtime target".into()),
+        _ => return Err("unsupported current Linux provider target".into()),
     };
-    let private_tcp = matches!(
-        &manifest.sealed,
-        memcordon_core::runtime_manifest::SealedRuntime::Included {
-            workload_contract_schema: 2,
-            ..
-        }
-    );
-    let combined = matches!(
-        &manifest.sealed,
-        memcordon_core::runtime_manifest::SealedRuntime::Included {
-            workload_contract_schema: 3,
-            ..
-        }
-    );
-    let expected = if combined {
-        RuntimeManifest::linux_combined(
-            manifest.version.clone(),
-            manifest.source_commit.clone(),
-            target.into(),
-            manifest.components.clone(),
-        )?
-    } else {
-        RuntimeManifest::linux_selected(
-            manifest.version.clone(),
-            manifest.source_commit.clone(),
-            target.into(),
-            manifest.components.clone(),
-            private_tcp,
-        )?
-    };
-    if manifest != expected {
-        return Err("provider runtime support differs".into());
+    if manifest.version != env!("CARGO_PKG_VERSION") || manifest.target != target {
+        return Err("current installed Linux provider version or target differs".into());
+    }
+    if require_private
+        && !matches!(&manifest.sealed, SealedRuntimeV2::Included { profile, .. } if profile == "linux-private-workload-v1")
+    {
+        return Err("current Linux private workload component is not installed".into());
     }
     let agent = manifest
         .components
         .iter()
-        .find(|value| value.role == RuntimeComponentRole::SealedAgent)
-        .ok_or("provider runtime agent absent")?;
+        .find(|component| component.role == RuntimeComponentRole::SealedAgent)
+        .ok_or("current Linux agent missing")?;
     let public = manifest
         .components
         .iter()
-        .find(|value| value.role == RuntimeComponentRole::PublicCli)
-        .ok_or("provider runtime CLI absent")?;
+        .find(|component| component.role == RuntimeComponentRole::PublicCli)
+        .ok_or("current Linux public frontend missing")?;
     if agent.id != "sealed-agent"
         || agent.path != "memcordon-sealed-agent"
         || agent.mode != 0o755
@@ -123,7 +105,7 @@ pub(super) fn installed_binding() -> Result<PublicProviderBindingV1, String> {
         || public.path != "memcordon"
         || public.mode != 0o755
     {
-        return Err("provider runtime roles differ".into());
+        return Err("current Linux installed component roles differ".into());
     }
     for component in &manifest.components {
         if !matches!(
@@ -132,12 +114,12 @@ pub(super) fn installed_binding() -> Result<PublicProviderBindingV1, String> {
                 | RuntimeComponentRole::SealedAgent
                 | RuntimeComponentRole::Arm32AbiHelper
         ) {
-            return Err("installed GNU runtime component role differs".into());
+            return Err("current Linux component role unsupported".into());
         }
         let file = protected(&Path::new("/usr/libexec").join(&component.path))?;
         let before = file.metadata().map_err(|error| error.to_string())?;
         if before.len() != component.size || before.mode() & 0o7777 != component.mode {
-            return Err("installed runtime component size/mode differs".into());
+            return Err("current Linux component size or mode differs".into());
         }
         let actual: String =
             protected_digest(file.try_clone().map_err(|error| error.to_string())?)?.into();
@@ -161,8 +143,8 @@ pub(super) fn installed_binding() -> Result<PublicProviderBindingV1, String> {
                 after.ctime_nsec(),
             )
         {
-            return Err("installed runtime component bytes changed or differ".into());
+            return Err("current Linux component bytes or held native identity differ".into());
         }
     }
-    Ok(binding)
+    manifest.public_binding(bytes)
 }

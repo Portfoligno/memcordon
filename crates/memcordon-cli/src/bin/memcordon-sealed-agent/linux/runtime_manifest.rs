@@ -1,8 +1,7 @@
 use std::path::Path;
 
-use memcordon_core::runtime_manifest::{
-    RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-};
+use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
 
 pub const INSTALLED: &str = "/usr/libexec/memcordon-runtime-manifest.json";
 pub const INSTALLED_ARM32_HELPER: &str = "/usr/libexec/memcordon-arm32-abi-helper";
@@ -19,7 +18,7 @@ pub(crate) fn target() -> Result<&'static str, String> {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    memcordon_core::workload_codec::hash_bytes(bytes).into()
+    memcordon_core::hash_bytes(bytes).into()
 }
 
 pub(crate) fn manifest_bytes(path: &Path, protected: bool) -> Result<Vec<u8>, String> {
@@ -178,22 +177,13 @@ pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let expected = if cfg!(feature = "private-tcp") {
-        RuntimeManifest::linux_combined(
-            env!("CARGO_PKG_VERSION").into(),
-            crate::SOURCE_COMMIT.into(),
-            target()?.into(),
-            components,
-        )?
-    } else {
-        RuntimeManifest::linux_selected(
-            env!("CARGO_PKG_VERSION").into(),
-            crate::SOURCE_COMMIT.into(),
-            target()?.into(),
-            components,
-            cfg!(feature = "private-tcp"),
-        )?
-    };
+    let expected = RuntimeManifest::linux(
+        env!("CARGO_PKG_VERSION").into(),
+        crate::SOURCE_COMMIT.into(),
+        target()?.into(),
+        components,
+        cfg!(feature = "private-tcp"),
+    )?;
     let path = directory.join("runtime-manifest.json");
     match manifest_bytes(&path, false) {
         Ok(bytes) => {

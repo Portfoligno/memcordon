@@ -1,4 +1,4 @@
-#[path = "support/windows_postauthorization.rs"]
+#[path = "support/windows_current_postauthorization.rs"]
 mod physical_fixture;
 
 use memcordon_core::*;
@@ -15,10 +15,10 @@ fn witness(mutant: WindowsSealedMutant) -> WindowsPrematureReleaseWitnessV1 {
     }
 }
 
-fn rejection() -> WindowsProviderRejectionV2 {
+fn rejection() -> WindowsProviderRejectionV3 {
     let mut rejected = physical_fixture::rejection();
     let mut receipt = rejected.terminal_receipt().unwrap().clone();
-    receipt.payload = WindowsTerminalPayloadV2::PrematureReleaseFailure {
+    receipt.payload = WindowsTerminalPayloadV3::PrematureReleaseFailure {
         witness: witness(WindowsSealedMutant::ResumeBeforeGuardian),
         child_pid: 1234,
         duration_millis: 29,
@@ -68,7 +68,7 @@ fn rejection() -> WindowsProviderRejectionV2 {
     rejected.code = "MCSEALED-WINDOWS-MUTANT-OBSERVED".into();
     rejected.phase = BoundarySetupPhase::Authorization;
     rejected.detail = "actual premature release observed, then native cleanup completed".into();
-    rejected.disposition = WindowsProviderRejectionDispositionV2::PrematureReleaseFailure {
+    rejected.disposition = WindowsProviderRejectionDispositionV3::PrematureReleaseFailure {
         receipt: Box::new(receipt),
     };
     assert!(rejected.is_consistent());
@@ -128,7 +128,7 @@ fn premature_receipt_requires_complete_native_retirement_and_never_certifies() {
     let payload = serde_json::to_value(&receipt.payload).unwrap();
     assert!(payload.get("authorization_offset_millis").is_none());
     assert!(payload.get("boundary_detail").is_none());
-    for dimension in 0..10 {
+    for dimension in 0..9 {
         let mut changed = receipt.clone();
         match dimension {
             0 => changed.retirement_proof.target_completion_observed = false,
@@ -137,9 +137,8 @@ fn premature_receipt_requires_complete_native_retirement_and_never_certifies() {
             3 => changed.retirement_proof.guardian_completion_observed = false,
             4 => changed.retirement_proof.owner_capabilities_closed = false,
             5 => changed.retirement_proof.launch_gate_closed = false,
-            6 => changed.retirement_proof.policy_reference_bound = false,
-            7 => changed.retirement_proof.request_sha256 = "foreign".into(),
-            8 => {
+            6 => changed.retirement_proof.request_sha256 = "foreign".into(),
+            7 => {
                 changed
                     .process_observation
                     .root_identity
@@ -155,7 +154,7 @@ fn premature_receipt_requires_complete_native_retirement_and_never_certifies() {
         );
     }
     let mut natural = receipt.clone();
-    let WindowsTerminalPayloadV2::PrematureReleaseFailure { outcome, .. } = &mut natural.payload
+    let WindowsTerminalPayloadV3::PrematureReleaseFailure { outcome, .. } = &mut natural.payload
     else {
         unreachable!()
     };
@@ -172,12 +171,12 @@ fn premature_rejection_rejects_ordinary_dispositions_and_foreign_cause_binding()
     let rejected = rejection();
     let receipt = rejected.terminal_receipt().unwrap().clone();
     let mut ordinary = rejected.clone();
-    ordinary.disposition = WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+    ordinary.disposition = WindowsProviderRejectionDispositionV3::PostauthorizationFailure {
         receipt: Box::new(receipt),
     };
     assert!(!ordinary.is_consistent());
     let mut wrong_payload = rejected.clone();
-    wrong_payload.disposition = WindowsProviderRejectionDispositionV2::PrematureReleaseFailure {
+    wrong_payload.disposition = WindowsProviderRejectionDispositionV3::PrematureReleaseFailure {
         receipt: Box::new(
             physical_fixture::rejection()
                 .terminal_receipt()
@@ -210,8 +209,8 @@ fn premature_outbox_joins_selected_witness_seed_and_exact_receipt() {
     let rejected = rejection();
     let receipt = rejected.terminal_receipt().unwrap().clone();
     let selected = witness(WindowsSealedMutant::ResumeBeforeGuardian);
-    let mut record = WindowsDurableAttemptRecordV4 {
-        schema_version: 4,
+    let mut record = WindowsDurableAttemptRecordV5 {
+        schema_version: 5,
         attempt_id: receipt.attempt_id.clone(),
         provider_generation: receipt.retirement_proof.provider_generation.clone(),
         boot_identity: receipt.retirement_proof.original_boot_id.clone(),
@@ -269,21 +268,19 @@ fn premature_outbox_joins_selected_witness_seed_and_exact_receipt() {
         },
         causal_diagnostics: WindowsCausalDiagnosticsV1::default(),
         diagnostic_retention: DiagnosticRetentionV1::admitted_at(0).unwrap(),
-        workload_admission: None,
-        workload_checkpoint: None,
         record_revision: 1,
         provider_incarnation: "34".repeat(32),
         integrity_sha256: String::new(),
     };
-    let response = WindowsLauncherResponseV3::Reject {
-        schema_version: 3,
+    let response = WindowsLauncherResponseV4::Reject {
+        schema_version: 4,
         attempt_id: receipt.attempt_id,
         nonce: receipt.nonce,
         request_sha256: receipt.request_sha256,
         rejection: rejected,
     };
     // This exercises the actual outbox-binding predicate, not record authentication.
-    assert!(windows_terminal_outbox_is_bound_v3(&record, &response));
+    assert!(windows_terminal_outbox_is_bound_v4(&record, &response));
     for dimension in 0..10 {
         let mut changed = record.clone();
         match dimension {
@@ -329,11 +326,11 @@ fn premature_outbox_joins_selected_witness_seed_and_exact_receipt() {
             }
         }
         assert!(
-            !windows_terminal_outbox_is_bound_v3(&changed, &response),
+            !windows_terminal_outbox_is_bound_v4(&changed, &response),
             "dimension {dimension}"
         );
     }
     record.terminal_seed.as_mut().unwrap().premature_release =
         Some(witness(WindowsSealedMutant::ResumeBeforeRelays));
-    assert!(!windows_terminal_outbox_is_bound_v3(&record, &response));
+    assert!(!windows_terminal_outbox_is_bound_v4(&record, &response));
 }

@@ -4,6 +4,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::fmt;
 
+pub fn hash_bytes(bytes: &[u8]) -> DiagnosticSha256 {
+    DiagnosticSha256::from_bytes(Sha256Hasher::digest(bytes).into())
+}
+
 pub const CAUSAL_DIAGNOSTIC_SCHEMA: u32 = 1;
 pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 512;
 pub const MAX_DIAGNOSTIC_SECONDARY_EVENTS: usize = 8;
@@ -140,25 +144,13 @@ pub trait WindowsResponseFrame: serde::de::DeserializeOwned {
     fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str>;
 }
 
-impl WindowsResponseFrame for crate::WindowsProviderResponseV1 {
+impl WindowsResponseFrame for crate::WindowsProviderResponseV4 {
     fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
         windows_response_frame_limit(prefix)
     }
 }
 
-impl WindowsResponseFrame for crate::WindowsProviderResponseV3 {
-    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
-        windows_response_frame_limit(prefix)
-    }
-}
-
-impl WindowsResponseFrame for crate::WindowsLauncherResponseV1 {
-    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
-        windows_launcher_response_frame_limit(prefix)
-    }
-}
-
-impl WindowsResponseFrame for crate::WindowsLauncherResponseV3 {
+impl WindowsResponseFrame for crate::WindowsLauncherResponseV4 {
     fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
         windows_launcher_response_frame_limit(prefix)
     }
@@ -177,16 +169,14 @@ fn response_kind_frame_limit(remainder: &[u8], public: bool) -> Result<usize, &'
         return Err("response discriminator is not canonical");
     }
     Ok(match kind {
-        b"attempt-retained" | b"attempt-retained-v2" | b"replay-pending" | b"replay-pending-v2" => {
-            MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
-        }
-        b"qualification-rejected" if public => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
+        b"attempt-retained-v2"
+        | b"replay-pending-v2"
+        | b"workload-accepted"
+        | b"preallocation-cancelled"
+        | b"workload-prepared" => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
         b"read-only-query-failure" => crate::WindowsReadOnlyQueryFailure::MAX_FRAME_BYTES,
         b"guardian-attempt-observation" if !public => {
             crate::WindowsGuardianAttemptObservation::MAX_FRAME_BYTES
-        }
-        b"workload-plan" | b"workload-discovery" if public => {
-            crate::workload_limits::PUBLIC_OBJECT_BYTES
         }
         b"terminal" | b"reject" => WINDOWS_MAX_TERMINAL_FRAME_BYTES,
         _ => crate::WINDOWS_MAX_FRAME_BYTES,
@@ -298,9 +288,7 @@ impl FailureCodeV1 {
             Self::TargetResume => "MCSEALED-WINDOWS-TARGET-RESUME",
             Self::TargetQuery => "MCSEALED-WINDOWS-TARGET-QUERY",
             Self::ControlTransport => "MCSEALED-WINDOWS-CONTROL-TRANSPORT",
-            Self::PolicyAdmission => "MCSEALED-POLICY-ADMISSION",
-            Self::PolicyReadback => "MCSEALED-POLICY-READBACK",
-            Self::PolicyRevoked => "MCSEALED-POLICY-DRIFT",
+            Self::JobConfigurationReadback => "MCSEALED-WINDOWS-JOB-CONFIGURATION",
             Self::TerminalBinding => "MCSEALED-WINDOWS-TERMINAL-RESPONSE",
             Self::RecordIo => "MCSEALED-WINDOWS-RECORD-IO",
             Self::RecordAuthentication => "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH",
@@ -481,11 +469,11 @@ macro_rules! vocabulary {
 }
 vocabulary!(DiagnosticOriginV1 { Launcher = 0, ControlRelay = 1, GuardianRecovery = 2, StartupRecovery = 3, RecordWriter = 4, ClientTransport = 5 });
 vocabulary!(FailureCategoryV1 { Admission = 0, Launch = 1, Monitor = 2, Cleanup = 3, Terminalization = 4, Transport = 5, Persistence = 6, Recovery = 7 });
-vocabulary!(FailureOperationV1 { AuthenticateCaller = 0, ResolveAdmission = 1, InstallPolicy = 2, VerifyPolicy = 3, StartGuardian = 4, CreateTarget = 5, VerifySuspendedTarget = 6, AuthorizeTarget = 7, ResumeTarget = 8, QueryJobProcessIds = 9, ObserveProcessIdentity = 10, AccumulateProcessInventory = 11, ReadJobNotification = 12, QueryPeakMemory = 13, PollTarget = 14, ReadTargetExit = 15, CheckGuardian = 16, CheckDesktopAuthority = 17, ReadControlFrame = 18, TerminateJob = 19, WaitJobEmpty = 20, RetireGuardian = 21, CloseFinalHandles = 22, BuildRejection = 23, ValidateTerminalResponse = 24, SerializeTerminalResponse = 25, StoreRecord = 26, DeliverResponse = 27, AcknowledgeTerminal = 28, RetireOutbox = 29, InspectRecoveryRecord = 30, UnexpectedUnwind = 31, UnclassifiedProviderOperation = 32, QueryJobAccounting = 33 });
-vocabulary!(FailureCodeV1 { ProcessInventoryObservation = 0, ProcessInventoryCapacity = 1, JobQuery = 2, GuardianLoss = 3, TargetCreate = 4, TargetResume = 5, TargetQuery = 6, ControlTransport = 7, PolicyAdmission = 8, PolicyReadback = 9, TerminalBinding = 10, RecordIo = 11, RecordAuthentication = 12, UnexpectedProviderFailure = 13, PolicyRevoked = 14 });
+vocabulary!(FailureOperationV1 { AuthenticateCaller = 0, ValidateRequest = 1, ConfigureJob = 2, VerifyJob = 3, StartGuardian = 4, CreateTarget = 5, VerifySuspendedTarget = 6, AuthorizeTarget = 7, ResumeTarget = 8, QueryJobProcessIds = 9, ObserveProcessIdentity = 10, AccumulateProcessInventory = 11, ReadJobNotification = 12, QueryPeakMemory = 13, PollTarget = 14, ReadTargetExit = 15, CheckGuardian = 16, CheckDesktopAuthority = 17, ReadControlFrame = 18, TerminateJob = 19, WaitJobEmpty = 20, RetireGuardian = 21, CloseFinalHandles = 22, BuildRejection = 23, ValidateTerminalResponse = 24, SerializeTerminalResponse = 25, StoreRecord = 26, DeliverResponse = 27, AcknowledgeTerminal = 28, RetireOutbox = 29, InspectRecoveryRecord = 30, UnexpectedUnwind = 31, UnclassifiedProviderOperation = 32, QueryJobAccounting = 33 });
+vocabulary!(FailureCodeV1 { ProcessInventoryObservation = 0, ProcessInventoryCapacity = 1, JobQuery = 2, GuardianLoss = 3, TargetCreate = 4, TargetResume = 5, TargetQuery = 6, ControlTransport = 7, JobConfigurationReadback = 9, TerminalBinding = 10, RecordIo = 11, RecordAuthentication = 12, UnexpectedProviderFailure = 13 });
 vocabulary!(SafeMessageIdV1 { OriginalFailureCaptured = 0, ReceiptRequiredForPosttarget = 1, PeerDisconnected = 2, CommitNotConfirmed = 3, ObservationUnavailableAfterOwnerLoss = 4 });
 vocabulary!(AttemptObservationPhaseV1 { BeforeAuthorization = 0, AuthorizedBeforeResume = 1, ResumeAttempted = 2, Monitoring = 3, TargetExitObserved = 4, Cleaning = 5, Terminalizing = 6, Recovery = 7 });
-vocabulary!(OriginalUnavailableReasonV1 { NoEarlierErrorObserved = 0, WorkerLostBeforeObservation = 1, ObservationNotDurableBeforeServiceLoss = 2, RecordUnavailable = 3, RecordAuthenticationFailed = 4, LegacyProvider = 5, RetentionExpired = 6 });
+vocabulary!(OriginalUnavailableReasonV1 { NoEarlierErrorObserved = 0, WorkerLostBeforeObservation = 1, ObservationNotDurableBeforeServiceLoss = 2, RecordUnavailable = 3, RecordAuthenticationFailed = 4, RetentionExpired = 6 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -495,7 +483,7 @@ pub enum NativeFailureCodeV1 {
     HResult(u32),
     Winsock(i32),
     Errno(i32),
-    LegacyUntyped(i32),
+    Unclassified(i32),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -880,7 +868,7 @@ fn hash_event(hash: &mut Sha256Hasher, event: &CausalEventV1) {
                 NativeFailureCodeV1::HResult(v) => (3, v.to_be_bytes()),
                 NativeFailureCodeV1::Winsock(v) => (4, v.to_be_bytes()),
                 NativeFailureCodeV1::Errno(v) => (5, v.to_be_bytes()),
-                NativeFailureCodeV1::LegacyUntyped(v) => (6, v.to_be_bytes()),
+                NativeFailureCodeV1::Unclassified(v) => (6, v.to_be_bytes()),
             };
             hash.update([domain]);
             hash.update(value);

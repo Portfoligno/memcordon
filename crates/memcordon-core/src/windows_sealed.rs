@@ -7,13 +7,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BoundaryMechanismEvidence, BoundaryRequirement, ChildTermination,
-    CredentialTransitionDisposition, ProviderRejectionEvidence, RestartSafetyProof, RunOutcome,
-    WindowsSealedEvidenceV2,
+    BoundaryMechanismEvidence, BoundaryRequirement, ChildTermination, RestartSafetyProof,
+    RunOutcome,
 };
 
-pub const WINDOWS_PUBLIC_PROTOCOL_VERSION: u32 = 3;
-pub const WINDOWS_PRIVATE_PROTOCOL_VERSION: u32 = 3;
+pub const WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION: u32 = 4;
+pub const WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION: u32 = 4;
 pub const WINDOWS_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const WINDOWS_MAX_JOB_PROCESS_IDENTITIES: usize = 256;
 pub const WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS: usize = 4;
@@ -332,21 +331,6 @@ pub enum WindowsMutantNativeObservationV1 {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsMutantNativeReceiptV1 {
-    pub schema_version: u32,
-    pub mutant: WindowsSealedMutant,
-    pub attempt_id: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub hook_observation: WindowsMutantHookObservationV1,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_observation_handle: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_candidate: Option<Box<WindowsTerminalReceiptV1>>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "hook", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsMutantHookObservationV1 {
@@ -359,16 +343,6 @@ pub enum WindowsMutantHookObservationV1 {
     JobMembershipReadbackSkipped {
         child_pid: u32,
     },
-}
-
-impl WindowsMutantNativeReceiptV1 {
-    pub fn binding_matches(&self, attempt_id: &str, nonce: &str, request_sha256: &str) -> bool {
-        self.schema_version == 1
-            && self.attempt_id == attempt_id
-            && self.nonce == nonce
-            && !self.nonce.is_empty()
-            && self.request_sha256 == request_sha256
-    }
 }
 
 /// Actual observation of a selected invalid release ordering. This is failure
@@ -791,11 +765,6 @@ pub struct WindowsPreauthorizationFaultMatrixEvidence<Rejection> {
     pub terminal_frame_truncation_rejected: bool,
 }
 
-pub type WindowsPreauthorizationFaultMatrixEvidenceV1 =
-    WindowsPreauthorizationFaultMatrixEvidence<ProviderRejectionEvidence>;
-pub type WindowsPreauthorizationFaultMatrixEvidenceV2 =
-    WindowsPreauthorizationFaultMatrixEvidence<WindowsProviderRejectionV2>;
-
 impl<Rejection: WindowsFaultRejection> WindowsPreauthorizationFaultMatrixEvidence<Rejection> {
     pub fn is_complete(&self) -> bool {
         self.schema_version == Rejection::MATRIX_SCHEMA_VERSION
@@ -817,11 +786,6 @@ pub struct WindowsRetirementFaultMatrixEvidence<Rejection> {
     pub rejections: Vec<WindowsFaultRejectionObservation<Rejection>>,
 }
 
-pub type WindowsRetirementFaultMatrixEvidenceV1 =
-    WindowsRetirementFaultMatrixEvidence<ProviderRejectionEvidence>;
-pub type WindowsRetirementFaultMatrixEvidenceV2 =
-    WindowsRetirementFaultMatrixEvidence<WindowsProviderRejectionV2>;
-
 impl<Rejection: WindowsFaultRejection> WindowsRetirementFaultMatrixEvidence<Rejection> {
     pub fn is_complete(&self) -> bool {
         self.schema_version == Rejection::MATRIX_SCHEMA_VERSION
@@ -839,42 +803,11 @@ pub struct WindowsFaultRejectionObservation<Rejection> {
     pub rejection: Rejection,
 }
 
-pub type WindowsFaultRejectionObservationV1 =
-    WindowsFaultRejectionObservation<ProviderRejectionEvidence>;
-pub type WindowsFaultRejectionObservationV2 =
-    WindowsFaultRejectionObservation<WindowsProviderRejectionV2>;
-
 pub trait WindowsFaultRejection {
     const MATRIX_SCHEMA_VERSION: u32;
     fn fault_code(&self) -> &str;
     fn target_released(&self) -> bool;
     fn is_consistent(&self) -> bool;
-}
-
-impl WindowsFaultRejection for ProviderRejectionEvidence {
-    const MATRIX_SCHEMA_VERSION: u32 = 1;
-    fn fault_code(&self) -> &str {
-        &self.code
-    }
-    fn target_released(&self) -> bool {
-        self.target_released
-    }
-    fn is_consistent(&self) -> bool {
-        ProviderRejectionEvidence::is_consistent(self)
-    }
-}
-
-impl WindowsFaultRejection for WindowsProviderRejectionV2 {
-    const MATRIX_SCHEMA_VERSION: u32 = 2;
-    fn fault_code(&self) -> &str {
-        &self.code
-    }
-    fn target_released(&self) -> bool {
-        self.target_released
-    }
-    fn is_consistent(&self) -> bool {
-        WindowsProviderRejectionV2::is_consistent(self)
-    }
 }
 
 fn fault_rejections_are_complete<Rejection: WindowsFaultRejection>(
@@ -901,11 +834,6 @@ pub struct WindowsCertificationObservations<Rejection> {
     pub preauthorization: WindowsPreauthorizationFaultMatrixEvidence<Rejection>,
     pub retirement: WindowsRetirementFaultMatrixEvidence<Rejection>,
 }
-
-pub type WindowsCertificationObservationsV1 =
-    WindowsCertificationObservations<ProviderRejectionEvidence>;
-pub type WindowsCertificationObservationsV2 =
-    WindowsCertificationObservations<WindowsProviderRejectionV2>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1396,53 +1324,6 @@ impl WindowsTerminalizationStatusV1 {
 /// The Windows service uses this parser before accepting durable recovery
 /// state. Keeping the strict parser in core also lets the dedicated fuzz target
 /// exercise the production authentication and state-invariant surface.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsDurableAttemptRecordV1 {
-    pub schema_version: u32,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub attempt_id: String,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub provider_generation: String,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub boot_identity: String,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub request_sha256: String,
-    pub caller_process_identity: WindowsProcessIdentityV1,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub caller_token_sha256: String,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub job_identity_sha256: String,
-    pub guardian_identity: Option<WindowsProcessIdentityV1>,
-    pub target_identity: Option<WindowsProcessIdentityV1>,
-    pub state: WindowsAttemptStateV1,
-    pub authorization_unix_millis: Option<u64>,
-    pub resume_attempted: bool,
-    pub target_released: bool,
-    pub cleanup_state: WindowsDurableCleanupStateV1,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::deserialize_record_outbox"
-    )]
-    pub terminal_response_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
-    pub terminalization: WindowsTerminalizationStatusV1,
-    pub causal_diagnostics: crate::WindowsCausalDiagnosticsV1,
-    pub diagnostic_retention: crate::DiagnosticRetentionV1,
-    pub workload_admission: Option<crate::workload_registry::RuntimeAdmissionSnapshot>,
-    pub workload_checkpoint: Option<(
-        crate::workload_evidence::RuntimeAttemptBinding,
-        crate::workload_evidence::VerifiedCheckpointV1,
-    )>,
-    pub record_revision: u64,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub provider_incarnation: String,
-    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
-    pub integrity_sha256: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WindowsTerminalLifecycleV1 {
@@ -1454,19 +1335,6 @@ pub enum WindowsTerminalLifecycleV1 {
     RetirementComplete,
     Retained,
     Quarantined,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsTerminalSeedV2 {
-    pub schema_version: u32,
-    pub attempt_id: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub process_observation: crate::WindowsProcessObservationV2,
-    pub primary_failure: Option<crate::ProviderFailureDiagnosticV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub premature_release: Option<WindowsPrematureReleaseWitnessV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1525,613 +1393,6 @@ impl WindowsControlWorkerSiteV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsDurableAttemptRecordV4 {
-    pub schema_version: u32,
-    pub attempt_id: String,
-    pub provider_generation: String,
-    pub boot_identity: String,
-    pub launch_incarnation: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub caller_process_identity: WindowsProcessIdentityV1,
-    pub caller_token_sha256: String,
-    pub job_identity_sha256: String,
-    pub guardian_identity: Option<WindowsProcessIdentityV1>,
-    pub worker_identity: Option<WindowsProcessIdentityV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_thread_identity: Option<WindowsWorkerThreadIdentityV1>,
-    pub target_identity: Option<WindowsProcessIdentityV1>,
-    pub state: WindowsAttemptStateV1,
-    pub lifecycle: WindowsTerminalLifecycleV1,
-    pub authorization_unix_millis: Option<u64>,
-    pub resume_attempted: bool,
-    pub target_released: bool,
-    pub cleanup_state: WindowsDurableCleanupStateV1,
-    pub owner_manifest: Option<crate::WindowsCapabilityOwnerManifestV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job_closure_contract: Option<crate::WindowsJobClosureContractV1>,
-    pub recovery_authorization: Option<crate::WindowsRecoveryAuthorizationV1>,
-    pub terminal_publication_reserved: bool,
-    pub terminal_seed: Option<WindowsTerminalSeedV2>,
-    pub retirement_proof: Option<WindowsRetirementProofV2>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::deserialize_record_outbox"
-    )]
-    pub terminal_response_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
-    pub terminalization: WindowsTerminalizationStatusV1,
-    pub causal_diagnostics: crate::WindowsCausalDiagnosticsV1,
-    pub diagnostic_retention: crate::DiagnosticRetentionV1,
-    pub workload_admission: Option<crate::workload_registry::RuntimeAdmissionSnapshot>,
-    pub workload_checkpoint: Option<(
-        crate::workload_evidence::RuntimeAttemptBinding,
-        crate::workload_evidence::VerifiedCheckpointV1,
-    )>,
-    pub record_revision: u64,
-    pub provider_incarnation: String,
-    pub integrity_sha256: String,
-}
-
-pub fn parse_and_authenticate_windows_attempt_record_v4(
-    bytes: &[u8],
-    expected_attempt_id: &str,
-    expected_provider_generation: &str,
-) -> Result<WindowsDurableAttemptRecordV4, &'static str> {
-    if bytes.len() > WINDOWS_MAX_FRAME_BYTES
-        || crate::validate_record_json_structure(bytes).is_err()
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=structural-budget");
-    }
-    let mut record: WindowsDurableAttemptRecordV4 = serde_json::from_slice(bytes)
-        .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=json-invalid")?;
-    authenticate_decoded_windows_attempt_record_v4(
-        &mut record,
-        expected_attempt_id,
-        expected_provider_generation,
-    )?;
-    Ok(record)
-}
-
-pub fn authenticate_decoded_windows_attempt_record_v4(
-    record: &mut WindowsDurableAttemptRecordV4,
-    expected_attempt_id: &str,
-    expected_provider_generation: &str,
-) -> Result<(), &'static str> {
-    if record.schema_version != 4
-        || record.attempt_id != expected_attempt_id
-        || record.provider_generation != expected_provider_generation
-        || !windows_sha256_text_is_valid(&record.attempt_id)
-        || !windows_sha256_text_is_valid(&record.request_sha256)
-        || !windows_sha256_text_is_valid(&record.job_identity_sha256)
-        || !windows_sha256_text_is_valid(&record.caller_token_sha256)
-        || !windows_sha256_text_is_valid(&record.provider_incarnation)
-        || record.boot_identity.is_empty()
-        || record.launch_incarnation.is_empty()
-        || record.nonce.is_empty()
-        || record.record_revision == 0
-        || !windows_process_identity_is_valid(&record.caller_process_identity)
-        || record
-            .guardian_identity
-            .as_ref()
-            .is_some_and(|identity| !windows_process_identity_is_valid(identity))
-        || record
-            .worker_identity
-            .as_ref()
-            .is_some_and(|identity| !windows_process_identity_is_valid(identity))
-        || record
-            .target_identity
-            .as_ref()
-            .is_some_and(|identity| !windows_process_identity_is_valid(identity))
-        || !record.causal_diagnostics.is_consistent()
-        || !record.diagnostic_retention.is_consistent()
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=v4-binding");
-    }
-    if let Some(error) = windows_durable_attempt_v4_state_error(record) {
-        return Err(error);
-    }
-    if let Some(manifest) = &record.owner_manifest {
-        if manifest.validate().is_err()
-            || manifest.attempt_id != record.attempt_id
-            || manifest.provider_generation != record.provider_generation
-            || manifest.launch_incarnation != record.launch_incarnation
-        {
-            return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=owner-manifest");
-        }
-    }
-    if let Some(contract) = &record.job_closure_contract {
-        if contract.validate().is_err()
-            || contract.attempt_id != record.attempt_id
-            || contract.nonce != record.nonce
-            || contract.request_sha256 != record.request_sha256
-            || contract.provider_generation != record.provider_generation
-            || contract.launch_incarnation != record.launch_incarnation
-            || contract.original_boot_id != record.boot_identity
-            || contract.job_identity != record.job_identity_sha256
-            || record
-                .owner_manifest
-                .as_ref()
-                .and_then(|manifest| manifest.canonical_sha256().ok())
-                .as_deref()
-                != Some(contract.owner_manifest_sha256.as_str())
-        {
-            return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=job-closure-contract");
-        }
-    }
-    let preauthorization_abort_release = record.target_released
-        && record.authorization_unix_millis.is_none()
-        && !record.resume_attempted
-        && record.terminal_disposition
-            == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort);
-    let authorized_intent = record.authorization_unix_millis.is_some()
-        || record.resume_attempted
-        || (record.target_released && !preauthorization_abort_release);
-    if authorized_intent && record.owner_manifest.is_none() {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=owner-manifest-absent");
-    }
-    if record
-        .recovery_authorization
-        .as_ref()
-        .is_some_and(|authorization| !authorization.is_consistent())
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=recovery-authorization");
-    }
-    if authorized_intent
-        && (record.recovery_authorization.is_none()
-            || !record.terminal_publication_reserved
-            || record.worker_identity.is_none())
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=authorization-reservation");
-    }
-    if let Some(seed) = &record.terminal_seed {
-        if seed.schema_version != 2
-            || seed.attempt_id != record.attempt_id
-            || seed.nonce != record.nonce
-            || seed.request_sha256 != record.request_sha256
-            || seed
-                .process_observation
-                .validate(&record.attempt_id, &record.nonce, &record.request_sha256)
-                .is_err()
-            || seed
-                .primary_failure
-                .as_ref()
-                .is_some_and(|failure| !failure.is_consistent())
-            || match (
-                record
-                    .terminal_disposition
-                    .and_then(|value| value.premature_release_mutant()),
-                seed.premature_release.as_ref(),
-            ) {
-                (Some(mutant), Some(witness)) => {
-                    !witness.is_consistent()
-                        || witness.mutant != mutant
-                        || !record.target_released
-                        || record.authorization_unix_millis.is_some()
-                        || record.resume_attempted
-                }
-                (None, None) => false,
-                _ => true,
-            }
-        {
-            return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-seed");
-        }
-    }
-    if let Some(proof) = &record.retirement_proof {
-        if proof.schema_version != 2
-            || proof.attempt_id != record.attempt_id
-            || proof.nonce != record.nonce
-            || proof.request_sha256 != record.request_sha256
-            || proof.provider_generation != record.provider_generation
-            || proof.launch_incarnation != record.launch_incarnation
-            || proof.original_boot_id != record.boot_identity
-            || proof.job_identity != record.job_identity_sha256
-            || record
-                .owner_manifest
-                .as_ref()
-                .and_then(|manifest| manifest.canonical_sha256().ok())
-                .as_deref()
-                != Some(proof.owner_manifest_sha256.as_str())
-            || proof
-                .capability_extinction
-                .as_ref()
-                .is_some_and(|extinction| {
-                    record.job_closure_contract.as_ref() != Some(&extinction.contract)
-                        || record.owner_manifest.as_ref() != Some(&extinction.owner_manifest)
-                })
-        {
-            return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=retirement-proof");
-        }
-    }
-    let has_complete_proof = record.terminal_seed.is_some() && record.retirement_proof.is_some();
-    let proof_checkpoint_valid = match record.lifecycle {
-        WindowsTerminalLifecycleV1::ProofReady => has_complete_proof,
-        WindowsTerminalLifecycleV1::OutboxStaged
-        | WindowsTerminalLifecycleV1::AckCommitted
-        | WindowsTerminalLifecycleV1::RetirementComplete => {
-            if record.terminal_disposition
-                == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
-            {
-                record.terminal_seed.is_none() && record.retirement_proof.is_none()
-            } else {
-                has_complete_proof
-            }
-        }
-        _ => true,
-    };
-    if !proof_checkpoint_valid {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=proof-checkpoint");
-    }
-    if matches!(
-        record.lifecycle,
-        WindowsTerminalLifecycleV1::OutboxStaged
-            | WindowsTerminalLifecycleV1::AckCommitted
-            | WindowsTerminalLifecycleV1::RetirementComplete
-    ) && record.terminal_response_json.is_none()
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=outbox-checkpoint");
-    }
-    if let Some(json) = &record.terminal_response_json {
-        let response: WindowsLauncherResponseV3 = serde_json::from_str(json)
-            .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=outbox-json")?;
-        if !windows_terminal_outbox_is_bound_v3(record, &response) {
-            return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=outbox-binding");
-        }
-    }
-    let integrity = std::mem::take(&mut record.integrity_sha256);
-    let mut canonical = crate::bounded_json_bytes(record, WINDOWS_MAX_FRAME_BYTES, false)
-        .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=canonicalization-failed")?;
-    canonical.pop();
-    let expected = windows_sha256(&canonical);
-    record.integrity_sha256 = integrity;
-    if record.integrity_sha256 != expected {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=integrity-digest");
-    }
-    Ok(())
-}
-
-fn windows_durable_attempt_v4_state_error(
-    record: &WindowsDurableAttemptRecordV4,
-) -> Option<&'static str> {
-    let premature_release = record
-        .terminal_disposition
-        .and_then(|value| value.premature_release_mutant())
-        .is_some();
-    if matches!(
-        record.terminal_disposition,
-        Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. })
-    ) && (!premature_release
-        || record.authorization_unix_millis.is_some()
-        || record.resume_attempted
-        || record.owner_manifest.is_none()
-        || record.workload_checkpoint.is_some()
-        || !record.cleanup_state.termination_requested
-        || !matches!(
-            record.state,
-            WindowsAttemptStateV1::Terminating | WindowsAttemptStateV1::Empty
-        ))
-    {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=premature-release-intent");
-    }
-    let guardian_required = matches!(
-        record.state,
-        WindowsAttemptStateV1::GuardianReady
-            | WindowsAttemptStateV1::TargetCreatedSuspended
-            | WindowsAttemptStateV1::Authorized
-    );
-    let preauthorization_abort = !record.resume_attempted
-        && record.authorization_unix_millis.is_none()
-        && record.terminal_disposition
-            == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
-        && matches!(
-            record.state,
-            WindowsAttemptStateV1::Terminating | WindowsAttemptStateV1::Empty
-        )
-        && record.cleanup_state.termination_requested;
-    let target_required = matches!(
-        record.state,
-        WindowsAttemptStateV1::TargetCreatedSuspended | WindowsAttemptStateV1::Authorized
-    ) || record.resume_attempted
-        || record.target_released;
-    if guardian_required && record.guardian_identity.is_none() {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-guardian-missing");
-    }
-    if target_required && record.target_identity.is_none() && !preauthorization_abort {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-target-missing");
-    }
-    if record.target_released
-        && !record.resume_attempted
-        && !preauthorization_abort
-        && !premature_release
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-release-without-intent",
-        );
-    }
-    if record.resume_attempted && record.authorization_unix_millis.is_none() {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-resume-without-authorization",
-        );
-    }
-    if record.state == WindowsAttemptStateV1::Authorized
-        && record.authorization_unix_millis.is_none()
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-authorized-without-timestamp",
-        );
-    }
-    if record.authorization_unix_millis.is_some()
-        && !matches!(
-            record.state,
-            WindowsAttemptStateV1::Authorized
-                | WindowsAttemptStateV1::Terminating
-                | WindowsAttemptStateV1::Empty
-        )
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-authorization-before-state",
-        );
-    }
-    if record.terminal_disposition
-        == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
-        && !matches!(
-            record.state,
-            WindowsAttemptStateV1::Terminating | WindowsAttemptStateV1::Empty
-        )
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-abort-before-termination",
-        );
-    }
-    if record.cleanup_state.final_handles_closed
-        && !(record.cleanup_state.termination_requested
-            && record.cleanup_state.active_processes_zero
-            && record.cleanup_state.guardian_reaped
-            && record.state == WindowsAttemptStateV1::Empty)
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-final-handles-before-empty",
-        );
-    }
-    if !record.terminalization.is_consistent() {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminalization-status");
-    }
-    if record.terminal_response_json.is_some()
-        != (record.terminalization.checkpoint == WindowsTerminalizationCheckpointV1::OutboxStaged)
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminalization-outbox-checkpoint",
-        );
-    }
-    if matches!(
-        record.terminalization.checkpoint,
-        WindowsTerminalizationCheckpointV1::CleanupProofReady
-            | WindowsTerminalizationCheckpointV1::RejectionBuilding
-            | WindowsTerminalizationCheckpointV1::OutboxStaging
-            | WindowsTerminalizationCheckpointV1::OutboxStaged
-            | WindowsTerminalizationCheckpointV1::AckRetiring
-    ) && record.state != WindowsAttemptStateV1::Empty
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminalization-checkpoint-before-empty",
-        );
-    }
-    if record.terminal_response_json.is_some()
-        && (record.state != WindowsAttemptStateV1::Empty || record.terminal_disposition.is_none())
-    {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-before-empty");
-    }
-    None
-}
-
-pub fn windows_terminal_outbox_is_bound_v3(
-    record: &WindowsDurableAttemptRecordV4,
-    response: &WindowsLauncherResponseV3,
-) -> bool {
-    let receipt_bound = |receipt: &WindowsTerminalReceiptV2| {
-        receipt.attempt_id == record.attempt_id
-            && receipt.nonce == record.nonce
-            && receipt.request_sha256 == record.request_sha256
-            && record.retirement_proof.as_ref() == Some(&receipt.retirement_proof)
-            && receipt.validate_for_attempt().is_ok()
-    };
-    match response {
-        WindowsLauncherResponseV3::Terminal(receipt) => {
-            record.terminal_disposition == Some(WindowsAttemptTerminalDispositionV1::Posttarget)
-                && receipt_bound(receipt)
-        }
-        WindowsLauncherResponseV3::Reject {
-            attempt_id,
-            nonce,
-            request_sha256,
-            rejection,
-            ..
-        } => {
-            attempt_id == &record.attempt_id
-                && nonce == &record.nonce
-                && request_sha256 == &record.request_sha256
-                && rejection.is_consistent()
-                && match (record.terminal_disposition, &rejection.disposition) {
-                    (
-                        Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure {
-                            mutant,
-                        }),
-                        WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt },
-                    ) => {
-                        receipt_bound(receipt)
-                            && record.authorization_unix_millis.is_none()
-                            && !record.resume_attempted
-                            && record.target_released
-                            && record.target_identity == receipt.process_observation.root_identity
-                            && record.terminal_seed.as_ref().is_some_and(|seed| {
-                                seed.process_observation == receipt.process_observation
-                            })
-                            && matches!(&receipt.payload,
-                            WindowsTerminalPayloadV2::PrematureReleaseFailure { witness, .. }
-                                if witness.mutant == mutant
-                                    && record.terminal_seed.as_ref()
-                                        .and_then(|seed| seed.premature_release.as_ref()) == Some(witness))
-                    }
-                    (
-                        Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort),
-                        WindowsProviderRejectionDispositionV2::Preauthorization { .. },
-                    ) => true,
-                    (
-                        Some(WindowsAttemptTerminalDispositionV1::Posttarget),
-                        WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt },
-                    ) => receipt_bound(receipt),
-                    _ => false,
-                }
-        }
-        _ => false,
-    }
-}
-
-pub fn parse_and_authenticate_windows_attempt_record(
-    bytes: &[u8],
-    expected_attempt_id: &str,
-    expected_provider_generation: &str,
-) -> Result<WindowsDurableAttemptRecordV1, &'static str> {
-    if bytes.len() > WINDOWS_MAX_FRAME_BYTES {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=frame-too-large");
-    }
-    crate::validate_record_json_structure(bytes)
-        .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=structural-budget")?;
-    if !windows_sha256_text_is_valid(expected_attempt_id) {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=expected-attempt-id-shape");
-    }
-    if expected_provider_generation.is_empty() {
-        return Err(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=expected-provider-generation-empty",
-        );
-    }
-    let mut record: WindowsDurableAttemptRecordV1 = serde_json::from_slice(bytes)
-        .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=json-invalid")?;
-    authenticate_decoded_windows_attempt_record(
-        &mut record,
-        expected_attempt_id,
-        expected_provider_generation,
-    )?;
-    Ok(record)
-}
-
-pub fn authenticate_decoded_windows_attempt_record(
-    record: &mut WindowsDurableAttemptRecordV1,
-    expected_attempt_id: &str,
-    expected_provider_generation: &str,
-) -> Result<(), &'static str> {
-    if !windows_sha256_text_is_valid(expected_attempt_id) || expected_provider_generation.is_empty()
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=expected-binding-shape");
-    }
-    let integrity = std::mem::take(&mut record.integrity_sha256);
-    struct CanonicalHash {
-        digest: Sha256,
-        remaining: usize,
-    }
-    impl std::io::Write for CanonicalHash {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.remaining {
-                return Err(std::io::Error::other("canonical record exceeds bound"));
-            }
-            self.remaining -= bytes.len();
-            self.digest.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut canonical = CanonicalHash {
-        digest: Sha256::new(),
-        remaining: WINDOWS_MAX_FRAME_BYTES,
-    };
-    serde_json::to_writer(&mut canonical, &record)
-        .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=canonicalization-failed")?;
-    let expected_integrity = canonical
-        .digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    record.integrity_sha256 = integrity;
-    if record.schema_version != 3 {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=schema-version");
-    }
-    if !record.causal_diagnostics.is_consistent()
-        || !record.diagnostic_retention.is_consistent()
-        || record.workload_admission.as_ref().is_some_and(|snapshot| {
-            snapshot.validate().is_err()
-                || String::from(snapshot.private_invocation_digest.clone()) != record.request_sha256
-                || !matches!(
-                    snapshot.caller,
-                    crate::workload_registry::CallerSelector::Windows { .. }
-                )
-        })
-        || record
-            .workload_checkpoint
-            .as_ref()
-            .is_some_and(|(binding, checkpoint)| {
-                !record
-                    .workload_admission
-                    .as_ref()
-                    .is_some_and(|snapshot| binding.matches_snapshot(snapshot))
-                    || binding.attempt_id.as_str() != record.attempt_id
-                    || !checkpoint.matches_binding(binding)
-            })
-        || !windows_sha256_text_is_valid(&record.provider_incarnation)
-        || record.record_revision == 0
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=diagnostic-state");
-    }
-    if record.attempt_id != expected_attempt_id {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=attempt-id-binding");
-    }
-    if record.provider_generation != expected_provider_generation {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=provider-generation");
-    }
-    if record.integrity_sha256 != expected_integrity {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=integrity-digest");
-    }
-    if !windows_sha256_text_is_valid(&record.request_sha256) {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=request-digest-shape");
-    }
-    if !windows_sha256_text_is_valid(&record.caller_token_sha256) {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=caller-token-digest-shape");
-    }
-    if !windows_sha256_text_is_valid(&record.job_identity_sha256) {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=job-identity-digest-shape");
-    }
-    if record.boot_identity.is_empty() {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=boot-identity-empty");
-    }
-    if !windows_process_identity_is_valid(&record.caller_process_identity) {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=caller-process-identity");
-    }
-    if !record
-        .guardian_identity
-        .as_ref()
-        .is_none_or(windows_process_identity_is_valid)
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=guardian-process-identity");
-    }
-    if !record
-        .target_identity
-        .as_ref()
-        .is_none_or(windows_process_identity_is_valid)
-    {
-        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=target-process-identity");
-    }
-    if let Some(error) = windows_durable_attempt_state_error(record) {
-        return Err(error);
-    }
-    Ok(())
-}
-
 fn windows_sha256_text_is_valid(value: &str) -> bool {
     let digest_length = windows_sha256(&[]).len();
     value.len() == digest_length
@@ -2155,188 +1416,6 @@ fn windows_sha256(bytes: &[u8]) -> String {
 
 const fn windows_process_identity_is_valid(identity: &WindowsProcessIdentityV1) -> bool {
     identity.process_id != 0 && identity.creation_time_100ns != 0
-}
-
-fn windows_durable_attempt_state_error(
-    record: &WindowsDurableAttemptRecordV1,
-) -> Option<&'static str> {
-    if matches!(
-        record.terminal_disposition,
-        Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. })
-    ) {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=premature-release-requires-v4");
-    }
-    let guardian_required = matches!(
-        record.state,
-        WindowsAttemptStateV1::GuardianReady
-            | WindowsAttemptStateV1::TargetCreatedSuspended
-            | WindowsAttemptStateV1::Authorized
-    );
-    let target_required = matches!(
-        record.state,
-        WindowsAttemptStateV1::TargetCreatedSuspended | WindowsAttemptStateV1::Authorized
-    ) || record.resume_attempted
-        || record.target_released;
-    let authorization_permitted = matches!(
-        record.state,
-        WindowsAttemptStateV1::Authorized
-            | WindowsAttemptStateV1::Terminating
-            | WindowsAttemptStateV1::Empty
-    );
-    let preauthorization_abort = !record.resume_attempted
-        && record.authorization_unix_millis.is_none()
-        && record.terminal_disposition
-            == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
-        && matches!(
-            record.state,
-            WindowsAttemptStateV1::Terminating | WindowsAttemptStateV1::Empty
-        )
-        && record.cleanup_state.termination_requested;
-    let preauthorization_abort_release = record.target_released && preauthorization_abort;
-    if guardian_required && record.guardian_identity.is_none() {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-guardian-missing");
-    }
-    if target_required && record.target_identity.is_none() && !preauthorization_abort {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-target-missing");
-    }
-    if record.target_released && !record.resume_attempted && !preauthorization_abort_release {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-release-without-intent",
-        );
-    }
-    if record.resume_attempted && record.authorization_unix_millis.is_none() {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-resume-without-authorization",
-        );
-    }
-    if record.state == WindowsAttemptStateV1::Authorized
-        && record.authorization_unix_millis.is_none()
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-authorized-without-timestamp",
-        );
-    }
-    if record.authorization_unix_millis.is_some() && !authorization_permitted {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-authorization-before-state",
-        );
-    }
-    if record.terminal_disposition
-        == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
-        && !matches!(
-            record.state,
-            WindowsAttemptStateV1::Terminating | WindowsAttemptStateV1::Empty
-        )
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-abort-before-termination",
-        );
-    }
-    if record.cleanup_state.final_handles_closed
-        && !(record.cleanup_state.termination_requested
-            && record.cleanup_state.active_processes_zero
-            && record.cleanup_state.guardian_reaped
-            && record.state == WindowsAttemptStateV1::Empty)
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-final-handles-before-empty",
-        );
-    }
-    if !record.terminalization.is_consistent() {
-        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminalization-status");
-    }
-    let outbox_staged = record.terminal_response_json.is_some();
-    if outbox_staged
-        != (record.terminalization.checkpoint == WindowsTerminalizationCheckpointV1::OutboxStaged)
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminalization-outbox-checkpoint",
-        );
-    }
-    if matches!(
-        record.terminalization.checkpoint,
-        WindowsTerminalizationCheckpointV1::CleanupProofReady
-            | WindowsTerminalizationCheckpointV1::RejectionBuilding
-            | WindowsTerminalizationCheckpointV1::OutboxStaging
-            | WindowsTerminalizationCheckpointV1::OutboxStaged
-            | WindowsTerminalizationCheckpointV1::AckRetiring
-    ) && record.state != WindowsAttemptStateV1::Empty
-    {
-        return Some(
-            "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminalization-checkpoint-before-empty",
-        );
-    }
-    if let Some(json) = record.terminal_response_json.as_ref() {
-        if json.len() > WINDOWS_MAX_FRAME_BYTES / 2 {
-            return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-size");
-        }
-        if crate::validate_record_json_structure(json.as_bytes()).is_err() {
-            return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-structural-budget");
-        }
-        if record.state != WindowsAttemptStateV1::Empty {
-            return Some(
-                "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-before-empty",
-            );
-        }
-        if record.terminal_disposition.is_none() {
-            return Some(
-                "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-without-disposition",
-            );
-        }
-        if !serde_json::from_str::<WindowsLauncherResponseV1>(json).is_ok_and(|response| {
-            !matches!(&response, WindowsLauncherResponseV1::Reject { rejection, .. } if rejection.provider_failure.is_some()) && windows_terminal_outbox_is_bound(
-                &record.attempt_id,
-                &record.request_sha256,
-                record.terminal_disposition,
-                &response,
-            )
-        }) {
-            return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-binding");
-        }
-    }
-    None
-}
-
-pub fn windows_terminal_outbox_is_bound(
-    attempt_id: &str,
-    request_sha256: &str,
-    terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
-    response: &WindowsLauncherResponseV1,
-) -> bool {
-    match response {
-        WindowsLauncherResponseV1::Terminal(receipt) => {
-            terminal_disposition == Some(WindowsAttemptTerminalDispositionV1::Posttarget)
-                && receipt.attempt_id == attempt_id
-                && receipt.request_sha256 == request_sha256
-                && receipt.process_identity_inventory_shape_is_bounded()
-        }
-        WindowsLauncherResponseV1::Reject {
-            attempt_id: response_attempt_id,
-            request_sha256: response_request_sha256,
-            rejection,
-            ..
-        } => {
-            let disposition_matches = match terminal_disposition {
-                Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => {
-                    rejection.terminal_ack_required && rejection.terminal_receipt.is_none()
-                }
-                Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {
-                    rejection.terminal_receipt.as_ref().is_some_and(|receipt| {
-                        receipt.attempt_id == attempt_id && receipt.request_sha256 == request_sha256
-                    })
-                }
-                None
-                | Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. }) => {
-                    false
-                }
-            };
-            response_attempt_id == attempt_id
-                && response_request_sha256 == request_sha256
-                && rejection.is_consistent()
-                && disposition_matches
-        }
-        _ => false,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2649,54 +1728,251 @@ impl WindowsLoaderDiagnosticSelectionV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Native facts for the current-token profile. This contains no workload grant
+/// or policy checkpoint and is never serialized under numeric execution 11.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WindowsLaunchRequestV1 {
-    pub restart_attempt: u64,
+pub struct WindowsSealedEvidenceV3 {
     pub schema_version: u32,
-    pub expected_provider_binding: crate::PublicProviderBindingV1,
-    #[serde(default, deserialize_with = "deserialize_workload_contract")]
-    pub workload_contract: Option<crate::workload_contract::WorkloadContractV1>,
-    /// Included in the canonical launch digest. Absent for ordinary launches.
+    pub target_identity: Option<WindowsProcessIdentityV1>,
+    pub process_observation: Option<Box<crate::WindowsProcessObservationV2>>,
+    pub service_identity: String,
+    pub caller_token_authenticated: bool,
+    pub initial_target_token_matches_caller: bool,
+    pub credential_transition_disposition: crate::CredentialTransitionDisposition,
+    pub job_membership_independent_of_token: bool,
+    pub job_created: bool,
+    pub job_limits_verified: bool,
+    pub kill_on_close_verified: bool,
+    pub breakaway_denied: bool,
+    pub completion_port_associated: bool,
+    pub guardian_ready: bool,
+    pub target_created_suspended: bool,
+    pub job_list_applied_at_creation: bool,
+    pub handle_list_applied_at_creation: bool,
+    pub target_job_membership_verified: bool,
+    pub target_still_suspended_during_verification: bool,
+    pub inherited_handles_verified: bool,
+    pub target_released: bool,
+    pub terminate_job_invoked: bool,
+    pub active_processes_zero: bool,
+    pub direct_target_reaped: bool,
+    pub relays_retired: bool,
+    pub guardian_reaped: bool,
+    pub final_job_handles_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loader_diagnostic: Option<Box<WindowsLoaderDiagnosticSelectionV1>>,
-    pub nonce: String,
-    pub command: NativeWindowsCommandV1,
-    pub environment: Vec<WindowsEnvironmentEntryV1>,
-    pub current_directory: Vec<u16>,
-    pub policy: WindowsLaunchPolicyV1,
+    pub loader_qualification: Option<crate::WindowsLoaderQualificationOutcomeV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_delivery: Option<WindowsFrontendDeliveryV3>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_provider_association: Option<crate::execution_facts::ProviderAttemptAssociationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<Box<WindowsRetirementProofV3>>,
 }
 
-fn deserialize_workload_contract<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<crate::workload_contract::WorkloadContractV1>, D::Error> {
-    let contract =
-        Option::<crate::workload_contract::WorkloadContractV1>::deserialize(deserializer)?;
-    if let Some(contract) = &contract {
-        contract.validate().map_err(serde::de::Error::custom)?;
+impl WindowsSealedEvidenceV3 {
+    pub fn prepared_boundary_is_verified(&self) -> bool {
+        self.caller_token_authenticated
+            && self.initial_target_token_matches_caller
+            && self.credential_transition_disposition
+                == crate::CredentialTransitionDisposition::PreserveCallerEnvelope
+            && self.job_membership_independent_of_token
+            && self.job_created
+            && self.job_limits_verified
+            && self.kill_on_close_verified
+            && self.breakaway_denied
+            && self.completion_port_associated
+            && self.guardian_ready
+            && self.target_created_suspended
+            && self.job_list_applied_at_creation
+            && self.handle_list_applied_at_creation
+            && self.target_job_membership_verified
+            && self.target_still_suspended_during_verification
+            && self.inherited_handles_verified
     }
-    Ok(contract)
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 3 || self.service_identity.is_empty() {
+            return Err("native Windows evidence format");
+        }
+        if self
+            .frontend_delivery
+            .as_ref()
+            .is_some_and(|delivery| !delivery.is_consistent() || self.process_observation.is_none())
+        {
+            return Err("native Windows frontend delivery binding");
+        }
+        if self.target_released && !self.prepared_boundary_is_verified() {
+            return Err("native Windows release gate");
+        }
+        if self.target_released
+            && (self.target_identity.is_none()
+                || self
+                    .process_observation
+                    .as_ref()
+                    .is_none_or(|observation| observation.root_identity != self.target_identity))
+        {
+            return Err("native Windows target process observation differs");
+        }
+        if let (Some(delivery), Some(observation)) =
+            (&self.frontend_delivery, &self.process_observation)
+        {
+            observation.validate(
+                &delivery.attempt_id,
+                &delivery.nonce,
+                &delivery.request_sha256,
+            )?;
+        }
+        if let Some(proof) = &self.retirement {
+            proof.validate()?;
+            if proof.native_job_empty_observed != self.active_processes_zero
+                || proof.target_completion_observed != self.direct_target_reaped
+                || proof.relay_closure_observed != self.relays_retired
+                || proof.guardian_completion_observed != self.guardian_reaped
+                || proof.owner_capabilities_closed != self.final_job_handles_closed
+            {
+                return Err("native retirement observations disagree");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WindowsLaunchBrokerRequestV1 {
-    pub schema_version: u32,
+pub struct WindowsFrontendDeliveryV3 {
     pub attempt_id: String,
+    pub nonce: String,
     pub request_sha256: String,
-    pub caller_process_identity: WindowsProcessIdentityV1,
-    pub caller_token_envelope: WindowsCallerTokenEnvelopeV1,
-    pub remote_primary_token_handle: u64,
-    pub remote_frontend_process_handle: u64,
-    /// Certification-only handles created by the authenticated frontend and
-    /// duplicated into the launcher. They are absent from ordinary launches.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remote_frontend_canary_handles: Vec<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub certification_fault: Option<WindowsSealedFault>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub certification_mutant: Option<WindowsSealedMutant>,
-    pub launch: WindowsLaunchRequestV1,
+    pub terminal_sha256: String,
+    pub retired_sha256: String,
+    pub terminal_validated: bool,
+    pub acknowledgement_observed: bool,
+}
+
+impl WindowsFrontendDeliveryV3 {
+    pub fn is_consistent(&self) -> bool {
+        windows_sha256_text_is_valid(&self.attempt_id)
+            && !self.nonce.is_empty()
+            && windows_sha256_text_is_valid(&self.request_sha256)
+            && windows_sha256_text_is_valid(&self.terminal_sha256)
+            && windows_sha256_text_is_valid(&self.retired_sha256)
+            && self.terminal_validated
+            && self.acknowledgement_observed
+    }
+}
+
+/// Factual native retirement under the same-owner recovery access floor.
+/// A terminal record cannot construct a live Job or a release gate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsRetirementProofV3 {
+    pub schema_version: u32,
+    pub source: WindowsRetirementProofSourceV2,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub provider_generation: String,
+    pub launch_incarnation: String,
+    pub original_boot_id: String,
+    pub job_identity: String,
+    pub owner_manifest_sha256: String,
+    pub guardian_receipt_sha256: Option<String>,
+    pub current_boot_id: Option<String>,
+    pub capability_extinction: Option<crate::WindowsCapabilityExtinctionProofV2>,
+    pub target_completion_observed: bool,
+    pub native_job_empty_observed: bool,
+    pub relay_closure_observed: bool,
+    pub guardian_completion_observed: bool,
+    pub owner_capabilities_closed: bool,
+    pub launch_gate_closed: bool,
+}
+
+impl WindowsRetirementProofV3 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 3
+            || self.attempt_id.is_empty()
+            || self.nonce.is_empty()
+            || !windows_sha256_text_is_valid(&self.request_sha256)
+            || self.provider_generation.is_empty()
+            || self.launch_incarnation.is_empty()
+            || self.original_boot_id.is_empty()
+            || self.job_identity.is_empty()
+            || !windows_sha256_text_is_valid(&self.owner_manifest_sha256)
+            || !self.owner_capabilities_closed
+            || !self.launch_gate_closed
+        {
+            return Err("native retirement binding");
+        }
+        match self.source {
+            WindowsRetirementProofSourceV2::LiveNative => {
+                if !self.target_completion_observed
+                    || !self.native_job_empty_observed
+                    || !self.relay_closure_observed
+                    || !self.guardian_completion_observed
+                    || self.guardian_receipt_sha256.is_some()
+                    || self.current_boot_id.is_some()
+                    || self.capability_extinction.is_some()
+                {
+                    return Err("live native retirement");
+                }
+            }
+            WindowsRetirementProofSourceV2::GuardianRecovery => {
+                if !self.native_job_empty_observed
+                    || !self.guardian_completion_observed
+                    || !self
+                        .guardian_receipt_sha256
+                        .as_deref()
+                        .is_some_and(windows_sha256_text_is_valid)
+                    || self.current_boot_id.is_some()
+                    || self.capability_extinction.is_some()
+                {
+                    return Err("guardian recovery retirement");
+                }
+            }
+            WindowsRetirementProofSourceV2::PriorBoot => {
+                if self.target_completion_observed
+                    || self.native_job_empty_observed
+                    || self.relay_closure_observed
+                    || self.guardian_completion_observed
+                    || self.guardian_receipt_sha256.is_some()
+                    || self.capability_extinction.is_some()
+                    || !self
+                        .current_boot_id
+                        .as_deref()
+                        .is_some_and(|boot| !boot.is_empty() && boot != self.original_boot_id)
+                {
+                    return Err("prior boot retirement");
+                }
+            }
+            WindowsRetirementProofSourceV2::CapabilityExtinction => {
+                let extinction = self
+                    .capability_extinction
+                    .as_ref()
+                    .ok_or("missing native capability extinction")?;
+                extinction.validate()?;
+                let contract = &extinction.contract;
+                if self.target_completion_observed
+                    || self.native_job_empty_observed
+                    || self.relay_closure_observed
+                    || self.guardian_completion_observed
+                    || self.guardian_receipt_sha256.is_some()
+                    || self.current_boot_id.is_some()
+                    || contract.attempt_id != self.attempt_id
+                    || contract.nonce != self.nonce
+                    || contract.request_sha256 != self.request_sha256
+                    || contract.provider_generation != self.provider_generation
+                    || contract.launch_incarnation != self.launch_incarnation
+                    || contract.original_boot_id != self.original_boot_id
+                    || contract.job_identity != self.job_identity
+                    || contract.owner_manifest_sha256 != self.owner_manifest_sha256
+                {
+                    return Err("native capability extinction binding");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2737,85 +2013,6 @@ pub fn validate_windows_stream_manifest(
     } else {
         Err("stream manifest contains duplicate or missing roles")
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsProviderRequestV1 {
-    WorkloadDiscovery {
-        schema_version: u32,
-        challenge: crate::workload_contract::Nonce128,
-    },
-    WorkloadPlan {
-        schema_version: u32,
-        challenge: crate::workload_contract::Nonce128,
-        contract: crate::workload_contract::WorkloadContractV1,
-    },
-    Probe {
-        schema_version: u32,
-    },
-    RecoveryStatus {
-        schema_version: u32,
-        challenge: String,
-    },
-    PackageCleanup {
-        schema_version: u32,
-        challenge: String,
-        deadline_millis: u64,
-    },
-    CertificationFault {
-        schema_version: u32,
-        fault: WindowsSealedFault,
-        attempt_id: String,
-        request_sha256: String,
-        caller_process_identity: WindowsProcessIdentityV1,
-        launch: WindowsLaunchRequestV1,
-    },
-    CertificationMutant {
-        schema_version: u32,
-        mutant: WindowsSealedMutant,
-        attempt_id: String,
-        request_sha256: String,
-        caller_process_identity: WindowsProcessIdentityV1,
-        launch: WindowsLaunchRequestV1,
-    },
-    CertificationMachineRestart {
-        schema_version: u32,
-    },
-    Launch(WindowsLaunchRequestV1),
-    RelaysReady {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    Cancel {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        signal: i32,
-    },
-    RelaysRetired {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    TerminalAcknowledged {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        terminal_response_sha256: String,
-    },
-    ReplayTerminal {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        relay_phase: WindowsRelayPhaseV1,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2921,7 +2118,7 @@ pub struct WindowsGuardianAttemptObservation {
     pub revision: u32,
     pub challenge: crate::BoundedText<128>,
     pub guardian_identity: WindowsProcessIdentityV1,
-    pub association: crate::result_v1::ProviderAttemptAssociationV1,
+    pub association: crate::execution_facts::ProviderAttemptAssociationV1,
     /// Observation-only live control metadata, joined to the authenticated
     /// durable record. These fields grant no replay or terminal authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2939,14 +2136,14 @@ impl WindowsGuardianAttemptObservation {
 
     /// Join the authenticated launcher owner's facts to the exact public query.
     /// A private error reply cannot become a successful observation.
-    pub fn from_launcher_query_response(
-        response: WindowsLauncherResponseV3,
+    pub fn from_launcher_query_response<Terminal, Rejection, Mutant>(
+        response: WindowsLauncherResponse<Terminal, Rejection, Mutant>,
         challenge: &str,
         provider: &crate::PublicProviderBindingV1,
         guardian: &WindowsProcessIdentityV1,
     ) -> Result<Self, String> {
         match response {
-            WindowsLauncherResponseV3::GuardianAttemptObservation(value) => {
+            WindowsLauncherResponse::GuardianAttemptObservation(value) => {
                 if !value.is_consistent()
                     || value.challenge.as_str() != challenge
                     || value.association.provider != *provider
@@ -2958,7 +2155,7 @@ impl WindowsGuardianAttemptObservation {
                 }
                 Ok(value)
             }
-            WindowsLauncherResponseV3::ReadOnlyQueryFailure(value) => Err(value.error_for(
+            WindowsLauncherResponse::ReadOnlyQueryFailure(value) => Err(value.error_for(
                 WindowsReadOnlyQueryOperation::GuardianObservation,
                 challenge,
                 provider,
@@ -2977,7 +2174,7 @@ impl WindowsGuardianAttemptObservation {
         if bytes.len() > Self::MAX_FRAME_BYTES {
             return Err("live guardian observation frame exceeds bound".into());
         }
-        crate::workload_contract::reject_duplicate_json_keys(bytes)?;
+        crate::canonical_json::reject_duplicate_json_keys(bytes)?;
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Reply {
@@ -3007,7 +2204,7 @@ impl WindowsGuardianAttemptObservation {
         if bytes.len() > Self::MAX_FRAME_BYTES {
             return Err("live guardian observation frame exceeds bound".into());
         }
-        crate::workload_contract::reject_duplicate_json_keys(bytes)?;
+        crate::canonical_json::reject_duplicate_json_keys(bytes)?;
         let observation: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         if !observation.is_consistent() {
             return Err("live guardian observation is inconsistent".into());
@@ -3046,142 +2243,13 @@ impl WindowsGuardianAttemptObservation {
     }
 }
 
-/// Live public protocol requests. V1 remains an explicit historical decoder.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsProviderRequestV3 {
-    CertificationControlReleased {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        fault: WindowsSealedFault,
-        target_pid: u32,
-    },
-    LoaderDiagnosticLaunch {
-        schema_version: u32,
-        attempt_id: String,
-        request_sha256: String,
-        caller_process_identity: WindowsProcessIdentityV1,
-        launch: WindowsLaunchRequestV1,
-    },
-    WorkloadDiscovery {
-        schema_version: u32,
-        challenge: crate::workload_contract::Nonce128,
-    },
-    WorkloadPlan {
-        schema_version: u32,
-        challenge: crate::workload_contract::Nonce128,
-        contract: crate::workload_contract::WorkloadContractV1,
-    },
-    Probe {
-        schema_version: u32,
-    },
-    ObserveGuardianAttempt {
-        schema_version: u32,
-        challenge: String,
-        guardian_identity: WindowsProcessIdentityV1,
-    },
-    RecoveryStatus {
-        schema_version: u32,
-        challenge: String,
-    },
-    RecoverAttempt {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        challenge: String,
-    },
-    ConvergeRecovery {
-        schema_version: u32,
-        challenge: String,
-        deadline_millis: u64,
-    },
-    PackageCleanup {
-        schema_version: u32,
-        challenge: String,
-        deadline_millis: u64,
-    },
-    CertificationFault {
-        schema_version: u32,
-        fault: WindowsSealedFault,
-        attempt_id: String,
-        request_sha256: String,
-        caller_process_identity: WindowsProcessIdentityV1,
-        launch: WindowsLaunchRequestV1,
-    },
-    CertificationMutant {
-        schema_version: u32,
-        mutant: WindowsSealedMutant,
-        attempt_id: String,
-        request_sha256: String,
-        caller_process_identity: WindowsProcessIdentityV1,
-        launch: WindowsLaunchRequestV1,
-    },
-    CertificationMachineRestart {
-        schema_version: u32,
-    },
-    Launch(WindowsLaunchRequestV1),
-    RelaysReady {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    Cancel {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        signal: i32,
-    },
-    RelaysRetired {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    TerminalAcknowledged {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        terminal_response_sha256: String,
-    },
-    ReplayTerminal {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        relay_phase: WindowsRelayPhaseV1,
-    },
-}
-
-impl WindowsProviderRequestV3 {
-    pub fn control_release_binds(
-        &self,
-        expected_attempt: &str,
-        expected_nonce: &str,
-        expected_request: &str,
-        expected_fault: WindowsSealedFault,
-        expected_target: u32,
-    ) -> bool {
-        matches!(
-            expected_fault,
-            WindowsSealedFault::ControlWorkerKilledAfterAuthorization
-                | WindowsSealedFault::ControlServiceKilledAfterAuthorization
-        ) && !expected_attempt.is_empty()
-            && !expected_nonce.is_empty()
-            && !expected_request.is_empty()
-            && expected_target != 0
-            && matches!(self, Self::CertificationControlReleased {
-                schema_version, attempt_id, nonce, request_sha256, fault, target_pid,
-            } if *schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && attempt_id == expected_attempt && nonce == expected_nonce
-                && request_sha256 == expected_request && *fault == expected_fault
-                && *target_pid == expected_target)
-    }
+/// Factual outcome of a current package cleanup request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsPackageCleanupOutcomeV1 {
+    pub status: WindowsControlRequestStatusV1,
+    pub attempts_empty: Option<bool>,
+    pub terminal_outboxes: Option<u32>,
+    pub detail: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3190,15 +2258,6 @@ pub enum WindowsControlRequestStatusV1 {
     Ready,
     Active,
     Failed,
-}
-
-/// Authenticated launcher evidence retained across both package cleanup boundaries.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WindowsPackageCleanupOutcomeV1 {
-    pub status: WindowsControlRequestStatusV1,
-    pub attempts_empty: Option<bool>,
-    pub terminal_outboxes: Option<u32>,
-    pub detail: String,
 }
 
 impl WindowsPackageCleanupOutcomeV1 {
@@ -3253,10 +2312,8 @@ impl WindowsProviderReplacementQuiescenceV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsAttemptRetainedV1 {
-    pub schema_version: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsRetainedMetadata {
     pub attempt_id: String,
     pub nonce: String,
     pub request_sha256: String,
@@ -3273,7 +2330,7 @@ pub struct WindowsAttemptRetainedV1 {
     pub diagnostic_availability: crate::DiagnosticProjectionAvailabilityV1,
 }
 
-impl WindowsAttemptRetainedV1 {
+impl WindowsRetainedMetadata {
     pub fn is_consistent_for(
         &self,
         attempt_id: &str,
@@ -3281,10 +2338,9 @@ impl WindowsAttemptRetainedV1 {
         request_sha256: &str,
         relay_phase: WindowsRelayPhaseV1,
     ) -> bool {
-        self.schema_version == 2
-            && self.provider_failure.is_some()
-                == (self.diagnostic_availability
-                    == crate::DiagnosticProjectionAvailabilityV1::Available)
+        self.provider_failure.is_some()
+            == (self.diagnostic_availability
+                == crate::DiagnosticProjectionAvailabilityV1::Available)
             && self.causal_diagnostics.is_consistent()
             && self.provider_failure.as_ref().is_none_or(|failure| {
                 failure.is_consistent()
@@ -3323,10 +2379,8 @@ pub enum WindowsReplayOutboxStageV1 {
     Staged,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsReplayPendingV1 {
-    pub schema_version: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsReplayMetadata {
     pub attempt_id: String,
     pub nonce: String,
     pub request_sha256: String,
@@ -3346,7 +2400,7 @@ pub struct WindowsReplayPendingV1 {
     pub diagnostic_availability: crate::DiagnosticProjectionAvailabilityV1,
 }
 
-impl WindowsReplayPendingV1 {
+impl WindowsReplayMetadata {
     pub fn is_consistent_for(
         &self,
         attempt_id: &str,
@@ -3354,10 +2408,9 @@ impl WindowsReplayPendingV1 {
         request_sha256: &str,
         relay_phase: WindowsRelayPhaseV1,
     ) -> bool {
-        self.schema_version == 3
-            && self.provider_failure.is_some()
-                == (self.diagnostic_availability
-                    == crate::DiagnosticProjectionAvailabilityV1::Available)
+        self.provider_failure.is_some()
+            == (self.diagnostic_availability
+                == crate::DiagnosticProjectionAvailabilityV1::Available)
             && self.causal_diagnostics.is_consistent()
             && self.provider_failure.as_ref().is_none_or(|failure| {
                 failure.is_consistent()
@@ -3609,8 +2662,7 @@ impl WindowsReplayPendingV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WindowsTerminalRetiredV1 {
-    pub schema_version: u32,
+pub struct WindowsRetirementMetadata {
     pub attempt_id: String,
     pub nonce: String,
     pub request_sha256: String,
@@ -3618,7 +2670,7 @@ pub struct WindowsTerminalRetiredV1 {
     pub disposition: WindowsAttemptTerminalDispositionV1,
 }
 
-impl WindowsTerminalRetiredV1 {
+impl WindowsRetirementMetadata {
     pub fn is_consistent_for(
         &self,
         attempt_id: &str,
@@ -3626,8 +2678,7 @@ impl WindowsTerminalRetiredV1 {
         request_sha256: &str,
         terminal_response_sha256: &str,
     ) -> bool {
-        self.schema_version == 1
-            && self.attempt_id == attempt_id
+        self.attempt_id == attempt_id
             && self.nonce == nonce
             && self.request_sha256 == request_sha256
             && self.terminal_response_sha256 == terminal_response_sha256
@@ -3881,17 +2932,10 @@ impl WindowsProviderProbeV1 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsProviderResponse<Terminal, Rejection> {
-    WorkloadDiscovery {
-        schema_version: u32,
-        challenge: crate::workload_contract::Nonce128,
-        discovery: crate::workload_discovery::WorkloadDiscovery,
-    },
-    WorkloadPlan {
-        schema_version: u32,
-        challenge: crate::workload_contract::Nonce128,
-        resolution: crate::workload_evidence::RuntimeWorkloadResolution,
-    },
+pub enum WindowsProviderResponse<Terminal, Rejection, Mutant = WindowsMutantNativeReceiptV2> {
+    WorkloadAccepted(crate::WindowsWorkloadAcceptedV1),
+    PreallocationCancelled(crate::WindowsPreallocationCancellationV1),
+    WorkloadPrepared(crate::WindowsWorkloadPreparedV1),
     Probe {
         schema_version: u32,
         observation: WindowsProviderProbeV1,
@@ -3952,8 +2996,8 @@ pub enum WindowsProviderResponse<Terminal, Rejection> {
         nonce: String,
         request_sha256: String,
     },
-    CertificationMutantHookObserved(WindowsMutantNativeReceiptV1),
-    CertificationMutantObserved(WindowsMutantNativeReceiptV1),
+    CertificationMutantHookObserved(Mutant),
+    CertificationMutantObserved(Mutant),
     Terminal(Terminal),
     Reject {
         schema_version: u32,
@@ -3962,215 +3006,16 @@ pub enum WindowsProviderResponse<Terminal, Rejection> {
         request_sha256: String,
         rejection: Rejection,
     },
-    AttemptRetained(WindowsAttemptRetainedV1),
     AttemptRetainedV2(WindowsAttemptRetainedV2),
-    ReplayPending(WindowsReplayPendingV1),
     ReplayPendingV2(WindowsReplayPendingV2),
-    TerminalRetired(WindowsTerminalRetiredV1),
     TerminalRetiredV2(WindowsTerminalRetiredV2),
-}
-
-pub type WindowsProviderResponseV1 =
-    WindowsProviderResponse<WindowsTerminalReceiptV1, ProviderRejectionEvidence>;
-pub type WindowsProviderResponseV3 =
-    WindowsProviderResponse<WindowsTerminalReceiptV2, WindowsProviderRejectionV2>;
-
-impl WindowsProviderResponseV3 {
-    /// Report preparation failure without granting terminal or retirement authority.
-    pub fn recovery_attempt_unavailable(
-        attempt_id: &str,
-        challenge: &str,
-        detail: &str,
-        native_detail_allowed: bool,
-    ) -> Result<Self, String> {
-        const DETAIL_LIMIT: usize = 1024;
-        const TRUNCATED: &str = " [detail truncated]";
-        let attempt_id = crate::BoundedText::<128>::new(attempt_id).map_err(str::to_owned)?;
-        let challenge = crate::BoundedText::<128>::new(challenge).map_err(str::to_owned)?;
-        if attempt_id.as_str().is_empty() || challenge.as_str().is_empty() {
-            return Err("recovery unavailability context is empty".into());
-        }
-        let detail = if native_detail_allowed {
-            if detail.is_empty() {
-                return Err("recovery preparation error is empty".into());
-            }
-            detail
-        } else {
-            "recovery preparation unavailable"
-        };
-        let detail = if detail.len() > DETAIL_LIMIT {
-            let mut end = DETAIL_LIMIT - TRUNCATED.len();
-            while !detail.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}{TRUNCATED}", &detail[..end])
-        } else {
-            detail.to_owned()
-        };
-        Ok(Self::RecoveryAttemptUnavailable {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            challenge: challenge.as_str().to_owned(),
-            attempt_id: attempt_id.as_str().to_owned(),
-            detail,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
-#[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsLauncherRequestV1 {
-    StartupAttestation {
-        schema_version: u32,
-        challenge: String,
-    },
-    Probe {
-        schema_version: u32,
-        challenge: String,
-    },
-    CertificationMachineRestart {
-        schema_version: u32,
-    },
-    PackageCleanup {
-        schema_version: u32,
-        deadline_millis: u64,
-    },
-    Membership {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        remote_process_handle: u64,
-    },
-    Launch(WindowsLaunchBrokerRequestV1),
-    RelaysReady {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    Cancel {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        signal: i32,
-    },
-    RelaysRetired {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    TerminalAcknowledged {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        terminal_response_sha256: String,
-    },
-    ReplayTerminal {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        relay_phase: WindowsRelayPhaseV1,
-        caller_process_identity: WindowsProcessIdentityV1,
-        caller_token_sha256: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminalization_error: Option<WindowsTerminalizationErrorV1>,
-    },
-}
-
-/// Live private protocol requests. V1 remains an explicit historical decoder.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
-#[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsLauncherRequestV3 {
-    StartupAttestation {
-        schema_version: u32,
-        challenge: String,
-    },
-    Probe {
-        schema_version: u32,
-        challenge: String,
-    },
-    ObserveGuardianAttempt {
-        schema_version: u32,
-        challenge: crate::BoundedText<128>,
-        guardian_identity: WindowsProcessIdentityV1,
-    },
-    CertificationMachineRestart {
-        schema_version: u32,
-    },
-    PackageCleanup {
-        schema_version: u32,
-        deadline_millis: u64,
-    },
-    RecoverAttempt {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        challenge: String,
-        caller: crate::WindowsRecoveryCallerEvidenceV1,
-    },
-    ConvergeRecovery {
-        schema_version: u32,
-        challenge: String,
-        deadline_millis: u64,
-    },
-    Membership {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        remote_process_handle: u64,
-    },
-    Launch(WindowsLaunchBrokerRequestV1),
-    RelaysReady {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    Cancel {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        signal: i32,
-    },
-    RelaysRetired {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-    },
-    TerminalAcknowledged {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        terminal_response_sha256: String,
-    },
-    ReplayTerminal {
-        schema_version: u32,
-        attempt_id: String,
-        nonce: String,
-        request_sha256: String,
-        relay_phase: WindowsRelayPhaseV1,
-        caller_process_identity: WindowsProcessIdentityV1,
-        caller_token_sha256: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminalization_error: Option<WindowsTerminalizationErrorV1>,
-    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsLauncherResponse<Terminal, Rejection> {
+pub enum WindowsLauncherResponse<Terminal, Rejection, Mutant = WindowsMutantNativeReceiptV2> {
+    WorkloadPrepared(crate::WindowsWorkloadPreparedV1),
     StartupAttestation {
         schema_version: u32,
         attestation: WindowsServiceSelfAttestationV1,
@@ -4234,8 +3079,8 @@ pub enum WindowsLauncherResponse<Terminal, Rejection> {
         nonce: String,
         request_sha256: String,
     },
-    CertificationMutantHookObserved(WindowsMutantNativeReceiptV1),
-    CertificationMutantObserved(WindowsMutantNativeReceiptV1),
+    CertificationMutantHookObserved(Mutant),
+    CertificationMutantObserved(Mutant),
     Terminal(Terminal),
     Reject {
         schema_version: u32,
@@ -4244,44 +3089,13 @@ pub enum WindowsLauncherResponse<Terminal, Rejection> {
         request_sha256: String,
         rejection: Rejection,
     },
-    AttemptRetained(WindowsAttemptRetainedV1),
     AttemptRetainedV2(WindowsAttemptRetainedV2),
-    ReplayPending(WindowsReplayPendingV1),
     ReplayPendingV2(WindowsReplayPendingV2),
-    TerminalRetired(WindowsTerminalRetiredV1),
     TerminalRetiredV2(WindowsTerminalRetiredV2),
 }
 
-pub type WindowsLauncherResponseV1 =
-    WindowsLauncherResponse<WindowsTerminalReceiptV1, ProviderRejectionEvidence>;
-pub type WindowsLauncherResponseV3 =
-    WindowsLauncherResponse<WindowsTerminalReceiptV2, WindowsProviderRejectionV2>;
-
 trait ExpirableRejectionDiagnostics {
     fn clear_expirable_diagnostics(&mut self);
-}
-
-impl ExpirableRejectionDiagnostics for ProviderRejectionEvidence {
-    fn clear_expirable_diagnostics(&mut self) {
-        self.provider_failure = None;
-        if let Some(crate::WindowsLoaderQualificationOutcomeV2::Failed(failure)) =
-            self.loader_qualification.as_mut()
-        {
-            failure.support_debug_observation = None;
-        }
-    }
-}
-
-impl ExpirableRejectionDiagnostics for WindowsProviderRejectionV2 {
-    fn clear_expirable_diagnostics(&mut self) {
-        self.provider_failure = None;
-        self.guardian_causal_receipt = None;
-        if let Some(crate::WindowsLoaderQualificationOutcomeV2::Failed(failure)) =
-            self.loader_qualification.as_mut()
-        {
-            failure.support_debug_observation = None;
-        }
-    }
 }
 
 macro_rules! terminal_authority_encoding {
@@ -4304,72 +3118,10 @@ macro_rules! terminal_authority_encoding {
         }
     };
 }
-terminal_authority_encoding!(WindowsProviderResponseV1);
-terminal_authority_encoding!(WindowsLauncherResponseV1);
-terminal_authority_encoding!(WindowsProviderResponseV3);
-terminal_authority_encoding!(WindowsLauncherResponseV3);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsTerminalReceiptV1 {
-    pub policy_enforcement: crate::workload_evidence::RuntimePolicyEnforcement,
-    pub schema_version: u32,
-    pub attempt_id: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub child_pid: u32,
-    pub duration_millis: u64,
-    pub authorization_offset_millis: u64,
-    pub job_total_processes: u32,
-    pub job_process_identities: Vec<WindowsProcessIdentityV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_process_creation: Option<WindowsCleanupProcessCreationEvidenceV1>,
-    pub outcome: RunOutcome,
-    pub restart_safety: RestartSafetyProof,
-    pub boundary_detail: BoundaryMechanismEvidence,
-}
-
-/// Version 2 intentionally carries only a bounded sample of Job identities.
-/// Native retirement authority is represented separately from this observation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsTerminalReceiptV2 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_enforcement: Option<crate::workload_evidence::RuntimePolicyEnforcement>,
-    pub schema_version: u32,
-    pub attempt_id: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub payload: WindowsTerminalPayloadV2,
-    pub process_observation: crate::WindowsProcessObservationV2,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_process_creation: Option<WindowsCleanupProcessCreationEvidenceV1>,
-    pub restart_safety: RestartSafetyProof,
-    pub retirement_proof: WindowsRetirementProofV2,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsTerminalPayloadV2 {
-    Execution {
-        child_pid: u32,
-        duration_millis: u64,
-        authorization_offset_millis: u64,
-        outcome: RunOutcome,
-        boundary_detail: Box<BoundaryMechanismEvidence>,
-    },
-    RecoveredClosure {
-        primary_failure: crate::OriginalFailureV1,
-        target_creation_observed: bool,
-        resume_attempted: bool,
-    },
-    PrematureReleaseFailure {
-        witness: WindowsPrematureReleaseWitnessV1,
-        child_pid: u32,
-        duration_millis: u64,
-        outcome: RunOutcome,
-    },
-}
+#[path = "windows_current.rs"]
+mod current;
+pub use current::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -4378,480 +3130,6 @@ pub enum WindowsRetirementProofSourceV2 {
     GuardianRecovery,
     PriorBoot,
     CapabilityExtinction,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsRetirementProofV2 {
-    pub schema_version: u32,
-    pub source: WindowsRetirementProofSourceV2,
-    pub attempt_id: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub provider_generation: String,
-    pub launch_incarnation: String,
-    pub original_boot_id: String,
-    pub job_identity: String,
-    pub owner_manifest_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guardian_receipt_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_boot_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability_extinction: Option<crate::WindowsCapabilityExtinctionProofV1>,
-    pub target_completion_observed: bool,
-    pub native_job_empty_observed: bool,
-    pub relay_closure_observed: bool,
-    pub guardian_completion_observed: bool,
-    pub owner_capabilities_closed: bool,
-    pub launch_gate_closed: bool,
-    pub policy_reference_bound: bool,
-}
-
-impl WindowsTerminalReceiptV2 {
-    pub fn execution(&self) -> Option<(u32, &RunOutcome, &BoundaryMechanismEvidence)> {
-        match &self.payload {
-            WindowsTerminalPayloadV2::Execution {
-                child_pid,
-                outcome,
-                boundary_detail,
-                ..
-            } => Some((*child_pid, outcome, boundary_detail)),
-            WindowsTerminalPayloadV2::RecoveredClosure { .. }
-            | WindowsTerminalPayloadV2::PrematureReleaseFailure { .. } => None,
-        }
-    }
-
-    pub fn validate_for_attempt(&self) -> Result<(), &'static str> {
-        if self.schema_version != 2 {
-            return Err("schema_version");
-        }
-        if self.attempt_id.is_empty() || self.nonce.is_empty() || self.request_sha256.is_empty() {
-            return Err("attempt_binding");
-        }
-        self.process_observation
-            .validate(&self.attempt_id, &self.nonce, &self.request_sha256)?;
-        let proof = &self.retirement_proof;
-        if proof.schema_version != 2
-            || proof.attempt_id != self.attempt_id
-            || proof.nonce != self.nonce
-            || proof.request_sha256 != self.request_sha256
-            || proof.provider_generation.is_empty()
-            || proof.launch_incarnation.is_empty()
-            || proof.original_boot_id.is_empty()
-            || proof.job_identity.is_empty()
-            || proof.owner_manifest_sha256.is_empty()
-            || !proof.owner_capabilities_closed
-            || !proof.launch_gate_closed
-            || !proof.policy_reference_bound
-        {
-            return Err("retirement_proof");
-        }
-        if proof.source != WindowsRetirementProofSourceV2::CapabilityExtinction
-            && proof.capability_extinction.is_some()
-        {
-            return Err("retirement_proof.unexpected_capability_extinction");
-        }
-        match (&self.payload, proof.source) {
-            (
-                WindowsTerminalPayloadV2::PrematureReleaseFailure {
-                    witness,
-                    child_pid,
-                    outcome,
-                    ..
-                },
-                WindowsRetirementProofSourceV2::LiveNative,
-            ) if witness.is_consistent()
-                && self.policy_enforcement.is_none()
-                && self.cleanup_process_creation.is_none()
-                && matches!(
-                    outcome,
-                    RunOutcome::MonitorFailed {
-                        child_after_termination: Some(_),
-                        ..
-                    }
-                )
-                && proof.target_completion_observed
-                && proof.native_job_empty_observed
-                && proof.relay_closure_observed
-                && proof.guardian_completion_observed
-                && proof.guardian_receipt_sha256.is_none()
-                && proof.current_boot_id.is_none()
-                && *child_pid != 0
-                && self
-                    .process_observation
-                    .root_identity
-                    .as_ref()
-                    .is_some_and(|root| root.process_id == *child_pid)
-                && self.restart_safety.is_safe_for(BoundaryRequirement::Sealed) => {}
-            (
-                WindowsTerminalPayloadV2::Execution { child_pid, .. },
-                WindowsRetirementProofSourceV2::LiveNative,
-            ) if proof.target_completion_observed
-                && proof.native_job_empty_observed
-                && proof.relay_closure_observed
-                && proof.guardian_completion_observed
-                && proof.guardian_receipt_sha256.is_none()
-                && proof.current_boot_id.is_none()
-                && *child_pid != 0
-                && self
-                    .process_observation
-                    .root_identity
-                    .as_ref()
-                    .is_some_and(|root| root.process_id == *child_pid) => {}
-            (
-                WindowsTerminalPayloadV2::RecoveredClosure {
-                    primary_failure, ..
-                },
-                WindowsRetirementProofSourceV2::GuardianRecovery,
-            ) if match primary_failure {
-                crate::OriginalFailureV1::Observed { event } => event.sequence != 0,
-                crate::OriginalFailureV1::Unavailable { reason } => {
-                    *reason != crate::OriginalUnavailableReasonV1::NoEarlierErrorObserved
-                }
-            } && proof.native_job_empty_observed
-                && proof.guardian_completion_observed
-                && proof
-                    .guardian_receipt_sha256
-                    .as_deref()
-                    .is_some_and(windows_sha256_text_is_valid)
-                && proof.current_boot_id.is_none()
-                && self.cleanup_process_creation.is_none() => {}
-            (
-                WindowsTerminalPayloadV2::RecoveredClosure {
-                    primary_failure, ..
-                },
-                WindowsRetirementProofSourceV2::PriorBoot,
-            ) if match primary_failure {
-                crate::OriginalFailureV1::Observed { event } => event.sequence != 0,
-                crate::OriginalFailureV1::Unavailable { reason } => {
-                    *reason != crate::OriginalUnavailableReasonV1::NoEarlierErrorObserved
-                }
-            } && !proof.target_completion_observed
-                && !proof.native_job_empty_observed
-                && !proof.relay_closure_observed
-                && !proof.guardian_completion_observed
-                && proof.guardian_receipt_sha256.is_none()
-                && proof
-                    .current_boot_id
-                    .as_deref()
-                    .is_some_and(|boot| !boot.is_empty() && boot != proof.original_boot_id)
-                && self.cleanup_process_creation.is_none() => {}
-            (
-                WindowsTerminalPayloadV2::RecoveredClosure {
-                    primary_failure, ..
-                },
-                WindowsRetirementProofSourceV2::CapabilityExtinction,
-            ) if match primary_failure {
-                crate::OriginalFailureV1::Observed { event } => event.sequence != 0,
-                crate::OriginalFailureV1::Unavailable { reason } => {
-                    *reason != crate::OriginalUnavailableReasonV1::NoEarlierErrorObserved
-                }
-            } && !proof.target_completion_observed
-                && !proof.native_job_empty_observed
-                && !proof.relay_closure_observed
-                && !proof.guardian_completion_observed
-                && proof.guardian_receipt_sha256.is_none()
-                && proof.current_boot_id.is_none()
-                && self.cleanup_process_creation.is_none()
-                && !self.restart_safety.direct_child_reaped
-                && !self.restart_safety.helpers_reaped
-                && !self.restart_safety.sealed_boundary_retired
-                && self.restart_safety.workload_empty == Some(true)
-                && self.restart_safety.containment_removed
-                && self.restart_safety.containment_incapable_of_live_members
-                && self.restart_safety.errors.is_empty()
-                && proof
-                    .capability_extinction
-                    .as_ref()
-                    .is_some_and(|extinction| {
-                        let contract = &extinction.contract;
-                        extinction.validate().is_ok()
-                            && contract.attempt_id == proof.attempt_id
-                            && contract.nonce == proof.nonce
-                            && contract.request_sha256 == proof.request_sha256
-                            && contract.provider_generation == proof.provider_generation
-                            && contract.launch_incarnation == proof.launch_incarnation
-                            && contract.original_boot_id == proof.original_boot_id
-                            && contract.job_identity == proof.job_identity
-                            && contract.owner_manifest_sha256 == proof.owner_manifest_sha256
-                            && extinction
-                                .owner_manifest
-                                .entries
-                                .iter()
-                                .find(|entry| {
-                                    entry.role
-                                        == crate::WindowsCapabilityOwnerRoleV1::DirectTargetProcess
-                                })
-                                .and_then(|entry| entry.process_identity.as_ref())
-                                == self.process_observation.root_identity.as_ref()
-                    }) => {}
-            _ => return Err("retirement_proof.source"),
-        }
-        if let WindowsTerminalPayloadV2::Execution {
-            boundary_detail, ..
-        } = &self.payload
-        {
-            if let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = boundary_detail.as_ref()
-            {
-                if native.frontend_delivery.is_some()
-                    || native.frontend_provider_association.is_some()
-                {
-                    return Err("boundary_detail.frontend_delivery_before_ack");
-                }
-            }
-        }
-        if matches!(self.payload, WindowsTerminalPayloadV2::Execution { .. })
-            && !self.restart_safety.is_safe_for(BoundaryRequirement::Sealed)
-        {
-            return Err("restart_safety");
-        }
-        if self
-            .cleanup_process_creation
-            .as_ref()
-            .is_some_and(|cleanup| !cleanup.is_consistent())
-        {
-            return Err("cleanup_process_creation");
-        }
-        Ok(())
-    }
-
-    pub fn validate_for_certification(
-        &self,
-        expected_attempt_binding: &str,
-        required_job_total_processes: u32,
-    ) -> Result<ValidatedWindowsCertificationTerminal<'_>, String> {
-        self.validate_for_attempt().map_err(str::to_owned)?;
-        let Some((_, outcome, boundary_detail)) = self.execution() else {
-            return Err("kind".to_owned());
-        };
-        let accounting = self
-            .process_observation
-            .final_accounting
-            .as_ref()
-            .ok_or_else(|| "process_observation.final_accounting".to_owned())?;
-        if accounting.total_processes_native_u32 < required_job_total_processes
-            || !accounting.observed_after_target_retirement
-            || accounting.active_processes_native_u32 != 0
-        {
-            return Err("process_observation.final_accounting".to_owned());
-        }
-        let cleanup = self
-            .cleanup_process_creation
-            .as_ref()
-            .ok_or_else(|| "cleanup_process_creation".to_owned())?;
-        if !cleanup.is_consistent()
-            || cleanup.attempt_binding != expected_attempt_binding
-            || accounting.total_processes_native_u32 < cleanup.total_processes_after
-        {
-            return Err("cleanup_process_creation".to_owned());
-        }
-        if !matches!(
-            outcome,
-            RunOutcome::Exited {
-                child: ChildTermination::ExitCode { code: 0 },
-                ..
-            }
-        ) {
-            return Err("outcome.child".to_owned());
-        }
-        let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = boundary_detail else {
-            return Err("boundary_detail.variant".to_owned());
-        };
-        if !native.active_processes_zero
-            || !native.direct_target_reaped
-            || !native.guardian_reaped
-            || !native.relays_retired
-            || !native.final_job_handles_closed
-        {
-            return Err("boundary_detail.retirement".to_owned());
-        }
-        Ok(ValidatedWindowsCertificationTerminal { native })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "disposition", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WindowsProviderRejectionDispositionV2 {
-    Preauthorization {
-        terminal_ack_required: bool,
-    },
-    PostauthorizationFailure {
-        receipt: Box<WindowsTerminalReceiptV2>,
-    },
-    PrematureReleaseFailure {
-        receipt: Box<WindowsTerminalReceiptV2>,
-    },
-    Retained {
-        evidence: Box<WindowsAttemptRetainedV1>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsProviderRejectionV2 {
-    pub schema_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workload_admission: Option<crate::workload_evidence::WorkloadAdmissionRejectionV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
-    /// Rehydrated only after authenticating the protected native receipt.
-    /// This causal projection is excluded from immutable outbox/ACK authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guardian_causal_receipt: Option<Box<crate::WindowsGuardianReceiptV2>>,
-    pub code: String,
-    pub phase: crate::BoundarySetupPhase,
-    pub detail: String,
-    pub os_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loader_qualification: Option<crate::WindowsLoaderQualificationOutcomeV2>,
-    pub target_created: bool,
-    pub target_released: bool,
-    pub cleanup_attempted: bool,
-    pub restart_safety: RestartSafetyProof,
-    pub disposition: WindowsProviderRejectionDispositionV2,
-}
-
-impl WindowsProviderRejectionV2 {
-    pub fn terminal_ack_required(&self) -> bool {
-        match self.disposition {
-            WindowsProviderRejectionDispositionV2::Preauthorization {
-                terminal_ack_required,
-            } => terminal_ack_required,
-            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { .. }
-            | WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { .. } => true,
-            WindowsProviderRejectionDispositionV2::Retained { .. } => false,
-        }
-    }
-
-    pub fn terminal_receipt(&self) -> Option<&WindowsTerminalReceiptV2> {
-        match &self.disposition {
-            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt }
-            | WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt } => {
-                Some(receipt)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn is_consistent(&self) -> bool {
-        if self.schema_version != 2
-            || self.code.is_empty()
-            || self.code.len() > 128
-            || !self
-                .code
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
-            || self.detail.is_empty()
-            || self.detail.len() > crate::PROVIDER_REJECTION_MAX_DETAIL_BYTES
-            || self.detail.contains('\0')
-            || (!self.target_created && self.target_released)
-            || self
-                .loader_qualification
-                .as_ref()
-                .is_some_and(|item| !item.is_consistent())
-            || self.provider_failure.as_ref().is_some_and(|failure| {
-                !failure.is_consistent() || failure.projection_sha256 != failure.canonical_digest()
-            })
-            || self
-                .guardian_causal_receipt
-                .as_ref()
-                .is_some_and(|guardian| {
-                    let Some(terminal) = self.terminal_receipt() else {
-                        return true;
-                    };
-                    let proof = &terminal.retirement_proof;
-                    !guardian.is_consistent()
-                        || guardian.attempt_id != terminal.attempt_id
-                        || guardian.nonce != terminal.nonce
-                        || guardian.request_sha256 != terminal.request_sha256
-                        || guardian.provider_generation != proof.provider_generation
-                        || guardian.launch_incarnation != proof.launch_incarnation
-                        || guardian.original_boot_id != proof.original_boot_id
-                        || guardian.job_identity != proof.job_identity
-                        || guardian.owner_manifest_sha256 != proof.owner_manifest_sha256
-                })
-        {
-            return false;
-        }
-        match &self.disposition {
-            WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt } => {
-                self.target_created && self.target_released && self.cleanup_attempted
-                    && receipt.validate_for_attempt().is_ok()
-                    && matches!(receipt.payload, WindowsTerminalPayloadV2::PrematureReleaseFailure { .. })
-                    && receipt.restart_safety == self.restart_safety
-                    && self.provider_failure.as_ref().is_none_or(|failure| {
-                        failure.provider_binding.generation.as_str() == receipt.retirement_proof.provider_generation
-                            && String::from(failure.attempt_id.clone()) == receipt.attempt_id
-                            && String::from(failure.request_sha256.clone()) == receipt.request_sha256
-                            && matches!(failure.original, crate::OriginalFailureV1::Observed { ref event }
-                            if event.sequence > 0)
-                    })
-            }
-            WindowsProviderRejectionDispositionV2::Preauthorization {
-                terminal_ack_required,
-            } => !self.target_released && (!terminal_ack_required || self.cleanup_attempted),
-            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } => {
-                let matching_authority = match &receipt.payload {
-                    WindowsTerminalPayloadV2::Execution {
-                        boundary_detail, ..
-                    } => matches!(
-                        boundary_detail.as_ref(),
-                        crate::BoundaryMechanismEvidence::WindowsJobObjectV2(native)
-                            if native.target_released == self.target_released
-                    ),
-                    WindowsTerminalPayloadV2::RecoveredClosure {
-                        target_creation_observed,
-                        resume_attempted,
-                        ..
-                    } => {
-                        *target_creation_observed == self.target_created
-                            && (!self.target_released || *resume_attempted)
-                    }
-                    WindowsTerminalPayloadV2::PrematureReleaseFailure { .. } => false,
-                };
-                // Expirable diagnostics are omitted from the immutable terminal
-                // outbox. When present, they must still match its primary cause.
-                let matching_primary = match (&receipt.payload, self.provider_failure.as_ref()) {
-                    (
-                        WindowsTerminalPayloadV2::Execution {
-                            outcome: RunOutcome::MonitorFailed { .. },
-                            ..
-                        },
-                        Some(failure),
-                    ) => matches!(
-                        failure.original,
-                        crate::OriginalFailureV1::Observed { ref event }
-                            if event.sequence > 0
-                    ),
-                    (
-                        WindowsTerminalPayloadV2::Execution {
-                            outcome: RunOutcome::MonitorFailed { .. },
-                            ..
-                        },
-                        None,
-                    ) => true,
-                    (
-                        WindowsTerminalPayloadV2::RecoveredClosure {
-                            primary_failure, ..
-                        },
-                        Some(failure),
-                    ) => &failure.original == primary_failure,
-                    (WindowsTerminalPayloadV2::RecoveredClosure { .. }, None) => true,
-                    _ => false,
-                };
-                self.target_created
-                    && self.cleanup_attempted
-                    && receipt.validate_for_attempt().is_ok()
-                    && receipt.restart_safety == self.restart_safety
-                    && matching_authority
-                    && matching_primary
-            }
-            WindowsProviderRejectionDispositionV2::Retained { evidence } => {
-                evidence.authority_retained && !self.restart_safety.sealed_boundary_retired
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4882,201 +3160,5 @@ impl WindowsCleanupProcessCreationEvidenceV1 {
             && self.child_identity.creation_time_100ns != 0
             && self.total_processes_after > self.total_processes_before
             && self.final_active_processes_zero
-    }
-}
-
-#[derive(Debug)]
-pub struct ValidatedWindowsCertificationTerminal<'a> {
-    pub native: &'a WindowsSealedEvidenceV2,
-}
-
-impl WindowsTerminalReceiptV1 {
-    pub fn process_identity_inventory_shape_is_bounded(&self) -> bool {
-        self.job_process_identities.len() <= WINDOWS_MAX_JOB_PROCESS_IDENTITIES
-            && self
-                .job_process_identities
-                .iter()
-                .all(|identity| identity.process_id != 0)
-            && self
-                .job_process_identities
-                .iter()
-                .enumerate()
-                .all(|(index, identity)| !self.job_process_identities[..index].contains(identity))
-    }
-
-    pub fn process_identity_inventory_is_bounded(&self) -> bool {
-        self.process_identity_inventory_shape_is_bounded()
-            && self
-                .cleanup_process_creation
-                .as_ref()
-                .is_none_or(WindowsCleanupProcessCreationEvidenceV1::is_consistent)
-    }
-
-    pub fn validate_for_certification(
-        &self,
-        expected_attempt_binding: &str,
-        required_job_total_processes: u32,
-    ) -> Result<ValidatedWindowsCertificationTerminal<'_>, String> {
-        if self.schema_version != 1 {
-            return Err("schema_version".to_owned());
-        }
-        if !self.process_identity_inventory_shape_is_bounded() {
-            return Err("job_process_identities".to_owned());
-        }
-        if !self.restart_safety.is_safe_for(BoundaryRequirement::Sealed) {
-            return Err("restart_safety".to_owned());
-        }
-        let cleanup = self
-            .cleanup_process_creation
-            .as_ref()
-            .ok_or_else(|| "cleanup_process_creation".to_owned())?;
-        if cleanup.attempt_binding != expected_attempt_binding {
-            return Err("cleanup_process_creation.attempt_binding".to_owned());
-        }
-        for (complete, field) in [
-            (
-                cleanup.schema_version == 1,
-                "cleanup_process_creation.schema_version",
-            ),
-            (
-                cleanup.attempted_after_terminating_transition,
-                "cleanup_process_creation.attempted_after_terminating_transition",
-            ),
-            (
-                cleanup.child_created,
-                "cleanup_process_creation.child_created",
-            ),
-            (
-                cleanup.child_job_membership_verified,
-                "cleanup_process_creation.child_job_membership_verified",
-            ),
-            (
-                cleanup.child_identity.process_id != 0,
-                "cleanup_process_creation.child_identity.process_id",
-            ),
-            (
-                cleanup.child_identity.creation_time_100ns != 0,
-                "cleanup_process_creation.child_identity.creation_time_100ns",
-            ),
-            (
-                cleanup.total_processes_after > cleanup.total_processes_before,
-                "cleanup_process_creation.total_processes_after",
-            ),
-            (
-                cleanup.final_active_processes_zero,
-                "cleanup_process_creation.final_active_processes_zero",
-            ),
-            (
-                self.job_total_processes >= cleanup.total_processes_after,
-                "job_total_processes.cleanup_floor",
-            ),
-            (
-                self.job_total_processes >= required_job_total_processes,
-                "job_total_processes.qualification_minimum",
-            ),
-        ] {
-            if !complete {
-                return Err(field.to_owned());
-            }
-        }
-        if !matches!(
-            self.outcome,
-            RunOutcome::Exited {
-                child: ChildTermination::ExitCode { code: 0 },
-                ..
-            }
-        ) {
-            return Err("outcome.child".to_owned());
-        }
-        let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = &self.boundary_detail else {
-            return Err("boundary_detail.variant".to_owned());
-        };
-        for (complete, field) in [
-            (native.schema_version == 2, "boundary_detail.schema_version"),
-            (
-                native.service_identity == "MemCordonSealedControl+MemCordonSealedLauncher:v1",
-                "boundary_detail.service_identity",
-            ),
-            (
-                native.caller_token_authenticated,
-                "boundary_detail.caller_token_authenticated",
-            ),
-            (
-                native.initial_target_token_matches_caller,
-                "boundary_detail.initial_target_token_matches_caller",
-            ),
-            (
-                native.credential_transition_disposition
-                    == CredentialTransitionDisposition::PreserveCallerEnvelope,
-                "boundary_detail.credential_transition_disposition",
-            ),
-            (
-                native.job_membership_independent_of_token,
-                "boundary_detail.job_membership_independent_of_token",
-            ),
-            (native.job_created, "boundary_detail.job_created"),
-            (
-                native.job_limits_verified,
-                "boundary_detail.job_limits_verified",
-            ),
-            (
-                native.kill_on_close_verified,
-                "boundary_detail.kill_on_close_verified",
-            ),
-            (native.breakaway_denied, "boundary_detail.breakaway_denied"),
-            (
-                native.completion_port_associated,
-                "boundary_detail.completion_port_associated",
-            ),
-            (native.guardian_ready, "boundary_detail.guardian_ready"),
-            (
-                native.target_created_suspended,
-                "boundary_detail.target_created_suspended",
-            ),
-            (
-                native.job_list_applied_at_creation,
-                "boundary_detail.job_list_applied_at_creation",
-            ),
-            (
-                native.handle_list_applied_at_creation,
-                "boundary_detail.handle_list_applied_at_creation",
-            ),
-            (
-                native.target_job_membership_verified,
-                "boundary_detail.target_job_membership_verified",
-            ),
-            (
-                native.target_still_suspended_during_verification,
-                "boundary_detail.target_still_suspended_during_verification",
-            ),
-            (
-                native.inherited_handles_verified,
-                "boundary_detail.inherited_handles_verified",
-            ),
-            (native.target_released, "boundary_detail.target_released"),
-            (
-                native.terminate_job_invoked,
-                "boundary_detail.terminate_job_invoked",
-            ),
-            (
-                native.active_processes_zero,
-                "boundary_detail.active_processes_zero",
-            ),
-            (
-                native.direct_target_reaped,
-                "boundary_detail.direct_target_reaped",
-            ),
-            (native.relays_retired, "boundary_detail.relays_retired"),
-            (native.guardian_reaped, "boundary_detail.guardian_reaped"),
-            (
-                native.final_job_handles_closed,
-                "boundary_detail.final_job_handles_closed",
-            ),
-        ] {
-            if !complete {
-                return Err(field.to_owned());
-            }
-        }
-        Ok(ValidatedWindowsCertificationTerminal { native })
     }
 }

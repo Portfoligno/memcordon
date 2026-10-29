@@ -1,7 +1,8 @@
 //! Actual selected-cell acquisition and its explicit outer cleanup boundary.
 use crate::{
     CiError, Result,
-    consumer_readiness_ledger::{self, CellEvidence, SourceIdentity},
+    consumer_readiness_current::{self, CellEvidenceV2 as CellEvidence},
+    readiness_identity::SourceIdentity,
 };
 use memcordon_readiness_verifier::ProductKey;
 use serde::{Deserialize, Serialize};
@@ -56,7 +57,7 @@ fn toolchain_environment(
 }
 
 #[cfg(target_os = "linux")]
-fn selected_toolchain_environment() -> Result<[std::ffi::OsString; 2]> {
+pub(super) fn selected_toolchain_environment() -> Result<[std::ffi::OsString; 2]> {
     let path = std::env::var_os("PATH")
         .ok_or_else(|| CiError::Message("native toolchain PATH absent".into()))?;
     let rustup_home = std::env::var_os("RUSTUP_HOME")
@@ -207,7 +208,7 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
             &std::env::current_exe()?,
             cleanup_deadline,
         )?
-        .run_with_producer_failure_forwarding(&mut std::io::stderr())
+        .run()
         .map(|_| ());
     }
     fs::create_dir_all(&arguments.destination)?;
@@ -246,14 +247,14 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
         cleanup_failures: Vec::new(),
     };
     super::source::write_json(&owner_path, &owner)?;
-    let index = consumer_readiness_ledger::initialize(
-        &root.join("ci/consumer-readiness-v1.toml"),
+    let index = consumer_readiness_current::initialize(
+        &root.join("ci/consumer-readiness-v2.toml"),
         identity.clone(),
     )
     .map_err(CiError::Message)?;
     let mut cell = CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
+        revision: 2,
         identity: identity.clone(),
         key: key.clone(),
         product: None,
@@ -270,6 +271,9 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
         cleanup_failures: Vec::new(),
         cache_quiescent: false,
     };
+    // A killed controller still leaves an explicit not-run inventory for the
+    // separate native cleanup reentry; no successful row is reconstructed.
+    super::source::write_json(&arguments.destination.join("cell.json"), &cell)?;
     let result = (|| -> Result<()> {
         let candidate_target = root.join(".release/target");
         let candidate_packages = root.join(".release/packages");
@@ -284,7 +288,7 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
         } else {
             (candidate_target, candidate_packages)
         };
-        let payload = if key.channel.ends_with("native") {
+        let mut payload = if key.channel.ends_with("native") {
             super::installed_consumer::materialize_native(&target, &prefix)?
         } else if key.channel.starts_with("public-") {
             super::installed_consumer::materialize_public_cargo(
@@ -321,101 +325,76 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
             )?;
             payload
         };
-        let predecessor = super::installed_consumer::acquire_cargo_predecessor(
-            root,
-            &target,
-            &bundle,
-            &prefix,
-            &prefix.join("predecessor"),
-            deadline,
-        )?;
+        super::installed_consumer::require_current_runtime(&payload)?;
+        #[cfg(target_os = "linux")]
+        payload.artifacts.extend(
+            super::original_native_components::retain_current_owner_probe(
+                root,
+                &identity,
+                &key.target,
+                &prefix.join("owner-probe"),
+            )?,
+        );
         #[cfg(target_os = "linux")]
         {
-            let mut lease = super::linux_readiness_lease::ReadinessLinuxLease::new(
-                identity.clone(),
-                key.clone(),
+            let observed = super::linux_current_installed::run_current_cell(
                 root,
+                &payload,
+                &identity,
+                &key,
+                &prefix.join("lifetime"),
                 &artifact_root,
-                &predecessor,
-                prefix.join("lifetime"),
                 deadline,
                 cleanup_deadline,
                 arguments.operation_deadline_unix_millis,
                 publication.clone(),
-            )?;
-            let observed = super::linux_installed_consumer::run_with_extension(
-                root,
-                &payload,
-                &prefix.join("installed"),
-                &mut lease,
             );
-            let normalization_started = lease.driver.begin_image_normalization();
-            let (diagnostics, normalized) =
-                super::linux_lifecycle_diagnostics::capture_before_normalize(
-                    &mut cell.artifacts,
-                    |retained| {
-                        lease
-                            .driver
-                            .collect_diagnostic_artifacts(&artifact_root, retained)
-                    },
-                    || {
-                        lease.driver.collect_case_records(
-                            &identity,
-                            &key,
-                            &artifact_root,
-                            &prefix.join("installed"),
-                        )
-                    },
-                );
-            let normalized = normalization_started.and(normalized).and_then(
-                |(records, artifacts)| -> Result<()> {
-                    for record in records {
-                        let selected = cell
-                            .records
-                            .iter_mut()
-                            .find(|selected| selected.key == record.key)
-                            .ok_or_else(|| {
-                                CiError::Message(
-                                    "installed driver emitted an unknown finite row".into(),
-                                )
-                            })?;
-                        *selected = record;
-                    }
-                    for artifact in artifacts {
-                        if let Some(existing) = cell
-                            .artifacts
-                            .iter()
-                            .find(|existing| existing.path == artifact.path)
-                        {
-                            if existing.length != artifact.length
-                                || existing.sha256 != artifact.sha256
-                            {
-                                return Err(CiError::Message(
-                                    "diagnostic and normalized artifact bytes conflict".into(),
-                                ));
-                            }
-                        } else {
-                            cell.artifacts.push(artifact);
+            let (records, captures, primary) = match observed {
+                Ok((records, captures)) => (records, captures, None),
+                Err(primary) => {
+                    match super::linux_current_installed::collect_current_cell_observations(
+                        &prefix.join("lifetime"),
+                        &artifact_root,
+                        &identity,
+                        &key,
+                    ) {
+                        Ok((records, captures)) => (records, captures, Some(primary)),
+                        Err(secondary) => {
+                            cell.cleanup_failures
+                                .push(format!("current original observation frame: {secondary}"));
+                            publication.verify().map_err(|error|CiError::Message(format!("{primary}; original frame capture: {secondary}; publication custody: {error}")))?;
+                            let captures=capture_current_failure_files(&prefix.join("lifetime"),&artifact_root)
+                            .map_err(|error|CiError::Message(format!("{primary}; original frame capture: {secondary}; native diagnostic capture: {error}")))?;
+                            (Vec::new(), captures, Some(primary))
                         }
                     }
-                    Ok(())
-                },
-            );
-            // Original source witnesses outlive diagnostic capture, both
-            // normalizers and row/artifact merge. Every outcome then crosses
-            // this explicit all-report native retirement boundary.
-            super::linux_image_custody_completion::finish(
-                observed,
-                diagnostics,
-                normalized,
-                || lease.driver.finish_image_custody(cleanup_deadline),
-            )
-            .map_err(CiError::Message)?;
-            let (product, artifacts) = super::readiness_product::collect(
+                }
+            };
+            for record in records {
+                let selected = cell
+                    .records
+                    .iter_mut()
+                    .find(|selected| selected.key == record.key)
+                    .ok_or_else(|| {
+                        CiError::Message(
+                            "current Linux driver emitted an unplanned native case".into(),
+                        )
+                    })?;
+                if selected.state != memcordon_readiness_verifier::CaseState::NotRun {
+                    return Err(CiError::Message(
+                        "current Linux driver duplicated an observed native case".into(),
+                    ));
+                }
+                *selected = record;
+            }
+            cell.artifacts.extend(captures);
+            if let Some(primary) = primary {
+                return Err(primary);
+            }
+            let (product, artifacts) = super::readiness_product::collect_current(
                 &identity,
                 &key,
                 &payload,
-                &predecessor,
                 root,
                 &prefix,
                 &artifact_root,
@@ -464,7 +443,6 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
             let observed = super::windows_readiness_lease::run(
                 root,
                 &payload,
-                &predecessor,
                 &identity,
                 &key,
                 &prefix.join("lifetime"),
@@ -590,12 +568,18 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
                 &lifetime.current,
                 &lifetime.assessment.refusal_cases,
             )?;
+            let special = crate::windows_readiness_adapter::normalize_special(
+                &context,
+                &lifetime.current,
+                &lifetime.assessment.cases,
+            )?;
             for record in normalized
                 .records
                 .into_iter()
                 .chain(losses.records)
                 .chain(capacity.records)
                 .chain(refusals.records)
+                .chain(special.records)
             {
                 let selected = cell
                     .records
@@ -617,11 +601,11 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
             cell.artifacts.extend(losses.artifacts);
             cell.artifacts.extend(capacity.artifacts);
             cell.artifacts.extend(refusals.artifacts);
-            let (product, artifacts) = super::readiness_product::collect(
+            cell.artifacts.extend(special.artifacts);
+            let (product, artifacts) = super::readiness_product::collect_current(
                 &identity,
                 &key,
                 &payload,
-                &predecessor,
                 root,
                 &prefix,
                 &artifact_root,
@@ -629,6 +613,31 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
                 &packages,
                 deadline,
             )?;
+            let package = crate::windows_readiness_adapter::normalize_lifecycle(
+                &context,
+                &lifetime.current,
+                &product,
+                &prefix.join("lifetime/installed-journal.json"),
+                &prefix.join("lifetime/windows-lease-owner.json"),
+            )?;
+            for record in package.records {
+                let selected = cell
+                    .records
+                    .iter_mut()
+                    .find(|selected| selected.key == record.key)
+                    .ok_or_else(|| {
+                        CiError::Message(
+                            "current Windows package adapter emitted unknown finite row".into(),
+                        )
+                    })?;
+                if selected.state != memcordon_readiness_verifier::CaseState::NotRun {
+                    return Err(CiError::Message(
+                        "current Windows package row already observed".into(),
+                    ));
+                }
+                *selected = record;
+            }
+            cell.artifacts.extend(package.artifacts);
             cell.product = Some(product);
             for artifact in artifacts {
                 if let Some(existing) = cell
@@ -667,11 +676,14 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
     // normalized product adapter joins that receipt separately.
     let retirement = prefix.join("lifetime/installed-retirement.json");
     if retirement.is_file() {
-        let receipt: memcordon_readiness_verifier::InstalledLifecycleReceipt =
+        let receipt: memcordon_readiness_verifier::current::InstalledLifecycleReceiptV2 =
             super::source::read_json(&retirement)?;
         owner.finalization_completed = receipt.package_absent
-            && receipt.policy_retired
-            && receipt.native_resources_retired
+            && memcordon_readiness_verifier::current::validate_native_inventory(
+                &key.target,
+                &receipt.native,
+            )
+            .is_ok()
             && receipt.outstanding.is_empty()
             && receipt.cleanup_failures.is_empty();
         cell.cache_quiescent = owner.finalization_completed;
@@ -702,6 +714,87 @@ pub fn cell_record_path(destination: &Path) -> PathBuf {
     {
         destination.join("cell.json")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_current_failure_files(
+    lifetime: &Path,
+    artifact_root: &Path,
+) -> Result<Vec<memcordon_readiness_verifier::Artifact>> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut captured = Vec::new();
+    for name in [
+        "current-owner.json",
+        "installed-journal.json",
+        "installed-retirement.json",
+        "native-absence.json",
+    ] {
+        let mut file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(lifetime.join(name))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let before = file.metadata()?;
+        if !before.is_file()
+            || before.uid() != 0
+            || before.mode() & 0o022 != 0
+            || before.nlink() != 1
+            || before.len() > 16 * 1024 * 1024
+        {
+            return Err(CiError::Message(
+                "current failure diagnostic file custody/bound differs".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if bytes.len() as u64 != before.len()
+            || (
+                before.dev(),
+                before.ino(),
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+            ) != (
+                after.dev(),
+                after.ino(),
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+            )
+        {
+            return Err(CiError::Message(
+                "current failure diagnostic changed during capture".into(),
+            ));
+        }
+        let path = lifetime.join(format!("controller-failure-capture-{name}"));
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        let relative = path.strip_prefix(artifact_root).map_err(|_| {
+            CiError::Message("current failure capture escapes original artifact namespace".into())
+        })?;
+        captured.push(memcordon_readiness_verifier::Artifact {
+            path: relative
+                .to_str()
+                .ok_or_else(|| CiError::Message("current failure capture encoding differs".into()))?
+                .into(),
+            length: bytes.len() as u64,
+            sha256: super::artifacts::checksum(&bytes),
+        });
+    }
+    Ok(captured)
 }
 
 #[cfg(unix)]
@@ -754,14 +847,15 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let recovered = super::linux_readiness_lease::recover_installation(
+        let recovered = super::linux_current_installed::recover_current_cell(
             root,
             &path.parent().expect("cell owner parent").join("lifetime"),
+            &arguments.destination,
             &identity,
             &key,
             deadline,
         );
-        if let Err(cause) = recovered {
+        if let Err(cause) = &recovered {
             let cell_path = arguments.destination.join("cell.json");
             let retention = (|| -> Result<()> {
                 let mut cell: CellEvidence = super::source::read_json(&cell_path)?;
@@ -779,15 +873,55 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
                 public_projection::publish(&arguments.destination, &cell, deadline)
             })();
             return crate::work_outcome::join_completed(
-                crate::work_outcome::WorkOutcome::<()>::from_result(Err(cause)),
+                crate::work_outcome::WorkOutcome::<()>::from_result(Err(CiError::Message(
+                    cause.to_string(),
+                ))),
                 crate::work_outcome::WorkOutcome::from_result(retention),
             )
             .into_result();
         }
+        let receipt: memcordon_readiness_verifier::current::InstalledLifecycleReceiptV2 =
+            super::source::read_json(
+                &path
+                    .parent()
+                    .expect("cell owner parent")
+                    .join("lifetime/installed-retirement.json"),
+            )?;
+        if receipt.format != "memcordon.installed-lifecycle.receipt"
+            || receipt.revision != 2
+            || receipt.key != key
+            || receipt.run_id != identity.run_id
+            || !receipt.package_absent
+            || !receipt.cache_quiescent
+            || !receipt.cleanup_failures.is_empty()
+            || !receipt.outstanding.is_empty()
+            || receipt.explicit_finalization_count != 1
+        {
+            return Err(CiError::Message(
+                "current recovered native finalization receipt is incomplete or reassociated"
+                    .into(),
+            ));
+        }
+        memcordon_readiness_verifier::current::validate_native_inventory(
+            &key.target,
+            &receipt.native,
+        )
+        .map_err(CiError::Message)?;
         owner.finalization_completed = true;
         super::source::write_json(&path, &owner)?;
         let cell_path = arguments.destination.join("cell.json");
         let mut cell: CellEvidence = super::source::read_json(&cell_path)?;
+        for artifact in recovered? {
+            if let Some(old) = cell.artifacts.iter().find(|old| old.path == artifact.path) {
+                if old.length != artifact.length || old.sha256 != artifact.sha256 {
+                    return Err(CiError::Message(
+                        "recovery capture conflicts with original retained bytes".into(),
+                    ));
+                }
+            } else {
+                cell.artifacts.push(artifact);
+            }
+        }
         if serde_json::to_value(&cell.identity)? != serde_json::to_value(&identity)?
             || cell.key != key
         {

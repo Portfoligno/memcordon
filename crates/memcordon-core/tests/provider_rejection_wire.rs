@@ -1,7 +1,4 @@
 use memcordon_core::provider_rejection_wire::RejectionWireV1;
-use memcordon_core::report_v11::{
-    PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivatePublicOutcomeV11, PrivatePublicResultV11,
-};
 
 fn raw_rejection(target_created: bool) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -26,38 +23,23 @@ fn raw_rejection(target_created: bool) -> Vec<u8> {
 }
 
 #[test]
-fn public_rejections_bind_exact_typed_raw_evidence() {
+fn native_rejection_projects_actual_bounded_fields() {
     for target_created in [false, true] {
         let raw = raw_rejection(target_created);
         let evidence = RejectionWireV1::parse_evidence(&raw).unwrap();
-        let result = if target_created {
-            PrivatePublicOutcomeV11::AllocatedUnverified {
-                rejection: Box::new(evidence.clone()),
-                raw_response: raw.clone(),
-            }
-        } else {
-            PrivatePublicOutcomeV11::PreallocationRejected {
-                rejection: Box::new(evidence.clone()),
-                raw_response: raw.clone(),
-            }
-        };
-        let mut public = PrivatePublicResultV11 {
-            schema_version: PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
-            result,
-        };
-        public.validate_structure().unwrap();
-
-        let mut other = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
-        other["detail"] = serde_json::json!("different refusal");
-        let mismatched = serde_json::to_vec(&other).unwrap();
-        match &mut public.result {
-            PrivatePublicOutcomeV11::PreallocationRejected { raw_response, .. }
-            | PrivatePublicOutcomeV11::AllocatedUnverified { raw_response, .. } => {
-                *raw_response = mismatched;
-            }
-            _ => unreachable!(),
-        }
-        assert!(public.validate_structure().is_err());
+        assert_eq!(evidence.target_created, target_created);
+        assert!(!evidence.target_released);
+        assert_eq!(evidence.detail, "refused");
+        assert_eq!(
+            evidence.phase,
+            memcordon_core::BoundarySetupPhase::RequestValidation
+        );
+        assert!(evidence.is_consistent());
+        let wire = RejectionWireV1::parse(&raw).unwrap();
+        assert_eq!(
+            RejectionWireV1::parse(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+            wire
+        );
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod current_workload;
 pub mod default_dacl_counterfactual;
 pub mod helper_wait_protocol;
 #[cfg(windows)]
@@ -16,4 +17,3 @@ pub mod selected_policy;
 pub mod selected_policy_native;
 pub mod startup_probe_contract;
 pub mod target;
-pub mod workload;

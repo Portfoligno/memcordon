@@ -23,14 +23,10 @@ fn original_recipe_output_is_exclusive_and_private() {
 #[test]
 fn only_exact_existing_measured_recipes_are_admitted() {
     let recipes = [
-        "native_index_mutations_emit_actual_parser_receipts",
-        "operational_parser_receipts::native_operational_parser_mutations_emit_actual_receipts",
-        "native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts",
-        "native_versions::native_version_vectors_emit_actual_component_receipts",
-        "private_attempt::durable_journal_barriers_emit_actual_component_receipts",
-        "native_mixed_release::native_leased_release_emit_actual_component_receipt",
-        "native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt",
-        "native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt",
+        "emit_current_parser_mutations",
+        "current_version_vectors::emit_current_request_result_vectors",
+        "native_current_filter::current_filter_vectors_emit_actual_component_receipts",
+        "protocol_tests::unsupported_current_wire_versions_emit_actual_receipt",
     ];
     for recipe in recipes {
         assert!(admitted(recipe));
@@ -39,9 +35,8 @@ fn only_exact_existing_measured_recipes_are_admitted() {
     for recipe in [
         "",
         "recover",
-        "native_original_recovery::native_original_recovery_emit_actual_receipt",
-        "native_mixed_recovery",
-        "native_mixed_release::native_leased_release_emit_actual_component_receipt --ignored",
+        "unsupported_recipe",
+        "emit_current_parser_mutations --ignored",
     ] {
         assert!(!admitted(recipe));
     }

@@ -7,17 +7,6 @@ mod caller_observation_publication;
 #[path = "../src/bin/memcordon-sealed-agent/network_readiness.rs"]
 mod network_readiness;
 
-#[path = "../src/bin/memcordon-sealed-agent/admission.rs"]
-mod admission;
-#[path = "sealed_agent/native_workload_admission.rs"]
-mod native_workload_admission;
-#[path = "sealed_agent/policy_activation_v2.rs"]
-mod policy_activation_v2;
-#[path = "../src/bin/memcordon-sealed-agent/policy_registry.rs"]
-mod policy_registry;
-#[path = "sealed_agent/policy_revocation.rs"]
-mod policy_revocation;
-
 #[path = "../src/bin/memcordon-sealed-agent/inspection_schema.rs"]
 mod inspection_schema;
 #[path = "../src/bin/memcordon-sealed-agent/package.rs"]
@@ -34,10 +23,6 @@ mod state;
 #[cfg(target_os = "linux")]
 #[path = "../src/bin/memcordon-sealed-agent/linux/mod.rs"]
 mod linux;
-
-#[cfg(target_os = "linux")]
-#[path = "../src/bin/memcordon-sealed-agent/private_policy_fixture_schema.rs"]
-mod private_policy_fixture_schema;
 
 #[cfg(target_os = "windows")]
 #[path = "../src/bin/memcordon-sealed-agent/windows/mod.rs"]
@@ -65,70 +50,44 @@ mod linux_package;
 mod linux_provider;
 #[path = "sealed_agent/linux_recovery.rs"]
 mod linux_recovery;
-#[path = "sealed_agent/linux_recovery_inventory.rs"]
-mod linux_recovery_inventory;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/linux_resource_publication.rs"]
+mod linux_resource_publication;
 #[path = "sealed_agent/linux_sealed.rs"]
 mod linux_sealed;
 #[path = "sealed_agent/linux_service.rs"]
 mod linux_service;
 #[path = "sealed_agent/linux_startup.rs"]
 mod linux_startup;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/linux_transport_deadline.rs"]
+mod linux_transport_deadline;
 #[path = "sealed_agent/namespace_startup.rs"]
 mod namespace_startup;
 #[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_current_filter.rs"]
+mod native_current_filter;
+#[cfg(target_os = "linux")]
 #[path = "sealed_agent/native_descriptor_custody.rs"]
 mod native_descriptor_custody;
-#[cfg(target_os = "linux")]
-#[path = "sealed_agent/native_entrypoint.rs"]
-mod native_entrypoint;
-#[cfg(all(target_os = "linux", feature = "private-tcp"))]
-#[path = "sealed_agent/native_mixed_recovery.rs"]
-mod native_mixed_recovery;
-#[cfg(all(target_os = "linux", feature = "private-tcp"))]
-#[path = "sealed_agent/native_mixed_release.rs"]
-mod native_mixed_release;
-#[cfg(all(target_os = "linux", feature = "private-tcp"))]
-#[path = "sealed_agent/native_original_recovery.rs"]
-mod native_original_recovery;
-#[cfg(target_os = "linux")]
-#[path = "release/native_private_image_inputs.rs"]
-mod native_private_image_inputs;
 #[path = "sealed_agent/native_private_namespace_init.rs"]
 mod native_private_namespace_init;
-#[cfg(target_os = "linux")]
-#[path = "release/native_private_owner_loss.rs"]
-mod native_private_owner_loss;
-#[cfg(target_os = "linux")]
-#[path = "sealed_agent/native_private_tcp.rs"]
-mod native_private_tcp;
-#[cfg(target_os = "linux")]
-#[path = "sealed_agent/native_versions.rs"]
-mod native_versions;
-#[cfg(target_os = "linux")]
-#[path = "sealed_agent/native_writable_mounts.rs"]
-mod native_writable_mounts;
 #[path = "sealed_agent/package.rs"]
 mod package_tests;
 #[path = "sealed_agent/package_verification.rs"]
 mod package_verification;
 #[cfg(target_os = "linux")]
-#[path = "sealed_agent/private_attempt.rs"]
-mod private_attempt;
-#[cfg(target_os = "linux")]
 #[path = "sealed_agent/private_guardian.rs"]
 mod private_guardian;
-#[cfg(target_os = "linux")]
-#[path = "sealed_agent/private_v4_relay_terminal.rs"]
-mod private_v4_relay_terminal;
-#[cfg(target_os = "linux")]
-#[path = "sealed_agent/private_version_recovery.rs"]
-mod private_version_recovery;
 #[path = "sealed_agent/protocol.rs"]
 mod protocol_tests;
 #[path = "sealed_agent/rejection.rs"]
 mod rejection_tests;
 #[path = "sealed_agent/request.rs"]
 mod request_tests;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_current_install_inventory.rs"]
+mod windows_current_install_inventory;
 #[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_guardian_startup.rs"]
 mod windows_guardian_startup;
@@ -153,6 +112,9 @@ mod windows_security;
 #[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_service_manager.rs"]
 mod windows_service_manager;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_terminal_transport.rs"]
+mod windows_terminal_transport;
 #[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_token.rs"]
 mod windows_token;

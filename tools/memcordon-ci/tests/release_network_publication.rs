@@ -679,7 +679,7 @@ fn bundle_zip(candidate: bool) -> Vec<u8> {
 fn bundle_zip_with_identity(build: memcordon_ci::release::source::BuildSourceIdentity) -> Vec<u8> {
     use memcordon_ci::release::{
         bundle::{CandidateBundle, CandidateManifest, NotesSelection, PublicManifest},
-        compatibility::{Compatibility, NativePackage},
+        compatibility::{CompatibilityV2 as Compatibility, NativePackage},
         installed_consumer,
         source::BuildSourceIdentity,
         target,
@@ -726,7 +726,8 @@ fn bundle_zip_with_identity(build: memcordon_ci::release::source::BuildSourceIde
             );
         }
         let manifest =
-            installed_consumer::measured_manifest(&build, selection, directory.path()).unwrap();
+            installed_consumer::measured_current_manifest(&build, selection, directory.path())
+                .unwrap();
         members.insert(
             "runtime-manifest.json".into(),
             serde_json::to_vec(&manifest).unwrap(),

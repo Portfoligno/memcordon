@@ -31,6 +31,18 @@ pub fn required_loss_keys() -> Vec<CaseKey> {
         family: "W-RETIREMENT".into(),
         scenario: scenario.into(),
     })
+    .chain(
+        ["frontend-loss", "service-loss", "worker-loss", "recovery"]
+            .into_iter()
+            .map(|scenario| CaseKey {
+                family: "C-LIFETIME".into(),
+                scenario: scenario.into(),
+            }),
+    )
+    .chain([CaseKey {
+        family: "W-REPLAY".into(),
+        scenario: "public-recovery-after-loss".into(),
+    }])
     .collect()
 }
 
@@ -424,8 +436,9 @@ mod native {
     #[serde(deny_unknown_fields)]
     struct Recovery {
         schema_version: u32,
-        provider_response: memcordon_core::WindowsProviderResponseV3,
-        frontend_delivery: Option<memcordon_core::WindowsTerminalDeliveryEvidenceV1>,
+        provider_response: memcordon_core::WindowsProviderResponseV4,
+        frontend_delivery: Option<memcordon_core::WindowsFrontendDeliveryV3>,
+        terminal_authority_json: String,
     }
 
     pub fn run(
@@ -528,34 +541,39 @@ mod native {
             &input.descriptor.challenge,
             &mut record.artifacts,
         )?;
-        input.workload_contract = config
-            .output_directory
-            .join("W-JOINT")
-            .join("ordinary")
-            .join("requested-contract.json");
-        let contract = read(&input.workload_contract, 256 * 1024)?;
-        memcordon_core::workload_contract::WorkloadContractV1::parse(&contract)
-            .map_err(CiError::Message)?;
+        input.workload_request = base.workload_request.clone();
+        let contract = read(&input.workload_request, 256 * 1024)?;
+        memcordon_core::workload_request::WorkloadRequestV1::parse(&contract)
+            .map_err(|error| CiError::Message(error.to_string()))?;
         retain(
-            &directory.join("requested-contract.json"),
+            &directory.join("workload-request.json"),
             &contract,
             &mut record.artifacts,
         )?;
-        input.workload_contract = directory.join("requested-contract.json");
+        input.workload_request = directory.join("workload-request.json");
         input.descriptor.output_root = base
             .descriptor
             .output_root
             .parent()
             .ok_or_else(|| CiError::Message("candidate output parent absent".into()))?
+            .join(&record.key.family)
             .join(&record.key.scenario);
+        fs::create_dir_all(
+            input
+                .descriptor
+                .output_root
+                .parent()
+                .ok_or_else(|| CiError::Message("owned loss output parent absent".into()))?,
+        )?;
         fs::create_dir(&input.descriptor.output_root)?;
         input.descriptor.transcript = input.descriptor.output_root.join("fixture-events.bin");
         input.descriptor.start_gate = Some(format!(
-            "{}-{}",
+            "{}-{}-{}",
             base.descriptor
                 .start_gate
                 .as_ref()
                 .ok_or_else(|| CiError::Message("start gate absent".into()))?,
+            record.key.family,
             record.key.scenario
         ));
         input.descriptor_path = directory.join("input.json");
@@ -762,7 +780,10 @@ mod native {
                             control_service: None,
                         }
                     }
-                    "control-service-loss" => {
+                    "control-service-loss"
+                    | "service-loss"
+                    | "recovery"
+                    | "public-recovery-after-loss" => {
                         let subject = hold_process(control_service()?.process_id, None, &agent)?;
                         if subject.image_sha256 != agent_sha256 {
                             return Err(io::Error::other(
@@ -790,7 +811,7 @@ mod native {
                             control_service: Some(scm),
                         }
                     }
-                    "attempt-worker-loss" => {
+                    "attempt-worker-loss" | "worker-loss" => {
                         let identity =
                             observed.worker_process_identity.as_ref().ok_or_else(|| {
                                 io::Error::other("live worker process metadata absent")
@@ -874,12 +895,28 @@ mod native {
             .with_extension("terminal-observation.json")
             .with_extension("provider-request.bin");
         let request_bytes = read(&request_path, memcordon_core::WINDOWS_MAX_FRAME_BYTES)?;
+        let original_terminal_path = report.with_extension("terminal-observation.json");
+        if original_terminal_path.try_exists()? {
+            let terminal = read(
+                &original_terminal_path,
+                3 * memcordon_core::WINDOWS_MAX_FRAME_BYTES,
+            )?;
+            if !terminal.is_empty() {
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&terminal)
+                    .map_err(CiError::Message)?;
+                retain(
+                    &directory.join("original-terminal.json"),
+                    &terminal,
+                    &mut record.artifacts,
+                )?;
+            }
+        }
         retain(
             &directory.join("provider-request.bin"),
             &request_bytes,
             &mut record.artifacts,
         )?;
-        let request: memcordon_core::WindowsLaunchRequestV1 =
+        let request: memcordon_core::WindowsLaunchRequestV2 =
             serde_json::from_slice(&request_bytes)?;
         if crate::windows_causal_acceptance::sha256(&request_bytes)
             != String::from(observation.association.request_sha256.clone())
@@ -933,9 +970,9 @@ mod native {
                 &mut record.artifacts,
             )?;
             let result =
-                memcordon_core::result_v1::ResultV1::parse(&bytes).map_err(CiError::Message)?;
-            if result.provider_association.as_ref() != Some(&observation.association)
-                || result.outcome.kind == memcordon_core::result_v1::OutcomeKindV1::Completed
+                memcordon_core::result_v3::ResultV3::parse(&bytes).map_err(CiError::Message)?;
+            if result.windows_attempt.as_ref() != Some(&observation.association)
+                || result.outcome.kind == memcordon_core::execution_facts::OutcomeKindV1::Completed
             {
                 return Err(CiError::Message(
                     "loss original result substituted another attempt or application origin".into(),
@@ -1136,14 +1173,14 @@ mod native {
         }
         let recovered: Recovery = serde_json::from_slice(&recovered.stdout)?;
         let terminal = match &recovered.provider_response {
-            memcordon_core::WindowsProviderResponseV3::Terminal(receipt) => Some(receipt),
-            memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => {
+            memcordon_core::WindowsProviderResponseV4::Terminal(receipt) => Some(receipt),
+            memcordon_core::WindowsProviderResponseV4::Reject { rejection, .. } => {
                 rejection.terminal_receipt()
             }
             _ => None,
         };
         if let Some(terminal) = terminal {
-            if recovered.schema_version != 1
+            if recovered.schema_version != 2
                 || terminal.attempt_id != attempt
                 || terminal.nonce != *nonce
                 || terminal.request_sha256 != request
@@ -1169,7 +1206,7 @@ mod native {
             }
             if matches!(
                 &terminal.payload,
-                memcordon_core::WindowsTerminalPayloadV2::Execution {
+                memcordon_core::WindowsTerminalPayloadV3::Execution {
                     outcome: memcordon_core::RunOutcome::Exited { .. },
                     ..
                 }
@@ -1208,14 +1245,15 @@ mod native {
                     attempt_id: attempt.clone(),
                     nonce: nonce.clone(),
                     request_sha256: request.clone(),
-                    worker_loss_before_freeze: record.key.scenario == "attempt-worker-loss",
+                    worker_loss_before_freeze: ["attempt-worker-loss", "worker-loss"]
+                        .contains(&record.key.scenario.as_str()),
                 },
             )?;
             drop(held);
-        } else if let memcordon_core::WindowsProviderResponseV3::TerminalRetiredV2(retired) =
+        } else if let memcordon_core::WindowsProviderResponseV4::TerminalRetiredV2(retired) =
             &recovered.provider_response
         {
-            if recovered.schema_version != 1
+            if recovered.schema_version != 2
                 || retired.provider_generation != config.provider.generation.as_str()
                 || !retired.is_consistent_for(
                     &attempt,

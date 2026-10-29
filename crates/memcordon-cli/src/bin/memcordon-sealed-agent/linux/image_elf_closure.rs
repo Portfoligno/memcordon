@@ -1,56 +1,103 @@
 //! Resolve every image ELF dependency against the same held immutable inventory.
-use super::runtime_image::InstalledRuntimeImage;
-use memcordon_core::workload_contract_v3::RootRelativePath;
-use memcordon_core::workload_registry_v3::ImageEntryV1;
-use std::collections::BTreeSet;
+use super::workload_snapshot::HeldSnapshot;
+use memcordon_core::workload_files::ImageEntryV1;
+use memcordon_core::workload_files::RootRelativePath;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-fn regular<'a>(
-    images: &[&'a InstalledRuntimeImage],
-    path: &RootRelativePath,
-) -> Result<(&'a InstalledRuntimeImage, RootRelativePath), String> {
-    let mut selected = path.clone();
-    let mut seen = BTreeSet::new();
-    loop {
-        if !seen.insert(selected.clone()) || seen.len() > 64 {
-            return Err("ELF immutable dependency link cycle/excessive depth".into());
-        }
-        let matches = images
-            .iter()
-            .flat_map(|image| {
-                image
-                    .definition()
-                    .entries
-                    .as_slice()
-                    .iter()
-                    .filter(|entry| entry.path() == &selected)
-                    .map(move |entry| (*image, entry))
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(format!(
-                "ELF dependency is absent/ambiguous in held images: {}",
-                selected.as_str()
-            ));
-        }
-        match matches[0] {
-            (image, ImageEntryV1::Regular { .. }) => return Ok((image, selected)),
-            (_, ImageEntryV1::Symlink { target, .. }) => selected = target.clone(),
+pub(crate) fn validate_initial_environment(
+    launch: &crate::request::LaunchRequestV2,
+) -> Result<(), String> {
+    if launch.environment.iter().any(|(name, _)| {
+        name.starts_with(b"LD_") || matches!(name.as_slice(), b"GLIBC_TUNABLES" | b"GCONV_PATH")
+    }) {
+        return Err("initial loader environment cannot select writable or external code".into());
+    }
+    Ok(())
+}
+pub(crate) fn initial_launch(
+    launch: &crate::request::LaunchRequestV2,
+    library_path: Option<String>,
+) -> Result<crate::request::LaunchRequestV2, String> {
+    validate_initial_environment(launch)?;
+    let mut trusted = launch.clone();
+    if let Some(path) = library_path {
+        trusted
+            .environment
+            .push((b"LD_LIBRARY_PATH".to_vec(), path.into_bytes()));
+    }
+    Ok(trusted)
+}
+
+fn resolved_members<'a>(
+    images: &[&'a HeldSnapshot],
+    cutoff: std::time::Instant,
+) -> Result<BTreeMap<RootRelativePath, (&'a HeldSnapshot, &'a ImageEntryV1)>, String> {
+    let mut entries = BTreeMap::new();
+    let mut resolved = BTreeMap::new();
+    for image in images {
+        for entry in image.definition().entries.as_slice() {
+            if std::time::Instant::now() >= cutoff {
+                return Err("original ELF closure cutoff expired".into());
+            }
+            if entries
+                .insert(entry.path().clone(), (*image, entry))
+                .is_some()
+            {
+                return Err("ELF immutable member is ambiguous".into());
+            }
+            if matches!(entry, ImageEntryV1::Regular { .. }) {
+                resolved.insert(entry.path().clone(), (*image, entry));
+            }
         }
     }
+    for start in entries.keys() {
+        let mut current = start.clone();
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        while !resolved.contains_key(&current) {
+            if std::time::Instant::now() >= cutoff {
+                return Err("original ELF closure cutoff expired".into());
+            }
+            if !seen.insert(current.clone()) {
+                return Err("ELF immutable link cycle".into());
+            }
+            chain.push(current.clone());
+            match entries.get(&current).map(|(_, entry)| *entry) {
+                Some(ImageEntryV1::Symlink { target, .. }) => current = target.clone(),
+                _ => return Err("ELF immutable link target absent".into()),
+            }
+        }
+        let target = resolved
+            .get(&current)
+            .copied()
+            .ok_or("ELF resolved target absent")?;
+        for member in chain {
+            resolved.insert(member, target);
+        }
+    }
+    Ok(resolved)
 }
 
 pub(super) fn validate(
-    runtime: &InstalledRuntimeImage,
-    input: &InstalledRuntimeImage,
+    runtime: &HeldSnapshot,
+    input: &HeldSnapshot,
+    layout: &memcordon_core::workload_request::PrivateRootLayoutV1,
+    cutoff: std::time::Instant,
 ) -> Result<Option<String>, String> {
+    memcordon_core::workload_bundle::validate_layout(
+        runtime.definition(),
+        input.definition(),
+        layout,
+    )?;
     runtime.revalidate()?;
     input.revalidate()?;
     if runtime.definition().target != input.definition().target {
         return Err("ELF image native targets differ".into());
     }
     let images = [runtime, input];
+    let members = resolved_members(&images, cutoff)?;
     let mut directories = Vec::new();
     for image in images {
         for directory in image.definition().library_directories.as_slice() {
@@ -61,6 +108,9 @@ pub(super) fn validate(
     }
     for image in images {
         for entry in image.definition().entries.as_slice() {
+            if std::time::Instant::now() >= cutoff {
+                return Err("original ELF closure cutoff expired".into());
+            }
             let name = entry.path().as_str();
             if matches!(
                 name,
@@ -69,7 +119,7 @@ pub(super) fn validate(
                 || name.starts_with("etc/ld.so.conf.d/")
             {
                 return Err(
-                    "ELF loader configuration is outside the approved immutable library catalogue"
+                    "ELF loader configuration is outside the declared immutable library catalogue"
                         .into(),
                 );
             }
@@ -84,6 +134,7 @@ pub(super) fn validate(
             );
             let dependency = memcordon_core::elf_closure::inspect(
                 |offset, buffer| {
+                    super::workload_snapshot::check_validation_cutoff(cutoff)?;
                     held.read_exact_at(buffer, offset)
                         .map_err(|error| error.to_string())
                 },
@@ -100,14 +151,10 @@ pub(super) fn validate(
                         .ok_or("ELF interpreter not absolute")?
                         .to_owned(),
                 )?;
-                let (image, path) = regular(&images, &interpreter)?;
-                let entry = image
-                    .definition()
-                    .entries
-                    .as_slice()
-                    .iter()
-                    .find(|entry| entry.path() == &path)
-                    .expect("resolved regular dependency");
+                let (image, entry) = members
+                    .get(&interpreter)
+                    .copied()
+                    .ok_or("ELF interpreter absent from immutable inventory")?;
                 if !matches!(
                     entry,
                     ImageEntryV1::Regular {
@@ -115,9 +162,9 @@ pub(super) fn validate(
                         ..
                     }
                 ) {
-                    return Err("ELF interpreter is not approved executable image member".into());
+                    return Err("ELF interpreter is not a declared executable image member".into());
                 }
-                image.object(&path)?;
+                image.object(entry.path())?;
             }
             for search in dependency.search_paths {
                 let parent = path.as_str().rsplit_once('/').map_or("", |pair| pair.0);
@@ -143,25 +190,21 @@ pub(super) fn validate(
                 }
                 let directory = RootRelativePath::new(components.join("/"))?;
                 if !directories.contains(&directory) {
-                    return Err("ELF loader search directory is outside approved immutable search catalogue".into());
+                    return Err("ELF loader search directory is outside the declared immutable search catalogue".into());
                 }
             }
             for name in dependency.needed {
+                if name.contains('/') || name.contains('$') {
+                    return Err(
+                        "ELF needed dependency must be an immutable library basename".into(),
+                    );
+                }
                 let candidates = directories
                     .iter()
                     .filter_map(|directory| {
                         RootRelativePath::new(format!("{}/{name}", directory.as_str())).ok()
                     })
-                    .filter(|path| {
-                        images.iter().any(|image| {
-                            image
-                                .definition()
-                                .entries
-                                .as_slice()
-                                .iter()
-                                .any(|entry| entry.path() == path)
-                        })
-                    })
+                    .filter(|path| members.contains_key(path))
                     .collect::<Vec<_>>();
                 if candidates.is_empty() {
                     return Err(format!(
@@ -170,8 +213,11 @@ pub(super) fn validate(
                 }
                 // Ordered provider-derived LD_LIBRARY_PATH is the actual search
                 // authority; aliases remain confined to held image members.
-                let (image, selected) = regular(&images, &candidates[0])?;
-                image.object(&selected)?;
+                let (image, selected) = members
+                    .get(&candidates[0])
+                    .copied()
+                    .ok_or("ELF dependency absent from immutable inventory")?;
+                image.object(selected.path())?;
             }
         }
     }

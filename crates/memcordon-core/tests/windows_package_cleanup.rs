@@ -1,48 +1,48 @@
 use memcordon_core::{
-    WINDOWS_PRIVATE_PROTOCOL_VERSION, WINDOWS_PUBLIC_PROTOCOL_VERSION,
-    WindowsControlRequestStatusV1, WindowsLauncherRequestV1, WindowsLauncherResponseV1,
-    WindowsPackageCleanupOutcomeV1, WindowsProviderRequestV1, WindowsProviderResponseV1,
+    WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION, WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+    WindowsControlRequestStatusV1, WindowsLauncherRequestV4, WindowsLauncherResponseV4,
+    WindowsPackageCleanupOutcomeV1, WindowsProviderRequestV4, WindowsProviderResponseV4,
 };
 
 #[test]
 fn package_cleanup_deadline_is_preserved_across_public_and_private_protocols() {
-    let public = WindowsProviderRequestV1::PackageCleanup {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let public = WindowsProviderRequestV4::PackageCleanup {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         challenge: "cleanup-challenge".to_owned(),
         deadline_millis: 12_345,
     };
     let public_json = serde_json::to_vec(&public).unwrap();
     assert_eq!(
-        serde_json::from_slice::<WindowsProviderRequestV1>(&public_json).unwrap(),
+        serde_json::from_slice::<WindowsProviderRequestV4>(&public_json).unwrap(),
         public
     );
 
-    let private = WindowsLauncherRequestV1::PackageCleanup {
-        schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let private = WindowsLauncherRequestV4::PackageCleanup {
+        schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         deadline_millis: 12_345,
     };
     let private_json = serde_json::to_vec(&private).unwrap();
     assert_eq!(
-        serde_json::from_slice::<WindowsLauncherRequestV1>(&private_json).unwrap(),
+        serde_json::from_slice::<WindowsLauncherRequestV4>(&private_json).unwrap(),
         private
     );
 }
 
 #[test]
 fn launcher_package_cleanup_reports_typed_retained_state() {
-    let response = WindowsLauncherResponseV1::PackageCleanup {
-        schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = WindowsLauncherResponseV4::PackageCleanup {
+        schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         status: WindowsControlRequestStatusV1::Active,
         attempts_empty: Some(false),
         terminal_outboxes: Some(2),
         detail: "MCSEALED-WINDOWS-PACKAGE-ACTIVE: guardian receipt pending".to_owned(),
     };
     let json = serde_json::to_vec(&response).unwrap();
-    let decoded = serde_json::from_slice::<WindowsLauncherResponseV1>(&json).unwrap();
+    let decoded = serde_json::from_slice::<WindowsLauncherResponseV4>(&json).unwrap();
     assert!(matches!(
         decoded,
-        WindowsLauncherResponseV1::PackageCleanup {
-            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        WindowsLauncherResponseV4::PackageCleanup {
+            schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
             status: WindowsControlRequestStatusV1::Active,
             attempts_empty: Some(false),
             terminal_outboxes: Some(2),
@@ -119,21 +119,21 @@ fn package_cleanup_inventory_survives_private_and_bound_public_serialization() {
             "authenticated terminal inventory read failed",
         ),
     ] {
-        let private = WindowsLauncherResponseV1::PackageCleanup {
-            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        let private = WindowsLauncherResponseV4::PackageCleanup {
+            schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
             status,
             attempts_empty,
             terminal_outboxes,
             detail: detail.to_owned(),
         };
         let encoded = serde_json::to_vec(&private).unwrap();
-        let decoded = serde_json::from_slice::<WindowsLauncherResponseV1>(&encoded).unwrap();
+        let decoded = serde_json::from_slice::<WindowsLauncherResponseV4>(&encoded).unwrap();
         assert_eq!(
             serde_json::to_value(&decoded).unwrap(),
             serde_json::to_value(&private).unwrap()
         );
 
-        let WindowsLauncherResponseV1::PackageCleanup {
+        let WindowsLauncherResponseV4::PackageCleanup {
             status: forwarded_status,
             attempts_empty: forwarded_empty,
             terminal_outboxes: forwarded_inventory,
@@ -143,8 +143,8 @@ fn package_cleanup_inventory_survives_private_and_bound_public_serialization() {
         else {
             panic!("cleanup response changed kind");
         };
-        let public = WindowsProviderResponseV1::PackageCleanupResult {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        let public = WindowsProviderResponseV4::PackageCleanupResult {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             challenge: "bound-package-cleanup-challenge".to_owned(),
             status: forwarded_status,
             attempts_empty: forwarded_empty,
@@ -152,15 +152,15 @@ fn package_cleanup_inventory_survives_private_and_bound_public_serialization() {
             detail: forwarded_detail,
         };
         let encoded = serde_json::to_vec(&public).unwrap();
-        let decoded = serde_json::from_slice::<WindowsProviderResponseV1>(&encoded).unwrap();
+        let decoded = serde_json::from_slice::<WindowsProviderResponseV4>(&encoded).unwrap();
         assert_eq!(
             serde_json::to_value(&decoded).unwrap(),
             serde_json::to_value(&public).unwrap()
         );
         assert!(matches!(
             decoded,
-            WindowsProviderResponseV1::PackageCleanupResult {
-                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            WindowsProviderResponseV4::PackageCleanupResult {
+                schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
                 challenge,
                 status: actual_status,
                 attempts_empty: actual_empty,

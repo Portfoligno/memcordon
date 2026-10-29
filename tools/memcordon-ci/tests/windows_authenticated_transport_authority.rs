@@ -1,4 +1,4 @@
-#[path = "../../../crates/memcordon-core/tests/support/windows_postauthorization.rs"]
+#[path = "../../../crates/memcordon-core/tests/support/windows_current_postauthorization.rs"]
 mod support;
 use memcordon_ci::windows_readiness_components::authenticated_transport_injection_authority;
 use memcordon_core::*;
@@ -107,7 +107,7 @@ fn service_recovery_executor_never_substitutes_for_original_held_owner() {
 }
 
 fn fixture() -> (
-    WindowsProviderResponseV3,
+    WindowsProviderResponseV4,
     PublicProviderBindingV1,
     String,
     String,
@@ -146,8 +146,8 @@ fn fixture() -> (
     rejection.phase = BoundarySetupPhase::Retirement;
     assert!(rejection.is_consistent());
     (
-        WindowsProviderResponseV3::Reject {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        WindowsProviderResponseV4::Reject {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt.clone(),
             nonce: nonce.clone(),
             request_sha256: request.clone(),
@@ -164,7 +164,7 @@ fn fixture() -> (
 fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
     let (response, provider, attempt, nonce, request) = fixture();
     let selected = WindowsSealedFault::ControlWorkerKilledAfterAuthorization;
-    let accepts = |response: &WindowsProviderResponseV3,
+    let accepts = |response: &WindowsProviderResponseV4,
                    selected,
                    provider: &PublicProviderBindingV1,
                    attempt: &str,
@@ -177,7 +177,7 @@ fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
     assert!(accepts(
         &response, selected, &provider, &attempt, &nonce, &request
     ));
-    let WindowsProviderResponseV3::Reject { rejection, .. } = &response else {
+    let WindowsProviderResponseV4::Reject { rejection, .. } = &response else {
         unreachable!()
     };
     let receipt = rejection.terminal_receipt().unwrap();
@@ -201,7 +201,7 @@ fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
     };
     assert!(retired.is_consistent_for(&attempt, &nonce, &request, &"11".repeat(32)));
     assert!(!accepts(
-        &WindowsProviderResponseV3::TerminalRetiredV2(retired),
+        &WindowsProviderResponseV4::TerminalRetiredV2(retired),
         selected,
         &provider,
         &attempt,
@@ -209,7 +209,7 @@ fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
         &request
     ));
     assert!(!accepts(
-        &WindowsProviderResponseV3::Terminal(receipt.clone()),
+        &WindowsProviderResponseV4::Terminal(receipt.clone()),
         selected,
         &provider,
         &attempt,
@@ -258,7 +258,7 @@ fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
         "schema",
     ] {
         let mut changed = response.clone();
-        let WindowsProviderResponseV3::Reject {
+        let WindowsProviderResponseV4::Reject {
             schema_version,
             rejection,
             ..
@@ -281,7 +281,7 @@ fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
                 }
             }
             _ => {
-                let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+                let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
                     &mut rejection.disposition
                 else {
                     unreachable!()
@@ -292,7 +292,7 @@ fn original_authenticated_transport_receipt_survives_later_ack_retirement() {
                         receipt.retirement_proof.provider_generation = "other-generation".into()
                     }
                     "natural-outcome" => {
-                        let WindowsTerminalPayloadV2::Execution { outcome, .. } =
+                        let WindowsTerminalPayloadV3::Execution { outcome, .. } =
                             &mut receipt.payload
                         else {
                             unreachable!()

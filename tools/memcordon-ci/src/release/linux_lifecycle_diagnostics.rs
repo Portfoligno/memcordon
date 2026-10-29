@@ -1,5 +1,5 @@
 //! Failure evidence publication; these artifacts never authorize intervention.
-use crate::consumer_readiness_ledger::SourceIdentity;
+use crate::readiness_identity::SourceIdentity;
 use crate::{CiError, Result};
 use memcordon_readiness_verifier::Artifact;
 use memcordon_readiness_verifier::ProductKey;

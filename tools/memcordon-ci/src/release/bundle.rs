@@ -357,7 +357,7 @@ fn assemble_build_inner(
         let members = super::target::decode_archive(&archive, &target.distribution.target)?;
         manifests.insert(
             target.distribution.target.clone(),
-            memcordon_core::runtime_manifest::RuntimeManifest::parse(
+            memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(
                 &members["runtime-manifest.json"],
             )
             .map_err(CiError::Message)?,
@@ -365,7 +365,7 @@ fn assemble_build_inner(
         bytes.push(archive);
     }
     let compatibility =
-        super::compatibility::Compatibility::selected(source, &distribution, &manifests)?;
+        super::compatibility::CompatibilityV2::selected(source, &distribution, &manifests)?;
     let mut compatibility_bytes = serde_json::to_vec_pretty(&compatibility)?;
     compatibility_bytes.push(b'\n');
     files.push(FileRecord {
@@ -510,7 +510,7 @@ fn load_payloads(
                     "prepared archive native inventory differs".into(),
                 ));
             }
-            let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(
+            let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(
                 &members["runtime-manifest.json"],
             )
             .map_err(CiError::Message)?;
@@ -591,9 +591,10 @@ fn load_payloads(
         .expect("validated compatibility inventory");
     memcordon_core::canonical_json::reject_duplicate_json_keys(&payloads[compatibility])
         .map_err(CiError::Message)?;
-    let supplied: super::compatibility::Compatibility =
+    let supplied: super::compatibility::CompatibilityV2 =
         serde_json::from_slice(&payloads[compatibility])?;
-    if supplied != super::compatibility::Compatibility::selected(build, distribution, &manifests)? {
+    if supplied != super::compatibility::CompatibilityV2::selected(build, distribution, &manifests)?
+    {
         return Err(CiError::Message(
             "public compatibility metadata differs from measured selected runtimes".into(),
         ));

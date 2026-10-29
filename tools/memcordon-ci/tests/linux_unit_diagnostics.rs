@@ -4,7 +4,7 @@ use memcordon_ci::{
     CiError,
     command::CommandSpec,
     config,
-    release::linux_installed_consumer::{
+    release::linux_unit_diagnostics::{
         PRIVATE_UNIT_DIAGNOSTIC_BYTES, PrivateUnitDiagnostic, diagnose_then_cleanup,
         private_unit_diagnostic_command, private_unit_journal_excerpt,
         retain_private_unit_diagnostic,

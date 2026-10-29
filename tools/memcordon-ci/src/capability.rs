@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
-use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, DoctorReport};
+use memcordon_core::discovery::CapabilitiesV3;
 use serde_json::Value;
 
 use crate::command::rustup_cargo;
@@ -21,6 +21,8 @@ pub fn probe(root: &Path, stable: &str, target_dir: &Path, deadline: Duration) -
         OsString::from("--"),
         OsString::from("doctor"),
         OsString::from("--json"),
+        OsString::from("--capability-format"),
+        OsString::from("capabilities-v3"),
     ];
     let output = rustup_cargo(root, stable, arguments, deadline).run()?;
     Ok(serde_json::from_slice(&output)?)
@@ -39,7 +41,7 @@ pub fn require_selected(probe: &Value) -> Result<&Value> {
 }
 
 pub fn require_certified_hard_backend(probe: &Value, backend: &str) -> Result<()> {
-    let report: DoctorReport = serde_json::from_value(probe.clone())?;
+    let report = CapabilitiesV3::parse(&serde_json::to_vec(probe)?).map_err(CiError::Message)?;
     let selected = report.selected.as_ref().ok_or_else(|| {
         CiError::Message(format!(
             "required backend capability is unavailable: {probe}"
@@ -49,11 +51,7 @@ pub fn require_certified_hard_backend(probe: &Value, backend: &str) -> Result<()
         .memory
         .as_ref()
         .is_some_and(|memory| memory.supported && memory.class == "hard");
-    if report.schema_version != DOCTOR_REPORT_SCHEMA_VERSION
-        || selected.name != backend
-        || !selected.containment.supported
-        || !hard_memory
-    {
+    if selected.name != backend || !selected.containment.supported || !hard_memory {
         return Err(CiError::Message(format!(
             "required certified hard backend is not selected: {probe}"
         )));
@@ -78,7 +76,7 @@ pub fn require_single_test_success(output: &[u8], test_name: &str) -> Result<()>
 
 pub fn require_certified_standard_backend(probe: &Value, backend: &str) -> Result<()> {
     require_certified_hard_backend(probe, backend)?;
-    let report: DoctorReport = serde_json::from_value(probe.clone())?;
+    let report = CapabilitiesV3::parse(&serde_json::to_vec(probe)?).map_err(CiError::Message)?;
     let selected = report
         .selected
         .expect("hard backend validation requires selection");

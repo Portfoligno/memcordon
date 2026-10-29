@@ -34,7 +34,7 @@ pub struct NativeTestOwner {
     admission_refusal: Option<Vec<u8>>,
     admission_refused: bool,
     crash_helpers: Vec<(
-        memcordon_core::result_v2::NativeProcessV2,
+        memcordon_core::execution_facts::NativeProcessV2,
         std::os::fd::OwnedFd,
         File,
         bool,
@@ -58,133 +58,11 @@ pub struct NativeAdminScope {
     path: PathBuf,
     root: File,
     ancestry: Vec<File>,
-    retirement: super::linux_mixed_installed::InstalledMixedDriver,
     batch: Option<NativeRecipeBatch>,
     recovered: Vec<std::os::fd::OwnedFd>,
     recovery_images: Vec<File>,
     recovery_image_identities: Vec<(u64, u64)>,
     settlement_publication: Option<NativePublication>,
-    component_package: Option<super::linux_native_package::NativeLinuxPackageLease>,
-    component_workspace: Option<PathBuf>,
-    component_fixture: Option<(PathBuf, String, File)>,
-    recovery_harness: Option<super::linux_recovery_harness::HeldRecoveryHarness>,
-}
-
-/// Read-only loans of the original acquired account records. The caller keeps
-/// these native handles until unchanged bytes have reached original job custody.
-pub struct NativeFixtureAcquisition {
-    entries: Vec<(String, Vec<u8>)>,
-    _files: Vec<File>,
-    _directories: Vec<File>,
-    original_metadata: Vec<std::fs::Metadata>,
-    directory_names: Vec<String>,
-}
-impl NativeFixtureAcquisition {
-    pub fn entries(&self) -> &[(String, Vec<u8>)] {
-        &self.entries
-    }
-    pub fn verify(&self, deadline: Instant) -> Result<()> {
-        use rustix::fs::{Mode, OFlags, openat};
-        use std::os::unix::fs::FileExt;
-        let stamp = |metadata: &std::fs::Metadata| {
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.len(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-                metadata.nlink(),
-                metadata.uid(),
-                metadata.mode(),
-            )
-        };
-        let parent = self
-            ._directories
-            .last()
-            .ok_or_else(|| CiError::Message("fixture loan parent absent".into()))?;
-        for (index, (name, expected_bytes)) in self.entries.iter().enumerate() {
-            if Instant::now() >= deadline {
-                return Err(CiError::Message(
-                    "original fixture loan cutoff exhausted".into(),
-                ));
-            }
-            let named = File::from(
-                openat(
-                    parent,
-                    name.as_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let expected = stamp(&self.original_metadata[index]);
-            for file in [&self._files[index], &named] {
-                if stamp(&file.metadata()?) != expected {
-                    return Err(CiError::Message(
-                        "fixture loan inode/protection changed".into(),
-                    ));
-                }
-                let mut bytes = vec![0; expected_bytes.len()];
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    if Instant::now() >= deadline {
-                        return Err(CiError::Message(
-                            "original fixture loan read cutoff exhausted".into(),
-                        ));
-                    }
-                    let count = file.read_at(&mut bytes[offset..], offset as u64)?;
-                    if count == 0 {
-                        return Err(CiError::Message("fixture loan record truncated".into()));
-                    }
-                    offset += count;
-                }
-                let mut extra = [0];
-                if bytes != *expected_bytes
-                    || file.read_at(&mut extra, bytes.len() as u64)? != 0
-                    || stamp(&file.metadata()?) != expected
-                {
-                    return Err(CiError::Message(
-                        "fixture loan original bytes changed".into(),
-                    ));
-                }
-            }
-        }
-        for (index, name) in self.directory_names.iter().enumerate() {
-            if Instant::now() >= deadline {
-                return Err(CiError::Message(
-                    "original fixture loan ancestry cutoff exhausted".into(),
-                ));
-            }
-            let named = File::from(
-                openat(
-                    &self._directories[index],
-                    name.as_str(),
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let held = self._directories[index + 1].metadata()?;
-            let current = named.metadata()?;
-            if (held.dev(), held.ino(), held.uid(), held.mode())
-                != (current.dev(), current.ino(), current.uid(), current.mode())
-                || !held.is_dir()
-                || held.nlink() == 0
-                || held.uid() != 0
-                || held.mode() & 0o022 != 0
-            {
-                return Err(CiError::Message(
-                    "fixture loan named protected ancestry changed".into(),
-                ));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(CiError::Message(
-                "original fixture loan final cutoff exhausted".into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl NativeAdminScope {
@@ -192,7 +70,7 @@ impl NativeAdminScope {
     /// directory. A retry never adopts an existing directory as a fresh scope.
     pub fn allocate_owned_scope(
         workspace: &Path,
-        identity: &crate::consumer_readiness_ledger::SourceIdentity,
+        identity: &crate::readiness_identity::SourceIdentity,
         target: &str,
         recipe_id: &str,
         artifact_prefix: &str,
@@ -324,28 +202,198 @@ impl NativeAdminScope {
             path: path.to_path_buf(),
             root,
             ancestry,
-            retirement: Default::default(),
             batch: None,
             recovered: Vec::new(),
             recovery_images: Vec::new(),
             recovery_image_identities: Vec::new(),
             settlement_publication: None,
-            component_package: None,
-            component_workspace: None,
-            component_fixture: None,
-            recovery_harness: None,
         })
     }
 
     /// Reacquire only the original protected image namespace. This restores
     /// cleanup obligations, never lost captures, exit status, or test evidence.
+    /// Current recipes acquire actual test children directly. No historical
+    /// policy registry, grant, account fixture or installed package is acquired.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Original native allocation and phase cutoffs remain explicit"
+    )]
+    pub fn execute_current_recipes(
+        &mut self,
+        parser: &MeasuredHarness,
+        operational: &MeasuredHarness,
+        run_id: &str,
+        recipe_id: &str,
+        allocation_recipe_id: &str,
+        target: &str,
+        prefix: &str,
+        work: Instant,
+        cleanup: Instant,
+        work_unix: u64,
+        cleanup_unix: u64,
+    ) -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        self.verify_named()?;
+        if self.batch.is_some()
+            || work > cleanup
+            || Instant::now() >= work
+            || target != super::distribution::native_target()?
+            || !parser.executable.starts_with(self.path.join("parser"))
+            || !operational
+                .executable
+                .starts_with(self.path.join("operational"))
+        {
+            return Err(CiError::Message(
+                "current native recipe allocation, role or cutoff differs".into(),
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| CiError::Message("native scope parent absent".into()))?;
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| CiError::Message("native scope name absent".into()))?;
+        let intent_bytes = crate::linux_consumer_readiness::measured(
+            &parent.join(format!("{name}.intent.json")),
+            65536,
+        )
+        .map_err(CiError::Message)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&intent_bytes)
+            .map_err(CiError::Message)?;
+        let intent: serde_json::Value = serde_json::from_slice(&intent_bytes)?;
+        if artifacts::checksum(&intent_bytes) != name
+            || !super::native_execution_association::matches(
+                &intent,
+                &super::native_execution_association::Allocation {
+                    run_id,
+                    recipe_id: allocation_recipe_id,
+                    target,
+                    artifact_prefix: prefix,
+                    work_deadline: work_unix,
+                    cleanup_deadline: cleanup_unix,
+                },
+            )
+        {
+            return Err(CiError::Message(
+                "current native recipe differs from held original allocation".into(),
+            ));
+        }
+        for (role, parser) in [("parser", parser), ("operational", operational)] {
+            let metadata = fs::symlink_metadata(&parser.executable)?;
+            let expected = serde_json::to_vec(
+                &serde_json::json!({"format":"memcordon.consumer-readiness.native-image-owner","revision":1,
+            "role":role,"path":parser.executable,"device":metadata.dev(),"inode":metadata.ino(),"sha256":parser.sha256}),
+            )?;
+            if crate::linux_consumer_readiness::measured(
+                &parent.join(format!("{name}.{role}-image-owner.json")),
+                65536,
+            )
+            .map_err(CiError::Message)?
+                != expected
+                || artifacts::checksum(
+                    &crate::linux_consumer_readiness::measured(
+                        &parser.executable,
+                        512 * 1024 * 1024,
+                    )
+                    .map_err(CiError::Message)?,
+                ) != parser.sha256
+            {
+                return Err(CiError::Message(
+                    "current native parser differs from held measured image".into(),
+                ));
+            }
+        }
+        let mut intent = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.path.join("native-execution-intent.json"))?;
+        intent.write_all(&serde_json::to_vec(&serde_json::json!({"format":"memcordon.consumer-readiness.native-execution-intent","revision":2,
+            "run_id":run_id,"recipe_id":recipe_id,"target":target,"artifact_prefix":prefix}))?)?;
+        intent.sync_all()?;
+        let output = self.path.join("recipes");
+        fs::DirBuilder::new().mode(0o700).create(&output)?;
+        self.root.sync_all()?;
+        let mut batch = NativeRecipeBatch {
+            failures: Vec::new(),
+            owners: Vec::new(),
+        };
+        for (parser, test, name) in [
+            (parser, "emit_current_parser_mutations", "current-parser"),
+            (
+                parser,
+                "current_version_vectors::emit_current_request_result_vectors",
+                "current-versions",
+            ),
+            (
+                operational,
+                "native_current_filter::current_filter_vectors_emit_actual_component_receipts",
+                "current-filter",
+            ),
+            (
+                operational,
+                "protocol_tests::unsupported_current_wire_versions_emit_actual_receipt",
+                "current-wire",
+            ),
+        ] {
+            if Instant::now() >= work {
+                batch
+                    .failures
+                    .push(format!("{test}: original work cutoff exhausted"));
+                break;
+            }
+            let directory = output.join(name);
+            let mut challenge = [0u8; 32];
+            File::open("/dev/urandom")?.read_exact(&mut challenge)?;
+            let mut input = serde_json::json!({"run_id":run_id,"recipe_id":recipe_id,
+                "native_target":target,"artifact_root":directory,"artifact_prefix":format!("{prefix}/{name}"),"challenge":challenge});
+            if name == "current-wire" {
+                input["work_deadline_unix_millis"] = serde_json::json!(work_unix);
+                input["cleanup_deadline_unix_millis"] = serde_json::json!(cleanup_unix);
+            }
+            let input = serde_json::to_vec(&input)?;
+            match NativeTestOwner::spawn(parser, test, &self.path, &directory) {
+                Ok(mut owner) => {
+                    if let Err(error) = owner.deliver(&input).and_then(|()| owner.finish(work)) {
+                        batch.failures.push(format!("{test}: {error}"));
+                        if let Err(error) = owner.stop() {
+                            batch.failures.push(format!("{test}: stop: {error}"));
+                        }
+                        if let Err(error) = owner.finish(cleanup) {
+                            batch.failures.push(format!("{test}: settlement: {error}"));
+                        }
+                    }
+                    if !owner.all_native_publications_settled() {
+                        batch.owners.push((test.into(), owner));
+                    }
+                }
+                Err(failure) => {
+                    batch.failures.push(format!("{test}: {}", failure.detail));
+                    if let Some(owner) = failure.owner {
+                        batch.settle_refused(test, owner, cleanup);
+                    }
+                }
+            }
+            if !batch.owners.is_empty() {
+                break;
+            }
+        }
+        self.batch = Some(batch);
+        self.root.sync_all()?;
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Retains the exact original image, source identity, recipe and finite cleanup custody together"
     )]
     pub fn recover_owned_scope(
         workspace: &Path,
-        identity: &crate::consumer_readiness_ledger::SourceIdentity,
+        identity: &crate::readiness_identity::SourceIdentity,
         target: &str,
         recipe_id: &str,
         prefix: &str,
@@ -403,24 +451,6 @@ impl NativeAdminScope {
             ));
         }
         let mut scope = Self::acquire(&path, device, inode)?;
-        match fs::symlink_metadata(path.join("component-package-admin")) {
-            Ok(_) => {
-                let admin = path.join("component-package-admin");
-                scope.component_package = Some(
-                    super::linux_native_package::NativeLinuxPackageLease::recover(
-                        workspace,
-                        identity,
-                        target,
-                        &admin,
-                        &admin.join("native-package-evidence"),
-                        deadline,
-                    )?,
-                );
-                scope.component_workspace = Some(workspace.to_path_buf());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
         let settled_bytes = match read(&base.join(format!("{key}.native-settlement.json"))) {
             Ok(bytes) => Some(bytes),
             Err(CiError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -570,7 +600,7 @@ impl NativeAdminScope {
     )]
     pub fn observe_retired_scope(
         workspace: &Path,
-        identity: &crate::consumer_readiness_ledger::SourceIdentity,
+        identity: &crate::readiness_identity::SourceIdentity,
         target: &str,
         recipe_id: &str,
         prefix: &str,
@@ -811,555 +841,10 @@ impl NativeAdminScope {
         Ok(protected)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Native image execution keeps measured harnesses, original identity and finite owner deadlines explicit"
-    )]
-    pub fn execute(
-        &mut self,
-        parser: &MeasuredHarness,
-        operational: &MeasuredHarness,
-        run_id: &str,
-        recipe_id: &str,
-        allocation_recipe_id: &str,
-        target: &str,
-        prefix: &str,
-        work: Instant,
-        cleanup: Instant,
-        work_unix: u64,
-        cleanup_unix: u64,
-    ) -> Result<()> {
-        use std::os::unix::fs::DirBuilderExt;
-        self.verify_named()?;
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| CiError::Message("native scope parent absent".into()))?;
-        let name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| CiError::Message("native scope name absent".into()))?;
-        let intent_bytes = crate::linux_consumer_readiness::measured(
-            &parent.join(format!("{name}.intent.json")),
-            65536,
-        )
-        .map_err(CiError::Message)?;
-        memcordon_core::canonical_json::reject_duplicate_json_keys(&intent_bytes)
-            .map_err(CiError::Message)?;
-        let intent: serde_json::Value = serde_json::from_slice(&intent_bytes)?;
-        if artifacts::checksum(&intent_bytes) != name
-            || !super::native_execution_association::matches(
-                &intent,
-                &super::native_execution_association::Allocation {
-                    run_id,
-                    recipe_id: allocation_recipe_id,
-                    target,
-                    artifact_prefix: prefix,
-                    work_deadline: work_unix,
-                    cleanup_deadline: cleanup_unix,
-                },
-            )
-            || Instant::now() >= work
-        {
-            return Err(CiError::Message(
-                "native execution differs from original allocation association/cutoffs".into(),
-            ));
-        }
-        if self.batch.is_some() {
-            return Err(CiError::Message(
-                "native administrator scope cannot repeat invocation".into(),
-            ));
-        }
-        if !parser.executable.starts_with(self.path.join("parser"))
-            || !operational
-                .executable
-                .starts_with(self.path.join("operational"))
-        {
-            return Err(CiError::Message(
-                "native recipes require this exact protected role scope".into(),
-            ));
-        }
-        for (role, harness) in [("parser", parser), ("operational", operational)] {
-            let metadata = fs::symlink_metadata(&harness.executable)?;
-            let expected = serde_json::to_vec(
-                &serde_json::json!({"format":"memcordon.consumer-readiness.native-image-owner","revision":1,"role":role,"path":harness.executable,"device":metadata.dev(),"inode":metadata.ino(),"sha256":harness.sha256}),
-            )?;
-            let parent = self
-                .path
-                .parent()
-                .ok_or_else(|| CiError::Message("native scope parent absent".into()))?;
-            let name = self
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| CiError::Message("native scope name absent".into()))?;
-            if crate::linux_consumer_readiness::measured(
-                &parent.join(format!("{name}.{role}-image-owner.json")),
-                65536,
-            )
-            .map_err(CiError::Message)?
-                != expected
-                || artifacts::checksum(
-                    &crate::linux_consumer_readiness::measured(
-                        &harness.executable,
-                        512 * 1024 * 1024,
-                    )
-                    .map_err(CiError::Message)?,
-                ) != harness.sha256
-            {
-                return Err(CiError::Message(
-                    "native execution differs from durable prepared image owner".into(),
-                ));
-            }
-        }
-        let mut intent = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.path.join("native-execution-intent.json"))?;
-        intent.write_all(&serde_json::to_vec(&serde_json::json!({"format":"memcordon.consumer-readiness.native-execution-intent","revision":1,"run_id":run_id,"recipe_id":recipe_id,"target":target,"artifact_prefix":prefix}))?)?;
-        intent.sync_all()?;
-        self.root.sync_all()?;
-        let output = self.path.join("recipes");
-        fs::DirBuilder::new().mode(0o700).create(&output)?;
-        self.root.sync_all()?;
-        let fixture=self.component_fixture.as_ref().ok_or_else(||CiError::Message("actual original installed fixture must be retained before native release invocation".into()))?;
-        let before = fixture.2.metadata()?;
-        use std::os::unix::fs::FileExt;
-        if before.len() > 16 * 1024 * 1024 {
-            return Err(CiError::Message(
-                "release fixture exceeds finite bound".into(),
-            ));
-        }
-        let mut bytes = vec![0u8; before.len() as usize];
-        fixture.2.read_exact_at(&mut bytes, 0)?;
-        let named_bytes = crate::linux_consumer_readiness::measured(&fixture.0, 16 * 1024 * 1024)
-            .map_err(CiError::Message)?;
-        let named = fs::symlink_metadata(&fixture.0)?;
-        let after = fixture.2.metadata()?;
-        let stamp = |value: &fs::Metadata| {
-            (
-                value.dev(),
-                value.ino(),
-                value.len(),
-                value.ctime(),
-                value.ctime_nsec(),
-                value.nlink(),
-                value.uid(),
-                value.mode(),
-            )
-        };
-        if stamp(&before) != stamp(&after)
-            || stamp(&after) != stamp(&named)
-            || after.nlink() != 1
-            || after.uid() != 0
-            || after.mode() & 0o077 != 0
-            || named_bytes != bytes
-            || artifacts::checksum(&bytes) != fixture.1
-        {
-            return Err(CiError::Message(
-                "retained release fixture descriptor native identity/bytes changed".into(),
-            ));
-        }
-        let package = self.component_package.as_mut().ok_or_else(|| {
-            CiError::Message("native component package recovery owner absent".into())
-        })?;
-        let workspace = self
-            .component_workspace
-            .as_ref()
-            .ok_or_else(|| CiError::Message("native component original workspace absent".into()))?;
-        self.batch = Some(NativeRecipeBatch::execute(
-            parser,
-            operational,
-            &self.path,
-            &output,
-            run_id,
-            recipe_id,
-            target,
-            prefix,
-            work,
-            cleanup,
-            &fixture.0,
-            &fixture.1,
-            work_unix,
-            cleanup_unix,
-            |directory, cutoff| {
-                package.recover_component(
-                    workspace,
-                    directory,
-                    cutoff,
-                    work_unix,
-                    cleanup_unix,
-                    self.recovery_harness.as_ref().ok_or_else(|| {
-                        CiError::Message("original recovery harness owner absent".into())
-                    })?,
-                )
-            },
-        )?);
-        Ok(())
-    }
-
     pub fn outputs(&self) -> &Path {
         &self.path
     }
-    /// Retains the selected package/resource owner before the first install.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Preparation binds selected source, target, artifact root and both finite owner deadlines"
-    )]
-    pub fn prepare_operational_fixture(
-        &mut self,
-        operational: &MeasuredHarness,
-        scope_id: &str,
-        workspace: &Path,
-        identity: &crate::consumer_readiness_ledger::SourceIdentity,
-        target: &str,
-        artifact_root: &Path,
-        work: Instant,
-        cleanup: Instant,
-        work_unix: u64,
-        cleanup_unix: u64,
-    ) -> Result<super::linux_mixed_installed::ActivatedMixedPolicy> {
-        use std::os::unix::fs::DirBuilderExt;
-        self.verify_named()?;
-        if self.component_package.is_some() {
-            return Err(CiError::Message(
-                "original operational fixture package cannot be reacquired".into(),
-            ));
-        }
-        let cell = memcordon_readiness_verifier::ProductKey {
-            target: target.into(),
-            channel: "candidate-native".into(),
-        };
-        self.recovery_harness = Some(super::linux_recovery_harness::HeldRecoveryHarness::acquire(
-            operational,
-            identity,
-            &cell,
-            scope_id,
-            work_unix,
-            cleanup_unix,
-            &self.path.join("recovery-harness-owner.json"),
-        )?);
-        let admin = self.path.join("component-package-admin");
-        fs::DirBuilder::new().mode(0o700).create(&admin)?;
-        self.root.sync_all()?;
-        let payload = super::installed_consumer::materialize_native(
-            &workspace.join(".release/target"),
-            &admin,
-        )?;
-        if payload.source.commit() != identity.source_commit
-            || payload.source.version().to_string() != identity.version
-            || payload.distribution.target != target
-        {
-            return Err(CiError::Message(
-                "original operational fixture source/target differs".into(),
-            ));
-        }
-        let output = admin.join("native-package-evidence");
-        self.component_package = Some(
-            super::linux_native_package::NativeLinuxPackageLease::acquire(
-                self.recovery_harness.as_ref().ok_or_else(|| {
-                    CiError::Message("original recovery harness owner absent".into())
-                })?,
-                payload,
-                &admin,
-                &output,
-            )?,
-        );
-        self.component_workspace = Some(workspace.to_path_buf());
-        let activated = self
-            .component_package
-            .as_mut()
-            .expect("retained native package owner")
-            .install_and_prepare(
-                workspace,
-                identity,
-                &memcordon_readiness_verifier::ProductKey {
-                    target: target.into(),
-                    channel: "candidate-native".into(),
-                },
-                &admin,
-                artifact_root,
-                work,
-                cleanup,
-                work_unix,
-                cleanup_unix,
-                self.recovery_harness.as_ref().ok_or_else(|| {
-                    CiError::Message("original recovery harness owner absent".into())
-                })?,
-            )?;
-        let bytes = serde_json::to_vec(
-            &serde_json::json!({"contract":activated.contract,"registry":activated.registry}),
-        )?;
-        let fixture = self.path.join("release-fixture.json");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&fixture)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        self.root.sync_all()?;
-        self.component_fixture = Some((fixture, artifacts::checksum(&bytes), file));
-        Ok(activated)
-    }
 
-    pub fn component_fixture_acquisition(
-        &self,
-        deadline: Instant,
-    ) -> Result<NativeFixtureAcquisition> {
-        self.component_acquisition_loan(deadline, false)
-    }
-
-    pub fn component_package_owner(&self, deadline: Instant) -> Result<NativeFixtureAcquisition> {
-        self.component_acquisition_loan(deadline, true)
-    }
-
-    fn component_acquisition_loan(
-        &self,
-        deadline: Instant,
-        owner_only: bool,
-    ) -> Result<NativeFixtureAcquisition> {
-        use rustix::fs::{Mode, OFlags, openat};
-        use std::os::unix::fs::FileExt;
-        self.verify_named()?;
-        if self.component_package.is_none() || self.component_fixture.is_none() {
-            return Err(CiError::Message(
-                "native component fixture was not acquired".into(),
-            ));
-        }
-        let root_device = self.root.metadata()?.dev();
-        let mut directories = vec![self.root.try_clone()?];
-        let directory_names: &[&str] = if owner_only {
-            &["component-package-admin", "native-package-evidence"]
-        } else {
-            &[
-                "component-package-admin",
-                "native-package-evidence",
-                "resources",
-            ]
-        };
-        for &name in directory_names {
-            if Instant::now() >= deadline {
-                return Err(CiError::Message(
-                    "original fixture custody cutoff exhausted".into(),
-                ));
-            }
-            let file = File::from(
-                openat(
-                    directories.last().expect("held fixture parent"),
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let metadata = file.metadata()?;
-            if !metadata.is_dir()
-                || metadata.uid() != 0
-                || metadata.mode() & 0o022 != 0
-                || metadata.dev() != root_device
-                || metadata.nlink() == 0
-            {
-                return Err(CiError::Message(
-                    "native fixture acquisition ancestry differs".into(),
-                ));
-            }
-            directories.push(file);
-        }
-        fn bytes(file: &File, bound: u64, deadline: Instant) -> Result<Vec<u8>> {
-            let mut result = Vec::new();
-            let mut chunk = [0u8; 65536];
-            loop {
-                if Instant::now() >= deadline {
-                    return Err(CiError::Message(
-                        "original fixture readback cutoff exhausted".into(),
-                    ));
-                }
-                let count = file.read_at(&mut chunk, result.len() as u64)?;
-                if count == 0 {
-                    break;
-                }
-                if result.len() as u64 + count as u64 > bound {
-                    return Err(CiError::Message(
-                        "native fixture record exceeds bound".into(),
-                    ));
-                }
-                result.extend_from_slice(&chunk[..count]);
-            }
-            Ok(result)
-        }
-        let parent = directories.last().expect("held original resource parent");
-        let mut entries = Vec::new();
-        let mut files = Vec::new();
-        let mut original_metadata = Vec::new();
-        let stamp = |metadata: &std::fs::Metadata| {
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.len(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-                metadata.nlink(),
-                metadata.uid(),
-                metadata.mode(),
-            )
-        };
-        let leaves: &[(&str, u64)] = if owner_only {
-            &[("native-package-owner.json", 16 * 1024 * 1024)]
-        } else {
-            &[
-                ("owned-resources-acquired.json", 16 * 1024 * 1024u64),
-                ("exclusive-account-intent.json", 1024 * 1024),
-                ("exclusive-account-getent.bin", 1024 * 1024),
-                ("exclusive-group-getent.bin", 1024 * 1024),
-            ]
-        };
-        for &(name, bound) in leaves {
-            let file = File::from(
-                openat(
-                    parent,
-                    name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let before = file.metadata()?;
-            if !before.is_file()
-                || before.uid() != 0
-                || before.mode() & 0o022 != 0
-                || before.nlink() != 1
-                || before.len() > bound
-                || before.dev() != root_device
-            {
-                return Err(CiError::Message(
-                    "native fixture record type/protection differs".into(),
-                ));
-            }
-            let actual = bytes(&file, bound, deadline)?;
-            let named = File::from(
-                openat(
-                    parent,
-                    name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let named_metadata = named.metadata()?;
-            let after = file.metadata()?;
-            if actual.len() as u64 != before.len()
-                || stamp(&before) != stamp(&after)
-                || stamp(&before) != stamp(&named_metadata)
-                || bytes(&named, bound, deadline)? != actual
-                || stamp(&before) != stamp(&file.metadata()?)
-            {
-                return Err(CiError::Message(
-                    "native fixture record changed through held readback".into(),
-                ));
-            }
-            files.push(file);
-            original_metadata.push(before);
-            entries.push((name.to_owned(), actual));
-        }
-        for (index, name) in directory_names.iter().copied().enumerate() {
-            let named = File::from(
-                openat(
-                    &directories[index],
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let expected = directories[index + 1].metadata()?;
-            let actual = named.metadata()?;
-            if (
-                expected.dev(),
-                expected.ino(),
-                expected.uid(),
-                expected.mode(),
-            ) != (actual.dev(), actual.ino(), actual.uid(), actual.mode())
-                || actual.nlink() == 0
-                || actual.uid() != 0
-                || actual.mode() & 0o022 != 0
-                || actual.dev() != root_device
-            {
-                return Err(CiError::Message(
-                    "native fixture named ancestor changed".into(),
-                ));
-            }
-        }
-        for (index, (name, actual)) in entries.iter().enumerate() {
-            let named = File::from(
-                openat(
-                    parent,
-                    name.as_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let expected = stamp(&original_metadata[index]);
-            if stamp(&files[index].metadata()?) != expected
-                || stamp(&named.metadata()?) != expected
-                || bytes(&files[index], actual.len() as u64, deadline)? != *actual
-                || bytes(&named, actual.len() as u64, deadline)? != *actual
-                || stamp(&files[index].metadata()?) != expected
-                || stamp(&named.metadata()?) != expected
-            {
-                return Err(CiError::Message(
-                    "native fixture final named/held record changed".into(),
-                ));
-            }
-        }
-        for (index, name) in directory_names.iter().copied().enumerate() {
-            if Instant::now() >= deadline {
-                return Err(CiError::Message(
-                    "original fixture final custody cutoff exhausted".into(),
-                ));
-            }
-            let named = File::from(
-                openat(
-                    &directories[index],
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?,
-            );
-            let held = directories[index + 1].metadata()?;
-            let actual = named.metadata()?;
-            if (held.dev(), held.ino(), held.uid(), held.mode())
-                != (actual.dev(), actual.ino(), actual.uid(), actual.mode())
-                || held.nlink() == 0
-                || actual.nlink() == 0
-                || actual.uid() != 0
-                || actual.mode() & 0o022 != 0
-                || actual.dev() != root_device
-            {
-                return Err(CiError::Message(
-                    "native fixture final ancestor changed".into(),
-                ));
-            }
-        }
-        self.verify_named()?;
-        Ok(NativeFixtureAcquisition {
-            entries,
-            _files: files,
-            _directories: directories,
-            original_metadata,
-            directory_names: directory_names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
-        })
-    }
     pub fn failures(&self) -> &[String] {
         self.batch
             .as_ref()
@@ -1369,16 +854,6 @@ impl NativeAdminScope {
     pub fn settle(&mut self, deadline: Instant) -> Result<()> {
         let mut failures = Vec::new();
         if let Some(Err(error)) = self.batch.as_mut().map(|batch| batch.settle(deadline)) {
-            failures.push(error.to_string());
-        }
-        if let Some(Err(error)) = self.component_package.as_mut().map(|package| {
-            package.finalize(
-                self.component_workspace
-                    .as_deref()
-                    .expect("retained original package workspace"),
-                deadline,
-            )
-        }) {
             failures.push(error.to_string());
         }
         for descriptor in &self.recovered {
@@ -1477,10 +952,6 @@ impl NativeAdminScope {
                 .batch
                 .as_ref()
                 .is_some_and(|batch| !batch.owners.is_empty())
-            || self
-                .component_package
-                .as_ref()
-                .is_some_and(|package| !package.native_settled())
         {
             return Err(CiError::Message(
                 "native administrator scope retains process/capture/publication/package owners"
@@ -1600,8 +1071,20 @@ impl NativeAdminScope {
             }
         }
         File::open(parent)?.sync_all()?;
-        self.retirement
-            .retire_admin_sources(&self.path, metadata.dev(), metadata.ino(), deadline)
+        if Instant::now() >= deadline {
+            return Err(CiError::Message(
+                "native source retirement cutoff exhausted".into(),
+            ));
+        }
+        super::linux_current_lease::retire_fixture_tree(
+            &self.path,
+            &serde_json::json!({"device":metadata.dev(),"inode":metadata.ino()}),
+            deadline,
+        )?;
+        Ok(
+            serde_json::json!({"format":"memcordon.native-source-retirement","revision":1,
+            "path":self.path,"device":metadata.dev(),"inode":metadata.ino(),"absent":true}),
+        )
     }
 }
 
@@ -1613,158 +1096,6 @@ pub struct NativeRecipeBatch {
 }
 
 impl NativeRecipeBatch {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The native recipe retains every measured owner and independent finite phase bound"
-    )]
-    pub fn execute(
-        parser: &MeasuredHarness,
-        operational: &MeasuredHarness,
-        workspace: &Path,
-        output: &Path,
-        run_id: &str,
-        recipe_id: &str,
-        target: &str,
-        artifact_prefix: &str,
-        work_deadline: Instant,
-        cleanup_deadline: Instant,
-        fixture_path: &Path,
-        fixture_sha256: &str,
-        work_unix: u64,
-        cleanup_unix: u64,
-        mut recover: impl FnMut(&Path, Instant) -> Result<()>,
-    ) -> Result<Self> {
-        if run_id.is_empty()
-            || recipe_id.is_empty()
-            || target != super::distribution::native_target()?
-            || !matches!(
-                target,
-                "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
-            )
-            || artifact_prefix.is_empty()
-            || artifact_prefix
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
-            || artifact_prefix.contains(['\\', ':'])
-            || work_deadline > cleanup_deadline
-        {
-            return Err(CiError::Message(
-                "native component batch association or original deadline differs".into(),
-            ));
-        }
-        protected_directory(output)?;
-        let mut batch = Self {
-            failures: Vec::new(),
-            owners: Vec::new(),
-        };
-        let recipes = [
-            (
-                parser,
-                "native_index_mutations_emit_actual_parser_receipts",
-                "index-parser",
-            ),
-            (
-                parser,
-                "operational_parser_receipts::native_operational_parser_mutations_emit_actual_receipts",
-                "operational-parser",
-            ),
-            (
-                operational,
-                "native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts",
-                "filter",
-            ),
-            (
-                operational,
-                "native_versions::native_version_vectors_emit_actual_component_receipts",
-                "versions",
-            ),
-            (
-                operational,
-                "private_attempt::durable_journal_barriers_emit_actual_component_receipts",
-                "journal",
-            ),
-            (
-                operational,
-                "native_mixed_release::native_leased_release_emit_actual_component_receipt",
-                "release",
-            ),
-            (
-                operational,
-                "native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt",
-                "account-retirement",
-            ),
-            (
-                operational,
-                "native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt",
-                "lost-terminal",
-            ),
-        ];
-        let mut prepared = Vec::new();
-        for (harness, test, name) in recipes {
-            let directory = output.join(name);
-            let mut challenge = [0u8; 32];
-            File::open("/dev/urandom")?.read_exact(&mut challenge)?;
-            let mut value = serde_json::json!({"run_id":run_id,"recipe_id":recipe_id,
-                "native_target":target,"artifact_root":directory,"artifact_prefix":format!("{artifact_prefix}/{name}"),"challenge":challenge});
-            if matches!(name, "release" | "account-retirement" | "lost-terminal") {
-                value["fixture_path"] = serde_json::to_value(fixture_path)?;
-                value["fixture_sha256"] = serde_json::json!(fixture_sha256);
-                value["work_deadline_unix_millis"] = serde_json::json!(work_unix);
-                value["cleanup_deadline_unix_millis"] = serde_json::json!(cleanup_unix);
-            }
-            let input = serde_json::to_vec(&value)?;
-            prepared.push((harness, test, directory, input));
-        }
-        for (harness, test, directory, input) in prepared {
-            if Instant::now() >= work_deadline {
-                batch
-                    .failures
-                    .push(format!("{test}: original native work deadline exhausted"));
-                break;
-            }
-            let mut owner = match NativeTestOwner::spawn(harness, test, workspace, &directory) {
-                Ok(owner) => owner,
-                Err(failure) => {
-                    batch.failures.push(format!("{test}: {}", failure.detail));
-                    if let Some(owner) = failure.owner
-                        && !batch.settle_refused(test, owner, cleanup_deadline)
-                    {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            let outcome=owner.deliver(&input).and_then(|()|if test=="native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt"{owner.await_account_boundary(&input,work_deadline).and_then(|()|owner.finish(cleanup_deadline))}else{owner.finish(work_deadline)});
-            if let Err(error) = outcome {
-                batch.failures.push(format!("{test}: {error}"));
-                if let Err(error) = owner.stop() {
-                    batch.failures.push(format!("{test}: native stop: {error}"));
-                }
-                if let Err(error) = owner.finish(cleanup_deadline) {
-                    batch
-                        .failures
-                        .push(format!("{test}: native settlement: {error}"));
-                }
-            }
-            if !owner.all_native_publications_settled() {
-                batch.owners.push((test.to_owned(), owner));
-                break;
-            } else if let Some(Err(error)) = matches!(
-                test,
-                "native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt"
-                    | "native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt"
-            )
-            .then(|| recover(&directory, cleanup_deadline))
-            {
-                batch
-                    .failures
-                    .push(format!("{test}: persisted native recovery: {error}"));
-                break;
-            }
-        }
-        Ok(batch)
-    }
-
     pub fn settle(&mut self, deadline: Instant) -> Result<()> {
         let mut remaining = Vec::new();
         for (name, mut owner) in self.owners.drain(..) {
@@ -1854,7 +1185,36 @@ fn capture(reader: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec
 }
 
 pub(crate) fn protected_directory(path: &Path) -> Result<Vec<File>> {
-    super::linux_recovery_harness::protected_directory(path)
+    if !path.is_absolute() {
+        return Err(CiError::Message(
+            "native component path must be absolute".into(),
+        ));
+    }
+    let mut current = PathBuf::from("/");
+    let mut held = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => (),
+            std::path::Component::Normal(name) => current.push(name),
+            _ => {
+                return Err(CiError::Message(
+                    "native component path is not normalized".into(),
+                ));
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&current)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(CiError::Message(
+                "native component ancestry is not protected".into(),
+            ));
+        }
+        held.push(file);
+    }
+    Ok(held)
 }
 
 /// Copy only measured bytes into the administrator's protected native scope;
@@ -1884,6 +1244,7 @@ pub fn protect_harness(harness: &MeasuredHarness, destination: &Path) -> Result<
     file.write_all(&bytes)?;
     file.set_permissions(fs::Permissions::from_mode(0o555))?;
     file.sync_all()?;
+    let _readonly = super::native_executable::retain_readonly(&executable, file)?;
     ancestry
         .last()
         .ok_or_else(|| CiError::Message("native protection directory absent".into()))?
@@ -2166,120 +1527,6 @@ impl NativeTestOwner {
             && descriptors[0]
                 .revents()
                 .intersects(PollFlags::IN | PollFlags::HUP))
-    }
-
-    fn await_account_boundary(&mut self, input: &[u8], deadline: Instant) -> Result<()> {
-        memcordon_core::canonical_json::reject_duplicate_json_keys(input)
-            .map_err(CiError::Message)?;
-        let request: serde_json::Value = serde_json::from_slice(input)?;
-        let challenge: [u8; 32] = serde_json::from_value(request["challenge"].clone())?;
-        let path = self.output.join("account-boundary.json");
-        loop {
-            if self.exited()? {
-                return Err(CiError::Message(
-                    "native worker exited before actual account boundary".into(),
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(CiError::Message(
-                    "original account boundary deadline exhausted".into(),
-                ));
-            }
-            match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-                Ok(_) => {
-                    let bytes = crate::linux_consumer_readiness::measured(&path, 4 * 1024 * 1024)
-                        .map_err(CiError::Message)?;
-                    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
-                        .map_err(CiError::Message)?;
-                    let observed: serde_json::Value = serde_json::from_slice(&bytes)?;
-                    if observed["format"] != "memcordon.linux-pre-account-native-boundary"
-                        || observed["revision"] != 1
-                        || observed["worker"]["pid"] != self.process_id
-                        || observed["worker"]["start_time"].as_u64() != self.birth
-                        || observed["run_id"] != request["run_id"]
-                        || observed["recipe_id"] != request["recipe_id"]
-                        || observed["native_target"] != request["native_target"]
-                        || observed["challenge_sha256"] != artifacts::checksum(&challenge)
-                        || observed["fixture_sha256"] != request["fixture_sha256"]
-                        || observed["work_deadline_unix_millis"]
-                            != request["work_deadline_unix_millis"]
-                        || observed["cleanup_deadline_unix_millis"]
-                            != request["cleanup_deadline_unix_millis"]
-                    {
-                        return Err(CiError::Message(
-                            "actual held account-boundary association differs".into(),
-                        ));
-                    }
-                    let prepared_bytes = crate::linux_consumer_readiness::measured(
-                        &self.output.join("native-prepared.json"),
-                        4 * 1024 * 1024,
-                    )
-                    .map_err(CiError::Message)?;
-                    memcordon_core::canonical_json::reject_duplicate_json_keys(&prepared_bytes)
-                        .map_err(CiError::Message)?;
-                    let prepared: memcordon_core::mixed_observation::MixedPreparedObservationV2 =
-                        serde_json::from_slice(&prepared_bytes)?;
-                    prepared.validate().map_err(CiError::Message)?;
-                    let caller = prepared.caller;
-                    let image =
-                        File::open(Path::new("/proc").join(caller.pid.to_string()).join("exe"))?;
-                    let native = image.metadata()?;
-                    let expected = self.image.metadata()?;
-                    if (native.dev(), native.ino()) != (expected.dev(), expected.ino())
-                        || birth(caller.pid)? != caller.birth
-                    {
-                        return Err(CiError::Message(
-                            "crash caller native image/birth differs".into(),
-                        ));
-                    }
-                    let pid = rustix::process::Pid::from_raw(i32::try_from(caller.pid).map_err(
-                        |_| CiError::Message("crash caller PID exceeds native range".into()),
-                    )?)
-                    .ok_or_else(|| CiError::Message("crash caller PID absent".into()))?;
-                    let descriptor =
-                        rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-                            .map_err(std::io::Error::from)?;
-                    self.crash_helpers.push((caller, descriptor, image, false));
-                    let retained = self
-                        .crash_helpers
-                        .last()
-                        .expect("retained caller native owner");
-                    let named = File::open(
-                        Path::new("/proc")
-                            .join(retained.0.pid.to_string())
-                            .join("exe"),
-                    )?
-                    .metadata()?;
-                    let held = retained.2.metadata()?;
-                    use rustix::event::{PollFd, PollFlags, Timespec};
-                    let mut live = [PollFd::new(&retained.1, PollFlags::IN)];
-                    let count = rustix::event::poll(
-                        &mut live,
-                        Some(&Timespec {
-                            tv_sec: 0,
-                            tv_nsec: 0,
-                        }),
-                    )
-                    .map_err(std::io::Error::from)?;
-                    if count != 0
-                        || !live[0].revents().is_empty()
-                        || (named.dev(), named.ino()) != (held.dev(), held.ino())
-                        || (named.dev(), named.ino()) != (expected.dev(), expected.ino())
-                        || birth(retained.0.pid)? != retained.0.birth
-                    {
-                        return Err(CiError::Message(
-                            "held crash caller live executable/birth changed".into(),
-                        ));
-                    }
-                    self.publish_owned("native-crash-controller.json",&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-native-crash-intent","revision":1,"run_id":request["run_id"],"recipe_id":request["recipe_id"],"native_target":request["native_target"],"worker_pid":self.process_id,"worker_birth":self.birth,"worker_image_sha256":self.image_sha256,"boundary_sha256":artifacts::checksum(&bytes),"requested_signal":"SIGKILL","held_before_boundary":true,"caller":self.crash_helpers.last().expect("retained actual caller").0}))?)?;
-                    self.stop()?;
-                    return Ok(());
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
     }
 
     /// Borrowed cleanup is retryable; no error consumes the exact native owner.

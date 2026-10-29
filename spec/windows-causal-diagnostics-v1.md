@@ -8,7 +8,7 @@ integration must be qualified before a provider advertises this capability.
 The public projection omits caller tokens, nonces, process creation identities,
 private paths, raw messages, arguments and environment. Details are closed
 provider message identifiers or numeric count/limit facts. Native codes preserve
-their original domain and full bit pattern; legacy integers remain untyped.
+their original domain and full bit pattern; unknown-domain integers remain explicitly unclassified.
 
 The first observed failure is immutable. The journal retains the next eight
 events in observation order, then counts omissions with saturating arithmetic.
@@ -49,7 +49,7 @@ u16 tags; native-code encoding; phase u16; detail encoding; redacted and truncat
 boolean bytes; terminalization reference encoding.
 
 Native code uses byte 0 for absent; Win32, NTSTATUS, HRESULT, Winsock, errno and
-legacy untyped use bytes 1 through 6 followed by the native 32-bit value.
+unclassified native codes use bytes 1 through 6 followed by the native 32-bit value.
 Detail uses byte 0 for none, byte 1 followed by observed/limit u32 values, or byte
 2 followed by the safe-message u16 tag. Terminalization reference uses byte 0 for
 absent, byte 1 for the first error, or byte 2 followed by a u8 secondary index.

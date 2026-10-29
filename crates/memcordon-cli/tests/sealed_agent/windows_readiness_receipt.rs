@@ -128,7 +128,7 @@ pub fn begin(test_name: &str) -> Option<Context> {
         return None;
     }
     assert!(bytes.len() <= 4096, "native receipt input exceeds bound");
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes).unwrap();
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes).unwrap();
     let input: Input = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(input.test_name, test_name);
     assert!(input.artifact_root.is_absolute());
@@ -248,7 +248,7 @@ impl Context {
         self.finish_payload(payload);
     }
     pub fn finish_payload(self, payload: serde_json::Value) {
-        let receipt = serde_json::json!({"format":"memcordon.windows-native-component", "revision":1,
+        let receipt = serde_json::json!({"format":"memcordon.windows-native-component", "revision":2,
             "run_id":self.input.run_id, "recipe_id":self.input.recipe_id, "test_name":self.test_name,
             "native_target":self.input.native_target, "executable_sha256":self.input.executable_sha256,
             "payload":payload});

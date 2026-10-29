@@ -41,56 +41,36 @@ pub fn installed_selection(
     Ok(selected)
 }
 
-/// Admit only settled original loader refusals; this confers no launch authority.
 pub fn installed_trigger(
-    original: &memcordon_core::ResultV1,
+    original: &memcordon_core::ResultV3,
     provider: &memcordon_core::PublicProviderBindingV1,
 ) -> Result<bool> {
-    use memcordon_core::result_v1::{AuthorizationV1, CleanupStateV1, LaunchStateV1};
     use memcordon_core::{WindowsLoaderCleanupStatusV1, WindowsLoaderQualificationOutcomeV2};
-    if original
-        .provider_association
-        .as_ref()
-        .map(|association| &association.provider)
-        != Some(provider)
-    {
+    original.validate().map_err(CiError::Message)?;
+    if original.provider.as_ref() != Some(provider) {
         return Err(CiError::Message(
-            "installed diagnostic original provider differs".into(),
+            "current diagnostic original provider differs".into(),
         ));
     }
-    if original.authorization != AuthorizationV1::RejectedBeforeRelease
-        || original.launch.state != LaunchStateV1::NotCreated
-        || original.cleanup.state != CleanupStateV1::Complete
+    if original.release != memcordon_core::result_v3::ReleaseKnowledgeV3::NotReleased
+        || original.cleanup.state != memcordon_core::execution_facts::CleanupStateV1::Complete
     {
         return Ok(false);
     }
-    Ok(original.attempts.last().is_some_and(|attempt| {
-        let Some(failure) = attempt.operational_failure.as_ref() else {
-            return false;
-        };
-        if failure.provider_association != original.provider_association {
-            return false;
-        }
-        let Some(rejection) = failure.windows_rejection.as_ref() else {
-            return false;
-        };
-        let Some(WindowsLoaderQualificationOutcomeV2::Failed(loader)) =
-            rejection.loader_qualification.as_ref()
-        else {
-            return false;
-        };
-        rejection.is_consistent()
-            && !rejection.target_created
-            && !rejection.target_released
-            && rejection.code == "MCSPAWN-FAILED"
-            && loader.cleanup.status == WindowsLoaderCleanupStatusV1::Complete
-            && loader.stable_code == "loader-control-pipe-accept"
-            && loader.detail.contains("bootstrap_role=loader-control")
-            && attempt.error.as_ref().is_some_and(|error| {
-                error.code == "MCSPAWN-FAILED"
-                    && error.message.contains("bootstrap_role=loader-control")
-            })
-    }))
+    let Some(rejection) = &original.windows_rejection else {
+        return Ok(false);
+    };
+    let Some(WindowsLoaderQualificationOutcomeV2::Failed(loader)) = &rejection.loader_qualification
+    else {
+        return Ok(false);
+    };
+    Ok(rejection.is_consistent()
+        && !rejection.target_created
+        && !rejection.target_released
+        && rejection.code == "MCSPAWN-FAILED"
+        && loader.cleanup.status == WindowsLoaderCleanupStatusV1::Complete
+        && loader.stable_code == "loader-control-pipe-accept"
+        && loader.detail.contains("bootstrap_role=loader-control"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,7 +79,7 @@ pub struct DiagnosticDeadline {
     pub format: String,
     pub revision: u32,
     pub diagnostic_only: bool,
-    pub source: crate::consumer_readiness_ledger::SourceIdentity,
+    pub source: crate::readiness_identity::SourceIdentity,
     pub native_target: String,
     pub production_settlement_sha256: String,
     pub started_unix_millis: u64,
@@ -109,7 +89,7 @@ pub struct DiagnosticDeadline {
 
 impl DiagnosticDeadline {
     pub fn at(
-        source: crate::consumer_readiness_ledger::SourceIdentity,
+        source: crate::readiness_identity::SourceIdentity,
         target: String,
         settlement: String,
         now: u64,
@@ -201,7 +181,7 @@ impl DiagnosticDeadline {
 #[serde(deny_unknown_fields)]
 pub struct FrontendObservation {
     pub selection: memcordon_core::WindowsLoaderDiagnosticSelectionV1,
-    pub launch: Option<memcordon_core::WindowsLaunchRequestV1>,
+    pub launch: Option<memcordon_core::WindowsLaunchRequestV2>,
     pub caller: Option<memcordon_core::WindowsProcessIdentityV1>,
     pub attempt_id: Option<String>,
     pub request_sha256: Option<String>,
@@ -215,7 +195,7 @@ pub fn validate_frontend(
     selected: &memcordon_core::WindowsLoaderDiagnosticSelectionV1,
     provider: &memcordon_core::PublicProviderBindingV1,
 ) -> Result<serde_json::Value> {
-    use memcordon_core::WindowsProviderResponseV3;
+    use memcordon_core::WindowsProviderResponseV4;
     if &observation.selection != selected
         || observation.capture_failure.is_some()
         || observation.authenticated_provider_frames.len() > 16
@@ -267,16 +247,16 @@ pub fn validate_frontend(
         }
         memcordon_core::canonical_json::reject_duplicate_json_keys(bytes)
             .map_err(CiError::Message)?;
-        let response: WindowsProviderResponseV3 = serde_json::from_slice(bytes)?;
+        let response: WindowsProviderResponseV4 = serde_json::from_slice(bytes)?;
         match &response {
-            WindowsProviderResponseV3::Reject {
+            WindowsProviderResponseV4::Reject {
                 schema_version,
                 attempt_id,
                 nonce,
                 request_sha256,
                 rejection,
             } => {
-                if *schema_version != memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+                if *schema_version != memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
                     || attempt_id != &attempt
                     || nonce != &launch.nonce
                     || request_sha256 != &request
@@ -286,7 +266,7 @@ pub fn validate_frontend(
                     || rejection.target_released
                     || !matches!(
                         rejection.disposition,
-                        memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization { .. }
+                        memcordon_core::WindowsProviderRejectionDispositionV3::Preauthorization { .. }
                     )
                 {
                     return Err(CiError::Message(
@@ -344,7 +324,7 @@ pub fn validate_frontend(
                     "terminal_authority_sha256":crate::windows_causal_acceptance::sha256(response.terminal_authority_json()?.as_bytes())}),
                 );
             }
-            WindowsProviderResponseV3::TerminalRetiredV2(receipt) => {
+            WindowsProviderResponseV4::TerminalRetiredV2(receipt) => {
                 let digest = retained
                     .as_ref()
                     .and_then(|value| value["terminal_authority_sha256"].as_str())
@@ -361,26 +341,26 @@ pub fn validate_frontend(
                     serde_json::to_value(receipt)?;
                 retired = true;
             }
-            WindowsProviderResponseV3::TargetAuthorized { .. }
-            | WindowsProviderResponseV3::Terminal(_) => {
+            WindowsProviderResponseV4::TargetAuthorized { .. }
+            | WindowsProviderResponseV4::Terminal(_) => {
                 return Err(CiError::Message(
                     "diagnostic cannot authorize or complete a workload".into(),
                 ));
             }
-            WindowsProviderResponseV3::StreamsPrepared {
+            WindowsProviderResponseV4::StreamsPrepared {
                 schema_version,
                 attempt_id,
                 nonce,
                 request_sha256,
                 ..
             }
-            | WindowsProviderResponseV3::RelaysAbort {
+            | WindowsProviderResponseV4::RelaysAbort {
                 schema_version,
                 attempt_id,
                 nonce,
                 request_sha256,
             } => {
-                if *schema_version != memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+                if *schema_version != memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
                     || retained.is_some()
                     || attempt_id != &attempt
                     || nonce != &launch.nonce

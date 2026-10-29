@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use memcordon_ci::command::CommandSpec;
-use memcordon_ci::consumer_readiness_ledger::{self as ledger, CellEvidence, SourceIdentity};
-use memcordon_ci::producer_failure_forwarding;
+use memcordon_ci::consumer_readiness_current::{self as ledger, CellEvidenceV2 as CellEvidence};
+use memcordon_ci::readiness_identity::SourceIdentity;
 use memcordon_readiness_verifier::{JobOutcome, ProducerOrigin};
 use std::{fs, path::PathBuf, process::ExitCode};
 
@@ -31,10 +31,6 @@ fn cleanup_failures(
     }
     failures
 }
-
-#[cfg(test)]
-#[path = "../../tests/private/readiness_cleanup_observation.rs"]
-mod cleanup_observation_tests;
 
 fn command_failure(result: &memcordon_ci::Result<memcordon_testkit::ObservedOutput>) -> String {
     use memcordon_ci::command::bounded_excerpt;
@@ -362,7 +358,7 @@ fn run(operation: Operation) -> Result<(), String> {
                 if std::path::absolute(&identity).map_err(|e| e.to_string())?
                     != workspace.join(".release/readiness-identity.json")
                     || std::path::absolute(&manifest).map_err(|e| e.to_string())?
-                        != workspace.join("ci/consumer-readiness-v1.toml")
+                        != workspace.join("ci/consumer-readiness-v2.toml")
                 {
                     return Err(
                         "privileged seal inputs differ from fixed selected workspace roles".into(),
@@ -377,7 +373,7 @@ fn run(operation: Operation) -> Result<(), String> {
                     serde_json::from_slice(&identity_bytes).map_err(|e| e.to_string())?;
                 let manifest_bytes = seal::read_input(
                     &workspace,
-                    std::path::Path::new("ci/consumer-readiness-v1.toml"),
+                    std::path::Path::new("ci/consumer-readiness-v2.toml"),
                 )?;
                 let context = if rustix::process::geteuid().as_raw() == 0 {
                     let bytes = privileged_seal_context.as_deref().ok_or(
@@ -527,7 +523,7 @@ fn run(operation: Operation) -> Result<(), String> {
                     .push("acquisition wrapper recorded native runner/cleanup failure".into());
             }
             if cell.format != "memcordon.consumer-readiness.cell"
-                || cell.revision != 1
+                || cell.revision != 2
                 || serde_json::to_value(&cell.identity).map_err(|e| e.to_string())?
                     != serde_json::to_value(&identity).map_err(|e| e.to_string())?
             {
@@ -582,9 +578,9 @@ fn run(operation: Operation) -> Result<(), String> {
             };
             #[cfg(not(target_os = "linux"))]
             let manifest_bytes = fs::read(&manifest).map_err(|e| e.to_string())?;
-            let sealed = memcordon_readiness_verifier::ProducerManifest {
+            let sealed = memcordon_readiness_verifier::current::ProducerManifestV2 {
                 format: "memcordon.consumer-readiness.producer".into(),
-                revision: 1,
+                revision: 2,
                 job,
                 run_id: identity.run_id,
                 run_attempt,
@@ -769,16 +765,6 @@ fn run(operation: Operation) -> Result<(), String> {
             let acquisition_failed = !acquisition
                 .as_ref()
                 .is_ok_and(|observed| observed.status.success());
-            if acquisition_failed {
-                // Separate from the generic excerpt/error string: preserve a complete
-                // selected original record even when it exceeds the excerpt budget.
-                let stderr = acquisition
-                    .as_ref()
-                    .ok()
-                    .map(|output| output.stderr.as_slice());
-                let _ = producer_failure_forwarding::inspect(stderr)
-                    .write_to(&mut std::io::stderr().lock());
-            }
             let cleanup = CommandSpec::new(&driver, &cwd, std::time::Duration::from_secs(15 * 60))
                 .bounded_until(cutoff)
                 .arg("consumer-readiness-cleanup")
@@ -931,7 +917,7 @@ fn run(operation: Operation) -> Result<(), String> {
             origins,
         } => {
             let plan_value: serde_json::Value = read(&plan)?;
-            let (mut index, _) = memcordon_readiness_verifier::storage::decode_evidence(
+            let (mut index, _) = memcordon_readiness_verifier::current::storage::decode_evidence(
                 &serde_json::to_vec(&plan_value).map_err(|e| e.to_string())?,
             )?;
             if !index.artifacts.is_empty() {
@@ -976,17 +962,17 @@ fn run(operation: Operation) -> Result<(), String> {
                             Ok(_) => {
                                 let value: serde_json::Value = read(&producer_path)?;
                                 let (producer, storage) =
-                                    memcordon_readiness_verifier::storage::decode_producer(
+                                    memcordon_readiness_verifier::current::storage::decode_producer(
                                         &serde_json::to_vec(&value).map_err(|e| e.to_string())?,
                                     )?;
-                                memcordon_readiness_verifier::storage::validate_cell(
+                                memcordon_readiness_verifier::current::storage::validate_cell(
                                     &producer,
                                     &serde_json::to_vec(&cell).map_err(|e| e.to_string())?,
                                 )?;
                                 storage
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                memcordon_readiness_verifier::storage::StoragePlan::legacy(
+                                memcordon_readiness_verifier::storage::StoragePlan::direct(
                                     &cell.artifacts,
                                 )?
                             }

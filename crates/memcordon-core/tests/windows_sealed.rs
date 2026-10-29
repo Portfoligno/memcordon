@@ -1,24 +1,4 @@
-use memcordon_core::WindowsProviderResponseV1;
-use memcordon_core::{
-    BoundaryMechanismEvidence, BoundarySetupPhase, ChildTermination, CleanupSummary,
-    CredentialTransitionDisposition, ProviderRejectionEvidence, RestartSafetyProof, RunOutcome,
-    SupervisionErrorRecord, SupervisionPhase, WINDOWS_MAX_JOB_PROCESS_IDENTITIES,
-    WindowsAttemptRetainedV1, WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1,
-    WindowsCleanupProcessCreationEvidenceV1, WindowsDurableAttemptRecordV1,
-    WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1, WindowsLaunchBrokerRequestV1,
-    WindowsLauncherResponseV1, WindowsProcessIdentityV1, WindowsProviderProbeV1,
-    WindowsProviderReplacementQuiescenceV1, WindowsProviderRequestV1, WindowsPublicFrameFailureV1,
-    WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1, WindowsRelayEventV1,
-    WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1, WindowsReplayPendingV1,
-    WindowsSealedEvidenceV2, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
-    WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
-    WindowsTerminalizationCheckpointV1, WindowsTerminalizationOwnerV1,
-    WindowsTerminalizationStatusV1, decode_windows_command_line, encode_windows_command_line,
-    encode_windows_environment_block, parse_and_authenticate_windows_attempt_record,
-    parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,
-    validate_windows_stream_manifest, windows_attempt_transition_allowed,
-    windows_certification_argument_prelude_len, windows_provider_replacement_quiescence,
-};
+use memcordon_core::*;
 use sha2::{Digest, Sha256};
 
 fn sha256(bytes: &[u8]) -> String {
@@ -32,18 +12,6 @@ fn sha256(bytes: &[u8]) -> String {
             ]
         })
         .collect()
-}
-
-fn authenticate_signed_attempt_record(
-    record: &mut WindowsDurableAttemptRecordV1,
-) -> Result<WindowsDurableAttemptRecordV1, &'static str> {
-    record.integrity_sha256.clear();
-    record.integrity_sha256 = sha256(&serde_json::to_vec(record).unwrap());
-    parse_and_authenticate_windows_attempt_record(
-        &serde_json::to_vec(record).unwrap(),
-        &record.attempt_id,
-        &record.provider_generation,
-    )
 }
 
 fn probe() -> WindowsProviderProbeV1 {
@@ -499,65 +467,11 @@ fn windows_probe_requires_named_identity_and_actual_live_service_facts() {
 }
 
 #[test]
-fn windows_protocol_rejects_unknown_fields() {
-    let value = serde_json::json!({
-        "message": "probe",
-        "schema_version": 1,
-        "unexpected": true
-    });
-    assert!(serde_json::from_value::<WindowsProviderRequestV1>(value).is_err());
-}
-
-#[test]
-fn windows_protocol_rejects_retired_qualification_ingress_and_probe_shapes() {
-    for message in [
-        "qualification-begin",
-        "qualification-acquire",
-        "qualification-authorize-child",
-        "qualification-witness",
-        "qualification-end",
-    ] {
-        let value = serde_json::json!({"message": message, "schema_version": memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION});
-        assert!(
-            serde_json::from_value::<memcordon_core::WindowsProviderRequestV3>(value).is_err(),
-            "{message} is retired before request dispatch"
-        );
-    }
-    let old_probe = serde_json::json!({"kind":"probe", "schema_version":memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION, "qualification":{}, "provider_binding":probe().provider_binding});
-    assert!(
-        serde_json::from_value::<memcordon_core::WindowsProviderResponseV3>(old_probe).is_err()
-    );
-    let new_probe = serde_json::json!({"kind":"probe", "schema_version":memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION, "observation":probe()});
-    assert!(serde_json::from_value::<memcordon_core::WindowsProviderResponseV3>(new_probe).is_ok());
-}
-
-#[test]
-fn windows_launch_broker_protocol_rejects_restricted_diagnostic_token_relay() {
-    let error = serde_json::from_value::<WindowsLaunchBrokerRequestV1>(serde_json::json!({
-        "loader_restriction_canary": null
-    }))
-    .unwrap_err();
-    assert!(error.to_string().contains("loader_restriction_canary"));
-    assert!(error.to_string().contains("unknown field"));
-}
-
-fn serialized_response_limit<T: memcordon_core::WindowsResponseFrame + serde::Serialize>(
-    response: &T,
-) -> usize {
-    let encoded = serde_json::to_vec(response).unwrap();
-    let prefix = &encoded[..encoded
-        .len()
-        .min(memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES)];
-    T::frame_limit(prefix).unwrap()
-}
-
-#[test]
 fn windows_retained_and_retired_outcomes_require_exact_typed_bindings() {
     let attempt_id = "a".repeat(64);
     let request_sha256 = "b".repeat(64);
     let terminal_response_sha256 = "c".repeat(64);
-    let retained = WindowsAttemptRetainedV1 {
-        schema_version: 2,
+    let retained = WindowsRetainedMetadata {
         causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
         provider_failure: None,
         diagnostic_availability:
@@ -581,18 +495,6 @@ fn windows_retained_and_retired_outcomes_require_exact_typed_bindings() {
         WindowsRelayPhaseV1::AwaitAbortRejection,
     ));
     let mut contradictory = retained.clone();
-    assert_eq!(
-        serialized_response_limit(&WindowsProviderResponseV1::AttemptRetained(
-            retained.clone()
-        )),
-        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
-    );
-    assert_eq!(
-        serialized_response_limit(&WindowsLauncherResponseV1::AttemptRetained(
-            retained.clone()
-        )),
-        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
-    );
     contradictory.cleanup_complete = false;
     assert!(!contradictory.is_consistent_for(
         &attempt_id,
@@ -601,8 +503,7 @@ fn windows_retained_and_retired_outcomes_require_exact_typed_bindings() {
         WindowsRelayPhaseV1::AwaitAbortRejection,
     ));
 
-    let retired = WindowsTerminalRetiredV1 {
-        schema_version: 1,
+    let retired = WindowsRetirementMetadata {
         attempt_id: attempt_id.clone(),
         nonce: "nonce".to_owned(),
         request_sha256: request_sha256.clone(),
@@ -678,212 +579,6 @@ fn windows_attempt_state_machine_rejects_authorization_shortcuts() {
 }
 
 #[test]
-fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
-    let digest = sha256(&[]);
-    let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 3,
-        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
-        diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(0).unwrap(),
-        record_revision: 1,
-        workload_admission: None,
-        workload_checkpoint: None,
-        provider_incarnation: digest.clone(),
-        attempt_id: digest.clone(),
-        provider_generation: "windows-provider-generation".to_owned(),
-        boot_identity: "boot-identity".to_owned(),
-        request_sha256: digest.clone(),
-        caller_process_identity: WindowsProcessIdentityV1 {
-            process_id: 17,
-            creation_time_100ns: 23,
-        },
-        caller_token_sha256: digest.clone(),
-        job_identity_sha256: digest.clone(),
-        guardian_identity: None,
-        target_identity: None,
-        state: WindowsAttemptStateV1::BoundaryCreated,
-        authorization_unix_millis: None,
-        resume_attempted: false,
-        target_released: false,
-        cleanup_state: WindowsDurableCleanupStateV1::default(),
-        terminal_response_json: None,
-        terminal_disposition: None,
-        terminalization: WindowsTerminalizationStatusV1 {
-            schema_version: 1,
-            owner: WindowsTerminalizationOwnerV1::LauncherWorker,
-            sequence: 1,
-            checkpoint: WindowsTerminalizationCheckpointV1::Executing,
-            last_error: None,
-            secondary_errors: Vec::new(),
-        },
-        integrity_sha256: String::new(),
-    };
-    record.integrity_sha256 = sha256(&serde_json::to_vec(&record).unwrap());
-    let bytes = serde_json::to_vec(&record).unwrap();
-    assert!(
-        parse_and_authenticate_windows_attempt_record(
-            &bytes,
-            &record.attempt_id,
-            &record.provider_generation,
-        )
-        .is_ok()
-    );
-
-    let mut tampered = record.clone();
-    tampered.target_released = true;
-    assert!(
-        parse_and_authenticate_windows_attempt_record(
-            &serde_json::to_vec(&tampered).unwrap(),
-            &record.attempt_id,
-            &record.provider_generation,
-        )
-        .is_err()
-    );
-
-    let mut pending = record.clone();
-    pending.state = WindowsAttemptStateV1::Empty;
-    pending.authorization_unix_millis = Some(1);
-    pending.resume_attempted = true;
-    pending.target_released = true;
-    pending.target_identity = Some(WindowsProcessIdentityV1 {
-        process_id: 29,
-        creation_time_100ns: 31,
-    });
-    pending.cleanup_state = WindowsDurableCleanupStateV1 {
-        termination_requested: true,
-        active_processes_zero: true,
-        guardian_reaped: true,
-        final_handles_closed: true,
-    };
-    let mut terminal = complete_windows_certification_terminal();
-    terminal.attempt_id = digest.clone();
-    terminal.request_sha256 = digest.clone();
-    pending.terminal_response_json =
-        Some(serde_json::to_string(&WindowsLauncherResponseV1::Terminal(terminal)).unwrap());
-    pending.terminal_disposition =
-        Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
-    pending.terminalization.sequence += 1;
-    pending.terminalization.checkpoint = WindowsTerminalizationCheckpointV1::OutboxStaged;
-    pending.integrity_sha256.clear();
-    pending.integrity_sha256 = sha256(&serde_json::to_vec(&pending).unwrap());
-    assert!(
-        parse_and_authenticate_windows_attempt_record(
-            &serde_json::to_vec(&pending).unwrap(),
-            &pending.attempt_id,
-            &pending.provider_generation,
-        )
-        .is_ok()
-    );
-
-    let mut mismatched_outbox = pending.clone();
-    let mut terminal = complete_windows_certification_terminal();
-    terminal.attempt_id = "d".repeat(64);
-    terminal.request_sha256 = digest.clone();
-    mismatched_outbox.terminal_response_json =
-        Some(serde_json::to_string(&WindowsLauncherResponseV1::Terminal(terminal)).unwrap());
-    mismatched_outbox.integrity_sha256.clear();
-    mismatched_outbox.integrity_sha256 = sha256(&serde_json::to_vec(&mismatched_outbox).unwrap());
-    assert!(
-        parse_and_authenticate_windows_attempt_record(
-            &serde_json::to_vec(&mismatched_outbox).unwrap(),
-            &mismatched_outbox.attempt_id,
-            &mismatched_outbox.provider_generation,
-        )
-        .is_err()
-    );
-
-    let mut unknown = serde_json::to_value(record).unwrap();
-    unknown["unknown"] = serde_json::json!(true);
-    assert!(
-        parse_and_authenticate_windows_attempt_record(
-            &serde_json::to_vec(&unknown).unwrap(),
-            &digest,
-            "windows-provider-generation",
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn windows_attempt_record_authenticates_only_typed_preauthorization_abort_release() {
-    let digest = sha256(&[]);
-    let process_identity = WindowsProcessIdentityV1 {
-        process_id: 17,
-        creation_time_100ns: 23,
-    };
-    let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 3,
-        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
-        diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(0).unwrap(),
-        record_revision: 1,
-        workload_admission: None,
-        workload_checkpoint: None,
-        provider_incarnation: digest.clone(),
-        attempt_id: digest.clone(),
-        provider_generation: "windows-provider-generation".to_owned(),
-        boot_identity: "boot-identity".to_owned(),
-        request_sha256: digest.clone(),
-        caller_process_identity: process_identity.clone(),
-        caller_token_sha256: digest.clone(),
-        job_identity_sha256: digest,
-        guardian_identity: Some(process_identity.clone()),
-        target_identity: Some(process_identity),
-        state: WindowsAttemptStateV1::TargetCreatedSuspended,
-        authorization_unix_millis: None,
-        resume_attempted: true,
-        target_released: false,
-        cleanup_state: WindowsDurableCleanupStateV1::default(),
-        terminal_response_json: None,
-        terminal_disposition: None,
-        terminalization: WindowsTerminalizationStatusV1 {
-            schema_version: 1,
-            owner: WindowsTerminalizationOwnerV1::LauncherWorker,
-            sequence: 1,
-            checkpoint: WindowsTerminalizationCheckpointV1::Executing,
-            last_error: None,
-            secondary_errors: Vec::new(),
-        },
-        integrity_sha256: String::new(),
-    };
-
-    assert_eq!(
-        authenticate_signed_attempt_record(&mut record),
-        Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-resume-without-authorization")
-    );
-
-    record.resume_attempted = false;
-    record.state = WindowsAttemptStateV1::Terminating;
-    record.cleanup_state.termination_requested = true;
-    record.terminal_disposition = Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort);
-    assert!(authenticate_signed_attempt_record(&mut record).is_ok());
-
-    record.target_released = true;
-    assert!(authenticate_signed_attempt_record(&mut record).is_ok());
-
-    let mut untyped_release = record.clone();
-    untyped_release.terminal_disposition = None;
-    assert_eq!(
-        authenticate_signed_attempt_record(&mut untyped_release),
-        Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-release-without-intent")
-    );
-
-    let mut before_target_creation = record.clone();
-    before_target_creation.target_identity = None;
-    before_target_creation.target_released = false;
-    assert!(authenticate_signed_attempt_record(&mut before_target_creation).is_ok());
-
-    authenticate_signed_attempt_record(&mut record).unwrap();
-    record.boot_identity = "tampered-boot-identity".to_owned();
-    assert_eq!(
-        parse_and_authenticate_windows_attempt_record(
-            &serde_json::to_vec(&record).unwrap(),
-            &record.attempt_id,
-            &record.provider_generation,
-        ),
-        Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=integrity-digest")
-    );
-}
-
-#[test]
 fn windows_security_descriptor_text_rejects_malformed_ace_shapes() {
     assert!(validate_windows_security_descriptor_text("D:P(A;;GA;;;SY)(A;;GR;;;AU)").is_ok());
     assert!(validate_windows_security_descriptor_text("O:SYD:P(A;;GA;;;SY)").is_ok());
@@ -919,7 +614,6 @@ fn windows_security_descriptor_text_rejects_malformed_ace_shapes() {
 #[test]
 fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
     let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
         provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-JOB".to_owned(),
@@ -931,8 +625,6 @@ fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
         target_released: false,
         cleanup_attempted: false,
         restart_safety: RestartSafetyProof::default(),
-        terminal_ack_required: false,
-        terminal_receipt: None,
     };
     let record = SupervisionErrorRecord {
         native_startup: None,
@@ -954,123 +646,6 @@ fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
     let mut windows_specific_wrapper = record;
     windows_specific_wrapper.code = "MCSEALED-WINDOWS-REJECTION".to_owned();
     assert!(!windows_specific_wrapper.is_consistent());
-}
-
-#[test]
-fn windows_posttarget_rejection_retains_truthful_terminal_receipt() {
-    let terminal = complete_windows_certification_terminal();
-    let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
-        provider_failure: None,
-        schema_version: 1,
-        code: "MCSEALED-WINDOWS-CLEANUP-PRODUCER-IO".to_owned(),
-        phase: BoundarySetupPhase::Retirement,
-        detail: "producer_phase=StartObserved attempted_phase=SpawnEntered operation=state-publish-rename"
-            .to_owned(),
-        os_code: Some(5),
-        loader_qualification: None,
-        target_created: true,
-        target_released: true,
-        cleanup_attempted: true,
-        restart_safety: terminal.restart_safety.clone(),
-        terminal_ack_required: true,
-        terminal_receipt: Some(Box::new(terminal.clone())),
-    };
-    assert!(rejection.is_consistent());
-    let round_trip: ProviderRejectionEvidence =
-        serde_json::from_slice(&serde_json::to_vec(&rejection).unwrap()).unwrap();
-    assert_eq!(round_trip.terminal_receipt.as_deref(), Some(&terminal));
-
-    let mut malformed_loader_evidence = rejection.clone();
-    malformed_loader_evidence.loader_qualification =
-        Some(memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
-            memcordon_core::WindowsLoaderReadyEvidenceV1 {
-                schema_version: 1,
-                launch_plan_sha256: String::from("not-a-sha256"),
-                launch_plan_json: None,
-                elapsed_millis: 1,
-            },
-        ));
-    assert!(!malformed_loader_evidence.is_consistent());
-
-    let mut contradictory = rejection;
-    contradictory.target_released = false;
-    assert!(!contradictory.is_consistent());
-}
-
-#[test]
-fn windows_preauthorization_abort_can_require_ack_without_target_receipt() {
-    let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
-        provider_failure: None,
-        schema_version: 1,
-        code: "MCSEALED-WINDOWS-LAUNCH".to_owned(),
-        phase: BoundarySetupPhase::TargetCreation,
-        detail: "target creation failed after stream publication".to_owned(),
-        os_code: Some(5),
-        loader_qualification: None,
-        target_created: false,
-        target_released: false,
-        cleanup_attempted: true,
-        restart_safety: RestartSafetyProof {
-            direct_child_reaped: true,
-            workload_empty: Some(true),
-            helpers_reaped: true,
-            containment_removed: true,
-            containment_incapable_of_live_members: true,
-            sealed_boundary_retired: true,
-            errors: Vec::new(),
-        },
-        terminal_ack_required: true,
-        terminal_receipt: None,
-    };
-    assert!(rejection.is_consistent());
-    let encoded = serde_json::to_value(&rejection).unwrap();
-    assert_eq!(encoded["terminal_ack_required"], true);
-
-    let mut unsafe_ack = rejection;
-    unsafe_ack.cleanup_attempted = false;
-    assert!(!unsafe_ack.is_consistent());
-}
-
-#[test]
-fn windows_terminal_process_identity_inventory_is_bounded_and_unique() {
-    let mut receipt = WindowsTerminalReceiptV1 {
-        policy_enforcement: Default::default(),
-        schema_version: 1,
-        attempt_id: "a".repeat(64),
-        nonce: "nonce".to_owned(),
-        request_sha256: "b".repeat(64),
-        child_pid: 1,
-        duration_millis: 1,
-        authorization_offset_millis: 0,
-        job_total_processes: 1,
-        job_process_identities: (0..WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
-            .map(|index| memcordon_core::WindowsProcessIdentityV1 {
-                process_id: u32::try_from(index + 1).unwrap(),
-                creation_time_100ns: u64::try_from(index).unwrap(),
-            })
-            .collect(),
-        cleanup_process_creation: None,
-        outcome: RunOutcome::Exited {
-            child: ChildTermination::ExitCode { code: 0 },
-            peak: None,
-            cleanup: CleanupSummary::default(),
-        },
-        restart_safety: RestartSafetyProof::default(),
-        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(Box::default()),
-    };
-    assert!(receipt.process_identity_inventory_is_bounded());
-    receipt
-        .job_process_identities
-        .push(memcordon_core::WindowsProcessIdentityV1 {
-            process_id: u32::try_from(WINDOWS_MAX_JOB_PROCESS_IDENTITIES + 1).unwrap(),
-            creation_time_100ns: 0,
-        });
-    assert!(!receipt.process_identity_inventory_is_bounded());
-    receipt.job_process_identities.pop();
-    receipt.job_process_identities[1] = receipt.job_process_identities[0].clone();
-    assert!(!receipt.process_identity_inventory_is_bounded());
 }
 
 #[test]
@@ -1136,177 +711,22 @@ fn windows_relay_phase_rejects_skipped_duplicate_reversed_and_late_abort_events(
     assert_eq!(abort, Phase::Terminal);
 }
 
-fn complete_windows_certification_terminal() -> WindowsTerminalReceiptV1 {
-    let attempt_binding = format!("attempt-{}", "a".repeat(64));
-    WindowsTerminalReceiptV1 {
-        policy_enforcement: Default::default(),
-        schema_version: 1,
-        attempt_id: "b".repeat(64),
-        nonce: "nonce".to_owned(),
-        request_sha256: "c".repeat(64),
-        child_pid: 10,
-        duration_millis: 1,
-        authorization_offset_millis: 1,
-        job_total_processes: 18,
-        job_process_identities: vec![WindowsProcessIdentityV1 {
-            process_id: 10,
-            creation_time_100ns: 10,
-        }],
-        cleanup_process_creation: Some(WindowsCleanupProcessCreationEvidenceV1 {
-            schema_version: 1,
-            attempt_binding,
-            attempted_after_terminating_transition: true,
-            child_created: true,
-            child_job_membership_verified: true,
-            child_identity: WindowsProcessIdentityV1 {
-                process_id: 11,
-                creation_time_100ns: 11,
-            },
-            total_processes_before: 17,
-            total_processes_after: 18,
-            final_active_processes_zero: true,
-        }),
-        outcome: RunOutcome::Exited {
-            child: ChildTermination::ExitCode { code: 0 },
-            peak: None,
-            cleanup: CleanupSummary::default(),
-        },
-        restart_safety: RestartSafetyProof {
-            direct_child_reaped: true,
-            workload_empty: Some(true),
-            helpers_reaped: true,
-            containment_removed: true,
-            containment_incapable_of_live_members: true,
-            sealed_boundary_retired: true,
-            errors: Vec::new(),
-        },
-        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
-            WindowsSealedEvidenceV2 {
-                schema_version: 2,
-                service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
-                caller_token_authenticated: true,
-                initial_target_token_matches_caller: true,
-                credential_transition_disposition:
-                    CredentialTransitionDisposition::PreserveCallerEnvelope,
-                job_membership_independent_of_token: true,
-                job_created: true,
-                job_limits_verified: true,
-                kill_on_close_verified: true,
-                breakaway_denied: true,
-                completion_port_associated: true,
-                guardian_ready: true,
-                target_created_suspended: true,
-                job_list_applied_at_creation: true,
-                handle_list_applied_at_creation: true,
-                target_job_membership_verified: true,
-                target_still_suspended_during_verification: true,
-                inherited_handles_verified: true,
-                target_released: true,
-                terminate_job_invoked: true,
-                active_processes_zero: true,
-                direct_target_reaped: true,
-                relays_retired: true,
-                guardian_reaped: true,
-                final_job_handles_closed: true,
-                loader_qualification: None,
-                frontend_delivery: None,
-                frontend_provider_association: None,
-            },
-        )),
-    }
-}
-
-#[test]
-fn maximum_native_process_inventory_fits_terminal_transport_reservation() {
-    let mut terminal = complete_windows_certification_terminal();
-    terminal.job_process_identities = (1..=WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
-        .map(|index| WindowsProcessIdentityV1 {
-            process_id: u32::try_from(index).unwrap(),
-            creation_time_100ns: u64::MAX,
-        })
-        .collect();
-    terminal.job_total_processes = u32::MAX;
-    terminal.duration_millis = u64::MAX;
-    terminal.authorization_offset_millis = u64::MAX;
-    assert!(terminal.process_identity_inventory_shape_is_bounded());
-    assert_eq!(
-        serialized_response_limit(&WindowsProviderResponseV1::Terminal(terminal.clone())),
-        memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
-    );
-    let response = WindowsLauncherResponseV1::Terminal(terminal);
-    assert_eq!(
-        serialized_response_limit(&response),
-        memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
-    );
-    let encoded = response.terminal_authority_json().unwrap();
-    assert!(encoded.len() < memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES);
-    memcordon_core::validate_record_json_structure(encoded.as_bytes()).unwrap();
-}
-
-#[test]
-fn windows_certification_terminal_validator_names_cross_field_failures() {
-    let complete = complete_windows_certification_terminal();
-    let binding = complete
-        .cleanup_process_creation
-        .as_ref()
-        .unwrap()
-        .attempt_binding
-        .clone();
-    assert!(complete.validate_for_certification(&binding, 18).is_ok());
-
-    let mut wrong_binding = complete.clone();
-    wrong_binding
-        .cleanup_process_creation
-        .as_mut()
-        .unwrap()
-        .attempt_binding = "attempt-wrong".to_owned();
-    assert_eq!(
-        wrong_binding
-            .validate_for_certification(&binding, 18)
-            .unwrap_err(),
-        "cleanup_process_creation.attempt_binding"
-    );
-
-    let mut zero_identity = complete.clone();
-    zero_identity
-        .cleanup_process_creation
-        .as_mut()
-        .unwrap()
-        .child_identity
-        .process_id = 0;
-    assert_eq!(
-        zero_identity
-            .validate_for_certification(&binding, 18)
-            .unwrap_err(),
-        "cleanup_process_creation.child_identity.process_id"
-    );
-
-    let mut below_cleanup = complete.clone();
-    below_cleanup.job_total_processes = 17;
-    assert_eq!(
-        below_cleanup
-            .validate_for_certification(&binding, 17)
-            .unwrap_err(),
-        "job_total_processes.cleanup_floor"
-    );
-
-    let mut nonzero = complete;
-    if let RunOutcome::Exited { child, .. } = &mut nonzero.outcome {
-        *child = ChildTermination::ExitCode { code: 125 };
-    }
-    assert_eq!(
-        nonzero
-            .validate_for_certification(&binding, 18)
-            .unwrap_err(),
-        "outcome.child"
-    );
-}
-
 #[test]
 fn windows_cleanup_identity_schema_rejects_unknown_and_omitted_fields() {
-    let cleanup = complete_windows_certification_terminal()
-        .cleanup_process_creation
-        .unwrap();
+    let cleanup = WindowsCleanupProcessCreationEvidenceV1 {
+        schema_version: 1,
+        attempt_binding: format!("attempt-{}", sha256(b"cleanup-attempt")),
+        attempted_after_terminating_transition: true,
+        child_created: true,
+        child_job_membership_verified: true,
+        child_identity: WindowsProcessIdentityV1 {
+            process_id: 41,
+            creation_time_100ns: 73,
+        },
+        total_processes_before: 1,
+        total_processes_after: 2,
+        final_active_processes_zero: true,
+    };
     let mut unknown = serde_json::to_value(&cleanup).unwrap();
     unknown["unexpected"] = serde_json::json!(true);
     assert!(serde_json::from_value::<WindowsCleanupProcessCreationEvidenceV1>(unknown).is_err());
@@ -1352,8 +772,7 @@ fn windows_public_terminal_recovery_is_bound_peer_close_only_and_one_shot() {
 fn windows_public_terminal_pending_is_exactly_bound() {
     let digest = sha256(b"request");
     let attempt = sha256(b"attempt");
-    let pending = WindowsReplayPendingV1 {
-        schema_version: 3,
+    let pending = WindowsReplayMetadata {
         causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
         provider_failure: None,
         diagnostic_availability:
@@ -1380,14 +799,6 @@ fn windows_public_terminal_pending_is_exactly_bound() {
         },
         detail: "durable terminal is not staged".to_owned(),
     };
-    assert_eq!(
-        serialized_response_limit(&WindowsProviderResponseV1::ReplayPending(pending.clone())),
-        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
-    );
-    assert_eq!(
-        serialized_response_limit(&WindowsLauncherResponseV1::ReplayPending(pending.clone())),
-        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
-    );
     assert!(pending.is_consistent_for(
         &attempt,
         "nonce",
@@ -1410,64 +821,4 @@ fn windows_public_terminal_pending_is_exactly_bound() {
         recovery.begin_replay_after_bound_pending(),
         WindowsTerminalReplayDecisionV1::FailClosed,
     );
-}
-
-#[test]
-fn windows_loader_outcome_binds_optional_plan_json_to_its_digest() {
-    let digest = sha256(b"production-plan");
-    let plan_json = serde_json::json!({
-        "schema_version": 1,
-        "launch_plan_sha256": digest,
-    })
-    .to_string();
-    let outcome = memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
-        memcordon_core::WindowsLoaderReadyEvidenceV1 {
-            schema_version: 1,
-            launch_plan_sha256: digest.clone(),
-            launch_plan_json: Some(plan_json),
-            elapsed_millis: 1,
-        },
-    );
-    assert!(outcome.is_consistent());
-    assert!(outcome.launch_plan_json().is_some());
-
-    let mut mismatched = outcome.clone();
-    mismatched.set_launch_plan_json(
-        serde_json::json!({
-            "schema_version": 1,
-            "launch_plan_sha256": sha256(b"different-plan"),
-        })
-        .to_string(),
-    );
-    assert!(!mismatched.is_consistent());
-
-    let mut malformed = outcome;
-    malformed.set_launch_plan_json(String::from("not-json"));
-    assert!(!malformed.is_consistent());
-}
-
-#[test]
-fn aborted_mutant_terminal_requires_retired_relays_and_is_one_shot() {
-    use WindowsRelayEventV1 as Event;
-    use WindowsRelayPhaseV1 as Phase;
-
-    let mut phase = Phase::AwaitStreams;
-    phase.advance(Event::StreamsPrepared).unwrap();
-    assert_eq!(phase, Phase::AwaitRelaysReady);
-    phase.advance(Event::RelaysReady).unwrap();
-    assert_eq!(phase, Phase::AwaitAuthorizationOrAbort);
-    phase.advance(Event::RelaysAbort).unwrap();
-    assert_eq!(phase, Phase::AwaitAbortRelayAck);
-
-    assert!(phase.advance(Event::MutantTerminal).is_err());
-    assert_eq!(phase, Phase::AwaitAbortRelayAck);
-    phase.advance(Event::RelaysRetired).unwrap();
-    assert_eq!(phase, Phase::AwaitAbortRejection);
-    phase.advance(Event::MutantTerminal).unwrap();
-    assert_eq!(phase, Phase::Terminal);
-
-    assert!(phase.advance(Event::MutantTerminal).is_err());
-    assert_eq!(phase, Phase::Terminal);
-    assert!(phase.advance(Event::TargetAuthorized).is_err());
-    assert_eq!(phase, Phase::Terminal);
 }

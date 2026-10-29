@@ -1,8 +1,7 @@
-use crate::admission::LinuxAdmission;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
@@ -16,115 +15,20 @@ use sha2::{Digest, Sha256};
 use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use crate::rejection::{RejectionCleanupV1, RejectionPhaseV1, RejectionV1};
-use crate::request::{CallerExecutionEnvelopeV2, LaunchRequestV2, NativePrivateLaunchInput};
-use memcordon_core::workload_contract::ExecutionIdentityRequestV2;
-use memcordon_core::workload_registry_v2::{LinuxExecutionIdentityV2, ProfileKindV2};
+use crate::request::{CallerExecutionEnvelopeV2, LaunchRequestV2};
 
 use super::attempt::AttemptRecord;
 use super::cgroup::{AttemptCgroup, AttemptRetirementObservation};
 use super::descriptor_custody::{
     ExpectedGatedDescriptorInventory, ProviderPipeStdio, provider_owned_byte_pipes,
 };
-use super::entrypoint::{VerifiedEntrypoint, open_preserved_entrypoint, open_verified_entrypoint};
-use super::execution_identity::{ResolvedTargetIdentity, resolve_target_identity};
+use super::entrypoint::VerifiedEntrypoint;
+use super::execution_identity::ResolvedTargetIdentity;
 use super::network_filter::NativeAbi;
 use super::private_target::{
     PrivateExecArguments, PrivateGatedTarget, PrivateNetworkNamespaceOwner,
 };
 
-/// Held executable and resolved credentials, pinned before native allocation.
-/// Release additionally requires live local admission and native custody.
-#[derive(Debug)]
-pub struct PrivatePrelaunchAuthority {
-    request: NativePrivateLaunchInput,
-    target_identity: ResolvedTargetIdentity,
-    entrypoint: VerifiedEntrypoint,
-    entrypoint_digest: memcordon_core::DiagnosticSha256,
-}
-
-impl PrivatePrelaunchAuthority {
-    pub fn target_identity(&self) -> &ResolvedTargetIdentity {
-        &self.target_identity
-    }
-
-    pub fn into_parts(
-        self,
-    ) -> (
-        ResolvedTargetIdentity,
-        VerifiedEntrypoint,
-        memcordon_core::DiagnosticSha256,
-    ) {
-        (
-            self.target_identity,
-            self.entrypoint,
-            self.entrypoint_digest,
-        )
-    }
-}
-
-/// `selected_identity` must come from the authenticated active-registry grant,
-/// never the broker request. The trusted caller-root descriptor is captured by
-/// the provider; no consumer-provided descriptor is executable authority. The
-/// structured V4 request keeps the V2 contract and program bytes in one object.
-pub fn pin_private_prelaunch_authority(
-    request: &NativePrivateLaunchInput,
-    selected_identity: Option<&LinuxExecutionIdentityV2>,
-    caller: &CallerExecutionEnvelopeV2,
-    caller_root: BorrowedFd<'_>,
-    provider_uid: u32,
-    guardian_uid: u32,
-) -> Result<PrivatePrelaunchAuthority, String> {
-    if request.contract.authorized_profile != ProfileKindV2::LinuxTcp4PrivateV1.reference()
-        || request.launch.workload_contract.is_some()
-    {
-        return Err("MCSEALED-PRIVATE-ENTRYPOINT: non-private or mixed-version request".into());
-    }
-    let identity_request = &request.contract.execution_identity;
-    let target_identity = resolve_target_identity(
-        identity_request,
-        selected_identity,
-        caller,
-        provider_uid,
-        guardian_uid,
-    )?;
-    if matches!(identity_request, ExecutionIdentityRequestV2::PreserveCaller) {
-        let entrypoint = open_preserved_entrypoint(caller_root, &request.launch.program)?;
-        let entrypoint_digest =
-            memcordon_core::DiagnosticSha256::from_bytes(entrypoint.identity().sha256);
-        return Ok(PrivatePrelaunchAuthority {
-            request: request.clone(),
-            target_identity,
-            entrypoint,
-            entrypoint_digest,
-        });
-    }
-    let record = match identity_request {
-        ExecutionIdentityRequestV2::AdministratorProfile { .. } => selected_identity
-            .ok_or("MCSEALED-PRIVATE-ENTRYPOINT: granted identity record absent")?,
-        ExecutionIdentityRequestV2::PreserveCaller => unreachable!("preserve branch returned"),
-    };
-    let mut matching = record.entrypoints.as_slice().iter().filter(|entrypoint| {
-        entrypoint.absolute_path.as_str().as_bytes() == request.launch.program
-    });
-    let approved = matching
-        .next()
-        .ok_or("MCSEALED-PRIVATE-ENTRYPOINT: program is not granted")?;
-    if matching.next().is_some() {
-        return Err("MCSEALED-PRIVATE-ENTRYPOINT: ambiguous granted program".into());
-    }
-    let entrypoint = open_verified_entrypoint(caller_root, approved)?;
-    Ok(PrivatePrelaunchAuthority {
-        request: request.clone(),
-        target_identity,
-        entrypoint,
-        entrypoint_digest: approved.sha256.clone(),
-    })
-}
-
-/// Provider-owned resources assembled before a private namespace clone. The
-/// caller must retain these endpoints for gated readback, relay ownership,
-/// checkpoint, and eventual retirement. Constructing this object neither
-/// allocates a target nor permits candidate execution.
 pub struct PrivateGatedPrelaunch {
     pub target: PrivateGatedTarget,
     pub provider_stdio: ProviderPipeStdio,
@@ -137,30 +41,6 @@ pub struct PrivateGatedPrelaunch {
 
 /// The native filter digest comes from the exact compiled finite ABI program;
 /// the trusted stub checks it again against those bytes.
-pub fn prepare_private_gated_prelaunch(
-    authority: PrivatePrelaunchAuthority,
-    request: &NativePrivateLaunchInput,
-    abi: NativeAbi,
-    expected_filter_digest: [u8; 32],
-) -> Result<PrivateGatedPrelaunch, String> {
-    if authority.request != *request {
-        return Err("MCSEALED-PRIVATE-PRELAUNCH: V4 request changed after ELF pinning".into());
-    }
-    let command = PrivateExecArguments::from_request(request)?;
-    let (identity, entrypoint, entrypoint_digest) = authority.into_parts();
-    build_private_gated_prelaunch(
-        identity,
-        entrypoint,
-        entrypoint_digest,
-        command,
-        abi,
-        expected_filter_digest,
-    )
-}
-
-/// The probe uses the identical descriptor, control and target construction
-/// but its authority is a protected installed-image lease, not a production
-/// request or synthetic administrator grant.
 pub(crate) fn prepare_probe_gated_prelaunch(
     identity: ResolvedTargetIdentity,
     entrypoint: VerifiedEntrypoint,
@@ -206,7 +86,6 @@ pub(super) fn build_private_gated_prelaunch(
     )
     .map_err(|error| format!("MCSEALED-PRIVATE-DESCRIPTOR-EXPECTATION: {error}"))?;
     let target = PrivateGatedTarget {
-        mixed_root_filter: false,
         entrypoint,
         identity,
         stdio: target_stdio,
@@ -296,9 +175,7 @@ pub enum TargetExecStatus {
 
 #[derive(Debug)]
 pub struct TerminalFacts {
-    pub policy_enforcement: memcordon_core::workload_evidence::RuntimePolicyEnforcement,
     pub child_status: Option<i32>,
-    pub policy_revoked: bool,
     pub exec_status: TargetExecStatus,
     pub spawn_error_reported: bool,
     pub target_pid: u32,
@@ -958,7 +835,6 @@ pub fn execute(
 ) -> Result<TerminalFacts, String> {
     let credentials = TargetCredentials::direct(uid, gid, groups)?;
     execute_inner(
-        false,
         request,
         descriptors,
         attempt,
@@ -1005,32 +881,6 @@ pub fn execute_brokered_typed(
     record: AttemptRecord,
 ) -> Result<TerminalFacts, RejectionV1> {
     let credentials = TargetCredentials::from_caller(&caller);
-    if let Some(contract) = request.workload_contract.as_ref() {
-        if let Err(admission) = crate::admission::check_linux(contract, credentials.uid) {
-            let mut rejection = RejectionV1::request_error(
-                "MCSEALED-POLICY-ADMISSION",
-                "exact caller workload admission was rejected before target allocation",
-            );
-            rejection.workload_admission = Some(Box::new(
-                memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1 {
-                    request: memcordon_core::workload_evidence::RequestBindingV1::from_contract(
-                        contract,
-                    )
-                    .map_err(|detail| {
-                        RejectionV1::request_error("MCSEALED-POLICY-ADMISSION", &detail)
-                    })?,
-                    rejection: admission,
-                },
-            ));
-            record
-                .transition("retired")
-                .and_then(|()| record.retire())
-                .map_err(|detail| {
-                    RejectionV1::request_error("MCSEALED-BOUNDARY-NOT-RETIRED", &detail)
-                })?;
-            return Err(rejection);
-        }
-    }
     let context = super::namespace::CallerMountContext {
         mount_namespace,
         root,
@@ -1038,7 +888,6 @@ pub fn execute_brokered_typed(
         root_identity: caller.root_identity,
     };
     execute_inner(
-        true,
         request,
         descriptors,
         attempt,
@@ -1067,7 +916,6 @@ pub fn execute_with_fault(
 ) -> Result<TerminalFacts, String> {
     let credentials = TargetCredentials::direct(uid, gid, groups)?;
     execute_inner(
-        false,
         request,
         descriptors,
         attempt,
@@ -1097,7 +945,6 @@ pub fn execute_with_fault_typed(
     let credentials = TargetCredentials::direct(uid, gid, groups)
         .map_err(|detail| fault_outcome(attempt, point, &detail))?;
     execute_inner(
-        false,
         request,
         descriptors,
         attempt,
@@ -1114,7 +961,6 @@ pub fn execute_with_fault_typed(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_inner(
-    authenticated_broker: bool,
     request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     attempt: [u8; 16],
@@ -1139,7 +985,7 @@ fn execute_inner(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mut record = match precreated_record {
+    let record = match precreated_record {
         Some(record) => record,
         None => AttemptRecord::create_v2(
             identity.clone(),
@@ -1152,37 +998,6 @@ fn execute_inner(
         .transition("caller-envelope-captured")
         .map_err(|error| format!("MCSEALED-RECORD-CALLER-ENVELOPE: {error}"))?;
     let mut cleanup_guard = AttemptCleanupGuard::new(record.clone(), attempt);
-    let admission = request
-        .workload_contract
-        .as_ref()
-        .map(|contract| {
-            if !authenticated_broker {
-                return Err("MCSEALED-POLICY-ADMISSION: authenticated broker required".to_owned());
-            }
-            let encoded = crate::request::encode_launch_request(&request)
-                .map_err(|error| format!("native invocation encoding failed: {error:?}"))?;
-            crate::admission::plan_linux(
-                contract,
-                credentials.uid,
-                memcordon_core::workload_codec::hash_bytes(&encoded),
-            )
-            .map_err(|rejection| format!("MCSEALED-POLICY-ADMISSION: {:?}", rejection))
-        })
-        .transpose()?;
-    let admission = if let Some((admission, lease)) = admission {
-        let encoded = crate::request::encode_launch_request(&request)
-            .map_err(|error| format!("native invocation encoding failed: {error:?}"))?;
-        record = record.bind_policy(
-            &admission,
-            credentials.uid,
-            memcordon_core::workload_codec::hash_bytes(&encoded),
-        )?;
-        cleanup_guard.record = record.clone();
-        drop(lease);
-        Some(admission)
-    } else {
-        None
-    };
     let cgroup = AttemptCgroup::create(
         &identity,
         request.policy.memory_limit_bytes,
@@ -1190,7 +1005,6 @@ fn execute_inner(
     )?;
     cleanup_guard.set_cgroup(cgroup.clone());
     let monitoring_policy = request.policy.clone();
-    let restart_attempt = request.restart_attempt;
     record
         .transition("boundary-created")
         .map_err(|error| format!("MCSEALED-RECORD-BOUNDARY: {error}"))?;
@@ -1461,32 +1275,6 @@ fn execute_inner(
                 return Err("MCSEALED-AUTHORIZATION: deadline expired before authorization; target was not authorized".to_owned());
             }
         }
-        let policy_lease = admission
-            .as_ref()
-            .map(crate::admission::FrozenAdmission::revalidate_linux)
-            .transpose()?;
-        let policy_checkpoint = if let Some(snapshot) = admission.as_ref() {
-            use memcordon_core::workload_evidence::{
-                BaselineRestrictionObservationV1, RuntimeAttemptBinding, VerifiedCheckpointV1,
-            };
-            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .map_err(|error| error.to_string())?;
-            let binding = RuntimeAttemptBinding::from_snapshot(
-                snapshot,
-                super::runtime_manifest::installed_binding()?,
-                memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
-                memcordon_core::BoundedText::new(&identity).map_err(str::to_owned)?,
-                restart_attempt,
-            )?;
-            let checkpoint = VerifiedCheckpointV1::observed(&binding,
-                BaselineRestrictionObservationV1::LinuxUnixOnlySocketSyscallFilterAlternatePathsUnknown,
-                true, true, true, true, policy_lease.is_some(), true)?;
-            record.bind_policy_checkpoint(&binding, &checkpoint)?;
-            cleanup_guard.record = record.clone();
-            Some((binding, checkpoint))
-        } else {
-            None
-        };
         provider_control
             .write_all(&[1])
             .map_err(|error| format!("MCSEALED-AUTHORIZATION: {error}"))?;
@@ -1494,7 +1282,6 @@ fn execute_inner(
         record
             .transition("authorized")
             .map_err(|error| format!("MCSEALED-AUTHORIZATION-RECORD: {error}"))?;
-        drop(policy_lease);
         #[cfg(feature = "test-support")]
         if matches!(
             fault,
@@ -1639,19 +1426,8 @@ fn execute_inner(
         let exec_status = receive_exec_status(&mut provider_control, exec_status_deadline)?;
         drop(provider_control);
         let mut deadline_exceeded = false;
-        let mut policy_revoked = false;
         let mut status = [0_u8; 4];
         loop {
-            if exec_status == TargetExecStatus::Succeeded
-                && admission
-                    .as_ref()
-                    .map(crate::admission::FrozenAdmission::revoked_linux)
-                    .transpose()?
-                    .unwrap_or(false)
-            {
-                policy_revoked = true;
-                break;
-            }
             let mut pollfd = libc::pollfd {
                 fd: status_read.as_raw_fd(),
                 events: libc::POLLIN | libc::POLLHUP,
@@ -1684,11 +1460,7 @@ fn execute_inner(
                 }
             }
         }
-        let child_status = if policy_revoked {
-            // Containment retirement also kills namespace init. No child exit
-            // status was observed; the receipt must not invent one.
-            None
-        } else if deadline_exceeded {
+        let child_status = if deadline_exceeded {
             Some(125)
         } else {
             status_read
@@ -1699,15 +1471,14 @@ fn execute_inner(
         let memory_limit_exceeded = cgroup
             .memory_oom_killed()
             .map_err(|error| format!("MCSEALED-MEMORY-READBACK: {error}"))?;
-        if !policy_revoked
-            && !deadline_exceeded
+        if !deadline_exceeded
             && !memory_limit_exceeded
             && monitoring_policy.lifetime == crate::request::Lifetime::Command
             && monitoring_policy.command_exit_grace_millis > 0
         {
             deadline_exceeded = wait_command_exit_grace(&cgroup, &monitoring_policy)?;
         }
-        if !policy_revoked && (deadline_exceeded || memory_limit_exceeded) {
+        if deadline_exceeded || memory_limit_exceeded {
             // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
             let _ = unsafe {
                 libc::syscall(
@@ -1786,19 +1557,7 @@ fn execute_inner(
         );
         }
         Ok(TerminalFacts {
-            policy_enforcement: match policy_checkpoint {
-                Some((binding, checkpoint)) => {
-                    memcordon_core::workload_evidence::RuntimePolicyEnforcement::retired(
-                        binding,
-                        checkpoint,
-                        true,
-                        cgroup_empty && init_reaped && guardian_reaped,
-                    )?
-                }
-                None => Default::default(),
-            },
             child_status,
-            policy_revoked,
             exec_status,
             spawn_error_reported: true,
             target_pid: target_pid as u32,

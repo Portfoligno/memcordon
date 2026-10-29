@@ -1,4 +1,4 @@
-#[path = "../../../crates/memcordon-core/tests/support/windows_frontend_guardian.rs"]
+#[path = "../../../crates/memcordon-core/tests/support/windows_current_frontend_guardian.rs"]
 mod support;
 use memcordon_ci::windows_readiness_components::{
     frontend_guardian_injection_authority, frontend_kill_observation,
@@ -6,7 +6,7 @@ use memcordon_ci::windows_readiness_components::{
 use memcordon_core::*;
 
 fn accepts(
-    rejection: &WindowsProviderRejectionV2,
+    rejection: &WindowsProviderRejectionV3,
     live: &WindowsGuardianAttemptObservation,
     action: &serde_json::Value,
 ) -> bool {
@@ -112,15 +112,15 @@ fn precise_guardian_first_frontend_kill_requires_complete_bound_cause() {
 fn optional_causal_projection_never_changes_ack_authority() {
     let (rejection, _, _, _) = support::fixture();
     let terminal = rejection.terminal_receipt().unwrap();
-    let mut response = WindowsProviderResponseV3::Reject {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let mut response = WindowsProviderResponseV4::Reject {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         attempt_id: terminal.attempt_id.clone(),
         nonce: terminal.nonce.clone(),
         request_sha256: terminal.request_sha256.clone(),
         rejection,
     };
     let before = response.terminal_authority_json().unwrap();
-    let WindowsProviderResponseV3::Reject { rejection, .. } = &mut response else {
+    let WindowsProviderResponseV4::Reject { rejection, .. } = &mut response else {
         unreachable!()
     };
     rejection.guardian_causal_receipt = None;
@@ -128,7 +128,7 @@ fn optional_causal_projection_never_changes_ack_authority() {
 }
 
 fn disconnect_fixture() -> (
-    WindowsProviderRejectionV2,
+    WindowsProviderRejectionV3,
     WindowsGuardianAttemptObservation,
     serde_json::Value,
     WindowsProcessIdentityV1,
@@ -177,7 +177,7 @@ fn disconnect_fixture() -> (
 }
 
 fn accepts_disconnect(
-    rejection: &WindowsProviderRejectionV2,
+    rejection: &WindowsProviderRejectionV3,
     live: &WindowsGuardianAttemptObservation,
     action: &serde_json::Value,
     held: &WindowsProcessIdentityV1,
@@ -318,12 +318,12 @@ fn disconnected_guardian_receipt_requires_original_attempt_root_and_exact_cause(
     let (wrong_fault, _, _, _) = support::fixture();
     assert!(!accepts_disconnect(&wrong_fault, &live, &action, &held));
     let mut natural = rejection.clone();
-    let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+    let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
         &mut natural.disposition
     else {
         panic!("actual original postauthorization receipt required")
     };
-    let WindowsTerminalPayloadV2::Execution { outcome, .. } = &mut receipt.payload else {
+    let WindowsTerminalPayloadV3::Execution { outcome, .. } = &mut receipt.payload else {
         panic!("actual original execution receipt required")
     };
     *outcome = RunOutcome::Exited {
@@ -333,7 +333,7 @@ fn disconnected_guardian_receipt_requires_original_attempt_root_and_exact_cause(
     };
     assert!(!accepts_disconnect(&natural, &live, &action, &held));
     let mut invalid_receipt = rejection.clone();
-    let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+    let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
         &mut invalid_receipt.disposition
     else {
         panic!("actual original postauthorization receipt required")

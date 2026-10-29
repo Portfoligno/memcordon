@@ -90,10 +90,26 @@ pub enum BoundaryMechanismEvidence {
         requested: BoundaryRequirement,
     },
     LinuxPidNamespaceCgroupV2(LinuxSealedEvidenceV2),
-    LinuxPrivateTcp4(Box<crate::private_runtime::PrivateRuntimeExecution>),
-    LinuxMixedPrivate(Box<crate::result_v2::MixedRuntimeExecutionV2>),
-    WindowsJobObjectV2(Box<WindowsSealedEvidenceV2>),
+    LinuxSealedCurrent {
+        native: Box<LinuxSealedEvidenceV2>,
+        provider: crate::PublicProviderBindingV1,
+    },
+    LinuxPrivateWorkloadV1 {
+        terminal: Box<crate::result_v3::LinuxWorkloadTerminalV1>,
+        frontend: WorkloadFrontendEvidenceV1,
+    },
+    WindowsJobObjectV3(Box<crate::windows_sealed::WindowsSealedEvidenceV3>),
     MacosEndpointSecurityV1(MacosSealedEvidence),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadFrontendEvidenceV1 {
+    pub control_handles_retired: bool,
+    pub relay_drained: bool,
+    pub output_delivery: crate::result_v3::OutputDeliveryStateV3,
+    pub interruption: Option<i32>,
+    pub failures: crate::BoundedVec<crate::BoundedText<4096>, 32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,45 +148,6 @@ pub struct LinuxSealedEvidenceV2 {
     pub namespace_init_reaped: bool,
     pub guardian_reaped: bool,
     pub cgroup_removed: bool,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsSealedEvidenceV2 {
-    pub schema_version: u32,
-    pub service_identity: String,
-    pub caller_token_authenticated: bool,
-    pub initial_target_token_matches_caller: bool,
-    pub credential_transition_disposition: CredentialTransitionDisposition,
-    pub job_membership_independent_of_token: bool,
-    pub job_created: bool,
-    pub job_limits_verified: bool,
-    pub kill_on_close_verified: bool,
-    pub breakaway_denied: bool,
-    pub completion_port_associated: bool,
-    pub guardian_ready: bool,
-    pub target_created_suspended: bool,
-    pub job_list_applied_at_creation: bool,
-    pub handle_list_applied_at_creation: bool,
-    pub target_job_membership_verified: bool,
-    pub target_still_suspended_during_verification: bool,
-    pub inherited_handles_verified: bool,
-    pub target_released: bool,
-    pub terminate_job_invoked: bool,
-    pub active_processes_zero: bool,
-    pub direct_target_reaped: bool,
-    pub relays_retired: bool,
-    pub guardian_reaped: bool,
-    pub final_job_handles_closed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loader_qualification: Option<WindowsLoaderQualificationOutcomeV2>,
-    /// Frontend-only projection recorded after validated authority and ACK.
-    /// This is not a provider-native containment or retirement claim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frontend_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
-    /// Exact authenticated provider/attempt/request retained by the frontend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frontend_provider_association: Option<crate::result_v1::ProviderAttemptAssociationV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -702,91 +679,84 @@ pub fn boundary_evidence_is_consistent(
                 && native.guardian_reaped
                 && native.cgroup_removed
         }
-        BoundaryMechanismEvidence::LinuxPrivateTcp4(native) => {
-            native.validate().is_ok()
-                && launch.mechanism == "linux-tcp4-private-v1"
-                && launch.boundary_requested == BoundaryRequirement::Sealed
-                && launch.target_released == native.terminal.authorization_offset_millis.is_some()
-                && if launch.target_released {
-                    launch.boundary_effective == BoundaryClass::Sealed
-                        && launch.containment_verified_before_authorization
-                        && launch.guardian_started_before_authorization
-                        && launch.boundary_assignment_verified
-                        && launch.inherited_resources_restricted
-                } else {
-                    launch.boundary_effective == BoundaryClass::Unavailable
-                }
-                && restart_safety.sealed_boundary_retired
-                    == (native.cleanup_state() == crate::result_v1::CleanupStateV1::Complete)
-                && (!restart_safety.is_safe()
-                    || native.cleanup_state() == crate::result_v1::CleanupStateV1::Complete)
-        }
-        BoundaryMechanismEvidence::LinuxMixedPrivate(native) => {
-            native.runtime.validate().is_ok()
-                && matches!(
-                    launch.mechanism.as_str(),
-                    "linux-tcp4-unix-private-v1" | "linux-tcp4-unix-private-v2"
+        BoundaryMechanismEvidence::LinuxSealedCurrent { native, provider } => {
+            provider.is_consistent()
+                && boundary_evidence_is_consistent(
+                    launch,
+                    restart_safety,
+                    &BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2((**native).clone()),
                 )
-                && launch.boundary_requested == BoundaryRequirement::Sealed
-                && (!restart_safety.is_safe()
-                    || (native.frontend.relay_drained && native.frontend.relay_error.is_none()))
-                && match &native.runtime.outcome {
-                    crate::result_v2::MixedRuntimeOutcomeV2::Executed { admission, .. } => {
-                        launch.mechanism == admission.profile_id.id.as_str()
-                            && launch.target_released
-                            && launch.boundary_effective == BoundaryClass::Sealed
-                            && restart_safety.sealed_boundary_retired
-                    }
-                    crate::result_v2::MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
-                        allocation,
-                        ..
-                    }
-                    | crate::result_v2::MixedRuntimeOutcomeV2::RejectedIngress {
-                        allocation, ..
-                    } => {
-                        !launch.target_released
-                            && launch.boundary_effective == BoundaryClass::Unavailable
-                            && (restart_safety.sealed_boundary_retired
-                                == allocation.obligations.as_slice().is_empty())
-                    }
-                    crate::result_v2::MixedRuntimeOutcomeV2::Indeterminate { .. } => {
-                        !restart_safety.is_safe()
-                    }
-                }
         }
-        BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
-            sealed_generic_evidence_is_consistent(launch, restart_safety)
-                && launch.mechanism == "windows-job-object-v2"
-                && native.schema_version == 2
-                && native.service_identity == "MemCordonSealedControl+MemCordonSealedLauncher:v1"
-                && native.caller_token_authenticated
-                && native.initial_target_token_matches_caller
-                && native.credential_transition_disposition
-                    == CredentialTransitionDisposition::PreserveCallerEnvelope
-                && native.job_membership_independent_of_token
-                && native.job_created
-                && native.job_limits_verified
-                && native.kill_on_close_verified
-                && native.breakaway_denied
-                && native.completion_port_associated
-                && native.guardian_ready
-                && native.target_created_suspended
-                && native.job_list_applied_at_creation
-                && native.handle_list_applied_at_creation
-                && native.target_job_membership_verified
-                && native.target_still_suspended_during_verification
-                && native.inherited_handles_verified
-                && native.target_released == launch.target_released
+        BoundaryMechanismEvidence::LinuxPrivateWorkloadV1 { terminal, frontend } => {
+            terminal.validate().is_ok()
+                && launch.target_released
+                    == (terminal.release == crate::result_v3::ReleaseKnowledgeV3::Released)
+                && (!restart_safety.is_safe_for(BoundaryRequirement::Sealed)
+                    || (terminal.cleanup.state == crate::execution_facts::CleanupStateV1::Complete
+                        && terminal
+                            .native
+                            .as_ref()
+                            .is_some_and(|native| native.native_wait_status.is_some())
+                        && frontend.relay_drained
+                        && frontend.control_handles_retired))
+        }
+        BoundaryMechanismEvidence::WindowsJobObjectV3(native) => {
+            let verified_suspended_closure = !launch.target_released
+                && !native.target_released
+                && launch.boundary_requested == BoundaryRequirement::Sealed
+                && launch.boundary_effective == BoundaryClass::Sealed
+                && launch.containment_verified_before_authorization
+                && launch.guardian_started_before_authorization
+                && launch.target_spawn_error_reported
+                && launch.boundary_assignment_verified
+                && launch.boundary_reconfiguration_denied
+                && launch.inherited_resources_restricted
+                && launch.frontend_loss_cleanup_authority_verified
+                && restart_safety.is_safe_for(BoundaryRequirement::Sealed)
+                && native.prepared_boundary_is_verified()
+                && native.target_identity.is_some()
+                && native
+                    .process_observation
+                    .as_ref()
+                    .is_some_and(|observed| observed.root_identity == native.target_identity)
+                && native.retirement.as_ref().is_some_and(|proof| {
+                    proof.source == crate::WindowsRetirementProofSourceV2::LiveNative
+                        && proof.validate().is_ok()
+                })
+                && native
+                    .frontend_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.is_consistent())
+                && native
+                    .frontend_provider_association
+                    .as_ref()
+                    .is_some_and(|association| association.provider.is_consistent())
                 && native.terminate_job_invoked
+                && match (
+                    &native.retirement,
+                    &native.frontend_delivery,
+                    &native.frontend_provider_association,
+                ) {
+                    (Some(proof), Some(delivery), Some(association)) => {
+                        proof.attempt_id == delivery.attempt_id
+                            && proof.nonce == delivery.nonce
+                            && proof.request_sha256 == delivery.request_sha256
+                            && String::from(association.attempt_id.clone()) == delivery.attempt_id
+                            && String::from(association.request_sha256.clone())
+                                == delivery.request_sha256
+                            && association.provider.generation.as_str() == proof.provider_generation
+                    }
+                    _ => false,
+                };
+            (sealed_generic_evidence_is_consistent(launch, restart_safety)
+                || verified_suspended_closure)
+                && native.validate().is_ok()
+                && native.target_released == launch.target_released
                 && native.active_processes_zero
                 && native.direct_target_reaped
                 && native.relays_retired
                 && native.guardian_reaped
                 && native.final_job_handles_closed
-                && native
-                    .loader_qualification
-                    .as_ref()
-                    .is_none_or(WindowsLoaderQualificationOutcomeV2::is_consistent)
         }
         BoundaryMechanismEvidence::MacosEndpointSecurityV1(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
@@ -1103,10 +1073,7 @@ impl Default for RestartDecisionRecord {
 pub struct AttemptRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operational_failure: Option<crate::error::OperationalAttemptFailure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub private_execution: Option<crate::private_runtime::PrivateRuntimeExecution>,
     pub runtime: Option<crate::RuntimeEvidenceV1>,
-    pub policy_enforcement: crate::workload_evidence::RuntimePolicyEnforcement,
     pub number: u64,
     pub kind: AttemptKind,
     pub phase: AttemptPhase,
@@ -1211,7 +1178,6 @@ impl AttemptRecord {
         self.operational_failure
             .as_ref()
             .is_none_or(|failure| failure.validate().is_ok() && self.error.is_some())
-            && self.policy_enforcement.is_consistent()
             && self.target_pid.is_none_or(|pid| pid > 0)
             && self.runtime.as_ref().is_none_or(|runtime| {
                 runtime.is_consistent()
@@ -1290,10 +1256,8 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         #[serde(deny_unknown_fields)]
         struct Wire {
             operational_failure: Option<crate::error::OperationalAttemptFailure>,
-            private_execution: Option<crate::private_runtime::PrivateRuntimeExecution>,
             number: u64,
             runtime: Option<crate::RuntimeEvidenceV1>,
-            policy_enforcement: crate::workload_evidence::RuntimePolicyEnforcement,
             kind: AttemptKind,
             phase: AttemptPhase,
             target_pid: Option<u32>,
@@ -1311,10 +1275,8 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         let wire = Wire::deserialize(deserializer)?;
         let record = Self {
             operational_failure: wire.operational_failure,
-            private_execution: wire.private_execution,
             runtime: wire.runtime,
             number: wire.number,
-            policy_enforcement: wire.policy_enforcement,
             kind: wire.kind,
             phase: wire.phase,
             target_pid: wire.target_pid,
@@ -1424,13 +1386,7 @@ impl SupervisionAggregates {
         let unknown = record
             .runtime
             .as_ref()
-            .is_some_and(|runtime| matches!(runtime.release, crate::ReleaseEvidence::Unknown))
-            || matches!(&record.boundary_detail,
-                BoundaryMechanismEvidence::LinuxMixedPrivate(native)
-                if native.runtime.validate().is_ok()
-                    && matches!(&native.runtime.outcome,
-                        crate::result_v2::MixedRuntimeOutcomeV2::Indeterminate { retained_obligations, .. }
-                        if matches!(retained_obligations.authorization, crate::result_v2::MixedAuthorizationKnowledgeV2::Unknown)));
+            .is_some_and(|runtime| matches!(runtime.release, crate::ReleaseEvidence::Unknown));
         for (counter, increment) in [
             (
                 &mut self.confirmed_authorizations,

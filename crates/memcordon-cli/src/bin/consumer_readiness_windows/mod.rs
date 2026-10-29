@@ -506,13 +506,13 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             if args.next().is_some() {
                 return Err(io::Error::other("unexpected NUL refusal arguments"));
             }
-            let contract = memcordon_core::workload_contract::WorkloadContractV1::parse(&fs::read(
+            let contract = memcordon_core::workload_request::WorkloadRequestV1::parse(&fs::read(
                 contract_path,
             )?)
             .map_err(io::Error::other)?;
             let policy = memcordon::Policy::new(memcordon::ByteSize::gib(4))
                 .sealed()
-                .with_workload_contract(contract)
+                .with_workload_request(contract)
                 .map_err(io::Error::other)?;
             let native_argument = vec![b'a' as u16, 0, b'b' as u16];
             let command =
@@ -553,6 +553,38 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 return Err(io::Error::other("extra token snapshot arguments"));
             }
             io::stdout().write_all(&native::token_observation()?)?;
+            return Ok(0);
+        }
+        Some("owner-request-probe") => {
+            let argument = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| io::Error::other("current owner probe request absent"))?;
+            if argument.len() > 4096 || args.next().is_some() {
+                return Err(io::Error::other(
+                    "current owner probe request exceeds bounds",
+                ));
+            }
+            memcordon_core::canonical_json::reject_duplicate_json_keys(argument.as_bytes())
+                .map_err(io::Error::other)?;
+            let request: memcordon_core::WindowsProviderRequestV4 =
+                serde_json::from_str(&argument).map_err(io::Error::other)?;
+            if !matches!(
+                request,
+                memcordon_core::WindowsProviderRequestV4::RecoverAttempt { .. }
+                    | memcordon_core::WindowsProviderRequestV4::ReplayTerminal { .. }
+                    | memcordon_core::WindowsProviderRequestV4::Cancel { .. }
+            ) {
+                return Err(io::Error::other("unrelated current owner probe operation"));
+            }
+            let token: serde_json::Value =
+                serde_json::from_slice(&native::token_observation()?).map_err(io::Error::other)?;
+            let (response, error) =
+                match memcordon_platform::observe_windows_owner_request(&request) {
+                    Ok(raw) => (Some(raw), None),
+                    Err(error) => (None, Some(error)),
+                };
+            serde_json::to_writer(io::stdout().lock(),&serde_json::json!({"format":"memcordon.windows-current-foreign-owner-probe","revision":1,"process_id":std::process::id(),"token":token,"request":request,"response_bytes":response,"exchange_error":error})).map_err(io::Error::other)?;
             return Ok(0);
         }
         Some("restricted-frontend") => return native::restricted_frontend(args),
@@ -824,6 +856,22 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         Case::Churn => joint(&descriptor, &mut transcript, true)?,
         Case::Toolchain => toolchain::execute(&descriptor, &mut transcript)?,
         Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
+        Case::EmptyInput => {
+            let mut actual = Vec::new();
+            io::stdin().take(1).read_to_end(&mut actual)?;
+            if !actual.is_empty() {
+                return Err(io::Error::other(
+                    "empty-input fixture received unexpected stdin bytes",
+                ));
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(descriptor.output_root.join("stdin.bin"))?;
+            file.write_all(&actual)?;
+            file.sync_all()?;
+            transcript.event("stdin-read-to-eof", None, &actual)?;
+        }
         Case::BinaryStreams => {
             let stdout = descriptor.stdout.clone();
             let stderr = descriptor.stderr.clone();

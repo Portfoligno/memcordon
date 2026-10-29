@@ -1,4 +1,4 @@
-#[path = "../../../crates/memcordon-core/tests/support/windows_frontend_guardian.rs"]
+#[path = "../../../crates/memcordon-core/tests/support/windows_current_frontend_guardian.rs"]
 mod support;
 use memcordon_ci::windows_readiness_components::{
     ControlServiceRetirement, control_retirement_matches, control_service_loss_observation,
@@ -7,8 +7,8 @@ use memcordon_ci::windows_readiness_components::{
 use memcordon_core::*;
 
 fn fixture() -> (
-    WindowsProviderResponseV3,
-    WindowsTerminalDeliveryEvidenceV1,
+    WindowsProviderResponseV4,
+    WindowsFrontendDeliveryV3,
     WindowsGuardianAttemptObservation,
     WindowsControlWorkerSiteV1,
     ControlServiceRetirement,
@@ -75,8 +75,8 @@ fn fixture() -> (
         frontend,
         frontend_status: 125,
     };
-    let response = WindowsProviderResponseV3::Reject {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let response = WindowsProviderResponseV4::Reject {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         attempt_id: terminal.attempt_id.clone(),
         nonce: terminal.nonce.clone(),
         request_sha256: terminal.request_sha256.clone(),
@@ -86,8 +86,8 @@ fn fixture() -> (
     (response, delivery, live, site, facts)
 }
 
-fn delivery(response: &WindowsProviderResponseV3) -> WindowsTerminalDeliveryEvidenceV1 {
-    let WindowsProviderResponseV3::Reject {
+fn delivery(response: &WindowsProviderResponseV4) -> WindowsFrontendDeliveryV3 {
+    let WindowsProviderResponseV4::Reject {
         attempt_id,
         nonce,
         request_sha256,
@@ -96,16 +96,16 @@ fn delivery(response: &WindowsProviderResponseV3) -> WindowsTerminalDeliveryEvid
     else {
         panic!("rejection required")
     };
-    WindowsTerminalDeliveryEvidenceV1 {
-        schema_version: 1,
+    WindowsFrontendDeliveryV3 {
         attempt_id: attempt_id.clone(),
         nonce: nonce.clone(),
         request_sha256: request_sha256.clone(),
-        authority_sha256: memcordon_ci::windows_causal_acceptance::sha256(
+        terminal_sha256: memcordon_ci::windows_causal_acceptance::sha256(
             response.terminal_authority_json().unwrap().as_bytes(),
         ),
         retired_sha256: "ab".repeat(32),
-        retired_confirmed: true,
+        terminal_validated: true,
+        acknowledgement_observed: true,
     }
 }
 
@@ -116,8 +116,8 @@ fn exact_service_loss_guardian_chain_requires_original_native_witness_and_ack() 
     assert!(control_service_recovery_authority(
         &response, &ack, &live, &witness
     ));
-    let pending = WindowsProviderResponseV3::RecoveryAttemptUnavailable {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let pending = WindowsProviderResponseV4::RecoveryAttemptUnavailable {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         attempt_id: site.attempt_id.clone(),
         challenge: "authenticated-but-pending".into(),
         detail: "exact recovery authority remains retained pending checked closure".into(),
@@ -128,8 +128,8 @@ fn exact_service_loss_guardian_chain_requires_original_native_witness_and_ack() 
     for field in ["retired", "authority", "nonce", "attempt", "request"] {
         let mut changed = ack.clone();
         match field {
-            "retired" => changed.retired_confirmed = false,
-            "authority" => changed.authority_sha256 = "99".repeat(32),
+            "retired" => changed.acknowledgement_observed = false,
+            "authority" => changed.terminal_sha256 = "99".repeat(32),
             "nonce" => changed.nonce = "99".repeat(32),
             "attempt" => changed.attempt_id = "99".repeat(32),
             "request" => changed.request_sha256 = "99".repeat(32),
@@ -226,7 +226,7 @@ fn forged_missing_secondary_or_nonmonitor_terminal_never_substitutes() {
     for mutation in 0..9 {
         let (mut response, _, live, site, facts) = fixture();
         let witness = control_service_loss_observation(&site, &facts, &live).unwrap();
-        let WindowsProviderResponseV3::Reject { rejection, .. } = &mut response else {
+        let WindowsProviderResponseV4::Reject { rejection, .. } = &mut response else {
             unreachable!()
         };
         match mutation {
@@ -277,13 +277,13 @@ fn forged_missing_secondary_or_nonmonitor_terminal_never_substitutes() {
                 );
             }
             6 | 7 => {
-                let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+                let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
                     &mut rejection.disposition
                 else {
                     unreachable!()
                 };
                 if mutation == 6 {
-                    let WindowsTerminalPayloadV2::Execution { outcome, .. } = &mut receipt.payload
+                    let WindowsTerminalPayloadV3::Execution { outcome, .. } = &mut receipt.payload
                     else {
                         unreachable!()
                     };

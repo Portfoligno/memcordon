@@ -393,18 +393,6 @@ fn cargo_fuzz_budget_is_reviewed_only_at_the_owned_command_boundary() {
 }
 
 #[test]
-fn mixed_release_helpers_use_the_reviewed_descriptor_inheritance_boundary() {
-    let fixture = Path::new("crates/memcordon-cli/tests/sealed_agent/native_mixed_release.rs");
-    validate_rust_policy_bytes(
-        fixture,
-        include_bytes!("../../../crates/memcordon-cli/tests/sealed_agent/native_mixed_release.rs"),
-    )
-    .unwrap();
-    let direct = br#"fn run(command: &mut std::process::Command) { unsafe { command.pre_exec(|| Ok(())); } }"#;
-    assert!(validate_rust_policy_bytes(fixture, direct).is_err());
-}
-
-#[test]
 fn unrelated_exec_method_is_not_rejected_by_name() {
     let source = b"struct Example; impl Example { fn exec(&self) {} } fn use_it(value: &Example) { value.exec(); }";
     validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), source)

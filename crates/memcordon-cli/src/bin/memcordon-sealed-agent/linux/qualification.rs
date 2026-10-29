@@ -1,4 +1,4 @@
-pub use memcordon_core::runtime_readiness::ReadinessObservation;
+pub use memcordon_core::native_readiness::ReadinessObservation;
 
 /// Executed as a sacrificial native target under the inherited, package-verified
 /// systemd address-family filter. It deliberately makes no stronger claim about
@@ -209,15 +209,16 @@ fn observe_selected_after_package_verification(
         format: if network {
             "memcordon.network-launcher-readiness"
         } else {
-            "memcordon.runtime-readiness"
+            "memcordon.native-readiness"
         }
         .into(),
         revision: 1,
-        workload_profile: if network {
-            crate::network_readiness::profile()
+        probe_role: if network {
+            "private-network-launcher"
         } else {
-            memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
-        },
+            "credential-preserving"
+        }
+        .into(),
         workload_profile_probe_verified: profile_verified,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
@@ -383,7 +384,6 @@ fn sacrificial_attempt_with_arguments(
     .map_err(|error| error.to_string())?;
     let request = LaunchRequestV2 {
         restart_attempt: 0,
-        workload_contract: None,
         program: program.to_vec(),
         arguments,
         environment: Vec::new(),

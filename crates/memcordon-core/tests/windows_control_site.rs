@@ -70,8 +70,8 @@ fn control_site_binds_original_request_and_preserves_native_births() {
 #[test]
 fn ordinary_authorization_omits_site_and_support_site_roundtrips() {
     let site = site();
-    let mut frame = WindowsProviderResponseV3::TargetAuthorized {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let mut frame = WindowsProviderResponseV4::TargetAuthorized {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         attempt_id: site.attempt_id.clone(),
         nonce: site.nonce.clone(),
         request_sha256: site.request_sha256.clone(),
@@ -81,11 +81,11 @@ fn ordinary_authorization_omits_site_and_support_site_roundtrips() {
     let bytes = serde_json::to_vec(&frame).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(value.get("control_site").is_none());
-    if let WindowsProviderResponseV3::TargetAuthorized { control_site, .. } = &mut frame {
+    if let WindowsProviderResponseV4::TargetAuthorized { control_site, .. } = &mut frame {
         *control_site = Some(Box::new(site));
     }
     let bytes = serde_json::to_vec(&frame).unwrap();
-    let decoded: WindowsProviderResponseV3 = serde_json::from_slice(&bytes).unwrap();
+    let decoded: WindowsProviderResponseV4 = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 }
 
@@ -96,15 +96,15 @@ fn control_release_requires_exact_support_selection_and_original_authorization()
         WindowsSealedFault::ControlServiceKilledAfterAuthorization,
     ] {
         let original = site();
-        let release = WindowsProviderRequestV3::CertificationControlReleased {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        let release = WindowsProviderRequestV4::CertificationControlReleased {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id: original.attempt_id.clone(),
             nonce: original.nonce.clone(),
             request_sha256: original.request_sha256.clone(),
             fault,
             target_pid: original.target_pid,
         };
-        let binds = |value: &WindowsProviderRequestV3| {
+        let binds = |value: &WindowsProviderRequestV4| {
             value.control_release_binds(
                 &original.attempt_id,
                 &original.nonce,
@@ -132,8 +132,8 @@ fn control_release_requires_exact_support_selection_and_original_authorization()
             let decoded = serde_json::from_value(changed_value).unwrap();
             assert!(!binds(&decoded), "accepted foreign {field}");
         }
-        assert!(!binds(&WindowsProviderRequestV3::Probe {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION
+        assert!(!binds(&WindowsProviderRequestV4::Probe {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
         }));
         assert!(!release.control_release_binds(
             &original.attempt_id,
@@ -145,10 +145,10 @@ fn control_release_requires_exact_support_selection_and_original_authorization()
         for field in ["nonce", "target_pid", "fault"] {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
-            assert!(serde_json::from_value::<WindowsProviderRequestV3>(missing).is_err());
+            assert!(serde_json::from_value::<WindowsProviderRequestV4>(missing).is_err());
         }
         let mut unknown = value.clone();
         unknown["extra"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<WindowsProviderRequestV3>(unknown).is_err());
+        assert!(serde_json::from_value::<WindowsProviderRequestV4>(unknown).is_err());
     }
 }

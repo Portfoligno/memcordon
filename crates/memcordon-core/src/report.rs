@@ -7,7 +7,6 @@ use std::path::Path;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 
 use crate::{
     AttemptRecord, BackendCapabilityReport, DETAILED_ATTEMPT_CAPACITY, DeadlineScope,
@@ -16,10 +15,6 @@ use crate::{
 };
 
 pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 10;
-pub const HISTORICAL_EXECUTION_REPORT_SCHEMA_V10: u32 = 10;
-pub const WINDOWS_EXECUTION_REPORT_SCHEMA_V11: u32 = 11;
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 9;
-pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;
 pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
@@ -32,54 +27,58 @@ pub struct MemcordonReport {
     pub supervision: Option<SupervisionReport>,
     pub attempts: Vec<AttemptRecord>,
     pub error: Option<ExecutionErrorReport>,
-    pub windows_terminal_delivery: Option<WindowsTerminalDeliveryEvidenceV1>,
+}
+
+fn validate_standard_boundary(
+    policy: &PolicyEnvelopeReport,
+    backend: Option<&BackendCapabilityReport>,
+    attempts: &[AttemptRecord],
+    error: Option<&ExecutionErrorReport>,
+) -> Result<(), ReportModelError> {
+    if policy.requested.boundary != crate::BoundaryRequirement::Standard
+        || policy.effective.boundary == crate::BoundaryClass::Sealed
+        || backend.is_some_and(|value| value.boundary.class == crate::BoundaryClass::Sealed)
+        || attempts.iter().any(|attempt| {
+            attempt.launch.boundary_requested != crate::BoundaryRequirement::Standard
+                || attempt.launch.boundary_effective == crate::BoundaryClass::Sealed
+                || attempt.operational_failure.is_some()
+                || !matches!(
+                    &attempt.boundary_detail,
+                    crate::BoundaryMechanismEvidence::Standard { .. }
+                        | crate::BoundaryMechanismEvidence::SetupFailure {
+                            requested: crate::BoundaryRequirement::Standard,
+                            ..
+                        }
+                )
+        })
+        || error.is_some_and(|value| {
+            value.provider_rejection.is_some()
+                || value.provider_failure.is_some()
+                || value
+                    .boundary_setup_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.requested == crate::BoundaryRequirement::Sealed)
+        })
+    {
+        return Err(ReportModelError::PolicyEnvelope);
+    }
+    Ok(())
 }
 
 impl Serialize for MemcordonReport {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use crate::workload_evidence::{
-            RuntimePolicyEnforcement, RuntimeWorkloadResolution, WorkloadRequestReport,
-        };
-        use serde::ser::SerializeStruct;
-        if self
-            .error
-            .as_ref()
-            .is_some_and(|error| error.private_rejection.is_some())
-            || !matches!(
-                self.policy.requested.workload,
-                WorkloadRequestReport::LegacyUnspecified
-            )
-            || !matches!(
-                self.policy.effective.workload,
-                RuntimeWorkloadResolution::LegacyUnspecified { .. }
-            )
-            || self.attempts.iter().any(|attempt| {
-                attempt.operational_failure.is_some()
-                    || attempt.private_execution.is_some()
-                    || !matches!(
-                        attempt.policy_enforcement,
-                        RuntimePolicyEnforcement::LegacyUnspecified
-                    )
-            })
-            || self
-                .error
-                .as_ref()
-                .and_then(|error| error.policy_enforcement.as_ref())
-                .is_some_and(|evidence| {
-                    !matches!(evidence, RuntimePolicyEnforcement::LegacyUnspecified)
-                })
-        {
-            return Err(serde::ser::Error::custom(
-                "named operational workload facts require memcordon.result revision 1",
-            ));
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.schema_version != EXECUTION_REPORT_SCHEMA_VERSION {
+            return Err(serde::ser::Error::custom(ReportModelError::SchemaVersion));
         }
-        let mut wire = serializer.serialize_struct(
-            "MemcordonReport",
-            8 + usize::from(self.windows_terminal_delivery.is_some()),
-        )?;
+        validate_standard_boundary(
+            &self.policy,
+            self.backend.as_ref(),
+            &self.attempts,
+            self.error.as_ref(),
+        )
+        .map_err(serde::ser::Error::custom)?;
+        use serde::ser::SerializeStruct;
+        let mut wire = serializer.serialize_struct("MemcordonReport", 8)?;
         wire.serialize_field("schema_version", &self.schema_version)?;
         wire.serialize_field("tool", &self.tool)?;
         wire.serialize_field("invocation", &self.invocation)?;
@@ -88,332 +87,12 @@ impl Serialize for MemcordonReport {
         wire.serialize_field("supervision", &self.supervision)?;
         wire.serialize_field("attempts", &self.attempts)?;
         wire.serialize_field("error", &self.error)?;
-        if let Some(delivery) = &self.windows_terminal_delivery {
-            wire.serialize_field("windows_terminal_delivery", delivery)?;
-        }
         wire.end()
     }
 }
 
-/// Diagnostic-only historical report. Its frozen bindings never become runtime admission objects.
-#[derive(Clone, Debug)]
-pub struct HistoricalMemcordonReport {
-    pub schema_version: u32,
-    document: serde_json::Value,
-}
-
-impl HistoricalMemcordonReport {
-    pub fn document(&self) -> &serde_json::Value {
-        &self.document
-    }
-
-    fn parse(bytes: &[u8], expected_schema: u32) -> Result<Self, String> {
-        use crate::historical_workload_evidence::{
-            AttemptPolicyEnforcementV1, WorkloadResolutionReportV1,
-        };
-        use crate::workload_evidence::{
-            PolicyTerminalEvidenceV1, RequestBindingV1, WorkloadRequestReport,
-        };
-        if bytes.len() > crate::result_v1::RESULT_MAX_BYTES {
-            return Err("historical report exceeds byte bound".into());
-        }
-        crate::workload_contract::reject_duplicate_json_keys(bytes)?;
-        let document: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-        if document
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(u64::from(expected_schema))
-        {
-            return Err(ReportModelError::SchemaVersion.to_string());
-        }
-        let request: WorkloadRequestReport =
-            serde_json::from_value(document["policy"]["requested"]["workload"].clone())
-                .map_err(|error| error.to_string())?;
-        let resolution: WorkloadResolutionReportV1 =
-            serde_json::from_value(document["policy"]["effective"]["workload"].clone())
-                .map_err(|error| error.to_string())?;
-        if !resolution.matches_request(&request) {
-            return Err(ReportModelError::PolicyEnvelope.to_string());
-        }
-        let contract = match &request {
-            WorkloadRequestReport::LegacyUnspecified => None,
-            WorkloadRequestReport::StrictV1 { contract } => Some(contract.as_ref()),
-        };
-        let expected = contract.map(RequestBindingV1::from_contract).transpose()?;
-        let attempts = document["attempts"]
-            .as_array()
-            .ok_or("historical attempt inventory absent")?;
-        let mut terminal_resolution = None;
-        let mut contribution = 0usize;
-        for (value, number, successful) in attempts
-            .iter()
-            .map(|attempt| {
-                let completed = attempt["outcome"].as_object().is_some_and(|_| {
-                    serde_json::from_value::<crate::RunOutcome>(attempt["outcome"].clone())
-                        .is_ok_and(|outcome| crate::supervision::outcome_status(&outcome) == 0)
-                });
-                let restarting = serde_json::from_value::<crate::RestartDecisionRecord>(
-                    attempt["restart_decision"].clone(),
-                )
-                .is_ok_and(|decision| {
-                    matches!(
-                        decision.decision,
-                        crate::RestartDecisionKind::HalfLifeLogisticBackoff
-                            | crate::RestartDecisionKind::CircuitCooldown
-                            | crate::RestartDecisionKind::HalfOpenLaunch
-                    )
-                });
-                (
-                    &attempt["policy_enforcement"],
-                    attempt["number"].as_u64(),
-                    completed || restarting,
-                )
-            })
-            .chain(
-                document
-                    .get("error")
-                    .filter(|error| !error.is_null())
-                    .and_then(|error| error.get("policy_enforcement"))
-                    .filter(|evidence| !evidence.is_null())
-                    .map(|value| (value, None, false)),
-            )
-        {
-            let evidence: AttemptPolicyEnforcementV1 =
-                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
-            contribution = contribution
-                .checked_add(
-                    serde_json::to_vec(&evidence)
-                        .map_err(|error| error.to_string())?
-                        .len(),
-                )
-                .ok_or("historical contribution overflow")?;
-            if !evidence.is_consistent()
-                || (contract.is_some()
-                    && successful
-                    && !matches!(
-                        evidence,
-                        AttemptPolicyEnforcementV1::Authorized {
-                            terminal: PolicyTerminalEvidenceV1::Retired { .. },
-                            ..
-                        }
-                    ))
-            {
-                return Err(ReportModelError::PolicyEnvelope.to_string());
-            }
-            let matches = match (&evidence, &expected) {
-                (AttemptPolicyEnforcementV1::LegacyUnspecified, None) => true,
-                (AttemptPolicyEnforcementV1::NotAuthorized { request, .. }, Some(expected)) => {
-                    request == expected
-                }
-                (
-                    AttemptPolicyEnforcementV1::AuthorizationUncertain {
-                        request: Some(request),
-                        ..
-                    },
-                    Some(expected),
-                ) => request == expected,
-                (AttemptPolicyEnforcementV1::Authorized { admission, .. }, Some(expected)) => {
-                    &admission.plan.request == expected
-                        && admission
-                            .plan
-                            .matches_contract(contract.expect("strict request checked"))
-                        && number.is_none_or(|number| {
-                            admission.restart_attempt.checked_add(1) == Some(number)
-                        })
-                }
-                _ => false,
-            };
-            if !matches {
-                return Err(ReportModelError::PolicyEnvelope.to_string());
-            }
-            terminal_resolution = evidence.resolution().or(terminal_resolution);
-        }
-        if contribution > crate::workload_limits::REPORT_CONTRIBUTION_BYTES
-            || terminal_resolution.is_some_and(|terminal| terminal != resolution)
-        {
-            return Err(ReportModelError::PolicyEnvelope.to_string());
-        }
-        // Validate the shared native/timeline/error envelope independently. Only the diagnostic
-        // workload fields are replaced in this temporary validation view; no historical binding
-        // is translated to a runtime plan, attempt, snapshot, or permission owner.
-        let mut neutral = document.clone();
-        neutral["policy"]["requested"]["workload"] =
-            serde_json::to_value(WorkloadRequestReport::LegacyUnspecified)
-                .map_err(|error| error.to_string())?;
-        neutral["policy"]["effective"]["workload"] = serde_json::to_value(crate::workload_evidence::RuntimeWorkloadResolution::unresolved(None, crate::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend)).map_err(|error| error.to_string())?;
-        for attempt in neutral["attempts"]
-            .as_array_mut()
-            .ok_or("historical attempt inventory absent")?
-        {
-            attempt["policy_enforcement"] = serde_json::to_value(
-                crate::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        if let Some(error) = neutral
-            .get_mut("error")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            error.remove("policy_enforcement");
-        }
-        let _: MemcordonReport =
-            serde_json::from_value(neutral).map_err(|error| error.to_string())?;
-        Ok(Self {
-            schema_version: expected_schema,
-            document,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsTerminalDeliveryEvidenceV1 {
-    pub schema_version: u32,
-    pub attempt_id: String,
-    pub nonce: String,
-    pub request_sha256: String,
-    pub authority_sha256: String,
-    pub retired_sha256: String,
-    pub retired_confirmed: bool,
-}
-
-impl WindowsTerminalDeliveryEvidenceV1 {
-    pub fn is_consistent(&self) -> bool {
-        fn sha256(value: &str) -> bool {
-            value.len() == sha2::Sha256::output_size() * 2
-                && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }
-        self.schema_version == 1
-            && sha256(&self.attempt_id)
-            && !self.nonce.is_empty()
-            && sha256(&self.request_sha256)
-            && sha256(&self.authority_sha256)
-            && sha256(&self.retired_sha256)
-            && self.retired_confirmed
-    }
-}
-
-fn validate_windows_terminal_delivery(
-    schema: u32,
-    backend: Option<&BackendCapabilityReport>,
-    supervision: Option<&SupervisionReport>,
-    attempts: &[AttemptRecord],
-    error: Option<&ExecutionErrorReport>,
-    delivery: Option<&WindowsTerminalDeliveryEvidenceV1>,
-) -> Result<(), ReportModelError> {
-    if schema == HISTORICAL_EXECUTION_REPORT_SCHEMA_V10 {
-        return if delivery.is_none()
-            && error.is_none_or(|error| error.windows_provider_rejection_v2.is_none())
-        {
-            Ok(())
-        } else {
-            Err(ReportModelError::ProviderFailure)
-        };
-    }
-    if schema != WINDOWS_EXECUTION_REPORT_SCHEMA_V11 {
-        return Err(ReportModelError::SchemaVersion);
-    }
-    if delivery.is_some_and(|delivery| !delivery.is_consistent()) {
-        return Err(ReportModelError::ProviderFailure);
-    }
-    let windows = backend.is_some_and(|backend| backend.name == "windows-job-object");
-    let authority_expected = windows
-        && (supervision.is_some()
-            || error
-                .and_then(|error| error.windows_provider_rejection_v2.as_ref())
-                .is_some_and(|rejection| rejection.terminal_ack_required()));
-    if authority_expected != delivery.is_some() {
-        return Err(ReportModelError::ProviderFailure);
-    }
-    if supervision.is_some() && windows {
-        let observed = attempts
-            .last()
-            .and_then(|attempt| match &attempt.boundary_detail {
-                crate::BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
-                    native.frontend_delivery.as_ref()
-                }
-                _ => None,
-            });
-        if observed != delivery {
-            return Err(ReportModelError::ProviderFailure);
-        }
-    }
-    if let (Some(error), Some(delivery)) = (error, delivery) {
-        if let Some(rejection) = error.windows_provider_rejection_v2.as_ref() {
-            if let Some(receipt) = rejection.terminal_receipt() {
-                if receipt.attempt_id != delivery.attempt_id
-                    || receipt.nonce != delivery.nonce
-                    || receipt.request_sha256 != delivery.request_sha256
-                {
-                    return Err(ReportModelError::ProviderFailure);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 impl MemcordonReport {
-    /// Select only the historical and Windows report schemas this binary validates.
-    pub fn supports_schema(schema: u32) -> bool {
-        schema == HISTORICAL_EXECUTION_REPORT_SCHEMA_V10
-            || schema == EXECUTION_REPORT_SCHEMA_VERSION
-            || schema == WINDOWS_EXECUTION_REPORT_SCHEMA_V11
-    }
-
-    /// Decode a report against the caller's trusted, exact schema selection.
-    /// The report's own version field cannot choose a decoder on its own.
-    pub fn parse_exact_schema(
-        bytes: &[u8],
-        expected_schema: u32,
-    ) -> Result<HistoricalMemcordonReport, String> {
-        if !Self::supports_schema(expected_schema) {
-            return Err(ReportModelError::SchemaVersion.to_string());
-        }
-        HistoricalMemcordonReport::parse(bytes, expected_schema)
-    }
-
-    pub fn parse_historical_v10(bytes: &[u8]) -> Result<HistoricalMemcordonReport, String> {
-        Self::parse_exact_schema(bytes, HISTORICAL_EXECUTION_REPORT_SCHEMA_V10)
-    }
-
-    /// Builds the current schema-10 report. Older constructor names are aliases,
-    /// not historical schema writers.
     pub fn schema10(
-        tool: ToolReport,
-        invocation: InvocationReport,
-        policy: PolicyEnvelopeReport,
-        backend: Option<BackendCapabilityReport>,
-        supervision: Option<SupervisionExecution>,
-        error: Option<ExecutionErrorReport>,
-    ) -> Result<Self, ReportModelError> {
-        Self::schema9(tool, invocation, policy, backend, supervision, error)
-    }
-
-    pub fn schema11(
-        tool: ToolReport,
-        invocation: InvocationReport,
-        policy: PolicyEnvelopeReport,
-        backend: Option<BackendCapabilityReport>,
-        supervision: Option<SupervisionExecution>,
-        error: Option<ExecutionErrorReport>,
-        windows_terminal_delivery: Option<WindowsTerminalDeliveryEvidenceV1>,
-    ) -> Result<Self, ReportModelError> {
-        let mut report = Self::schema10(tool, invocation, policy, backend, supervision, error)?;
-        report.schema_version = WINDOWS_EXECUTION_REPORT_SCHEMA_V11;
-        report.windows_terminal_delivery = windows_terminal_delivery;
-        validate_windows_terminal_delivery(
-            report.schema_version,
-            report.backend.as_ref(),
-            report.supervision.as_ref(),
-            &report.attempts,
-            report.error.as_ref(),
-            report.windows_terminal_delivery.as_ref(),
-        )?;
-        Ok(report)
-    }
-    pub fn schema9(
         tool: ToolReport,
         invocation: InvocationReport,
         policy: PolicyEnvelopeReport,
@@ -438,7 +117,7 @@ impl MemcordonReport {
         if let Some(summary) = &supervision {
             validate_attempt_history(summary, &attempts)?;
         }
-        validate_workload_history(&policy, &attempts, error.as_ref())?;
+        validate_standard_boundary(&policy, backend.as_ref(), &attempts, error.as_ref())?;
         Ok(Self {
             schema_version: EXECUTION_REPORT_SCHEMA_VERSION,
             tool,
@@ -448,7 +127,6 @@ impl MemcordonReport {
             supervision,
             attempts,
             error,
-            windows_terminal_delivery: None,
         })
     }
 }
@@ -485,6 +163,7 @@ impl<'de> Deserialize<'de> for MemcordonReport {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Wire {
             schema_version: u32,
             tool: ToolReport,
@@ -494,61 +173,15 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             supervision: Option<SupervisionReport>,
             attempts: Vec<AttemptRecord>,
             error: Option<ExecutionErrorReport>,
-            #[serde(default)]
-            windows_terminal_delivery: Option<WindowsTerminalDeliveryEvidenceV1>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        if !Self::supports_schema(wire.schema_version) {
+        if wire.schema_version != EXECUTION_REPORT_SCHEMA_VERSION {
             return Err(serde::de::Error::custom(ReportModelError::SchemaVersion));
-        }
-        if wire
-            .error
-            .as_ref()
-            .is_some_and(|error| error.private_rejection.is_some())
-            || !matches!(
-                wire.policy.requested.workload,
-                crate::workload_evidence::WorkloadRequestReport::LegacyUnspecified
-            )
-            || !matches!(
-                wire.policy.effective.workload,
-                crate::workload_evidence::RuntimeWorkloadResolution::LegacyUnspecified { .. }
-            )
-            || wire.attempts.iter().any(|attempt| {
-                attempt.operational_failure.is_some()
-                    || attempt.private_execution.is_some()
-                    || !matches!(
-                        attempt.policy_enforcement,
-                        crate::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified
-                    )
-            })
-            || wire
-                .error
-                .as_ref()
-                .and_then(|error| error.policy_enforcement.as_ref())
-                .is_some_and(|evidence| {
-                    !matches!(
-                        evidence,
-                        crate::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified
-                    )
-                })
-        {
-            return Err(serde::de::Error::custom(
-                "numeric workload reports require the historical diagnostic decoder",
-            ));
         }
         if wire.supervision.is_some() == wire.error.is_some() {
             return Err(serde::de::Error::custom(ReportModelError::TerminalEnvelope));
         }
         validate_provider_failure(wire.error.as_ref()).map_err(serde::de::Error::custom)?;
-        validate_windows_terminal_delivery(
-            wire.schema_version,
-            wire.backend.as_ref(),
-            wire.supervision.as_ref(),
-            &wire.attempts,
-            wire.error.as_ref(),
-            wire.windows_terminal_delivery.as_ref(),
-        )
-        .map_err(serde::de::Error::custom)?;
         if let Some(summary) = &wire.supervision {
             validate_attempt_history(summary, &wire.attempts).map_err(serde::de::Error::custom)?;
         } else if !wire.attempts.is_empty() {
@@ -562,8 +195,13 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             .map_err(serde::de::Error::custom)?;
         validate_boundary_envelope(&wire.policy, wire.backend.as_ref())
             .map_err(serde::de::Error::custom)?;
-        validate_workload_history(&wire.policy, &wire.attempts, wire.error.as_ref())
-            .map_err(serde::de::Error::custom)?;
+        validate_standard_boundary(
+            &wire.policy,
+            wire.backend.as_ref(),
+            &wire.attempts,
+            wire.error.as_ref(),
+        )
+        .map_err(serde::de::Error::custom)?;
         Ok(Self {
             schema_version: wire.schema_version,
             tool: wire.tool,
@@ -573,132 +211,8 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             supervision: wire.supervision,
             attempts: wire.attempts,
             error: wire.error,
-            windows_terminal_delivery: wire.windows_terminal_delivery,
         })
     }
-}
-
-fn validate_workload_history(
-    policy: &PolicyEnvelopeReport,
-    attempts: &[AttemptRecord],
-    error: Option<&ExecutionErrorReport>,
-) -> Result<(), ReportModelError> {
-    use crate::workload_evidence::{
-        RequestBindingV1, RuntimePolicyEnforcement, WorkloadRequestReport,
-    };
-    let contract = match &policy.requested.workload {
-        WorkloadRequestReport::LegacyUnspecified => None,
-        WorkloadRequestReport::StrictV1 { contract } => Some(contract.as_ref()),
-    };
-    let expected = contract
-        .map(RequestBindingV1::from_contract)
-        .transpose()
-        .map_err(|_| ReportModelError::PolicyEnvelope)?;
-    if contract.is_some() && attempts.iter().any(|attempt| {
-        let successful_outcome = attempt
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| crate::supervision::outcome_status(outcome) == 0);
-        let restart_authorized = matches!(
-            attempt.restart_decision.decision,
-            crate::RestartDecisionKind::HalfLifeLogisticBackoff
-                | crate::RestartDecisionKind::CircuitCooldown
-                | crate::RestartDecisionKind::HalfOpenLaunch
-        );
-        // An unavailable policy terminal is an honest failed observation,
-        // but cannot authorize successful completion or another attempt.
-        (successful_outcome || restart_authorized)
-            && !matches!(
-                attempt.policy_enforcement,
-                RuntimePolicyEnforcement::Authorized {
-                    terminal: crate::workload_evidence::PolicyTerminalEvidenceV1::Retired { .. },
-                    ..
-                }
-            )
-    }) {
-        return Err(ReportModelError::PolicyEnvelope);
-    }
-    let mut bytes = 0usize;
-    for (enforcement, number) in attempts
-        .iter()
-        .map(|attempt| (&attempt.policy_enforcement, Some(attempt.number)))
-        .chain(
-            error
-                .and_then(|error| error.policy_enforcement.as_ref())
-                .map(|enforcement| (enforcement, None)),
-        )
-    {
-        bytes = bytes
-            .checked_add(
-                serde_json::to_vec(enforcement)
-                    .map_err(|_| ReportModelError::PolicyEnvelope)?
-                    .len(),
-            )
-            .ok_or(ReportModelError::PolicyEnvelope)?;
-        if !enforcement.is_consistent() {
-            return Err(ReportModelError::PolicyEnvelope);
-        }
-        let matches = match (enforcement, &expected) {
-            (RuntimePolicyEnforcement::LegacyUnspecified, None) => true,
-            (RuntimePolicyEnforcement::NotAuthorized { request, .. }, Some(expected)) => {
-                request == expected
-            }
-            (
-                RuntimePolicyEnforcement::AuthorizationUncertain {
-                    request: Some(request),
-                    ..
-                },
-                Some(expected),
-            ) => request == expected,
-            (RuntimePolicyEnforcement::Authorized { admission, .. }, Some(expected)) => {
-                &admission.plan.request == expected
-                    && admission
-                        .plan
-                        .matches_contract(contract.expect("strict expected binding"))
-                    && number.is_none_or(|number| {
-                        admission.restart_attempt.checked_add(1) == Some(number)
-                    })
-            }
-            _ => false,
-        };
-        if !matches {
-            return Err(ReportModelError::PolicyEnvelope);
-        }
-    }
-    if bytes > crate::workload_limits::REPORT_CONTRIBUTION_BYTES {
-        return Err(ReportModelError::PolicyEnvelope);
-    }
-    if let Some(enforcement) = error
-        .and_then(|error| error.policy_enforcement.as_ref())
-        .or_else(|| attempts.last().map(|attempt| &attempt.policy_enforcement))
-    {
-        if let Some(resolution) = enforcement.resolution() {
-            if policy.effective.workload != resolution {
-                return Err(ReportModelError::PolicyEnvelope);
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_operational_history(
-    policy: &PolicyEnvelopeReport,
-    supervision: Option<&SupervisionReport>,
-    attempts: &[AttemptRecord],
-    error: Option<&ExecutionErrorReport>,
-) -> Result<(), ReportModelError> {
-    if supervision.is_some() == error.is_some()
-        || attempts.iter().any(|attempt| !attempt.is_consistent())
-    {
-        return Err(ReportModelError::TerminalEnvelope);
-    }
-    validate_provider_failure(error)?;
-    if let Some(summary) = supervision {
-        validate_attempt_history(summary, attempts)?;
-    } else if !attempts.is_empty() {
-        return Err(ReportModelError::AttemptHistory);
-    }
-    validate_workload_history(policy, attempts, error)
 }
 
 fn validate_provider_failure(error: Option<&ExecutionErrorReport>) -> Result<(), ReportModelError> {
@@ -723,30 +237,12 @@ fn validate_provider_failure(error: Option<&ExecutionErrorReport>) -> Result<(),
     }) {
         return Err(ReportModelError::NativeStartup);
     }
-    if error.is_some_and(|error| {
-        error.provider_rejection.is_some() && error.windows_provider_rejection_v2.is_some()
-            || error
-                .windows_provider_rejection_v2
-                .as_ref()
-                .is_some_and(|rejection| {
-                    !rejection.is_consistent()
-                        || rejection.target_released != error.target_released
-                        || (rejection.terminal_receipt().is_some() && error.workload_may_be_alive)
-                })
-    }) {
-        return Err(ReportModelError::ProviderFailure);
-    }
     for failure in error
         .and_then(|error| error.provider_failure.as_ref())
         .into_iter()
         .chain(
             error
                 .and_then(|error| error.provider_rejection.as_ref())
-                .and_then(|rejection| rejection.provider_failure.as_ref()),
-        )
-        .chain(
-            error
-                .and_then(|error| error.windows_provider_rejection_v2.as_ref())
                 .and_then(|rejection| rejection.provider_failure.as_ref()),
         )
     {
@@ -1002,7 +498,7 @@ impl InvocationReport {
 }
 
 impl PolicyEnvelopeReport {
-    fn validate(&self, invocation: &InvocationReport) -> Result<(), ReportModelError> {
+    pub(crate) fn validate(&self, invocation: &InvocationReport) -> Result<(), ReportModelError> {
         self.validate_budget_presence(
             invocation.memory_token.is_some(),
             invocation.deadline_token.is_some(),
@@ -1014,13 +510,6 @@ impl PolicyEnvelopeReport {
         memory: bool,
         deadline: bool,
     ) -> Result<(), ReportModelError> {
-        if !self
-            .effective
-            .workload
-            .matches_request(&self.requested.workload)
-        {
-            return Err(ReportModelError::PolicyEnvelope);
-        }
         if self.requested.memory.is_some() != memory
             || self.requested.deadline.is_some() != deadline
             || self.requested.restart.enabled != self.effective.restart.enabled
@@ -1136,6 +625,7 @@ impl NativeArgument {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyEnvelopeReport {
     pub requested: RequestedPolicyReport,
     pub effective: EffectivePolicyReport,
@@ -1143,8 +633,8 @@ pub struct PolicyEnvelopeReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestedPolicyReport {
-    pub workload: crate::workload_evidence::WorkloadRequestReport,
     pub boundary: crate::BoundaryRequirement,
     pub memory: Option<RequestedMemoryPolicyReport>,
     pub deadline: Option<DeadlinePolicyReport>,
@@ -1201,8 +691,8 @@ pub struct CircuitBreakerPolicyReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectivePolicyReport {
-    pub workload: crate::workload_evidence::RuntimeWorkloadResolution,
     pub boundary: crate::BoundaryClass,
     pub memory: Option<EffectiveMemoryPolicyReport>,
     pub deadline: Option<DeadlinePolicyReport>,
@@ -1258,15 +748,12 @@ pub enum OptionEffectReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionErrorReport {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private_rejection: Option<crate::private_runtime::PrivateRuntimeRejection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<crate::RuntimeEvidenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_startup: Option<crate::NativeStartupDiagnosticV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_enforcement: Option<crate::workload_evidence::RuntimePolicyEnforcement>,
     pub category: String,
     pub code: String,
     pub message: String,
@@ -1278,77 +765,15 @@ pub struct ExecutionErrorReport {
     pub workload_may_be_alive: bool,
     pub boundary_setup_failure: Option<crate::BoundarySetupFailure>,
     pub provider_rejection: Option<crate::ProviderRejectionEvidence>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub windows_provider_rejection_v2: Option<crate::WindowsProviderRejectionV2>,
     pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "PlanReportWire")]
+#[derive(Clone, Debug)]
 pub struct PlanReport {
-    pub schema_version: u32,
     pub tool: ToolReport,
     pub budget_tokens: Vec<BudgetTokenReport>,
     pub request: RequestedPolicyReport,
     pub resolution: PlanResolutionReport,
-}
-
-#[derive(Deserialize)]
-struct PlanReportWire {
-    schema_version: u32,
-    tool: ToolReport,
-    budget_tokens: Vec<BudgetTokenReport>,
-    request: RequestedPolicyReport,
-    resolution: PlanResolutionReport,
-}
-
-impl TryFrom<PlanReportWire> for PlanReport {
-    type Error = String;
-    fn try_from(wire: PlanReportWire) -> Result<Self, Self::Error> {
-        if wire.schema_version != PLAN_REPORT_SCHEMA_VERSION
-            || !matches!(
-                wire.request.workload,
-                crate::workload_evidence::WorkloadRequestReport::LegacyUnspecified
-            )
-            || !matches!(
-                wire.resolution.effective.workload,
-                crate::workload_evidence::RuntimeWorkloadResolution::LegacyUnspecified { .. }
-            )
-        {
-            return Err("numeric local plan requires historical diagnostic decoding".into());
-        }
-        Ok(Self {
-            schema_version: wire.schema_version,
-            tool: wire.tool,
-            budget_tokens: wire.budget_tokens,
-            request: wire.request,
-            resolution: wire.resolution,
-        })
-    }
-}
-
-impl Serialize for PlanReport {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        if !matches!(
-            self.request.workload,
-            crate::workload_evidence::WorkloadRequestReport::LegacyUnspecified
-        ) || !matches!(
-            self.resolution.effective.workload,
-            crate::workload_evidence::RuntimeWorkloadResolution::LegacyUnspecified { .. }
-        ) {
-            return Err(serde::ser::Error::custom(
-                "named local plans require memcordon.plan revision 1",
-            ));
-        }
-        let mut wire = serializer.serialize_struct("PlanReport", 5)?;
-        wire.serialize_field("schema_version", &self.schema_version)?;
-        wire.serialize_field("tool", &self.tool)?;
-        wire.serialize_field("budget_tokens", &self.budget_tokens)?;
-        wire.serialize_field("request", &self.request)?;
-        wire.serialize_field("resolution", &self.resolution)?;
-        wire.end()
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1361,88 +786,14 @@ pub struct PlanResolutionReport {
     pub backoff_sample_ms: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "DoctorReportWire")]
+#[derive(Clone, Debug)]
 pub struct DoctorReport {
-    pub schema_version: u32,
     pub tool: ToolReport,
     pub host: HostReport,
     pub selected: Option<BackendCapabilityReport>,
     pub available: Vec<BackendCapabilityReport>,
     pub unavailable: Vec<UnavailableCapabilityReport>,
     pub requirement: RequirementReport,
-    pub workload_discovery: crate::workload_discovery::DiscoveryReportV1,
-}
-
-#[derive(Deserialize)]
-struct DoctorReportWire {
-    schema_version: u32,
-    tool: ToolReport,
-    host: HostReport,
-    selected: Option<BackendCapabilityReport>,
-    available: Vec<BackendCapabilityReport>,
-    unavailable: Vec<UnavailableCapabilityReport>,
-    requirement: RequirementReport,
-    workload_discovery: crate::workload_discovery::DiscoveryReportV1,
-}
-
-impl TryFrom<DoctorReportWire> for DoctorReport {
-    type Error = String;
-    fn try_from(wire: DoctorReportWire) -> Result<Self, Self::Error> {
-        if wire.schema_version != DOCTOR_REPORT_SCHEMA_VERSION
-            || matches!(
-                wire.workload_discovery,
-                crate::workload_discovery::DiscoveryReportV1::Authenticated { .. }
-            )
-            || wire.requirement.workload.as_ref().is_some_and(|workload| {
-                !matches!(
-                    workload,
-                    crate::workload_evidence::RuntimeWorkloadResolution::LegacyUnspecified { .. }
-                )
-            })
-        {
-            return Err("numeric local discovery requires historical diagnostic decoding".into());
-        }
-        Ok(Self {
-            schema_version: wire.schema_version,
-            tool: wire.tool,
-            host: wire.host,
-            selected: wire.selected,
-            available: wire.available,
-            unavailable: wire.unavailable,
-            requirement: wire.requirement,
-            workload_discovery: wire.workload_discovery,
-        })
-    }
-}
-
-impl Serialize for DoctorReport {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        if matches!(
-            self.workload_discovery,
-            crate::workload_discovery::DiscoveryReportV1::Authenticated { .. }
-        ) || self.requirement.workload.as_ref().is_some_and(|workload| {
-            !matches!(
-                workload,
-                crate::workload_evidence::RuntimeWorkloadResolution::LegacyUnspecified { .. }
-            )
-        }) {
-            return Err(serde::ser::Error::custom(
-                "named local discovery requires memcordon.capabilities revision 1",
-            ));
-        }
-        let mut wire = serializer.serialize_struct("DoctorReport", 8)?;
-        wire.serialize_field("schema_version", &self.schema_version)?;
-        wire.serialize_field("tool", &self.tool)?;
-        wire.serialize_field("host", &self.host)?;
-        wire.serialize_field("selected", &self.selected)?;
-        wire.serialize_field("available", &self.available)?;
-        wire.serialize_field("unavailable", &self.unavailable)?;
-        wire.serialize_field("requirement", &self.requirement)?;
-        wire.serialize_field("workload_discovery", &self.workload_discovery)?;
-        wire.end()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1462,7 +813,6 @@ pub struct RequirementReport {
     pub kind: Option<String>,
     pub met: bool,
     pub reason: Option<String>,
-    pub workload: Option<crate::workload_evidence::RuntimeWorkloadResolution>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

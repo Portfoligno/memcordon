@@ -289,53 +289,12 @@ fn execute(
         .find(|case| case.key.family == "W-ENVELOPE" && case.key.scenario == "restricted")
         .ok_or_else(|| CiError::Message("diagnostic restricted envelope absent".into()))?
         .clone();
-    let apply = crate::command::CommandSpec::new(
-        &config.installed_agent.path,
-        &config.output_directory,
-        Duration::from_secs(90),
-    )
-    .args([
-        std::ffi::OsString::from("package"),
-        "policy".into(),
-        "apply".into(),
-        "--file".into(),
-        suite.local_policy.as_os_str().to_owned(),
-    ])
-    .bounded_until(
-        selected
-            .work
-            .checked_sub(crate::support_loader_producer::BOOTSTRAP_WORK)
-            .ok_or_else(|| CiError::Message("diagnostic preparation cutoff unavailable".into()))?,
-    )
-    .output_limit(256 * 1024)
-    .output_quiet()?;
-    crate::command::require_successful_output("diagnostic selected policy", &apply)?;
-    persist(
-        &artifacts_directory.join("policy-activation.json"),
-        &apply.stdout,
-    )?;
-    let configured = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(
-        &OwnedRecord::read(&suite.local_policy)?.bytes,
-    )
-    .map_err(CiError::Message)?;
-    let requested_contract = memcordon_core::workload_contract::WorkloadContractV1::parse(
-        &OwnedRecord::read(&case.workload_contract)?.bytes,
-    )
-    .map_err(CiError::Message)?;
-    let contract = crate::windows_policy_activation::refresh_contract(
-        &requested_contract,
-        &configured,
-        &apply.stdout,
-    )?;
-    let requested = artifacts_directory.join("requested-contract.json");
-    let contract_bytes = serde_json::to_vec(&contract)?;
-    publication::publish(&requested, &contract_bytes)?;
-    if OwnedRecord::read(&requested)?.bytes != contract_bytes {
-        return Err(CiError::Message(
-            "diagnostic activated contract readback differs".into(),
-        ));
-    }
-    case.workload_contract = requested;
+    let request_bytes = OwnedRecord::read(&case.workload_request)?.bytes;
+    memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    let requested = artifacts_directory.join("workload-request.json");
+    publication::publish(&requested, &request_bytes)?;
+    case.workload_request = requested;
     std::fs::create_dir_all(&case.descriptor.output_root)?;
     persist(
         &case.descriptor_path,
@@ -404,8 +363,7 @@ fn execute(
         &artifacts_directory.join("invocation.json"),
         &serde_json::to_vec(&serde_json::json!({"diagnostic_only":true,
         "selection":selection,"provider":config.provider,"cli":config.cli,"wrapper":config.fixture,
-        "requested_contract_sha256":artifacts::checksum(&contract_bytes),
-        "policy_activation_sha256":artifacts::checksum(&apply.stdout),
+        "requested_request_sha256":artifacts::checksum(&request_bytes),
         "deadline_sha256":artifacts::checksum(&OwnedRecord::read(deadline_path)?.bytes)}))?,
     )?;
     let result = command.output_quiet();

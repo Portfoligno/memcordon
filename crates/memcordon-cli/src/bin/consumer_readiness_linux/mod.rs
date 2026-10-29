@@ -1,6 +1,9 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+mod images;
+mod isolation;
+mod snapshot;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -63,6 +66,13 @@ pub fn run() -> Result<()> {
         challenge,
     };
     match mode.to_str().ok_or("mode not UTF-8")? {
+        "image-custody" => images::run(&mut transcript, arguments),
+        mode @ ("snapshot-read" | "snapshot-read-held") => {
+            snapshot::run(&mut transcript, mode, arguments)
+        }
+        mode @ ("isolation-listener" | "isolation-peer" | "isolation-path" | "isolation-proc") => {
+            isolation::run(&mut transcript, mode, arguments)
+        }
         "exec-held" => {
             use std::os::unix::process::CommandExt;
             let program = arguments.next().ok_or("held native executable absent")?;
@@ -401,6 +411,18 @@ pub fn run() -> Result<()> {
                 serde_json::json!({"name":name,"bytes":received}),
             )
         }
+        "deadline-demand" => {
+            if arguments.next().is_some() {
+                return Err("deadline demand fixture received unexpected argument".into());
+            }
+            transcript.record(
+                "deadline-demand-started",
+                serde_json::json!({"demand":"live-until-native-deadline"}),
+            )?;
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         "empty-input" => {
             if arguments.next().is_some() {
                 return Err("empty input fixture received unexpected argument".into());
@@ -414,9 +436,16 @@ pub fn run() -> Result<()> {
             io::stderr().flush()?;
             Ok(())
         }
-        "bounded-large-output" => {
+        "bounded-large-output" | "relay-backpressure" => {
             if arguments.next().is_some() {
                 return Err("large output fixture received unexpected argument".into());
+            }
+            if mode == "relay-backpressure" {
+                transcript.record(
+                    "relay-pressure-ready",
+                    serde_json::json!({"bytes_per_stream":2097152}),
+                )?;
+                wait_release()?;
             }
             let vector: Vec<u8> = (u8::MIN..=u8::MAX).collect();
             for _ in 0..8192 {
@@ -1001,7 +1030,7 @@ fn export_object(transcript: &mut Transcript, scenario: &str) -> Result<()> {
             std::os::unix::fs::symlink("/owned-source/Cargo.toml", output)?;
             "symlink"
         }
-        "fifo" => "admin-fifo-required",
+        "fifo" => "controller-fifo-required",
         "socket" => {
             socket = Some(std::os::unix::net::UnixListener::bind(output)?);
             "socket"
@@ -1017,7 +1046,7 @@ fn export_object(transcript: &mut Transcript, scenario: &str) -> Result<()> {
             std::os::unix::fs::symlink("/work/other", "/work/parent")?;
             "parent-symlink"
         }
-        "device" => "admin-device-required",
+        "device" => "controller-device-required",
         "concurrent-writer" => {
             let (child, identity) = native_child("export-writer-child", &transcript.challenge)?;
             // Retain the actual Child before a fallible controller receipt.

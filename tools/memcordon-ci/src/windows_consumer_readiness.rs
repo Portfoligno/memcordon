@@ -1,9 +1,8 @@
 //! Positive Windows workload assessment. Diagnostics cannot satisfy these cases.
 use crate::{CiError, Result};
 use memcordon_core::ChildTermination;
-use memcordon_core::result_v1::{
-    AuthorizationV1, CleanupStateV1, LaunchStateV1, OutcomeKindV1, ResultV1, RuntimeV1,
-};
+use memcordon_core::execution_facts::{CleanupStateV1, OutcomeKindV1};
+use memcordon_core::result_v3::{ReleaseKnowledgeV3, ResultV3, RuntimeExecutionV3};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -106,7 +105,7 @@ pub struct CaseInput {
     pub key: CaseKey,
     pub descriptor: descriptor::Descriptor,
     pub descriptor_path: PathBuf,
-    pub workload_contract: PathBuf,
+    pub workload_request: PathBuf,
     pub expected_token: TokenObservation,
 }
 
@@ -125,7 +124,6 @@ pub struct TokenObservation {
 pub struct SuiteInput {
     pub format: String,
     pub revision: u32,
-    pub local_policy: PathBuf,
     pub cases: Vec<CaseInput>,
 }
 
@@ -134,8 +132,7 @@ pub struct SuiteInput {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsReadinessPlan {
-    pub local_policy: PathBuf,
-    pub workload_contract_template: PathBuf,
+    pub request_template: PathBuf,
     pub toolchain: descriptor::Toolchain,
     pub candidate_output_root: PathBuf,
     pub protected_write_probes: Vec<PathBuf>,
@@ -216,8 +213,7 @@ pub struct CaseAssessment {
     pub stdout_sha256: Option<String>,
     pub stderr_sha256: Option<String>,
     pub transcript_sha256: Option<String>,
-    pub contract_sha256: Option<String>,
-    pub policy_activation_sha256: Option<String>,
+    pub request_sha256: Option<String>,
     pub terminal_observation_sha256: Option<String>,
 }
 
@@ -234,6 +230,33 @@ struct Event {
 pub fn positive_keys() -> BTreeSet<CaseKey> {
     let mut keys = BTreeSet::new();
     for (family, scenarios) in [
+        (
+            "C-IO",
+            &[
+                "empty-input",
+                "empty-message",
+                "binary-streams",
+                "binary-file",
+                "native-argv",
+                "bounded-large-output",
+            ][..],
+        ),
+        (
+            "C-STATUS",
+            &[
+                "zero", "nonzero", "exit-123", "exit-124", "exit-125", "exit-126", "exit-127",
+                "deadline", "memory",
+            ][..],
+        ),
+        ("C-PARSER", &["valid-current-result"][..]),
+        ("C-LIFETIME", &["root-first"][..]),
+        ("W-RETIREMENT", &["natural", "output-backpressure"][..]),
+        ("W-UPGRADE", &["fresh-positive"][..]),
+        ("C-ADMISSION", &["positive"][..]),
+        (
+            "W-BINDING",
+            &["effective-caller-token", "restricted-token-preserved"][..],
+        ),
         (
             "W-ENVELOPE",
             &["ordinary", "restricted", "sentinel-handles"][..],
@@ -301,7 +324,7 @@ pub fn positive_keys() -> BTreeSet<CaseKey> {
 }
 
 pub fn validate_suite(input: &SuiteInput) -> Result<()> {
-    if input.format != "memcordon.windows-readiness-input" || input.revision != 1 {
+    if input.format != "memcordon.windows-readiness-input" || input.revision != 2 {
         return Err(CiError::Message(
             "unsupported Windows readiness input format/revision".into(),
         ));
@@ -312,9 +335,12 @@ pub fn validate_suite(input: &SuiteInput) -> Result<()> {
             return Err(CiError::Message("duplicate Windows positive case".into()));
         }
         case.descriptor.validate().map_err(CiError::Message)?;
-        if !case.workload_contract.is_absolute()
+        if !case.workload_request.is_absolute()
             || !case.descriptor_path.is_absolute()
-            || case.key.scenario == "restricted" && !case.expected_token.restricted
+            || matches!(
+                case.key.scenario.as_str(),
+                "restricted" | "restricted-token-preserved"
+            ) && !case.expected_token.restricted
         {
             return Err(CiError::Message(
                 "case input lacks exact contract/path/caller binding".into(),
@@ -401,7 +427,18 @@ fn validate_vectors(case: &CaseInput) -> Result<()> {
 fn expected_fixture_case(key: &CaseKey) -> Result<descriptor::Case> {
     use descriptor::Case;
     let case = match key.family.as_str() {
-        "W-ENVELOPE" => Case::Envelope,
+        "W-ENVELOPE" | "W-BINDING" | "C-ADMISSION" | "C-PARSER" | "W-UPGRADE" => Case::Envelope,
+        "C-LIFETIME" if key.scenario == "root-first" => Case::RootFirst,
+        "C-IO" => match key.scenario.as_str() {
+            "empty-input" => Case::EmptyInput,
+            "empty-message" => Case::Joint,
+            "binary-file" => Case::BinaryFiles,
+            "native-argv" => Case::NativeArgv,
+            "binary-streams" | "bounded-large-output" => Case::BinaryStreams,
+            _ => return Err(CiError::Message("unknown common IO scenario".into())),
+        },
+        "W-RETIREMENT" if key.scenario == "natural" => Case::ApplicationExit,
+        "W-RETIREMENT" if key.scenario == "output-backpressure" => Case::BinaryStreams,
         "W-JOINT" if key.scenario == "endpoint-mismatch" => Case::EndpointMismatch,
         "W-JOINT" => Case::Joint,
         "W-TOOLCHAIN" => Case::Toolchain,
@@ -413,9 +450,9 @@ fn expected_fixture_case(key: &CaseKey) -> Result<descriptor::Case> {
             value if value.starts_with("argv-") => Case::NativeArgv,
             _ => Case::BinaryStreams,
         },
-        "W-STATUS" if key.scenario == "deadline" => Case::DeadlineDemand,
-        "W-STATUS" if key.scenario == "memory" => Case::MemoryDemand,
-        "W-STATUS" => Case::ApplicationExit,
+        "W-STATUS" | "C-STATUS" if key.scenario == "deadline" => Case::DeadlineDemand,
+        "W-STATUS" | "C-STATUS" if key.scenario == "memory" => Case::MemoryDemand,
+        "W-STATUS" | "C-STATUS" => Case::ApplicationExit,
         "W-DESCENDANT" => match key.scenario.as_str() {
             "root-first" => Case::RootFirst,
             "intermediate-parent-first" => Case::IntermediateFirst,
@@ -433,7 +470,7 @@ fn expected_status(key: &CaseKey) -> u32 {
     if key.family == "W-JOINT" && key.scenario == "endpoint-mismatch" {
         return 42;
     }
-    if key.family == "W-STATUS" {
+    if matches!(key.family.as_str(), "W-STATUS" | "C-STATUS") {
         match key.scenario.as_str() {
             "nonzero" | "target-failure" => 17,
             value => value
@@ -575,7 +612,7 @@ fn support_loader_command_with_environment<const SYSTEM_ENVIRONMENT: bool>(
         ));
     }
     case.descriptor.validate().map_err(CiError::Message)?;
-    if !case.workload_contract.is_absolute() || !case.descriptor_path.is_absolute() {
+    if !case.workload_request.is_absolute() || !case.descriptor_path.is_absolute() {
         return Err(CiError::Message(
             "diagnostic contract/input paths are not selected absolute paths".into(),
         ));
@@ -616,20 +653,20 @@ fn public_command_observation(
     #[cfg(not(windows))]
     let request_observation = false;
     let mut args: Vec<OsString> = ["+4GiB", "+600s"].into_iter().map(OsString::from).collect();
-    // A strict contract on the ordinary backend is a deliberately unsupported
+    // A named request on the ordinary backend is a deliberately unsupported
     // public request. Every other readiness operation selects sealed runtime.
     if case.key.scenario != "unsupported-public-request" {
         args.push("--sealed".into());
     }
-    args.push("--workload-contract".into());
+    args.push("--workload-request".into());
     if case.descriptor.case == descriptor::Case::DeadlineDemand {
         args[1] = "+10s".into();
     }
     if case.descriptor.case == descriptor::Case::MemoryDemand {
         args[0] = "+64MiB".into();
     }
-    args.push(std::path::absolute(&case.workload_contract)?.into_os_string());
-    args.extend(["--report-format", "result-v1", "--report"].map(OsString::from));
+    args.push(std::path::absolute(&case.workload_request)?.into_os_string());
+    args.extend(["--report-format", "result-v3", "--report"].map(OsString::from));
     args.push(std::path::absolute(report)?.into_os_string());
     if terminal_observation {
         args.push("--windows-terminal-observation".into());
@@ -813,95 +850,77 @@ fn decode_events(bytes: &[u8], live: bool) -> Result<Vec<Event>> {
 
 /// A launch refusal or abnormal completion cannot satisfy the live positive-fixture barrier.
 /// This observation only rejects; it never supplies accepted workload authority.
+pub fn current_native(result: &ResultV3) -> Result<&memcordon_core::WindowsSealedEvidenceV3> {
+    match &result.runtime {
+        RuntimeExecutionV3::WindowsSealed { native, .. } => Ok(native),
+        _ => Err(CiError::Message(
+            "current result lacks actual Windows native execution".into(),
+        )),
+    }
+}
+pub fn current_association(
+    result: &ResultV3,
+) -> Result<&memcordon_core::execution_facts::ProviderAttemptAssociationV1> {
+    current_native(result)?
+        .frontend_provider_association
+        .as_ref()
+        .ok_or_else(|| {
+            CiError::Message("current Windows result lacks actual provider association".into())
+        })
+}
 pub fn check_positive_barrier_result(
     bytes: &[u8],
     provider: &memcordon_core::PublicProviderBindingV1,
 ) -> Result<()> {
-    let result = ResultV1::parse(bytes).map_err(CiError::Message)?;
-    if result
-        .provider_association
-        .as_ref()
-        .map(|association| &association.provider)
-        != Some(provider)
-    {
+    let result = ResultV3::parse(bytes).map_err(CiError::Message)?;
+    if result.provider.as_ref() != Some(provider) {
         return Err(CiError::Message(
-            "positive barrier result has no matching selected provider binding".into(),
+            "positive fixture provider binding differs from selected installed image".into(),
         ));
     }
-    let native_failure = match result.outcome.native_termination.as_ref() {
-        Some(ChildTermination::ExitCode { code }) => *code != 0,
-        Some(ChildTermination::WindowsStatus { status }) => *status != 0,
-        Some(ChildTermination::UnixSignal { .. }) => true,
-        Some(ChildTermination::Unavailable) | None => false,
-    };
-    let completed_failure = result.outcome.kind == OutcomeKindV1::Completed
-        && (result.outcome.wrapper_status != 0 || native_failure);
-    if completed_failure
+    if result.release != ReleaseKnowledgeV3::Released
         || matches!(
             result.outcome.kind,
-            OutcomeKindV1::LaunchFailure | OutcomeKindV1::ProviderFailure
+            OutcomeKindV1::LaunchFailure | OutcomeKindV1::ProviderFailure | OutcomeKindV1::Unknown
         )
-        || result.authorization == AuthorizationV1::RejectedBeforeRelease
-        || matches!(
-            result.launch.state,
-            LaunchStateV1::NotCreated | LaunchStateV1::ExecFailed
-        )
+        || (result.outcome.kind == OutcomeKindV1::Completed && result.outcome.wrapper_status != 0)
     {
-        let original = result
-            .attempts
-            .last()
-            .and_then(|attempt| attempt.error.as_ref());
-        let native_termination = match result.outcome.native_termination.as_ref() {
-            Some(ChildTermination::WindowsStatus { status }) => {
-                format!("windows-status={status} (0x{status:08X})")
-            }
-            other => format!("{other:?}"),
-        };
-        return Err(CiError::Message(format!(
-            "positive fixture launch already failed; wrapper-status={}; outcome={:?}; native-termination={}; authorization={:?}; launch={:?}; original={}",
-            result.outcome.wrapper_status,
-            result.outcome.kind,
-            native_termination,
-            result.authorization,
-            result.launch.state,
-            original.map_or_else(
-                || "no original attempt error".into(),
-                |error| format!(
-                    "{}: {}",
-                    error.code,
-                    error.message.chars().take(1024).collect::<String>()
-                )
-            ),
-        )));
+        let mut detail = format!(
+            "positive fixture launch already failed or completed abnormally; wrapper-status={}; outcome={:?}; release={:?}",
+            result.outcome.wrapper_status, result.outcome.kind, result.release
+        );
+        if let Some(ChildTermination::WindowsStatus { status }) = result.outcome.native_termination
+        {
+            detail.push_str(&format!("; windows-status={status} (0x{status:08X})"));
+        }
+        if let Some(rejection) = &result.windows_rejection {
+            detail.push_str(&format!("; {}: {}", rejection.code, rejection.detail));
+        }
+        if let Some(failure) = &result.provider_failure {
+            detail.push_str(&format!(
+                "; original-provider-failure={:?}",
+                failure.original
+            ));
+        } else {
+            detail.push_str("; no original provider failure observed");
+        }
+        for diagnostic in result.diagnostics.as_slice() {
+            detail.push_str("; ");
+            detail.push_str(diagnostic.as_str());
+        }
+        return Err(CiError::Message(detail));
     }
     Ok(())
 }
-
-/// Select read-only OS-event context; this never establishes execution or retirement.
-pub fn released_target_loader_event_candidate(result: &ResultV1) -> bool {
-    result.outcome.kind == OutcomeKindV1::Completed
+pub fn released_target_loader_event_candidate(result: &ResultV3) -> bool {
+    result.release == ReleaseKnowledgeV3::Released
+        && result.outcome.kind == OutcomeKindV1::Completed
         && result.outcome.wrapper_status == 125
-        && result.authorization == AuthorizationV1::Granted
-        && result.launch.state == LaunchStateV1::ReleaseIssued
         && matches!(
             result.outcome.native_termination,
             Some(ChildTermination::WindowsStatus { status: 0xC0000142 })
         )
-        && result.cleanup.state == CleanupStateV1::Complete
-        && result.cleanup.direct_child_reaped
-        && result.cleanup.workload_empty == Some(true)
-        && result.cleanup.outstanding.is_empty()
-        && result.cleanup.failed_operations.is_empty()
-        && result.attempts.last().is_some_and(|attempt| {
-            let proof = &attempt.restart_safety;
-            proof.direct_child_reaped
-                && proof.workload_empty == Some(true)
-                && proof.helpers_reaped
-                && proof.containment_removed
-                && proof.containment_incapable_of_live_members
-                && proof.sealed_boundary_retired
-                && proof.errors.is_empty()
-        })
+        && validate_retirement(result).is_ok()
 }
 
 pub fn assess(
@@ -911,23 +930,19 @@ pub fn assess(
     stderr: &[u8],
     transcript: &[u8],
     native_status: i32,
-    expected_association: &memcordon_core::result_v1::ProviderAttemptAssociationV1,
+    expected_association: &memcordon_core::execution_facts::ProviderAttemptAssociationV1,
 ) -> Result<()> {
-    let result = ResultV1::parse(result_bytes).map_err(CiError::Message)?;
+    let result = ResultV3::parse(result_bytes).map_err(CiError::Message)?;
     let target_status = expected_status(&case.key);
     let policy_kind = match case.descriptor.case {
         descriptor::Case::DeadlineDemand => Some(OutcomeKindV1::Deadline),
         descriptor::Case::MemoryDemand => Some(OutcomeKindV1::ConfirmedMemoryLimit),
         _ => None,
     };
-    if result.authorization != AuthorizationV1::Granted
+    if result.release != ReleaseKnowledgeV3::Released
         || result.outcome.kind != policy_kind.unwrap_or(OutcomeKindV1::Completed)
         || result.outcome.wrapper_status != native_status
-        || result.diagnostics.is_some()
-        || !matches!(
-            result.launch.state,
-            LaunchStateV1::ReleaseIssued | LaunchStateV1::ExecObserved
-        )
+        || !result.diagnostics.as_slice().is_empty()
         || policy_kind.is_none()
             && !matches!(result.outcome.native_termination.as_ref(),
             Some(ChildTermination::WindowsStatus { status }) if *status == target_status)
@@ -937,7 +952,7 @@ pub fn assess(
             "positive Windows case did not complete with exact application origin/status".into(),
         ));
     }
-    if result.provider_association.as_ref() != Some(expected_association) {
+    if current_association(&result)? != expected_association {
         return Err(CiError::Message(
             "positive result differs from independently held provider/attempt/request association"
                 .into(),
@@ -958,7 +973,12 @@ pub fn assess(
             "fixture start/finish/challenge evidence differs".into(),
         ));
     }
-    if result.launch.target_pid.map(|pid| pid.get()) != Some(first.pid) {
+    if current_native(&result)?
+        .target_identity
+        .as_ref()
+        .map(|identity| identity.process_id)
+        != Some(first.pid)
+    {
         return Err(CiError::Message(
             "fixture root differs from authenticated target identity".into(),
         ));
@@ -1099,17 +1119,16 @@ pub fn assess(
     Ok(())
 }
 
-pub fn validate_retirement(result: &ResultV1) -> Result<()> {
-    let RuntimeV1::WindowsSealed { observation } = &result.runtime else {
-        return Err(CiError::Message(
-            "positive result omitted native Windows boundary".into(),
-        ));
-    };
+pub fn validate_retirement(result: &ResultV3) -> Result<()> {
+    result.validate().map_err(CiError::Message)?;
+    let observation = current_native(result)?;
     if result.cleanup.state != CleanupStateV1::Complete
-        || !result.cleanup.direct_child_reaped
-        || result.cleanup.workload_empty != Some(true)
-        || !result.cleanup.outstanding.is_empty()
-        || !result.cleanup.failed_operations.is_empty()
+        || result
+            .cleanup
+            .obligations
+            .as_slice()
+            .iter()
+            .any(|obligation| !obligation.settled)
         || !observation.caller_token_authenticated
         || !observation.initial_target_token_matches_caller
         || !observation.job_list_applied_at_creation
@@ -1142,8 +1161,7 @@ pub fn accepted(records: &[CaseAssessment]) -> bool {
                 && record.stderr_sha256.is_some()
                 && record.transcript_sha256.is_some()
                 && record.terminal_observation_sha256.is_some()
-                && record.contract_sha256.is_some()
-                && record.policy_activation_sha256.is_some()
+                && record.request_sha256.is_some()
         })
 }
 
@@ -1173,7 +1191,7 @@ pub fn run_installed(
 }
 
 #[cfg(any(windows, test))]
-pub(crate) fn write_activated_contract(
+pub(crate) fn write_workload_request(
     output_directory: &Path,
     key: &CaseKey,
     bytes: &[u8],
@@ -1183,7 +1201,7 @@ pub(crate) fn write_activated_contract(
         .join(&key.family)
         .join(&key.scenario);
     std::fs::create_dir_all(&directory)?;
-    let path = directory.join("requested-contract.json");
+    let path = directory.join("workload-request.json");
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1306,8 +1324,7 @@ pub(crate) mod native {
         work_deadline: Instant,
     ) -> Result<()> {
         config.require_workload_diagnostic()?;
-        use memcordon_core::workload_contract::*;
-        use memcordon_core::workload_registry::*;
+        use memcordon_core::workload_request::*;
         use std::num::NonZeroU64;
         let directory = std::path::absolute(&config.output_directory)?;
         fs::create_dir_all(&directory)?;
@@ -1519,225 +1536,17 @@ pub(crate) mod native {
             directory.join("windows-owned-inputs.json"),
             serde_json::to_vec_pretty(&copied_measurements)?,
         )?;
-        let plan_hash = crate::windows_causal_acceptance::sha256(&serde_json::to_vec(&(
-            positive_keys(),
-            &config.fixture,
-            &measured,
-            &copied_measurements,
-            &toolchain.linker_mode,
-            &toolchain.input_root,
-            &toolchain.native_linker,
-        ))?);
-        let plan_digest = memcordon_core::BoundedText::<64>::new(&plan_hash)
-            .and_then(memcordon_core::DiagnosticSha256::try_from)
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        let profile = BaselineProfile::WindowsHostNetworkExternal;
-        let one = NonZeroU64::new(1).expect("one is nonzero");
-        let grant_id =
-            LogicalId::new("windows-readiness-owned".into()).map_err(CiError::Message)?;
-        let registry = RuntimePolicyRegistry {
-            format: "memcordon.local-policy".into(),
-            revision: 1,
-            profiles: bounded_vec(vec![RuntimeProfileDefinition {
-                profile,
-                reference: profile.reference(),
-                enabled: true,
-            }])
-            .map_err(|error| CiError::Message(error.to_string()))?,
-            grants: bounded_vec(vec![PolicyGrantV1 {
-                id: grant_id.clone(),
-                revision: one,
-                profile: profile.reference(),
-                ceiling: profile.ceiling(),
-                enabled: true,
-                callers: bounded_vec(vec![CallerSelector::Windows {
-                    sid: memcordon_core::BoundedText::new(&sid)
-                        .map_err(|error| CiError::Message(error.to_string()))?,
-                }])
-                .map_err(|error| CiError::Message(error.to_string()))?,
-                approved_plans: bounded_vec(vec![plan_digest.clone()])
-                    .map_err(|error| CiError::Message(error.to_string()))?,
-            }])
-            .map_err(|error| CiError::Message(error.to_string()))?,
-            active_attempt_disposition: GrantChangeDisposition::DrainExisting,
-        };
-        registry.validate().map_err(CiError::Message)?;
-        let local_policy = directory.join("windows-local-policy.json");
-        let mut policy_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&local_policy)?;
-        policy_file.write_all(&serde_json::to_vec_pretty(&registry)?)?;
-        policy_file.sync_all()?;
-        let agent_custody = crate::windows_readiness_adapter::hold_artifact(
-            &config.installed_agent.path,
-            Some(&config.installed_agent.sha256),
-            512 * 1024 * 1024,
-        )?;
-        let prior_budget = provision_budget(work_deadline)?;
-        let mut prior_command =
-            CommandSpec::new(&config.installed_agent.path, &directory, prior_budget)
-                .args([
-                    OsString::from("package"),
-                    "policy".into(),
-                    "apply".into(),
-                    "--file".into(),
-                    local_policy.clone().into_os_string(),
-                ])
-                .materialize()?;
-        prior_command.env_clear();
-        let prior_invocation = {
-            use std::os::windows::ffi::OsStrExt;
-            serde_json::to_vec(&serde_json::json!({
-                "format":"memcordon.windows-policy-activation-command",
-                "revision":1,
-                "agent_sha256":config.installed_agent.sha256,
-                "program_utf16":prior_command.get_program().encode_wide().collect::<Vec<_>>(),
-                "argv_utf16":prior_command.get_args().map(|argument|argument.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
-                "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),
-                "environment_cleared":true,
-                "budget_millis":prior_budget.as_millis(),
-                "policy_sha256":crate::windows_causal_acceptance::sha256(&serde_json::to_vec_pretty(&registry)?),
-            }))?
-        };
-        crate::windows_readiness_adapter::publish_receipt(
-            &directory.join("windows-policy-prior-activation.invocation.json"),
-            &prior_invocation,
-        )?;
-        let prior_output = memcordon_testkit::run_with_deadline_output_limit(
-            &mut prior_command,
-            prior_budget,
-            256 * 1024,
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?;
-        crate::windows_readiness_adapter::publish_receipt(
-            &directory.join("windows-policy-prior-activation.json"),
-            &prior_output.stdout,
-        )?;
-        crate::windows_readiness_adapter::publish_receipt(
-            &directory.join("windows-policy-prior-activation.stderr.bin"),
-            &prior_output.stderr,
-        )?;
-        crate::windows_readiness_adapter::publish_receipt(
-            &directory.join("windows-policy-prior-activation.exit.json"),
-            &serde_json::to_vec(&serde_json::json!({
-                "format":"memcordon.windows-policy-activation-exit",
-                "revision":1,
-                "invocation_sha256":crate::windows_causal_acceptance::sha256(&prior_invocation),
-                "status":prior_output.status.code(),
-                "success":prior_output.status.success(),
-                "stdout_sha256":crate::windows_causal_acceptance::sha256(&prior_output.stdout),
-                "stderr_sha256":crate::windows_causal_acceptance::sha256(&prior_output.stderr),
-            }))?,
-        )?;
-        crate::windows_readiness_adapter::verify_named_artifact(
-            &agent_custody,
-            &config.installed_agent.path,
-        )?;
-        if !prior_output.status.success() {
-            return Err(CiError::Message(
-                "actual Windows prior policy activation failed".into(),
-            ));
-        }
-        memcordon_core::canonical_json::reject_duplicate_json_keys(&prior_output.stdout)
-            .map_err(CiError::Message)?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct PriorActivation {
-            format: String,
-            revision: u32,
-            registry: RuntimePolicyRegistry,
-            registry_digest: memcordon_core::DiagnosticSha256,
-            epoch: PolicyEpoch,
-            revoked_admissions: memcordon_core::BoundedVec<Nonce128, 256>,
-        }
-        let prior: PriorActivation = serde_json::from_slice(&prior_output.stdout)?;
-        if prior.format != "memcordon.local-activation"
-            || prior.revision != 1
-            || prior.registry != registry
-            || prior.registry_digest != registry.canonical_digest().map_err(CiError::Message)?
-            || !prior.revoked_admissions.as_slice().is_empty()
-            || Instant::now() >= work_deadline
-        {
-            return Err(CiError::Message("actual Windows prior activation differs from exact owned policy or original cutoff".into()));
-        }
-        let tcp_id = LogicalId::new("owned-tcp".into()).map_err(CiError::Message)?;
-        let endpoint = LogicalId::new("owned-listener".into()).map_err(CiError::Message)?;
-        let operations = TcpOperations::new(
-            bounded_vec(vec![
-                TcpOperation::Create,
-                TcpOperation::Bind,
-                TcpOperation::Listen,
-                TcpOperation::Accept,
-                TcpOperation::StreamRead,
-                TcpOperation::StreamWrite,
-            ])
-            .map_err(|error| CiError::Message(error.to_string()))?,
-        )
-        .map_err(CiError::Message)?;
-        let client_operations = TcpOperations::new(
-            bounded_vec(vec![
-                TcpOperation::Create,
-                TcpOperation::Connect,
-                TcpOperation::StreamRead,
-                TcpOperation::StreamWrite,
-            ])
-            .map_err(|error| CiError::Message(error.to_string()))?,
-        )
-        .map_err(CiError::Message)?;
-        let contract = WorkloadContractV1 {
-            schema_version: ContractVersionOne::default(),
-            workload_plan_digest: plan_digest.clone(),
-            authorized_profile: profile.reference(),
-            authorization: AuthorizationRef {
-                grant_id,
-                grant_revision: one,
-                approved_plan_digest: plan_digest,
-            },
-            ceiling: profile.ceiling(),
-            requirements: bounded_vec(vec![
-                RequirementV1::Tcp {
-                    id: tcp_id.clone(),
-                    family: IpFamily::V4,
-                    operations,
-                    scope: TcpScope::HostSharedLoopback,
-                    local_ports: LocalPortRequirement::KernelAssigned,
-                    // The listener does not connect. Its explicit loopback peer
-                    // terminates the endpoint graph; the actual client below
-                    // consumes the declared listener without a self-cycle.
-                    peer: TcpPeerRequirement::ExactAddress {
-                        endpoint: TcpEndpoint::V4 {
-                            address: [127, 0, 0, 1],
-                            port: std::num::NonZeroU16::new(1).expect("nonzero declared port"),
-                        },
-                    },
-                },
-                RequirementV1::Tcp {
-                    id: LogicalId::new("owned-tcp-client".into()).map_err(CiError::Message)?,
-                    family: IpFamily::V4,
-                    operations: client_operations,
-                    scope: TcpScope::HostSharedLoopback,
-                    local_ports: LocalPortRequirement::KernelAssigned,
-                    peer: TcpPeerRequirement::SameAttemptEndpoint {
-                        endpoint: endpoint.clone(),
-                    },
-                },
-            ])
-            .map_err(|error| CiError::Message(error.to_string()))?,
-            endpoints: bounded_vec(vec![EndpointDeclarationV1 {
-                id: endpoint,
-                requirement: tcp_id,
-            }])
-            .map_err(|error| CiError::Message(error.to_string()))?,
-            expected_epoch: prior.epoch,
-        };
-        contract.validate().map_err(CiError::Message)?;
-        let template = directory.join("windows-contract-template.json");
+        let request = memcordon_core::workload_request::WorkloadRequestV1::parse(br#"{"format":"memcordon.workload-request","revision":1,"runtime":{"kind":"windows-sealed","profile":"windows-sealed-current-token-v1"},"requirements":[]}"#).map_err(|error| CiError::Message(error.to_string()))?;
+        let template = directory.join("windows-request-template.json");
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&template)?
-            .write_all(&serde_json::to_vec_pretty(&contract)?)?;
+            .write_all(
+                &request
+                    .canonical_bytes()
+                    .map_err(|error| CiError::Message(error.to_string()))?,
+            )?;
         let candidate = directory.join("candidate-outputs");
         fs::create_dir(&candidate)?;
         let provider_root = config
@@ -1762,8 +1571,7 @@ pub(crate) mod native {
             ])?,
         )?;
         let plan = WindowsReadinessPlan {
-            local_policy,
-            workload_contract_template: template,
+            request_template: template,
             toolchain,
             candidate_output_root: candidate,
             protected_write_probes: vec![
@@ -2096,6 +1904,14 @@ pub(crate) mod native {
         Ok(())
     }
 
+    pub(crate) fn prepare_owned_probe_image(path: &Path, caller_sid: &[u8]) -> Result<()> {
+        let sid = sid_text(caller_sid)?;
+        set_directory_acl(
+            path,
+            &format!("D:P(A;;GA;;;{sid})(A;;GRGX;;;RC)(A;;GA;;;SY)"),
+        )
+    }
+
     #[allow(unsafe_code)] // Native ACL installation/readback only on explicitly owned paths.
     fn set_directory_acl(path: &Path, sddl: &str) -> Result<()> {
         use std::os::windows::ffi::OsStrExt;
@@ -2412,6 +2228,33 @@ pub(crate) mod native {
                     _ => {}
                 }
             }
+            if key.family == "W-RETIREMENT" && key.scenario == "output-backpressure" {
+                stdout = (u8::MIN..=u8::MAX).cycle().take(16384).collect();
+                stderr = (u8::MIN..=u8::MAX).rev().cycle().take(16384).collect();
+            }
+            if key.family == "C-IO" {
+                match key.scenario.as_str() {
+                    "binary-streams" => {
+                        stdout = (u8::MIN..=u8::MAX).collect();
+                        stderr = (u8::MIN..=u8::MAX).rev().collect();
+                    }
+                    "bounded-large-output" => {
+                        stdout = (u8::MIN..=u8::MAX).cycle().take(16384).collect();
+                        stderr = (u8::MIN..=u8::MAX).rev().cycle().take(16384).collect();
+                    }
+                    "native-argv" => {
+                        arguments = vec![
+                            String::new(),
+                            "space and\ttab".into(),
+                            "literal \"quotes\"".into(),
+                            "trailing\\".into(),
+                            "日本語-λ".into(),
+                            "C:\\path with spaces\\file".into(),
+                        ]
+                    }
+                    _ => {}
+                }
+            }
             let event_stem = format!(
                 "Local\\memcordon-readiness-{run}-{}-{}",
                 key.family, key.scenario
@@ -2428,7 +2271,10 @@ pub(crate) mod native {
                     .into_owned()
             });
             let status = expected_status(&key);
-            let caller = if key.scenario == "restricted" {
+            let caller = if matches!(
+                key.scenario.as_str(),
+                "restricted" | "restricted-token-preserved"
+            ) {
                 restricted.clone()
             } else {
                 ordinary.clone()
@@ -2446,7 +2292,10 @@ pub(crate) mod native {
                 application_status: status,
                 churn_creations: descriptor::CHURN_CREATIONS,
                 churn_live: descriptor::CHURN_LIVE,
-                denied_write_paths: if key.scenario == "restricted" {
+                denied_write_paths: if matches!(
+                    key.scenario.as_str(),
+                    "restricted" | "restricted-token-preserved"
+                ) {
                     plan.protected_write_probes.clone()
                 } else {
                     Vec::new()
@@ -2470,7 +2319,7 @@ pub(crate) mod native {
                 key,
                 descriptor,
                 descriptor_path: output.with_extension("input.json"),
-                workload_contract: plan.workload_contract_template.clone(),
+                workload_request: plan.request_template.clone(),
                 expected_token: caller,
             });
         }
@@ -2478,8 +2327,7 @@ pub(crate) mod native {
         // identity to the descriptor before launching the actual public frontend.
         let suite = SuiteInput {
             format: "memcordon.windows-readiness-input".into(),
-            revision: 1,
-            local_policy: plan.local_policy.clone(),
+            revision: 2,
             cases,
         };
         let bytes = serde_json::to_vec_pretty(&suite)?;
@@ -2529,10 +2377,8 @@ pub(crate) mod native {
             public_report,
             crate::windows_causal_acceptance::MAX_REPORT_BYTES,
         )?;
-        let result = ResultV1::parse(&bytes).map_err(CiError::Message)?;
-        let association = result.provider_association.as_ref().ok_or_else(|| {
-            CiError::Message("callback product context lacks provider association".into())
-        })?;
+        let result = ResultV3::parse(&bytes).map_err(CiError::Message)?;
+        let association = super::current_association(&result)?;
         if &association.provider != provider {
             return Err(CiError::Message(
                 "callback product context provider differs".into(),
@@ -2567,7 +2413,7 @@ pub(crate) mod native {
             let terminal: memcordon_platform::AuthenticatedWindowsTerminalObservation =
                 serde_json::from_slice(&bytes)?;
             if terminal.format != "memcordon.windows-terminal-observation"
-                || terminal.revision != 1
+                || terminal.revision != 2
                 || terminal.provider != association.provider
                 || terminal.terminal.attempt_id != String::from(association.attempt_id.clone())
                 || terminal.terminal.request_sha256
@@ -4290,7 +4136,7 @@ pub(crate) mod native {
                         "positive native guardian association differs",
                     ));
                 }
-                let expected = memcordon_core::result_v1::ProviderAttemptAssociationV1 {
+                let expected = memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
                     provider: observed.association.provider.clone(),
                     attempt_id: observed.association.attempt_id.clone(),
                     request_sha256: observed.association.request_sha256.clone(),
@@ -5259,28 +5105,17 @@ pub(crate) mod native {
                             &public_report,
                             crate::windows_causal_acceptance::MAX_REPORT_BYTES,
                         )?;
-                        let original = ResultV1::parse(&bytes).map_err(CiError::Message)?;
-                        if original
-                            .provider_association
-                            .as_ref()
-                            .map(|association| &association.provider)
-                            != Some(&config.provider)
-                        {
+                        let original = ResultV3::parse(&bytes).map_err(CiError::Message)?;
+                        if original.provider.as_ref() != Some(&config.provider) {
                             return Err(CiError::Message(
                                 "OS diagnostic original result provider differs".into(),
                             ));
                         }
-                        let bootstrap_refusal = original.authorization
-                            == AuthorizationV1::RejectedBeforeRelease
-                            && original.launch.state == LaunchStateV1::NotCreated
-                            && original
-                                .attempts
-                                .last()
-                                .and_then(|attempt| attempt.error.as_ref())
-                                .is_some_and(|error| {
-                                    error.code == "MCSPAWN-FAILED"
-                                        && error.message.contains("bootstrap_role=loader-control")
-                                });
+                        let bootstrap_refusal = original.release == ReleaseKnowledgeV3::NotReleased
+                            && original.diagnostics.as_slice().iter().any(|detail| {
+                                detail.as_str().contains("MCSPAWN-FAILED")
+                                    && detail.as_str().contains("bootstrap_role=loader-control")
+                            });
                         let released_target =
                             super::released_target_loader_event_candidate(&original);
                         if !bootstrap_refusal && !released_target {
@@ -5295,15 +5130,7 @@ pub(crate) mod native {
                         }
                         let capture = super::loader_event_diagnostics::observe(work_deadline);
                         let observed_utc = std::time::SystemTime::now();
-                        let failure = original
-                            .attempts
-                            .last()
-                            .and_then(|attempt| attempt.error.as_ref())
-                            .map(|error| {
-                                serde_json::json!({"code":error.code,
-                                "message":error.message.chars().take(4096).collect::<String>(),
-                                "message_truncated":error.message.chars().count()>4096})
-                            });
+                        let failure = &original.diagnostics;
                         let unix_millis = |time: std::time::SystemTime| {
                             time.duration_since(std::time::UNIX_EPOCH)
                                 .map(|duration| duration.as_millis())
@@ -5312,13 +5139,13 @@ pub(crate) mod native {
                         let metadata = serde_json::to_vec(&serde_json::json!({
                             "format":"memcordon.windows-loader-os-event-candidates","revision":1,
                             "case":input.key,"provider":config.provider,"source_commit":config.source_commit,
-                            "association":original.provider_association,
+                            "association":super::current_association(&original).ok(),
                             "installed_images":config.installed_components,"original_result":public_report,
                             "original_result_sha256":crate::windows_causal_acceptance::sha256(&bytes),
                             "original_failure":failure,
                             "trigger":if released_target { "released-target-initialization-failure" } else { "bootstrap-launch-refusal" },
                             "original_outcome":original.outcome,
-                            "observed_target_pid":original.launch.target_pid,
+                            "observed_target_pid":super::current_native(&original).ok().and_then(|native| native.target_identity.as_ref()).map(|identity| identity.process_id),
                             "observed_target_pid_is_not_faulting_identity":true,
                             "controller_started_unix_millis":unix_millis(native_started_utc)?,
                             "controller_observed_unix_millis":unix_millis(observed_utc)?,
@@ -5451,7 +5278,7 @@ pub(crate) mod native {
                 held,
             )?;
             if terminal.format != "memcordon.windows-terminal-observation"
-                || terminal.revision != 1
+                || terminal.revision != 2
                 || terminal.provider != held.provider
                 || terminal.terminal.attempt_id != String::from(held.attempt_id.clone())
                 || terminal.terminal.request_sha256 != String::from(held.request_sha256.clone())
@@ -5466,18 +5293,18 @@ pub(crate) mod native {
                         .into(),
                 ));
             }
-            let request: memcordon_core::WindowsLaunchRequestV1 =
+            let request: memcordon_core::WindowsLaunchRequestV2 =
                 serde_json::from_slice(&terminal.provider_request)?;
-            let contract = memcordon_core::workload_contract::WorkloadContractV1::parse(&read(
-                &input.workload_contract,
+            let contract = memcordon_core::workload_request::WorkloadRequestV1::parse(&read(
+                &input.workload_request,
                 256 * 1024,
             )?)
-            .map_err(CiError::Message)?;
+            .map_err(|error| CiError::Message(error.to_string()))?;
             if crate::windows_causal_acceptance::sha256(&terminal.provider_request)
                 != terminal.terminal.request_sha256
                 || request.expected_provider_binding != held.provider
                 || request.nonce != terminal.terminal.nonce
-                || request.workload_contract.as_ref() != Some(&contract)
+                || request.workload_request.as_ref() != Some(&contract)
                 || request.environment != fixture_environment::entries()?
             {
                 return Err(CiError::Message("exact observed launch request differs from held binding, declared contract or native system prerequisite environment".into()));
@@ -5748,7 +5575,7 @@ pub(crate) mod native {
             .join("result.json");
         let original_path = report.with_extension("failed-frontend.json");
         if original_path.try_exists()? {
-            let original = ResultV1::parse(&read(
+            let original = ResultV3::parse(&read(
                 &original_path,
                 crate::windows_causal_acceptance::MAX_REPORT_BYTES,
             )?)
@@ -5805,83 +5632,6 @@ pub(crate) mod native {
             &provider_probe,
             &format!("D:P(D;OICI;GW;;;RC)(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)"),
         )?;
-        if !input.local_policy.is_absolute() {
-            return Err(CiError::Message(
-                "Windows local policy must be explicit absolute input".into(),
-            ));
-        }
-        let budget = work_deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(90));
-        if budget.is_zero() {
-            return Err(CiError::Message(
-                "original Windows work deadline exhausted before policy activation".into(),
-            ));
-        }
-        let mut apply = CommandSpec::new(
-            &config.installed_agent.path,
-            &config.output_directory,
-            budget,
-        )
-        .args([
-            OsString::from("package"),
-            "policy".into(),
-            "apply".into(),
-            "--file".into(),
-            input.local_policy.clone().into_os_string(),
-        ])
-        .materialize()?;
-        let activation =
-            memcordon_testkit::run_with_deadline_output_limit(&mut apply, budget, 256 * 1024)
-                .map_err(|error| CiError::Message(error.to_string()))?;
-        fs::write(
-            config
-                .output_directory
-                .join("windows-policy-activation.json"),
-            &activation.stdout,
-        )?;
-        fs::write(
-            config
-                .output_directory
-                .join("windows-policy-activation.stderr.bin"),
-            &activation.stderr,
-        )?;
-        if !activation.status.success() {
-            return Err(CiError::Message(
-                "Windows baseline policy activation failed".into(),
-            ));
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Activation {
-            format: String,
-            revision: u32,
-            registry: memcordon_core::workload_registry::RuntimePolicyRegistry,
-            registry_digest: memcordon_core::DiagnosticSha256,
-            epoch: memcordon_core::workload_contract::PolicyEpoch,
-            revoked_admissions:
-                memcordon_core::BoundedVec<memcordon_core::workload_contract::Nonce128, 256>,
-        }
-        let activated: Activation = serde_json::from_slice(&activation.stdout)?;
-        let configured = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(&read(
-            &input.local_policy,
-            256 * 1024,
-        )?)
-        .map_err(CiError::Message)?;
-        if activated.revision != 1
-            || activated.format != "memcordon.local-activation"
-            || activated.registry != configured
-            || activated
-                .registry
-                .canonical_digest()
-                .map_err(CiError::Message)?
-                != activated.registry_digest
-            || !activated.revoked_admissions.as_slice().is_empty()
-        {
-            return Err(CiError::Message(
-                "Windows activated registry differs from exact configured V1 policy".into(),
-            ));
-        }
         assessments.extend(input.cases.iter().map(|case| CaseAssessment {
             key: case.key.clone(),
             behavior: Err("case not run".into()),
@@ -5892,25 +5642,26 @@ pub(crate) mod native {
             stdout_sha256: None,
             stderr_sha256: None,
             transcript_sha256: None,
-            contract_sha256: None,
-            policy_activation_sha256: Some(crate::windows_causal_acceptance::sha256(
-                &activation.stdout,
-            )),
+            request_sha256: None,
             terminal_observation_sha256: None,
         }));
         let mut first_error = None;
         for (case, assessment) in input.cases.iter().zip(assessments.iter_mut()) {
             let mut execution = case.clone();
-            let mut contract = memcordon_core::workload_contract::WorkloadContractV1::parse(&read(
-                &case.workload_contract,
-                256 * 1024,
-            )?)
-            .map_err(CiError::Message)?;
-            contract.expected_epoch = activated.epoch.clone();
-            let contract = serde_json::to_vec(&contract)?;
-            execution.workload_contract =
-                write_activated_contract(&config.output_directory, &case.key, &contract)?;
-            assessment.contract_sha256 = Some(crate::windows_causal_acceptance::sha256(&contract));
+            let request_bytes = read(
+                &case.workload_request,
+                memcordon_core::workload_limits::REQUEST_BYTES,
+            )?;
+            execution.workload_request =
+                write_workload_request(&config.output_directory, &case.key, &request_bytes)?;
+            let request =
+                memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+            assessment.request_sha256 = Some(String::from(
+                request
+                    .digest()
+                    .map_err(|error| CiError::Message(error.to_string()))?,
+            ));
             if let Err(error) = execute_until_with_cleanup(
                 config,
                 &execution,

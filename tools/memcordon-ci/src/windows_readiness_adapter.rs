@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct WindowsAdapterContext {
-    pub identity: crate::consumer_readiness_ledger::SourceIdentity,
+    pub identity: crate::readiness_identity::SourceIdentity,
     pub product: memcordon_readiness_verifier::ProductKey,
     pub lease_id: String,
     pub destination: PathBuf,
@@ -22,7 +22,7 @@ pub struct WindowsNormalizedRows {
 
 #[derive(Clone, Debug)]
 pub struct WindowsComponentAdapterContext {
-    pub identity: crate::consumer_readiness_ledger::SourceIdentity,
+    pub identity: crate::readiness_identity::SourceIdentity,
     pub destination: PathBuf,
     pub fixture_source: crate::windows_installed_cases::SelectedArtifact,
 }
@@ -30,6 +30,842 @@ pub struct WindowsComponentAdapterContext {
 /// Retains observed rows after an installed lifetime returns an error. It reads
 /// the actual persisted assessment and never converts absent executions into
 /// successful rows or changes their original producer identity.
+#[cfg(windows)]
+pub fn normalize_lifecycle(
+    context: &WindowsAdapterContext,
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    product: &memcordon_readiness_verifier::current::ProductObservationV2,
+    journal_path: &Path,
+    owner_path: &Path,
+) -> crate::Result<WindowsNormalizedRows> {
+    use memcordon_readiness_verifier::*;
+    if product.key != context.product
+        || product.lifecycle.lease_id != context.lease_id
+        || product.source_commit != context.identity.source_commit
+        || config.source_commit != context.identity.source_commit
+        || product.version != config.version
+    {
+        return Err(crate::CiError::Message(
+            "package collector differs from actual selected product/lease".into(),
+        ));
+    }
+    let journal_bytes = hold_artifact(journal_path, None, 16 * 1024 * 1024)?;
+    let journal: serde_json::Value = serde_json::from_slice(&journal_bytes.bytes)?;
+    let events = journal["events"].as_array().ok_or_else(|| {
+        crate::CiError::Message("actual installed package journal events absent".into())
+    })?;
+    let mut bundle = Bundle {
+        destination: context.destination.clone(),
+        prefix: PathBuf::from(&context.product.target).join(&context.product.channel),
+        artifacts: Vec::new(),
+        held: Vec::new(),
+    };
+    let fixture = bundle.copy(
+        &config.agent.path,
+        Path::new("package/selected-agent.exe"),
+        Some(&config.agent.sha256),
+    )?;
+    let recovery_cli = bundle.copy(
+        &config.cli.path,
+        Path::new("package/recovery-cli.exe"),
+        Some(&config.cli.sha256),
+    )?;
+    let source = bundle.copy(
+        &context.fixture_source.path,
+        Path::new("package/fixture-source.bin"),
+        Some(&context.fixture_source.sha256),
+    )?;
+    let owner = bundle.copy(owner_path, Path::new("package/lease-owner.json"), None)?;
+    let journal_ref = bundle.copy(journal_path, Path::new("package/journal.json"), None)?;
+    let retirement = bundle.copy(
+        &context.destination.join(&product.lifecycle.receipt),
+        Path::new("package/retirement.json"),
+        None,
+    )?;
+    let mut records = Vec::new();
+    for (family, scenario, phase_operation, operation, fresh) in [
+        (
+            "C-INSTALL-CURRENT",
+            "fresh-without-registry",
+            "actual-selected-current-fresh-install",
+            "install",
+            true,
+        ),
+        (
+            "C-INSTALL-CURRENT",
+            "current-reinstall",
+            "actual-current-upgrade",
+            "upgrade",
+            false,
+        ),
+        (
+            "C-INSTALL-CURRENT",
+            "current-recovery",
+            "actual-owned-native-recovery",
+            "recover",
+            false,
+        ),
+        (
+            "C-INSTALL-CURRENT",
+            "owned-current-uninstall",
+            "actual-package-and-native-removal",
+            "uninstall",
+            false,
+        ),
+        (
+            "C-INSTALL-CURRENT",
+            "opaque-state-refused",
+            "actual-opaque-current-state-refusal",
+            "install",
+            false,
+        ),
+        (
+            "C-INSTALL-CURRENT",
+            "interrupted-current-install",
+            "actual-interrupted-current-install",
+            "upgrade",
+            false,
+        ),
+        (
+            "C-PACKAGE",
+            "fresh-install",
+            "actual-selected-current-fresh-install",
+            "install",
+            true,
+        ),
+        (
+            "C-PACKAGE",
+            "verify",
+            "actual-selected-current-fresh-verification",
+            "verify",
+            true,
+        ),
+        (
+            "C-PACKAGE",
+            "upgrade",
+            "actual-current-upgrade",
+            "upgrade",
+            false,
+        ),
+        (
+            "C-PACKAGE",
+            "final-uninstall",
+            "actual-package-and-native-removal",
+            "uninstall",
+            false,
+        ),
+        (
+            "W-PACKAGE",
+            "materialize",
+            "actual-selected-current-fresh-install",
+            "install",
+            true,
+        ),
+        (
+            "W-PACKAGE",
+            "install",
+            "actual-selected-current-fresh-install",
+            "install",
+            true,
+        ),
+        (
+            "W-PACKAGE",
+            "verify",
+            "actual-selected-current-fresh-verification",
+            "verify",
+            true,
+        ),
+        (
+            "W-PACKAGE",
+            "component-measure",
+            "actual-installed-package-readback",
+            "upgrade",
+            false,
+        ),
+        (
+            "W-UPGRADE",
+            "upgrade",
+            "actual-current-upgrade",
+            "upgrade",
+            false,
+        ),
+        (
+            "W-UPGRADE",
+            "verify",
+            "actual-selected-current-upgraded-verification",
+            "verify",
+            false,
+        ),
+        (
+            "W-UPGRADE",
+            "uninstall",
+            "actual-package-and-native-removal",
+            "uninstall",
+            false,
+        ),
+        (
+            "W-UPGRADE",
+            "recover",
+            "actual-owned-native-recovery",
+            "recover",
+            false,
+        ),
+    ] {
+        let selected = events
+            .iter()
+            .filter(|event| event["operation"] == phase_operation)
+            .collect::<Vec<_>>();
+        if selected.len() != 1 || selected[0]["succeeded"] != true {
+            return Err(crate::CiError::Message(format!(
+                "actual selected package phase {phase_operation} absent, duplicated or failed"
+            )));
+        }
+        let phase_relative = selected[0]["native_receipt"].as_str().ok_or_else(|| {
+            crate::CiError::Message("actual package native phase receipt absent".into())
+        })?;
+        Bundle::relative(Path::new(phase_relative))?;
+        let row = PathBuf::from("package/cases").join(family).join(scenario);
+        let phase = bundle.copy(
+            &context.destination.join(phase_relative),
+            &row.join("native-phase.json"),
+            None,
+        )?;
+        let directory =
+            if ["opaque-state-refused", "interrupted-current-install"].contains(&scenario) {
+                config.output_directory.join(scenario)
+            } else if fresh {
+                config.output_directory.join("selected-fresh-lifetime")
+            } else {
+                config.output_directory.clone()
+            };
+        let recovery = operation == "recover";
+        let recovery_directory = config.output_directory.join("outer-finalization");
+        let capture_source = if recovery {
+            owner_path
+                .parent()
+                .ok_or_else(|| {
+                    crate::CiError::Message("original lease owner parent absent".into())
+                })?
+                .join("native-finalization.json")
+        } else {
+            directory.join(format!("package-{operation}.capture.json"))
+        };
+        let capture = bundle.copy(&capture_source, &row.join("capture.json"), None)?;
+        let invocation = bundle.copy(
+            &if recovery {
+                recovery_directory.join("recovery-invocation.json")
+            } else {
+                directory.join(format!("package-{operation}.invocation.json"))
+            },
+            &row.join("invocation.json"),
+            None,
+        )?;
+        let stdout = bundle.copy(
+            &if recovery {
+                recovery_directory.join("recovery.stdout.bin")
+            } else {
+                directory.join(format!("package-{operation}.stdout.bin"))
+            },
+            &row.join("stdout.bin"),
+            None,
+        )?;
+        let stderr = bundle.copy(
+            &if recovery {
+                recovery_directory.join("recovery.stderr.bin")
+            } else {
+                directory.join(format!("package-{operation}.stderr.bin"))
+            },
+            &row.join("stderr.bin"),
+            None,
+        )?;
+        let key = CaseKey {
+            target: context.product.target.clone(),
+            channel: Some(context.product.channel.clone()),
+            evidence_class: EvidenceClass::InstalledProduct,
+            family: family.into(),
+            scenario: scenario.into(),
+        };
+        let mut recovery_artifacts = std::collections::BTreeMap::new();
+        if scenario == "interrupted-current-install" {
+            for operation in ["upgrade", "verify"] {
+                for leaf in [
+                    "invocation.json",
+                    "capture.json",
+                    "stdout.bin",
+                    "stderr.bin",
+                ] {
+                    let name = format!("package-{operation}.{leaf}");
+                    recovery_artifacts.insert(
+                        name.clone(),
+                        bundle.copy(
+                            &directory.join("recovery").join(&name),
+                            &row.join("recovery").join(&name),
+                            None,
+                        )?,
+                    );
+                }
+            }
+        }
+        let input = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.windows-package-case","revision":1,"key":key,"run_id":context.identity.run_id,"source_commit":context.identity.source_commit,"source_tree_sha256":context.identity.source_tree_sha256,"lease_id":context.lease_id,"phase_operation":phase_operation,"operation":operation,"owner":owner,"journal":journal_ref,"phase":phase,"capture":capture,"recovery_artifacts":recovery_artifacts}),
+        )?;
+        let input_path = bundle.retain(&row.join("input.json"), &input)?;
+        let mut evidence = current::CaseEvidenceV2 {
+            format: "memcordon.consumer-readiness.case".into(),
+            revision: 2,
+            key: key.clone(),
+            run_id: context.identity.run_id.clone(),
+            source_commit: context.identity.source_commit.clone(),
+            source_tree_sha256: context.identity.source_tree_sha256.clone(),
+            lease_id: Some(context.lease_id.clone()),
+            fixture: if recovery {
+                recovery_cli.clone()
+            } else {
+                fixture.clone()
+            },
+            fixture_source: source.clone(),
+            fixture_sha256: if recovery {
+                config.cli.sha256.clone()
+            } else {
+                config.agent.sha256.clone()
+            },
+            fixture_source_sha256: context.fixture_source.sha256.clone(),
+            input: input_path.clone(),
+            input_sha256: sha256(&input),
+            invocation,
+            request: None,
+            raw_result: None,
+            attempt_observation: None,
+            authenticated_terminal: None,
+            recovery: None,
+            stdout,
+            stderr,
+            outputs: vec![owner.clone(), journal_ref.clone(), capture],
+            native_observation: phase,
+            retirement: retirement.clone(),
+            semantic_observation: input_path,
+            component_recipe_id: None,
+        };
+        evidence.outputs.extend(recovery_artifacts.into_values());
+        let evidence_path =
+            bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
+        records.push(CaseRecord {
+            key,
+            run_id: context.identity.run_id.clone(),
+            state: CaseState::Passed,
+            reason: None,
+            evidence: Some(evidence_path),
+        });
+    }
+    {
+        let key = CaseKey {
+            target: context.product.target.clone(),
+            channel: Some(context.product.channel.clone()),
+            evidence_class: EvidenceClass::InstalledProduct,
+            family: "C-CANCEL".into(),
+            scenario: "before-preparation".into(),
+        };
+        let original = config
+            .output_directory
+            .join("current-controls/before-preparation");
+        let row = PathBuf::from("current-controls/cases/C-CANCEL/before-preparation");
+        let mut paths = std::collections::BTreeMap::new();
+        for leaf in [
+            "invocation.json",
+            "request.json",
+            "accepted.json",
+            "native-launch.json",
+            "cancel.json",
+            "native-cancellation.json",
+            "native.json",
+            "result.json",
+            "wait.json",
+            "stdout.bin",
+            "stderr.bin",
+        ] {
+            paths.insert(
+                leaf,
+                bundle.copy(&original.join(leaf), &row.join(leaf), None)?,
+            );
+        }
+        let cli = bundle.copy(
+            &config.cli.path,
+            &row.join("memcordon.exe"),
+            Some(&config.cli.sha256),
+        )?;
+        let target_fixture = bundle.copy(
+            &config.fixture.path,
+            &row.join("memcordon-test-fixture.exe"),
+            Some(&config.fixture.sha256),
+        )?;
+        let input = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.windows-current-preallocation-case","revision":1,"key":key,"run_id":context.identity.run_id,"source_commit":context.identity.source_commit,"source_tree_sha256":context.identity.source_tree_sha256,"lease_id":context.lease_id,"owner":owner,"artifacts":paths,"target_fixture":target_fixture,"target_fixture_sha256":config.fixture.sha256}),
+        )?;
+        let input_path = bundle.retain(&row.join("input.json"), &input)?;
+        let evidence = current::CaseEvidenceV2 {
+            format: "memcordon.consumer-readiness.case".into(),
+            revision: 2,
+            key: key.clone(),
+            run_id: context.identity.run_id.clone(),
+            source_commit: context.identity.source_commit.clone(),
+            source_tree_sha256: context.identity.source_tree_sha256.clone(),
+            lease_id: Some(context.lease_id.clone()),
+            fixture: cli,
+            fixture_source: source.clone(),
+            fixture_sha256: config.cli.sha256.clone(),
+            fixture_source_sha256: context.fixture_source.sha256.clone(),
+            input: input_path.clone(),
+            input_sha256: sha256(&input),
+            invocation: paths["invocation.json"].clone(),
+            request: Some(paths["request.json"].clone()),
+            raw_result: Some(paths["result.json"].clone()),
+            attempt_observation: Some(paths["accepted.json"].clone()),
+            authenticated_terminal: None,
+            recovery: None,
+            stdout: paths["stdout.bin"].clone(),
+            stderr: paths["stderr.bin"].clone(),
+            outputs: vec![
+                paths["native-launch.json"].clone(),
+                paths["cancel.json"].clone(),
+                paths["native-cancellation.json"].clone(),
+                paths["wait.json"].clone(),
+                owner.clone(),
+                target_fixture,
+            ],
+            native_observation: paths["native.json"].clone(),
+            retirement: retirement.clone(),
+            semantic_observation: input_path,
+            component_recipe_id: None,
+        };
+        let evidence_path =
+            bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
+        records.push(CaseRecord {
+            key,
+            run_id: context.identity.run_id.clone(),
+            state: CaseState::Passed,
+            reason: None,
+            evidence: Some(evidence_path),
+        });
+    }
+    {
+        let key = CaseKey {
+            target: context.product.target.clone(),
+            channel: Some(context.product.channel.clone()),
+            evidence_class: EvidenceClass::InstalledProduct,
+            family: "C-CANCEL".into(),
+            scenario: "service-restart-fresh-request".into(),
+        };
+        let original = config
+            .output_directory
+            .join("current-controls/service-restart-fresh-request");
+        let row = PathBuf::from("current-controls/cases/C-CANCEL/service-restart-fresh-request");
+        let mut paths = std::collections::BTreeMap::new();
+        for leaf in [
+            "invocation.json",
+            "request.json",
+            "service.json",
+            "result.json",
+            "terminal.json",
+            "wait.json",
+            "stdout.bin",
+            "stderr.bin",
+        ] {
+            paths.insert(
+                leaf,
+                bundle.copy(&original.join(leaf), &row.join(leaf), None)?,
+            );
+        }
+        let cli = bundle.copy(
+            &config.cli.path,
+            &row.join("memcordon.exe"),
+            Some(&config.cli.sha256),
+        )?;
+        let target_fixture = bundle.copy(
+            &config.fixture.path,
+            &row.join("memcordon-test-fixture.exe"),
+            Some(&config.fixture.sha256),
+        )?;
+        let input = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.windows-current-service-restart-case","revision":1,"key":key,"run_id":context.identity.run_id,"source_commit":context.identity.source_commit,"source_tree_sha256":context.identity.source_tree_sha256,"lease_id":context.lease_id,"artifacts":paths,"target_fixture":target_fixture,"target_fixture_sha256":config.fixture.sha256,"owner":owner}),
+        )?;
+        let input_path = bundle.retain(&row.join("input.json"), &input)?;
+        let evidence = current::CaseEvidenceV2 {
+            format: "memcordon.consumer-readiness.case".into(),
+            revision: 2,
+            key: key.clone(),
+            run_id: context.identity.run_id.clone(),
+            source_commit: context.identity.source_commit.clone(),
+            source_tree_sha256: context.identity.source_tree_sha256.clone(),
+            lease_id: Some(context.lease_id.clone()),
+            fixture: cli,
+            fixture_source: source.clone(),
+            fixture_sha256: config.cli.sha256.clone(),
+            fixture_source_sha256: context.fixture_source.sha256.clone(),
+            input: input_path.clone(),
+            input_sha256: sha256(&input),
+            invocation: paths["invocation.json"].clone(),
+            request: Some(paths["request.json"].clone()),
+            raw_result: Some(paths["result.json"].clone()),
+            attempt_observation: None,
+            authenticated_terminal: Some(paths["terminal.json"].clone()),
+            recovery: None,
+            stdout: paths["stdout.bin"].clone(),
+            stderr: paths["stderr.bin"].clone(),
+            outputs: vec![paths["wait.json"].clone(), owner.clone(), target_fixture],
+            native_observation: paths["service.json"].clone(),
+            retirement: retirement.clone(),
+            semantic_observation: input_path,
+            component_recipe_id: None,
+        };
+        let evidence_path =
+            bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
+        records.push(CaseRecord {
+            key,
+            run_id: context.identity.run_id.clone(),
+            state: CaseState::Passed,
+            reason: None,
+            evidence: Some(evidence_path),
+        });
+    }
+    for (family, scenario) in [
+        ("C-CANCEL", "held-before-release"),
+        ("C-CANCEL", "after-release"),
+        ("C-CANCEL", "during-drain"),
+        ("C-OWNER", "request-substitution"),
+        ("C-OWNER", "foreign-inspect"),
+        ("C-OWNER", "foreign-cancel"),
+        ("C-OWNER", "foreign-recover"),
+        ("C-OWNER", "stale-attempt"),
+    ] {
+        let key = CaseKey {
+            target: context.product.target.clone(),
+            channel: Some(context.product.channel.clone()),
+            evidence_class: EvidenceClass::InstalledProduct,
+            family: family.into(),
+            scenario: scenario.into(),
+        };
+        let original =
+            config
+                .output_directory
+                .join("current-controls")
+                .join(if scenario == "during-drain" {
+                    "during-drain"
+                } else if ["after-release", "stale-attempt"].contains(&scenario) {
+                    "after-release"
+                } else {
+                    "held-before-release"
+                });
+        let row = PathBuf::from("current-controls/cases")
+            .join(family)
+            .join(scenario);
+        let mut paths = std::collections::BTreeMap::new();
+        for leaf in [
+            "invocation.json",
+            "request.json",
+            "prepared.json",
+            "accepted.json",
+            "accepted-ack.json",
+            "native-launch.json",
+            "cancel.json",
+            "native.json",
+            "result.json",
+            "terminal.json",
+            "wait.json",
+            "stdout.bin",
+            "stderr.bin",
+        ] {
+            paths.insert(
+                leaf,
+                bundle.copy(&original.join(leaf), &row.join(leaf), None)?,
+            );
+        }
+        if ["after-release", "stale-attempt"].contains(&scenario) {
+            for leaf in ["prepared-ack.json", "target-started.json"] {
+                paths.insert(
+                    leaf,
+                    bundle.copy(&original.join(leaf), &row.join(leaf), None)?,
+                );
+            }
+        }
+        let cli = bundle.copy(
+            &config.cli.path,
+            &row.join("memcordon.exe"),
+            Some(&config.cli.sha256),
+        )?;
+        let target_fixture = bundle.copy(
+            &config.fixture.path,
+            &row.join("memcordon-test-fixture.exe"),
+            Some(&config.fixture.sha256),
+        )?;
+        let probe = if family == "C-OWNER" {
+            Some(bundle.copy(
+                &original.join(if scenario == "request-substitution" {
+                    "request-substitution-probe.json".into()
+                } else {
+                    format!("{scenario}.json")
+                }),
+                &row.join("owner-probe.json"),
+                None,
+            )?)
+        } else {
+            None
+        };
+        let substitution = if family == "C-OWNER" && scenario == "request-substitution" {
+            Some(bundle.copy(
+                &original.join("substitution-launch.json"),
+                &row.join("substitution-launch.json"),
+                None,
+            )?)
+        } else {
+            None
+        };
+        let mut drain_artifacts = std::collections::BTreeMap::new();
+        if scenario == "during-drain" {
+            for leaf in [
+                "drain.json",
+                "drain-recovery.json",
+                "cancel-sent.json",
+                "package-upgrade.invocation.json",
+                "package-upgrade.capture.json",
+                "package-upgrade.stdout.bin",
+                "package-upgrade.stderr.bin",
+            ] {
+                drain_artifacts.insert(
+                    leaf.to_owned(),
+                    bundle.copy(&original.join(leaf), &row.join("drain").join(leaf), None)?,
+                );
+            }
+            for operation in ["upgrade", "verify"] {
+                for leaf in [
+                    "invocation.json",
+                    "capture.json",
+                    "stdout.bin",
+                    "stderr.bin",
+                ] {
+                    let name = format!("package-{operation}.{leaf}");
+                    drain_artifacts.insert(
+                        format!("recovery/{name}"),
+                        bundle.copy(
+                            &original.join("package-recovery").join(&name),
+                            &row.join("drain/recovery").join(&name),
+                            None,
+                        )?,
+                    );
+                }
+            }
+        }
+        let input = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.windows-current-control-case","revision":1,"key":key,"run_id":context.identity.run_id,"source_commit":context.identity.source_commit,"source_tree_sha256":context.identity.source_tree_sha256,"lease_id":context.lease_id,"artifacts":paths,"target_fixture":target_fixture,"target_fixture_sha256":config.fixture.sha256,"owner":owner,"owner_probe":probe,"substitution_launch":substitution,"drain_artifacts":drain_artifacts}),
+        )?;
+        let input_path = bundle.retain(&row.join("input.json"), &input)?;
+        let evidence = current::CaseEvidenceV2 {
+            format: "memcordon.consumer-readiness.case".into(),
+            revision: 2,
+            key: key.clone(),
+            run_id: context.identity.run_id.clone(),
+            source_commit: context.identity.source_commit.clone(),
+            source_tree_sha256: context.identity.source_tree_sha256.clone(),
+            lease_id: Some(context.lease_id.clone()),
+            fixture: cli,
+            fixture_source: source.clone(),
+            fixture_sha256: config.cli.sha256.clone(),
+            fixture_source_sha256: context.fixture_source.sha256.clone(),
+            input: input_path.clone(),
+            input_sha256: sha256(&input),
+            invocation: paths["invocation.json"].clone(),
+            request: Some(paths["request.json"].clone()),
+            raw_result: Some(paths["result.json"].clone()),
+            attempt_observation: Some(paths["prepared.json"].clone()),
+            authenticated_terminal: Some(paths["terminal.json"].clone()),
+            recovery: None,
+            stdout: paths["stdout.bin"].clone(),
+            stderr: paths["stderr.bin"].clone(),
+            outputs: vec![
+                paths["cancel.json"].clone(),
+                paths["wait.json"].clone(),
+                target_fixture,
+                owner.clone(),
+            ],
+            native_observation: paths["native.json"].clone(),
+            retirement: retirement.clone(),
+            semantic_observation: input_path,
+            component_recipe_id: None,
+        };
+        let mut evidence = evidence;
+        evidence.outputs.extend(probe);
+        evidence.outputs.extend(substitution);
+        evidence.outputs.extend(drain_artifacts.into_values());
+        let evidence_path =
+            bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
+        records.push(CaseRecord {
+            key,
+            run_id: context.identity.run_id.clone(),
+            state: CaseState::Passed,
+            reason: None,
+            evidence: Some(evidence_path),
+        });
+    }
+    Ok(WindowsNormalizedRows {
+        records,
+        artifacts: bundle.artifacts,
+    })
+}
+
+#[cfg(windows)]
+pub fn normalize_special(
+    context: &WindowsAdapterContext,
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    observed: &[crate::windows_causal_acceptance::InstalledCaseResult],
+) -> crate::Result<WindowsNormalizedRows> {
+    use crate::windows_causal_acceptance::InstalledCase;
+    use memcordon_readiness_verifier::*;
+    let mut bundle = Bundle {
+        destination: context.destination.clone(),
+        prefix: PathBuf::from(&context.product.target).join(&context.product.channel),
+        artifacts: Vec::new(),
+        held: Vec::new(),
+    };
+    let fixture = bundle.copy(
+        &config.fixture.path,
+        Path::new("special/fixture.exe"),
+        Some(&config.fixture.sha256),
+    )?;
+    let source = bundle.copy(
+        &context.fixture_source.path,
+        Path::new("special/fixture-source.bin"),
+        Some(&context.fixture_source.sha256),
+    )?;
+    let public_cli = bundle.copy(
+        &config.cli.path,
+        Path::new("special/public-cli.exe"),
+        Some(&config.cli.sha256),
+    )?;
+    let mut records = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for assessment in observed {
+        let name = assessment.case.name();
+        if !seen.insert(name) || !assessment.accepted() {
+            return Err(crate::CiError::Message(
+                "actual installed special case duplicated or not accepted".into(),
+            ));
+        }
+        let raw = PathBuf::from("special/raw").join(name);
+        let mut paths = std::collections::BTreeMap::new();
+        paths.insert("public_cli", public_cli.clone());
+        for (role, leaf) in [
+            ("result", format!("{name}.json")),
+            ("request", format!("{name}.request.json")),
+            ("terminal", format!("{name}.terminal-observation.json")),
+            ("invocation", format!("{name}.invocation.json")),
+            ("stdout", format!("{name}.stdout.bin")),
+            ("stderr", format!("{name}.stderr.bin")),
+            ("before", format!("{name}.native-before.json")),
+            ("exit", format!("{name}.native-exit.json")),
+            ("retirement", format!("{name}.native-retirement.json")),
+        ] {
+            let reference =
+                bundle.copy(&config.output_directory.join(&leaf), &raw.join(&leaf), None)?;
+            paths.insert(role, reference);
+        }
+        if assessment.case.is_guardian_loss() {
+            for (role, leaf) in [
+                ("guardian_action", format!("{name}.guardian-action.json")),
+                (
+                    "guardian_live",
+                    format!("{name}.guardian-live-association.json"),
+                ),
+                (
+                    "guardian_query_capture",
+                    format!("{name}.guardian-query/guardian-query.capture.json"),
+                ),
+            ] {
+                let reference =
+                    bundle.copy(&config.output_directory.join(&leaf), &raw.join(&leaf), None)?;
+                paths.insert(role, reference);
+            }
+        }
+        let keys: &[(&str, &str)] = match assessment.case {
+            InstalledCase::SamplingPopulation => &[("W-POPULATION", "held-257-deadline")],
+            InstalledCase::GuardianLossAfterRelease => &[
+                ("W-GUARDIAN", "after-release"),
+                ("W-CAUSAL", "known-guardian-original"),
+            ],
+            InstalledCase::GuardianLossLifetime => &[("C-LIFETIME", "guardian-loss")],
+        };
+        for (family, scenario) in keys {
+            let key = CaseKey {
+                target: context.product.target.clone(),
+                channel: Some(context.product.channel.clone()),
+                evidence_class: EvidenceClass::InstalledProduct,
+                family: (*family).into(),
+                scenario: (*scenario).into(),
+            };
+            let row = PathBuf::from("special/cases").join(family).join(scenario);
+            let input = serde_json::to_vec(
+                &serde_json::json!({"format":"memcordon.windows-installed-special-case","revision":1,"key":key,"run_id":context.identity.run_id,"source_commit":context.identity.source_commit,"source_tree_sha256":context.identity.source_tree_sha256,"lease_id":context.lease_id,"case":assessment.case,"artifacts":paths}),
+            )?;
+            let input_path = bundle.retain(&row.join("input.json"), &input)?;
+            let get = |role: &str| {
+                paths.get(role).cloned().ok_or_else(|| {
+                    crate::CiError::Message(format!("actual special {role} artifact absent"))
+                })
+            };
+            let evidence = current::CaseEvidenceV2 {
+                format: "memcordon.consumer-readiness.case".into(),
+                revision: 2,
+                key: key.clone(),
+                run_id: context.identity.run_id.clone(),
+                source_commit: context.identity.source_commit.clone(),
+                source_tree_sha256: context.identity.source_tree_sha256.clone(),
+                lease_id: Some(context.lease_id.clone()),
+                fixture: fixture.clone(),
+                fixture_source: source.clone(),
+                fixture_sha256: config.fixture.sha256.clone(),
+                fixture_source_sha256: context.fixture_source.sha256.clone(),
+                input: input_path.clone(),
+                input_sha256: sha256(&input),
+                invocation: get("invocation")?,
+                request: Some(get("request")?),
+                raw_result: Some(get("result")?),
+                attempt_observation: paths.get("guardian_live").cloned(),
+                authenticated_terminal: Some(get("terminal")?),
+                recovery: None,
+                stdout: get("stdout")?,
+                stderr: get("stderr")?,
+                outputs: paths.values().cloned().collect(),
+                native_observation: get("before")?,
+                retirement: get("retirement")?,
+                semantic_observation: input_path,
+                component_recipe_id: None,
+            };
+            let path =
+                bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
+            records.push(CaseRecord {
+                key,
+                run_id: context.identity.run_id.clone(),
+                state: CaseState::Passed,
+                reason: None,
+                evidence: Some(path),
+            });
+        }
+    }
+    if seen
+        != std::collections::BTreeSet::from([
+            InstalledCase::SamplingPopulation.name(),
+            InstalledCase::GuardianLossAfterRelease.name(),
+            InstalledCase::GuardianLossLifetime.name(),
+        ])
+    {
+        return Err(crate::CiError::Message(
+            "actual installed special case inventory incomplete".into(),
+        ));
+    }
+    Ok(WindowsNormalizedRows {
+        records,
+        artifacts: bundle.artifacts,
+    })
+}
+
 #[cfg(windows)]
 pub fn normalize_retained(
     context: &WindowsAdapterContext,
@@ -720,8 +1556,9 @@ fn normalize_positive_cases(
             crate::windows_causal_acceptance::MAX_REPORT_BYTES,
         )?;
         let result =
-            memcordon_core::ResultV1::parse(&result_bytes).map_err(crate::CiError::Message)?;
-        if result.invocation.association_sha256 != invocation.association_sha256
+            memcordon_core::ResultV3::parse(&result_bytes).map_err(crate::CiError::Message)?;
+        if crate::windows_causal_acceptance::sha256(&serde_json::to_vec(&result.invocation)?)
+            != invocation.association_sha256
             || exit["capture_complete"] != true
         {
             return Err(crate::CiError::Message(
@@ -744,8 +1581,8 @@ fn normalize_positive_cases(
             &row.join("provider-request.bin"),
             &terminal.provider_request,
         )?;
-        let request_bytes = read(&source.join("requested-contract.json"), 256 * 1024)?;
-        let request_path = bundle.reference(&row.join("raw/requested-contract.json"))?;
+        let request_bytes = read(&source.join("workload-request.json"), 256 * 1024)?;
+        let request_path = bundle.reference(&row.join("raw/workload-request.json"))?;
         let native_family: Vec<HeldProcessIdentity> =
             serde_json::from_value(retired["held_processes"].clone())?;
         let root_pid = terminal
@@ -765,12 +1602,14 @@ fn normalize_positive_cases(
             OutcomeOrigin::ApplicationRefusal
         } else {
             match result.outcome.kind {
-                memcordon_core::result_v1::OutcomeKindV1::Completed => OutcomeOrigin::Target,
-                memcordon_core::result_v1::OutcomeKindV1::Deadline => OutcomeOrigin::Deadline,
-                memcordon_core::result_v1::OutcomeKindV1::ConfirmedMemoryLimit => {
+                memcordon_core::execution_facts::OutcomeKindV1::Completed => OutcomeOrigin::Target,
+                memcordon_core::execution_facts::OutcomeKindV1::Deadline => OutcomeOrigin::Deadline,
+                memcordon_core::execution_facts::OutcomeKindV1::ConfirmedMemoryLimit => {
                     OutcomeOrigin::Memory
                 }
-                memcordon_core::result_v1::OutcomeKindV1::Interrupted => OutcomeOrigin::Interrupted,
+                memcordon_core::execution_facts::OutcomeKindV1::Interrupted => {
+                    OutcomeOrigin::Interrupted
+                }
                 _ => OutcomeOrigin::ProviderFailure,
             }
         };
@@ -836,26 +1675,17 @@ fn normalize_positive_cases(
             namespace_init_reaped: None,
             private_root_closed: None,
             exports_finalized: None,
-            account_reservation_retired: None,
             final_job_handles_closed: Some(proof.owner_capabilities_closed),
             active_processes_zero: Some(proof.native_job_empty_observed),
             outstanding: result
                 .cleanup
-                .outstanding
+                .obligations
+                .as_slice()
                 .iter()
-                .map(|obligation| {
-                    serde_json::to_value(obligation)
-                        .map_err(crate::CiError::from)
-                        .and_then(|value| {
-                            value.as_str().map(str::to_owned).ok_or_else(|| {
-                                crate::CiError::Message(
-                                    "retirement obligation lacks frozen text projection".into(),
-                                )
-                            })
-                        })
-                })
-                .collect::<crate::Result<Vec<_>>>()?,
-            failed_operations: result.cleanup.failed_operations.clone(),
+                .filter(|obligation| !obligation.settled)
+                .map(|obligation| format!("{:?}", obligation.resource))
+                .collect(),
+            failed_operations: Vec::new(),
         };
         let native_path = bundle.retain(&row.join("native.json"), &serde_json::to_vec(&native)?)?;
         let retirement_path = bundle.retain(
@@ -978,9 +1808,9 @@ fn normalize_positive_cases(
         }
         let semantic_path =
             bundle.retain(&row.join("semantic.json"), &serde_json::to_vec(&semantic)?)?;
-        let evidence = CaseEvidence {
+        let evidence = memcordon_readiness_verifier::current::CaseEvidenceV2 {
             format: "memcordon.consumer-readiness.case".into(),
-            revision: 1,
+            revision: 2,
             key: key.clone(),
             run_id: context.identity.run_id.clone(),
             source_commit: context.identity.source_commit.clone(),
@@ -995,17 +1825,12 @@ fn normalize_positive_cases(
             invocation: invocation.path,
             request: Some(request_path),
             raw_result: Some(bundle.reference(&row.join("raw/result.json"))?),
-            provider_request: Some(provider_request),
+            attempt_observation: None,
             authenticated_terminal: Some(terminal_path),
-            windows_loss: None,
-            execution_invocation: None,
-            execution_environment: None,
-            transcript: Some(transcript),
-            inventory: None,
-            qualification: None,
-            export_receipt: None,
-            prepared_observation: None,
-            prepared_native_receipt: None,
+            recovery: None,
+            stdout: bundle.reference(&row.join("raw/result.stdout.bin"))?,
+            stderr: bundle.reference(&row.join("raw/result.stderr.bin"))?,
+            outputs: vec![transcript, provider_request],
             native_observation: native_path,
             retirement: retirement_path,
             semantic_observation: semantic_path,
@@ -1213,9 +2038,9 @@ pub fn normalize_capacity(
                 ));
             }
             case.descriptor = descriptor;
-            case.workload_contract = config
+            case.workload_request = config
                 .output_directory
-                .join("W-JOINT/ordinary/requested-contract.json");
+                .join("W-JOINT/ordinary/workload-request.json");
             let namespace = row.join(format!("attempt-{ordinal}"));
             let nested = normalize_positive_cases(
                 context,
@@ -1264,7 +2089,8 @@ pub fn normalize_capacity(
             None,
             4 * 1024 * 1024,
         )?;
-        let mut evidence: CaseEvidence = serde_json::from_slice(&held.bytes)?;
+        let mut evidence: memcordon_readiness_verifier::current::CaseEvidenceV2 =
+            serde_json::from_slice(&held.bytes)?;
         let semantic_custody = hold_artifact(
             &context.destination.join(&evidence.semantic_observation),
             None,
@@ -1394,6 +2220,7 @@ fn normalize_positive_semantic(
     }
     for (role, path) in [
         ("native-argv", "native-argv.json"),
+        ("actual-stdin", "stdin.bin"),
         ("empty-file", "nested/empty.bin"),
         ("binary-file", "nested/all-bytes.bin"),
         ("challenge-file", "nested/challenge.bin"),
@@ -1776,7 +2603,6 @@ fn normalize_positive_semantic(
         component_test: None,
         component_actors: None,
         windows_capacity: None,
-        windows_refusal: None,
         fixture_behavior: Some(FixtureBehavior {
             descriptor: descriptor_path,
             transcript: transcript.into(),
@@ -1796,15 +2622,15 @@ pub fn normalize_refusals(
     observed: &[crate::windows_readiness_refusals::RefusalAssessment],
 ) -> crate::Result<WindowsNormalizedRows> {
     use crate::windows_consumer_readiness::native::read;
-    use memcordon_readiness_verifier::*;
-    use std::os::windows::ffi::OsStringExt;
+    use memcordon_readiness_verifier::current::CaseEvidenceV2;
+    use memcordon_readiness_verifier::{CaseKey, CaseRecord, CaseState, EvidenceClass};
     if context.product.target != config.target
         || context.identity.source_commit != config.source_commit
         || context.identity.version != config.version
         || context.lease_id.is_empty()
     {
         return Err(crate::CiError::Message(
-            "refusal producer association differs".into(),
+            "current refusal association differs".into(),
         ));
     }
     let mut bundle = Bundle {
@@ -1823,17 +2649,14 @@ pub fn normalize_refusals(
         Path::new("windows-refusal-fixture-source.bin"),
         Some(&context.fixture_source.sha256),
     )?;
-    let active_source = config
-        .output_directory
-        .join("W-JOINT")
-        .join("ordinary")
-        .join("requested-contract.json");
     let mut records = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for assessment in observed {
-        if !crate::windows_readiness_refusals::required_keys().contains(&assessment.key) {
+        if !crate::windows_readiness_refusals::required_keys().contains(&assessment.key)
+            || !seen.insert(assessment.key.clone())
+        {
             return Err(crate::CiError::Message(
-                "refusal normalization received unrelated row".into(),
+                "undeclared or duplicate current refusal".into(),
             ));
         }
         let key = CaseKey {
@@ -1843,11 +2666,6 @@ pub fn normalize_refusals(
             family: assessment.key.family.clone(),
             scenario: assessment.key.scenario.clone(),
         };
-        if !seen.insert(key.clone()) {
-            return Err(crate::CiError::Message(
-                "refusal normalization duplicates row".into(),
-            ));
-        }
         let source = config
             .output_directory
             .join(&key.family)
@@ -1859,451 +2677,54 @@ pub fn normalize_refusals(
         if source.is_dir() {
             bundle.copy_directory(&source, &raw)?;
         }
-        if let Some(reason) = [
-            &assessment.collection,
+        if let Some(error) = [
             &assessment.behavior,
+            &assessment.collection,
             &assessment.retirement,
         ]
         .into_iter()
-        .find_map(|value| value.as_ref().err())
+        .find_map(|result| result.as_ref().err())
         {
             records.push(CaseRecord {
                 key,
                 run_id: context.identity.run_id.clone(),
                 state: CaseState::Failed,
-                reason: Some(reason.clone()),
+                reason: Some(error.clone()),
                 evidence: None,
             });
             continue;
         }
-        if key.scenario == "component-substitution" {
-            let evidence = AcquisitionCaseEvidence {
-                format: "memcordon.consumer-readiness.acquisition-case".into(),
-                revision: 1,
-                key: key.clone(),
-                run_id: context.identity.run_id.clone(),
-                source_commit: context.identity.source_commit.clone(),
-                source_tree_sha256: context.identity.source_tree_sha256.clone(),
-                lease_id: context.lease_id.clone(),
-                fixture: fixture.clone(),
-                fixture_sha256: config.fixture.sha256.clone(),
-                original_acquisition: bundle.reference(&raw.join("original-acquisition.json"))?,
-                substituted_acquisition: bundle
-                    .reference(&raw.join("substituted-acquisition.json"))?,
-                refusal: bundle.reference(&raw.join("acquisition-refusal.json"))?,
-                quiescence: bundle.reference(&raw.join("native-quiescence.json"))?,
-            };
-            let path =
-                bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
-            records.push(CaseRecord {
-                key,
-                run_id: context.identity.run_id.clone(),
-                state: CaseState::Passed,
-                reason: None,
-                evidence: Some(path),
-            });
-            continue;
-        }
-        let json = |name: &str| -> crate::Result<serde_json::Value> {
-            let bytes = read(&source.join(name), 4 * 1024 * 1024)?;
-            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
-                .map_err(crate::CiError::Message)?;
-            serde_json::from_slice(&bytes).map_err(Into::into)
-        };
-        let launch = json("native-invocation.json")?;
-        let exit = json("native-exit.json")?;
-        let quiet = json("native-quiescence.json")?;
+        let component = key.scenario == "component-substitution";
         let nul = key.scenario == "argv-nul-rejection";
-        let executable = if nul {
-            &config.fixture.sha256
+        let input_name = if component {
+            "original-acquisition.json"
+        } else if nul {
+            "native-argument-observation.json"
         } else {
-            &config.cli.sha256
+            "input.json"
         };
-        if exit["capture_complete"] != true
-            || exit["executable_sha256"] != *executable
-            || launch["environment_cleared"] != true
-            || quiet["format"] != "memcordon.windows-native-refusal-quiescence"
-            || quiet["revision"] != 1
-            || quiet["guardian_native_quiescence"] != true
-            || quiet["fixture_processes_absent"] != true
-            || quiet["installed_agent_sha256"] != config.installed_agent.sha256
-            || quiet["runtime_manifest_sha256"] != config.installed_manifest.sha256
-            || serde_json::from_value::<memcordon_core::PublicProviderBindingV1>(
-                quiet["provider"].clone(),
-            )? != config.provider
-        {
-            return Err(crate::CiError::Message(
-                "refusal actual capture/quiescence association differs".into(),
-            ));
-        }
-        let changed = matches!(
-            key.scenario.as_str(),
-            "revoked-grant" | "wrong-authorized-caller"
-        );
-        if quiet["owned_policy_restoration_required"] != changed
-            || quiet["owned_policy_restoration_completed"] != changed
-        {
-            return Err(crate::CiError::Message(
-                "refusal actual policy restoration differs".into(),
-            ));
-        }
-        let (invocation_path, association, arguments) = if nul {
-            if launch["executable_sha256"] != *executable {
-                return Err(crate::CiError::Message(
-                    "NUL facade measured image differs".into(),
-                ));
-            }
-            let program: Vec<u16> = serde_json::from_value(launch["program_utf16"].clone())?;
-            let argv: Vec<Vec<u16>> = serde_json::from_value(launch["argv_utf16"].clone())?;
-            let arguments: Vec<Vec<u16>> = std::iter::once(program).chain(argv).collect();
-            let report = memcordon_core::InvocationReport {
-                syntax: "plus-budgets-v1".into(),
-                budget_tokens: Vec::new(),
-                memory_token: None,
-                deadline_token: None,
-                argv: arguments
-                    .iter()
-                    .map(|arg| {
-                        memcordon_core::NativeArgument::from_os(&std::ffi::OsString::from_wide(arg))
-                    })
-                    .collect(),
-            };
-            let association =
-                crate::windows_causal_acceptance::sha256(&serde_json::to_vec(&report)?);
-            let environment = serde_json::to_vec(&NativeEnvironment::WindowsUtf16(Vec::new()))?;
-            let environment_path = bundle.retain(&row.join("environment.json"), &environment)?;
-            let invocation = NativeInvocation {
-                format: "memcordon.consumer-readiness.invocation".into(),
-                revision: 1,
-                arguments: NativeArguments::WindowsUtf16(arguments.clone()),
-                executable_sha256: executable.clone(),
-                environment: environment_path,
-                environment_sha256: crate::windows_causal_acceptance::sha256(&environment),
-                association_sha256: association.clone(),
-                budget_tokens: Vec::new(),
-                memory_token: None,
-                deadline_token: None,
-            };
-            (
-                bundle.retain(
-                    &row.join("invocation.json"),
-                    &serde_json::to_vec(&invocation)?,
-                )?,
-                association,
-                arguments,
-            )
+        let input_bytes = read(&source.join(input_name), 4 * 1024 * 1024)?;
+        let invocation = if component {
+            bundle.reference(&raw.join("acquisition-refusal.json"))?
         } else {
-            let projection =
-                normalize_public_invocation(&mut bundle, &row, &launch, &config.cli.sha256)?;
-            (
-                projection.path,
-                projection.association_sha256,
-                projection.arguments,
-            )
+            bundle.reference(&raw.join("native-invocation.json"))?
         };
-        let status = i32::try_from(
-            exit["native_status"]
-                .as_i64()
-                .ok_or_else(|| crate::CiError::Message("refusal native status absent".into()))?,
-        )
-        .map_err(|_| crate::CiError::Message("refusal status exceeds signed DWORD".into()))?;
-        let result = if nul {
-            None
+        let stdout = if component {
+            bundle.retain(&row.join("stdout.bin"), &[])?
         } else {
-            Some(
-                memcordon_core::ResultV1::parse(&read(
-                    &source.join("result.json"),
-                    crate::windows_causal_acceptance::MAX_REPORT_BYTES,
-                )?)
-                .map_err(crate::CiError::Message)?,
-            )
+            bundle.reference(&raw.join("stdout.bin"))?
         };
-        if result.as_ref().is_some_and(|result| {
-            result.invocation.association_sha256 != association
-                || result.outcome.wrapper_status != status
-                || result.authorization
-                    != if key.scenario == "unsupported-public-request" {
-                        memcordon_core::result_v1::AuthorizationV1::NotRequiredForStandard
-                    } else {
-                        memcordon_core::result_v1::AuthorizationV1::RejectedBeforeRelease
-                    }
-                || result.launch.target_pid.is_some()
-                || result.launch.state != memcordon_core::result_v1::LaunchStateV1::NotCreated
-        }) {
-            return Err(crate::CiError::Message(
-                "refusal result differs from actual public invocation/status or creates target"
-                    .into(),
-            ));
-        }
-        let provider_request = if source.join("provider-request.bin").is_file() {
-            Some(read(
-                &source.join("provider-request.bin"),
-                memcordon_core::WINDOWS_MAX_FRAME_BYTES,
-            )?)
+        let stderr = if component {
+            bundle.retain(&row.join("stderr.bin"), &[])?
         } else {
-            None
+            bundle.reference(&raw.join("stderr.bin"))?
         };
-        let provider_association = result
-            .as_ref()
-            .and_then(|result| result.provider_association.as_ref());
-        if provider_request.is_some() != provider_association.is_some() {
-            return Err(crate::CiError::Message(
-                "refusal provider request/association availability differs".into(),
-            ));
-        }
-        let request_sha256 = provider_request
-            .as_ref()
-            .map(|bytes| crate::windows_causal_acceptance::sha256(bytes));
-        if provider_association.is_some_and(|association| {
-            association.provider != config.provider
-                || Some(String::from(association.request_sha256.clone())) != request_sha256
-        }) {
-            return Err(crate::CiError::Message(
-                "refusal authenticated provider request differs".into(),
-            ));
-        }
-        let nonce = provider_request
-            .as_ref()
-            .map(|bytes| serde_json::from_slice::<memcordon_core::WindowsLaunchRequestV1>(bytes))
-            .transpose()?
-            .map(|request| request.nonce);
-        let native = NativeObservation {
-            format: "memcordon.consumer-readiness.native".into(),
-            revision: 1,
-            run_id: context.identity.run_id.clone(),
-            lease_id: Some(context.lease_id.clone()),
-            target: config.target.clone(),
-            executable_sha256: executable.clone(),
-            invocation_sha256: association,
-            execution_invocation_sha256: None,
-            request_sha256,
-            provider_sha256: provider_association.map(|_| config.installed_agent.sha256.clone()),
-            provider_generation: provider_association
-                .map(|_| config.provider.generation.as_str().to_owned()),
-            runtime_manifest_sha256: provider_association
-                .map(|_| String::from(config.provider.runtime_manifest_sha256.clone())),
-            attempt_id: provider_association
-                .map(|association| String::from(association.attempt_id.clone())),
-            root_pid: None,
-            root_birth: None,
-            attempt_nonce: nonce,
-            held_processes: Vec::new(),
-            frontend_status: status,
-            origin: OutcomeOrigin::AdmissionRefusal,
-            target_status: None,
-            authenticated_provider_exchange: provider_association.is_some(),
-            relay_complete: true,
-            result_named_identity_verified: true,
-            result_readback_verified: true,
-            application_stage: None,
-        };
-        let retirement = RetirementObservation {
-            format: "memcordon.consumer-readiness.retirement".into(),
-            revision: 1,
-            run_id: native.run_id.clone(),
-            attempt_id: native.attempt_id.clone(),
-            root_pid: None,
-            root_birth: None,
-            target_reaped_or_absent: true,
-            aggregate_empty: true,
-            relays_retired: false,
-            guardian_retired: false,
-            native_handles_closed: false,
-            independently_observed: true,
-            namespace_init_reaped: None,
-            private_root_closed: None,
-            exports_finalized: None,
-            account_reservation_retired: None,
-            final_job_handles_closed: None,
-            active_processes_zero: None,
-            outstanding: Vec::new(),
-            failed_operations: Vec::new(),
-        };
-        let native_path = bundle.retain(&row.join("native.json"), &serde_json::to_vec(&native)?)?;
-        let retirement_path = bundle.retain(
-            &row.join("retirement.json"),
-            &serde_json::to_vec(&retirement)?,
-        )?;
-        let challenge = read(&source.join("challenge.bin"), 32)?;
-        if challenge.len() != 32 || challenge.iter().all(|byte| *byte == 0) {
-            return Err(crate::CiError::Message(
-                "refusal challenge unavailable".into(),
-            ));
-        }
-        let input = FixtureInput {
-            format: "memcordon.consumer-readiness.input".into(),
-            revision: 1,
-            run_id: native.run_id.clone(),
-            key: key.clone(),
-            challenge_sha256: crate::windows_causal_acceptance::sha256(&challenge),
-            binary: Vec::new(),
-            target_argv: NativeArguments::WindowsUtf16(arguments),
-            deadline_millis: if nul { None } else { Some(600000) },
-            memory_bytes: if nul {
-                None
-            } else {
-                Some(4 * 1024 * 1024 * 1024)
-            },
-            toolchain_identity: None,
-        };
-        let input_bytes = serde_json::to_vec(&input)?;
-        let input_path = bundle.retain(&row.join("input.json"), &input_bytes)?;
-        let quiescence = bundle.reference(&raw.join("native-quiescence.json"))?;
-        let refusal = if nul {
-            WindowsRefusalEvidence::NativeArgument {
-                receipt: bundle.reference(&raw.join("native-argument-refusal.json"))?,
-                guardian_quiescence: bundle
-                    .reference(&raw.join("native-guardian-quiescence.json"))?,
-                frontend: bundle.reference(&raw.join("native-frontend.json"))?,
-                quiescence,
-            }
-        } else if key.scenario == "unsupported-public-request" {
-            WindowsRefusalEvidence::UnsupportedPublicRequest {
-                guardian_quiescence: bundle
-                    .reference(&raw.join("native-guardian-quiescence.json"))?,
-                frontend: bundle.reference(&raw.join("native-frontend.json"))?,
-                quiescence,
-            }
-        } else {
-            let suite_bytes = read(
-                &config.output_directory.join("windows-readiness-input.json"),
-                4 * 1024 * 1024,
-            )?;
-            memcordon_core::canonical_json::reject_duplicate_json_keys(&suite_bytes)
-                .map_err(crate::CiError::Message)?;
-            let suite: crate::windows_consumer_readiness::SuiteInput =
-                serde_json::from_slice(&suite_bytes)?;
-            if suite.local_policy != config.output_directory.join("windows-local-policy.json") {
-                return Err(crate::CiError::Message(
-                    "refusal baseline policy is outside its exact owned input".into(),
-                ));
-            }
-            let baseline_policy =
-                bundle.copy(&suite.local_policy, &row.join("baseline-policy.json"), None)?;
-            let baseline_contract =
-                bundle.copy(&active_source, &row.join("baseline-contract.json"), None)?;
-            let prior = suite
-                .cases
-                .iter()
-                .find(|case| case.key.family == "W-JOINT" && case.key.scenario == "ordinary")
-                .ok_or_else(|| {
-                    crate::CiError::Message("refusal prior measured contract absent".into())
-                })?;
-            if prior.workload_contract
-                != config
-                    .output_directory
-                    .join("windows-contract-template.json")
-            {
-                return Err(crate::CiError::Message(
-                    "refusal prior contract differs from exact owned template".into(),
-                ));
-            }
-            let prior_contract = bundle.copy(
-                &prior.workload_contract,
-                &row.join("prior-contract.json"),
-                None,
-            )?;
-            let baseline_activation = bundle.copy(
-                &config
-                    .output_directory
-                    .join("windows-policy-activation.json"),
-                &row.join("baseline-activation.json"),
-                None,
-            )?;
-            let prior_activation = bundle.copy(
-                &config
-                    .output_directory
-                    .join("windows-policy-prior-activation.json"),
-                &row.join("prior-activation.json"),
-                None,
-            )?;
-            WindowsRefusalEvidence::AuthenticatedAdmission {
-                baseline_policy,
-                baseline_contract,
-                prior_contract,
-                prior_activation,
-                prior_invocation: bundle.copy(
-                    &config
-                        .output_directory
-                        .join("windows-policy-prior-activation.invocation.json"),
-                    &row.join("prior-invocation.json"),
-                    None,
-                )?,
-                prior_exit: bundle.copy(
-                    &config
-                        .output_directory
-                        .join("windows-policy-prior-activation.exit.json"),
-                    &row.join("prior-exit.json"),
-                    None,
-                )?,
-                prior_stderr: bundle.copy(
-                    &config
-                        .output_directory
-                        .join("windows-policy-prior-activation.stderr.bin"),
-                    &row.join("prior-stderr.bin"),
-                    None,
-                )?,
-                guardian_quiescence: bundle
-                    .reference(&raw.join("native-guardian-quiescence.json"))?,
-                frontend: bundle.reference(&raw.join("native-frontend.json"))?,
-                baseline_activation,
-                provider_request: bundle.reference(&raw.join("provider-request.bin"))?,
-                requested_contract: bundle.reference(&raw.join("requested-contract.json"))?,
-                quiescence,
-                policy_apply: if changed {
-                    Some(bundle.reference(&raw.join("policy-apply.stdout.json"))?)
-                } else {
-                    None
-                },
-                policy_restore: if changed {
-                    Some(bundle.reference(&raw.join("policy-restore.stdout.json"))?)
-                } else {
-                    None
-                },
-            }
-        };
-        let semantic = SemanticObservation {
-            format: "memcordon.consumer-readiness.semantic".into(),
-            revision: 1,
-            run_id: native.run_id.clone(),
-            key: key.clone(),
-            challenge: bundle.reference(&raw.join("challenge.bin"))?,
-            operations: vec![OperationObservation {
-                operation: if nul {
-                    "argv-nul-rejected".into()
-                } else {
-                    "admission-refused".into()
-                },
-                attempt_id: native.attempt_id.clone(),
-                root_pid: None,
-                observer: "owned-native-preauthorization".into(),
-                native_receipt: bundle.reference(&raw.join(if nul {
-                    "native-argument-refusal.json"
-                } else {
-                    "result.json"
-                }))?,
-            }],
-            comparisons: Vec::new(),
-            counters: std::collections::BTreeMap::new(),
-            negative_probe: None,
-            component_test: None,
-            component_actors: None,
-            windows_capacity: None,
-            windows_refusal: Some(refusal),
-            fixture_behavior: None,
-        };
-        let semantic_path =
-            bundle.retain(&row.join("semantic.json"), &serde_json::to_vec(&semantic)?)?;
-        let request = if nul {
-            bundle.copy(&active_source, &row.join("requested-contract.json"), None)?
-        } else {
-            bundle.reference(&raw.join("requested-contract.json"))?
-        };
-        let evidence = CaseEvidence {
+        let semantic=bundle.retain(&row.join("semantic.json"),&serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-refusal-observation","revision":2,"scenario":key.scenario,"raw_prefix":bundle.reference(&raw)?,"provider":config.provider}))?)?;
+        let evidence = CaseEvidenceV2 {
             format: "memcordon.consumer-readiness.case".into(),
-            revision: 1,
+            revision: 2,
             key: key.clone(),
-            run_id: native.run_id.clone(),
+            run_id: context.identity.run_id.clone(),
             source_commit: context.identity.source_commit.clone(),
             source_tree_sha256: context.identity.source_tree_sha256.clone(),
             lease_id: Some(context.lease_id.clone()),
@@ -2311,42 +2732,31 @@ pub fn normalize_refusals(
             fixture_source: fixture_source.clone(),
             fixture_sha256: config.fixture.sha256.clone(),
             fixture_source_sha256: context.fixture_source.sha256.clone(),
-            input: input_path,
+            input: bundle.reference(&raw.join(input_name))?,
             input_sha256: crate::windows_causal_acceptance::sha256(&input_bytes),
-            invocation: invocation_path,
-            request: Some(request),
-            raw_result: Some(bundle.reference(&raw.join(if nul {
-                "native-argument-refusal.json"
-            } else {
-                "result.json"
-            }))?),
-            provider_request: provider_request
-                .as_ref()
-                .map(|_| bundle.reference(&raw.join("provider-request.bin")))
+            invocation,
+            request: (!component && !nul)
+                .then(|| bundle.reference(&raw.join("workload-request.json")))
                 .transpose()?,
+            raw_result: None,
+            attempt_observation: None,
             authenticated_terminal: None,
-            windows_loss: None,
-            execution_invocation: None,
-            execution_environment: None,
-            transcript: Some(bundle.reference(&raw.join("native-quiescence.json"))?),
-            inventory: None,
-            qualification: None,
-            export_receipt: None,
-            prepared_observation: None,
-            prepared_native_receipt: None,
-            native_observation: native_path,
-            retirement: retirement_path,
-            semantic_observation: semantic_path,
+            recovery: None,
+            stdout,
+            stderr,
+            outputs: Vec::new(),
+            native_observation: bundle.reference(&raw.join("native-guardian-quiescence.json"))?,
+            retirement: bundle.reference(&raw.join("native-quiescence.json"))?,
+            semantic_observation: semantic,
             component_recipe_id: None,
         };
-        let evidence_path =
-            bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
+        let path = bundle.retain(&row.join("evidence.json"), &serde_json::to_vec(&evidence)?)?;
         records.push(CaseRecord {
             key,
-            run_id: native.run_id,
+            run_id: context.identity.run_id.clone(),
             state: CaseState::Passed,
             reason: None,
-            evidence: Some(evidence_path),
+            evidence: Some(path),
         });
     }
     Ok(WindowsNormalizedRows {
@@ -2367,8 +2777,9 @@ pub fn normalize_loss(
     #[serde(deny_unknown_fields)]
     struct Recovery {
         schema_version: u32,
-        provider_response: memcordon_core::WindowsProviderResponseV3,
-        frontend_delivery: Option<memcordon_core::WindowsTerminalDeliveryEvidenceV1>,
+        provider_response: memcordon_core::WindowsProviderResponseV4,
+        frontend_delivery: Option<memcordon_core::WindowsFrontendDeliveryV3>,
+        terminal_authority_json: String,
     }
     if context.product.target != config.target
         || context.identity.source_commit != config.source_commit
@@ -2469,7 +2880,7 @@ pub fn normalize_loss(
         if !live.is_consistent()
             || live.association.provider != config.provider
             || crate::windows_causal_acceptance::sha256(&request_bytes) != request_sha256
-            || recovery.schema_version != 1
+            || recovery.schema_version != 2
             || exit["capture_complete"] != true
         {
             return Err(crate::CiError::Message(
@@ -2485,7 +2896,7 @@ pub fn normalize_loss(
         }).collect::<crate::Result<Vec<_>>>()?;
         let original = if source.join("original-result.json").is_file() {
             Some(
-                memcordon_core::ResultV1::parse(&read(
+                memcordon_core::ResultV3::parse(&read(
                     &source.join("original-result.json"),
                     crate::windows_causal_acceptance::MAX_REPORT_BYTES,
                 )?)
@@ -2495,15 +2906,19 @@ pub fn normalize_loss(
             None
         };
         if original.as_ref().is_some_and(|result| {
-            result.invocation.association_sha256 != invocation.association_sha256
+            serde_json::to_vec(&result.invocation)
+                .map(|bytes| crate::windows_causal_acceptance::sha256(&bytes))
+                .ok()
+                .as_deref()
+                != Some(invocation.association_sha256.as_str())
         }) {
             return Err(crate::CiError::Message(
                 "loss original result differs from actual public invocation".into(),
             ));
         }
         let terminal = match &recovery.provider_response {
-            memcordon_core::WindowsProviderResponseV3::Terminal(terminal) => Some(terminal),
-            memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => {
+            memcordon_core::WindowsProviderResponseV4::Terminal(terminal) => Some(terminal),
+            memcordon_core::WindowsProviderResponseV4::Reject { rejection, .. } => {
                 rejection.terminal_receipt()
             }
             _ => None,
@@ -2528,7 +2943,7 @@ pub fn normalize_loss(
         } else {
             if !matches!(
                 &recovery.provider_response,
-                memcordon_core::WindowsProviderResponseV3::TerminalRetiredV2(_)
+                memcordon_core::WindowsProviderResponseV4::TerminalRetiredV2(_)
             ) {
                 return Err(crate::CiError::Message(
                     "loss recovery omitted real terminal or retired tombstone".into(),
@@ -2539,19 +2954,37 @@ pub fn normalize_loss(
                     "loss tombstone lacks original actual selected result".into(),
                 )
             })?;
-            let memcordon_core::result_v1::RuntimeV1::WindowsSealed { observation } =
-                &original.runtime
-            else {
-                return Err(crate::CiError::Message(
-                    "loss tombstone lacks original native runtime projection".into(),
-                ));
-            };
-            (
-                observation.active_processes_zero,
-                observation.relays_retired,
-                observation.guardian_reaped,
-                observation.final_job_handles_closed,
-            )
+            match &original.runtime {
+                memcordon_core::result_v3::RuntimeExecutionV3::WindowsSealed {
+                    native: observation,
+                    ..
+                } => (
+                    observation.active_processes_zero,
+                    observation.relays_retired,
+                    observation.guardian_reaped,
+                    observation.final_job_handles_closed,
+                ),
+                memcordon_core::result_v3::RuntimeExecutionV3::WindowsRecovered {
+                    terminal,
+                    ..
+                }
+                | memcordon_core::result_v3::RuntimeExecutionV3::WindowsPrematureRelease {
+                    terminal,
+                    ..
+                } => {
+                    let proof = &terminal.retirement_proof;
+                    (
+                        proof.native_job_empty_observed,
+                        proof.relay_closure_observed,
+                        proof.guardian_completion_observed,
+                        proof.owner_capabilities_closed,
+                    )
+                }
+                _ => return Err(crate::CiError::Message(
+                    "loss tombstone lacks actual original native execution or recovered closure"
+                        .into(),
+                )),
+            }
         };
         let status =
             i32::try_from(exit["native_status"].as_i64().ok_or_else(|| {
@@ -2608,7 +3041,6 @@ pub fn normalize_loss(
             namespace_init_reaped: None,
             private_root_closed: None,
             exports_finalized: None,
-            account_reservation_retired: None,
             final_job_handles_closed: Some(handles),
             active_processes_zero: Some(empty),
             outstanding: Vec::new(),
@@ -2666,7 +3098,6 @@ pub fn normalize_loss(
             component_test: None,
             component_actors: None,
             windows_capacity: None,
-            windows_refusal: None,
             fixture_behavior: None,
         };
         let semantic_path =
@@ -2696,9 +3127,16 @@ pub fn normalize_loss(
                 .then(|| bundle.reference(&raw.join("capture-failure.txt")))
                 .transpose()?,
         };
-        let evidence = CaseEvidence {
+        let loss_path = bundle.retain(
+            &row.join("loss-observation.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.windows-loss-observation","revision":2,
+                "run_id":context.identity.run_id,"key":key,"provider":config.provider,"loss":loss
+            }))?,
+        )?;
+        let evidence = memcordon_readiness_verifier::current::CaseEvidenceV2 {
             format: "memcordon.consumer-readiness.case".into(),
-            revision: 1,
+            revision: 2,
             key: key.clone(),
             run_id: native.run_id.clone(),
             source_commit: context.identity.source_commit.clone(),
@@ -2711,19 +3149,22 @@ pub fn normalize_loss(
             input: input_path,
             input_sha256: crate::windows_causal_acceptance::sha256(&input_bytes),
             invocation: invocation.path,
-            request: Some(bundle.reference(&raw.join("requested-contract.json"))?),
+            request: Some(bundle.reference(&raw.join("workload-request.json"))?),
             raw_result: loss.original_result.clone(),
-            provider_request: Some(bundle.reference(&raw.join("provider-request.bin"))?),
-            authenticated_terminal: None,
-            windows_loss: Some(loss),
-            execution_invocation: None,
-            execution_environment: None,
-            transcript: None,
-            inventory: None,
-            qualification: None,
-            export_receipt: None,
-            prepared_observation: None,
-            prepared_native_receipt: None,
+            attempt_observation: Some(loss.live_observation.clone()),
+            authenticated_terminal: source
+                .join("original-terminal.json")
+                .is_file()
+                .then(|| bundle.reference(&raw.join("original-terminal.json")))
+                .transpose()?,
+            recovery: Some(loss.recovery.clone()),
+            stdout: loss.stdout.clone(),
+            stderr: loss.stderr.clone(),
+            outputs: vec![
+                loss_path,
+                bundle.reference(&raw.join("provider-request.bin"))?,
+                bundle.reference(&raw.join("native-exit.json"))?,
+            ],
             native_observation: native_path,
             retirement: retirement_path,
             semantic_observation: semantic_path,
@@ -2807,8 +3248,8 @@ pub fn normalize_actors(
             .output_directory
             .join("W-JOINT")
             .join("ordinary")
-            .join("requested-contract.json"),
-        Path::new("actors/requested-contract.json"),
+            .join("workload-request.json"),
+        Path::new("actors/workload-request.json"),
         None,
     )?;
     let mut groups = std::collections::BTreeMap::<
@@ -2863,6 +3304,23 @@ pub fn normalize_actors(
                 crate::CiError::Message("support actor source escapes owned component root".into())
             })?;
         Bundle::relative(relative)?;
+        if assessment.selector["kind"] == "mutant" {
+            let facet = match assessment.selector["mutant"].as_str() {
+                Some("omit-job-list") => "remove-creation-job",
+                Some("resume-before-guardian") => "remove-suspended-check",
+                Some("create-under-service-token") => "replace-token",
+                Some("omit-handle-list") => "broaden-handle-list",
+                _ => {
+                    return Err(crate::CiError::Message(
+                        "unknown native envelope mutation".into(),
+                    ));
+                }
+            };
+            groups
+                .entry(facet)
+                .or_default()
+                .push((assessment, directory.clone()));
+        }
         groups
             .entry(name)
             .or_default()
@@ -2874,12 +3332,28 @@ pub fn normalize_actors(
         ("postresume", 8),
         ("cleanup", 6),
         ("after-exit", 1),
+        ("remove-creation-job", 1),
+        ("remove-suspended-check", 1),
+        ("replace-token", 1),
+        ("broaden-handle-list", 1),
     ] {
         let key = CaseKey {
             target: input.native_target.clone(),
             channel: None,
             evidence_class: EvidenceClass::NativeComponentRegression,
-            family: "W-CAUSAL".into(),
+            family: if [
+                "remove-creation-job",
+                "remove-suspended-check",
+                "replace-token",
+                "broaden-handle-list",
+            ]
+            .contains(&scenario)
+            {
+                "W-ENVELOPE"
+            } else {
+                "W-CAUSAL"
+            }
+            .into(),
             scenario: scenario.into(),
         };
         let members = groups.remove(scenario).unwrap_or_default();
@@ -3068,7 +3542,7 @@ pub fn normalize_actors(
             &serde_json::to_vec(&invocation)?,
         )?;
         let provider_request = serde_json::to_vec(&serde_json::from_value::<
-            memcordon_core::WindowsLaunchRequestV1,
+            memcordon_core::WindowsLaunchRequestV2,
         >(observation["launch"].clone())?)?;
         let request_sha256 = crate::windows_causal_acceptance::sha256(&provider_request);
         if observation["request_sha256"] != request_sha256
@@ -3130,7 +3604,6 @@ pub fn normalize_actors(
             namespace_init_reaped: None,
             private_root_closed: None,
             exports_finalized: None,
-            account_reservation_retired: None,
             final_job_handles_closed: None,
             active_processes_zero: None,
             outstanding: Vec::new(),
@@ -3179,14 +3652,18 @@ pub fn normalize_actors(
             component_test: None,
             component_actors: Some(actors),
             windows_capacity: None,
-            windows_refusal: None,
             fixture_behavior: None,
         };
         let semantic_path =
             bundle.retain(&row.join("semantic.json"), &serde_json::to_vec(&semantic)?)?;
-        let evidence = CaseEvidence {
+        let first_actor = semantic
+            .component_actors
+            .as_ref()
+            .and_then(|actors| actors.first())
+            .ok_or_else(|| crate::CiError::Message("current actor vector is empty".into()))?;
+        let evidence = memcordon_readiness_verifier::current::CaseEvidenceV2 {
             format: "memcordon.consumer-readiness.case".into(),
-            revision: 1,
+            revision: 2,
             key: key.clone(),
             run_id: input.run_id.clone(),
             source_commit: input.source_commit.clone(),
@@ -3200,18 +3677,13 @@ pub fn normalize_actors(
             input_sha256: crate::windows_causal_acceptance::sha256(&input_bytes),
             invocation: invocation_path,
             request: Some(contract.clone()),
-            provider_request: Some(request_path),
             raw_result: None,
+            attempt_observation: Some(first_actor.observation.clone()),
             authenticated_terminal: None,
-            windows_loss: None,
-            execution_invocation: None,
-            execution_environment: None,
-            transcript: None,
-            inventory: None,
-            qualification: None,
-            export_receipt: None,
-            prepared_observation: None,
-            prepared_native_receipt: None,
+            recovery: None,
+            stdout: first_actor.stdout.clone(),
+            stderr: first_actor.stderr.clone(),
+            outputs: vec![request_path],
             native_observation: native_path,
             retirement: retirement_path,
             semantic_observation: semantic_path,
@@ -3505,7 +3977,6 @@ pub fn normalize_native_tests(
                 namespace_init_reaped: None,
                 private_root_closed: None,
                 exports_finalized: None,
-                account_reservation_retired: None,
                 final_job_handles_closed: None,
                 active_processes_zero: None,
                 outstanding: Vec::new(),
@@ -3524,7 +3995,6 @@ pub fn normalize_native_tests(
                 counters: std::collections::BTreeMap::new(),
                 negative_probe: None,
                 component_test: Some(ComponentTest {
-                    fixture_acquisition: None,
                     recipe_id: input.recipe_id.clone(),
                     test_name: assessment.test_name.clone(),
                     native_exit: status,
@@ -3540,14 +4010,13 @@ pub fn normalize_native_tests(
                 }),
                 component_actors: None,
                 windows_capacity: None,
-                windows_refusal: None,
                 fixture_behavior: None,
             };
             let semantic =
                 bundle.retain(&row.join("semantic.json"), &serde_json::to_vec(&semantic)?)?;
-            let evidence = CaseEvidence {
+            let evidence = memcordon_readiness_verifier::current::CaseEvidenceV2 {
                 format: "memcordon.consumer-readiness.case".into(),
-                revision: 1,
+                revision: 2,
                 key: key.clone(),
                 run_id: input.run_id.clone(),
                 source_commit: context.identity.source_commit.clone(),
@@ -3562,17 +4031,16 @@ pub fn normalize_native_tests(
                 invocation,
                 request: None,
                 raw_result: None,
-                provider_request: None,
                 authenticated_terminal: None,
-                windows_loss: None,
-                execution_invocation: None,
-                execution_environment: None,
-                transcript: None,
-                inventory: None,
-                qualification: None,
-                export_receipt: None,
-                prepared_observation: None,
-                prepared_native_receipt: None,
+                attempt_observation: None,
+                recovery: None,
+                stdout: bundle.reference(&relative.join("stdout.bin"))?,
+                stderr: bundle.reference(&relative.join("stderr.bin"))?,
+                outputs: vec![
+                    bundle.reference(&relative.join("native-invocation.json"))?,
+                    bundle.reference(&relative.join("native-exit.json"))?,
+                    bundle.reference(&relative.join("native-retirement.json"))?,
+                ],
                 native_observation: native,
                 retirement: retired,
                 semantic_observation: semantic,
@@ -3601,7 +4069,7 @@ pub struct WindowsRemovalPlan {
     /// Exact paths from the measured package inspection and install receipt.
     pub binary_root: PathBuf,
     pub state_root: PathBuf,
-    pub policy_root: PathBuf,
+    pub diagnostics_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3619,7 +4087,7 @@ pub struct WindowsRemovalObservation {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn absent_owned_services(
+pub(crate) fn absent_owned_services(
     deadline: std::time::Instant,
 ) -> crate::Result<(Vec<String>, Vec<serde_json::Value>)> {
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, GetLastError};
@@ -3681,7 +4149,7 @@ fn absent_owned_services(
 fn absent_component_processes(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
     deadline: std::time::Instant,
-) -> crate::Result<()> {
+) -> crate::Result<serde_json::Value> {
     use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -3775,7 +4243,9 @@ fn absent_component_processes(
     if code != ERROR_NO_MORE_FILES {
         return Err(std::io::Error::from_raw_os_error(code as i32).into());
     }
-    Ok(())
+    Ok(
+        serde_json::json!({"api":"CreateToolhelp32Snapshot/Process32FirstW/Process32NextW","entries_observed":count,"terminal_native_code":code,"required_image_names_utf16":names,"matching_processes":[]}),
+    )
 }
 
 /// Distinct from installed-generation recovery: missing services are checked as
@@ -3795,7 +4265,7 @@ pub fn observe_removed(
     let mut paths = vec![
         plan.binary_root.clone(),
         plan.state_root.clone(),
-        plan.policy_root.clone(),
+        plan.diagnostics_root.clone(),
         config.installed_agent.path.clone(),
         config.installed_manifest.path.clone(),
     ];
@@ -3860,7 +4330,7 @@ pub fn observe_removed(
         }
     }
     let (absent_services, service_observations) = absent_owned_services(cleanup_deadline)?;
-    absent_component_processes(config, cleanup_deadline)?;
+    let component_census = absent_component_processes(config, cleanup_deadline)?;
     if !memcordon_testkit::windows_processes_for_image_until(
         &config.fixture.path,
         cleanup_deadline,
@@ -3885,10 +4355,10 @@ pub fn observe_removed(
         }
     }
     let bytes = serde_json::to_vec(
-        &serde_json::json!({"format":"memcordon.windows-native-removal","revision":1,
+        &serde_json::json!({"format":"memcordon.windows-native-removal","revision":2,
         "provider_generation":config.provider.generation.as_str(),"absent_services":absent_services,
         "absent_paths":paths,"fixture_processes_absent":true,"installed_image_processes_absent":true,
-        "native_component_census":"owned-package-image-names-no-live-candidate",
+        "native_component_census":component_census,
         "service_observations":service_observations,"path_observations":path_observations}),
     )?;
     if !output_directory.starts_with(&config.output_directory)
@@ -3916,7 +4386,7 @@ pub fn observe_removed(
     }
     Ok(WindowsRemovalObservation {
         format: "memcordon.windows-native-removal".into(),
-        revision: 1,
+        revision: 2,
         provider_generation: config.provider.generation.as_str().into(),
         absent_services,
         absent_paths: paths,
@@ -4099,7 +4569,7 @@ fn native_compiler_source_identity(
 
 #[cfg(windows)]
 #[allow(unsafe_code)] // Query-only identity of an exact held native file handle.
-fn native_file_identity(
+pub(crate) fn native_file_identity(
     file: &std::fs::File,
     directory: bool,
     path: &Path,
@@ -4513,7 +4983,18 @@ pub fn recover_and_observe_quiescence(
             &config.installed_agent.sha256,
             &config.installed_manifest.sha256,
         )
-        .map(|_| ())
+        .and_then(|baseline| {
+            let bytes = baseline.quiescence_receipt()?;
+            let path = output_directory.join("guardian-quiescence.json");
+            owned_receipts.push(publish_receipt(&path, &bytes)?);
+            receipt
+                .artifacts
+                .push(crate::windows_installed_cases::SelectedArtifact {
+                    path,
+                    sha256: crate::windows_causal_acceptance::sha256(&bytes),
+                });
+            Ok(())
+        })
         .map_err(|error| error.to_string())
     };
     if std::time::Instant::now() >= cleanup_deadline {

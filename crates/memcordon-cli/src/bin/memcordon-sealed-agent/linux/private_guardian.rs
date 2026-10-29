@@ -6,7 +6,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use super::cgroup::AttemptCgroup;
-use super::private_attempt::ProcessIdentityV4;
+use super::native_process::ProcessIdentityV4;
 
 const GUARDIAN_VERSION: u8 = 4;
 const READY: u8 = 1;

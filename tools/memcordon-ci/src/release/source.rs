@@ -5,7 +5,7 @@ use cargo_metadata::{DependencyKind, Metadata};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use super::git::Git;
+use super::{artifacts, git::Git};
 use crate::{CiError, Result};
 
 pub const PUBLIC_PACKAGES: [&str; 4] = [
@@ -19,6 +19,39 @@ const MAX_RECORD: u64 = 1024 * 1024;
 /// Complete selected Git tar, including source and regression fixtures.
 /// This is independent of the smaller bound for individual evidence records.
 pub const MAX_SOURCE_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Original complete selected source bytes. A fixture-module excerpt is not a
+/// substitute for this independently retained archive digest.
+pub fn selected_archive(
+    root: &Path,
+    commit: &str,
+    expected_sha256: &str,
+    cutoff: std::time::Instant,
+) -> Result<Vec<u8>> {
+    if commit.len() != 40
+        || expected_sha256.len() != 64
+        || commit
+            .bytes()
+            .chain(expected_sha256.bytes())
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(CiError::Message(
+            "selected source archive identity invalid".into(),
+        ));
+    }
+    let observed =
+        crate::command::CommandSpec::new("git", root, std::time::Duration::from_secs(60))
+            .bounded_until(cutoff)
+            .args(["archive", "--format=tar", commit])
+            .output_limit(MAX_SOURCE_ARCHIVE_BYTES)
+            .output_quiet()?;
+    if !observed.status.success() || artifacts::checksum(&observed.stdout) != expected_sha256 {
+        return Err(CiError::Message(
+            "actual complete selected source archive differs from original source identity".into(),
+        ));
+    }
+    Ok(observed.stdout)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

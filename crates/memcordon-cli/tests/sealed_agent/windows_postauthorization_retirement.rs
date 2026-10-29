@@ -1,8 +1,7 @@
 use memcordon_core::{
     BoundaryMechanismEvidence, BoundarySetupPhase, ChildTermination, CleanupSummary,
-    ProviderRejectionEvidence, RestartSafetyProof, RunOutcome, WINDOWS_PRIVATE_PROTOCOL_VERSION,
-    WindowsLauncherResponseV1, WindowsLauncherResponseV3, WindowsProcessIdentityV1,
-    WindowsSealedEvidenceV2, WindowsTerminalReceiptV1,
+    ProviderRejectionEvidence, RestartSafetyProof, RunOutcome,
+    WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION, WindowsLauncherResponseV4, WindowsProcessIdentityV1,
 };
 
 #[test]
@@ -100,7 +99,7 @@ fn frozen_seed_accepts_only_matching_later_retirement_proof() {
         BoundarySetupPhase::Authorization,
     );
     let failure = rejection.provider_failure.unwrap();
-    let memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+    let memcordon_core::WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
         rejection.disposition
     else {
         panic!("fixture must contain a receipt")
@@ -153,128 +152,6 @@ fn frozen_seed_accepts_only_matching_later_retirement_proof() {
             serde_json::json!({"kind":"binding-proof","before_record":before_path,
             "after_refusal_record":refused_path,"after_matching_record":after_path,
             "mismatched_receipt":mismatch_path,"matching_receipt":matching_path,"refusal":refused}),
-        );
-    }
-}
-
-#[test]
-fn revocation_remains_the_original_diagnostic_after_cleanup_failure() {
-    use memcordon_core::{
-        AttemptObservationPhaseV1, FailureCategoryV1, FailureCodeV1, FailureOperationV1,
-        OriginalFailureV1, WindowsCausalDiagnosticsV1,
-    };
-    let event = crate::windows::launcher_service::policy_revocation_observation_for_test();
-    assert_eq!(event.code, FailureCodeV1::PolicyRevoked);
-    assert_eq!(event.code.display_code(), "MCSEALED-POLICY-DRIFT");
-    assert_eq!(event.category, FailureCategoryV1::Monitor);
-    assert_eq!(event.operation, FailureOperationV1::VerifyPolicy);
-    assert_eq!(event.observed_phase, AttemptObservationPhaseV1::Monitoring);
-    let mut journal = WindowsCausalDiagnosticsV1::default();
-    journal.observe(event.clone()).unwrap();
-    let mut secondary = event;
-    secondary.code = FailureCodeV1::JobQuery;
-    secondary.operation = FailureOperationV1::WaitJobEmpty;
-    secondary.observed_phase = AttemptObservationPhaseV1::Terminalizing;
-    journal.observe(secondary).unwrap();
-    let OriginalFailureV1::Observed { event: original } = &journal.original else {
-        panic!("revocation original lost");
-    };
-    assert_eq!(original.code, FailureCodeV1::PolicyRevoked);
-    let encoded = serde_json::to_vec(&journal).unwrap();
-    assert_eq!(
-        serde_json::from_slice::<WindowsCausalDiagnosticsV1>(&encoded).unwrap(),
-        journal
-    );
-}
-
-#[test]
-fn policy_revocation_keeps_observed_status_in_a_bound_terminal_outbox() {
-    let cleanup = CleanupSummary {
-        force_attempted: true,
-        direct_child_reaped: true,
-        workload_empty: Some(true),
-        ..CleanupSummary::default()
-    };
-    for observed_status in [37, 0xc000_013a] {
-        let outcome = crate::windows::launcher_service::policy_revocation_outcome_for_test(
-            observed_status,
-            cleanup.clone(),
-        );
-        let RunOutcome::MonitorFailed {
-            error,
-            child_after_termination,
-            cleanup: observed_cleanup,
-        } = &outcome
-        else {
-            panic!("revocation must remain an explicit monitor failure");
-        };
-        assert_eq!(error, "MCSEALED-POLICY-DRIFT: active policy revoked");
-        let expected_child = if observed_status == 37 {
-            ChildTermination::ExitCode { code: 37 }
-        } else {
-            ChildTermination::WindowsStatus {
-                status: observed_status,
-            }
-        };
-        assert_eq!(child_after_termination, &Some(expected_child));
-        assert_eq!(observed_cleanup, &cleanup);
-        let terminal = WindowsTerminalReceiptV1 {
-            policy_enforcement: Default::default(),
-            schema_version: 1,
-            attempt_id: "attempt-revoked".to_owned(),
-            nonce: "nonce-revoked".to_owned(),
-            request_sha256: "ab".repeat(32),
-            child_pid: 412,
-            duration_millis: 20,
-            authorization_offset_millis: 7,
-            job_total_processes: 1,
-            job_process_identities: vec![WindowsProcessIdentityV1 {
-                process_id: 412,
-                creation_time_100ns: 991_337,
-            }],
-            cleanup_process_creation: None,
-            outcome,
-            restart_safety: RestartSafetyProof {
-                direct_child_reaped: true,
-                workload_empty: Some(true),
-                helpers_reaped: true,
-                containment_removed: true,
-                containment_incapable_of_live_members: true,
-                sealed_boundary_retired: true,
-                errors: Vec::new(),
-            },
-            boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
-                WindowsSealedEvidenceV2 {
-                    target_released: true,
-                    terminate_job_invoked: true,
-                    active_processes_zero: true,
-                    direct_target_reaped: true,
-                    relays_retired: true,
-                    guardian_reaped: true,
-                    final_job_handles_closed: true,
-                    ..WindowsSealedEvidenceV2::default()
-                },
-            )),
-        };
-        let response = WindowsLauncherResponseV1::Terminal(terminal.clone());
-        let disposition = Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
-        assert!(memcordon_core::windows_terminal_outbox_is_bound(
-            &terminal.attempt_id,
-            &terminal.request_sha256,
-            disposition,
-            &response
-        ));
-        assert!(!memcordon_core::windows_terminal_outbox_is_bound(
-            "different-attempt",
-            &terminal.request_sha256,
-            disposition,
-            &response
-        ));
-        let decoded: WindowsLauncherResponseV1 =
-            serde_json::from_str(&response.terminal_authority_json().unwrap()).unwrap();
-        assert_eq!(
-            serde_json::to_value(decoded).unwrap(),
-            serde_json::to_value(response).unwrap()
         );
     }
 }
@@ -339,8 +216,8 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
     release_mismatch.target_released = true;
     assert!(!release_mismatch.is_consistent());
 
-    let response = WindowsLauncherResponseV3::Reject {
-        schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = WindowsLauncherResponseV4::Reject {
+        schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
         request_sha256: record.request_sha256.clone(),
@@ -495,7 +372,7 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
             "expired_clock":retention.expires_monotonic_millis,"same_boot":true,
             "fixture_resource_claims":true,"installed_state_accessed":false}));
     }
-    let replayed: WindowsLauncherResponseV3 =
+    let replayed: WindowsLauncherResponseV4 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(replayed).unwrap(),
@@ -568,8 +445,8 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
         true,
     );
     assert!(rejection.is_consistent());
-    let response = WindowsLauncherResponseV3::Reject {
-        schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = WindowsLauncherResponseV4::Reject {
+        schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
         request_sha256: record.request_sha256.clone(),

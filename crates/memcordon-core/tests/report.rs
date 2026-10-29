@@ -2,9 +2,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::time::Duration;
 
-#[path = "support/windows_postauthorization.rs"]
-mod windows_postauthorization_fixture;
-
 use memcordon_core::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport, ByteSize,
     ChildTermination, CleanupSummary, DETAILED_ATTEMPT_CAPACITY, DeadlineEvidence,
@@ -86,7 +83,6 @@ fn sealed_setup_failure_preserves_truthful_incomplete_retirement() {
 #[test]
 fn typed_provider_rejection_round_trips_with_cleanup_proof() {
     let rejection = memcordon_core::ProviderRejectionEvidence {
-        workload_admission: None,
         provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-TARGET-DESCRIPTORS-READBACK".to_owned(),
@@ -106,14 +102,10 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
             sealed_boundary_retired: true,
             errors: Vec::new(),
         },
-        terminal_ack_required: false,
-        terminal_receipt: None,
     };
     let error = ExecutionErrorReport {
-        private_rejection: None,
         runtime: None,
         native_startup: None,
-        policy_enforcement: None,
         category: "setup".to_owned(),
         code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
         message: "provider rejected launch".to_owned(),
@@ -125,7 +117,6 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
         workload_may_be_alive: false,
         boundary_setup_failure: None,
         provider_rejection: Some(rejection.clone()),
-        windows_provider_rejection_v2: None,
         provider_failure: None,
     };
 
@@ -144,7 +135,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
 }
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema9(
+    MemcordonReport::schema10(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -161,7 +152,6 @@ fn report() -> MemcordonReport {
         },
         PolicyEnvelopeReport {
             requested: RequestedPolicyReport {
-                workload: Default::default(),
                 boundary: memcordon_core::BoundaryRequirement::Standard,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
@@ -184,7 +174,6 @@ fn report() -> MemcordonReport {
                 },
             },
             effective: EffectivePolicyReport {
-                workload: memcordon_core::workload_evidence::RuntimeWorkloadResolution::unresolved(None, memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend),
                 boundary: memcordon_core::BoundaryClass::Standard,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
@@ -209,10 +198,8 @@ fn report() -> MemcordonReport {
         None,
         None,
         Some(ExecutionErrorReport {
-            private_rejection:None,
             runtime: None,
             native_startup: None,
-            policy_enforcement: None,
             category: "spawn".to_owned(),
             code: "MCSPAWN".to_owned(),
             message: "fixture".to_owned(),
@@ -224,841 +211,35 @@ fn report() -> MemcordonReport {
             workload_may_be_alive: false,
             boundary_setup_failure: None,
             provider_rejection: None,
-            windows_provider_rejection_v2: None,
             provider_failure: None,
         }),
     )
     .expect("valid report")
 }
 
-fn private_report_fixture() -> MemcordonReport {
-    use memcordon_core::private_runtime::{
-        PrivateNetworkNamespaceIdentity, PrivateRuntimeExecution, PrivateRuntimeTerminal,
-    };
-    use memcordon_core::result_v1::{CleanupStateV1, LaunchStateV1, OutcomeKindV1};
-    use memcordon_core::workload_contract::{Nonce128, WorkloadContractV2};
-    use memcordon_core::workload_registry::CallerSelector;
-    use memcordon_core::workload_registry_v2::ProfileKindV2;
-    use memcordon_core::{BoundedText, DiagnosticSha256, PublicProviderBindingV1};
-    let mut request = WorkloadContractV2::parse(include_bytes!(
-        "../../../fuzz/corpus/workload-request/baseline-v2.json"
-    ))
-    .unwrap();
-    request.authorized_profile = ProfileKindV2::LinuxTcp4PrivateV1.reference();
-    request.ceiling = ProfileKindV2::LinuxTcp4PrivateV1.ceiling();
-    request.requirements = Default::default();
-    let metadata = memcordon_core::workload_admission_v2::RuntimePrivateAdmissionSnapshot {
-        format: "memcordon.private-admission-metadata".into(),
-        revision: 1,
-        request_sha256: memcordon_core::workload_codec::contract_digest_v2(&request).unwrap(),
-        invocation_sha256: DiagnosticSha256::from_bytes([7; 32]),
-        caller: CallerSelector::Linux { uid: 1000 },
-        registry_digest: DiagnosticSha256::from_bytes([8; 32]),
-        epoch: request.expected_epoch.clone(),
-        admission_nonce: Nonce128([9; 16]),
-        profile_id: request.authorized_profile.clone(),
-        request,
-    };
-    let private = PrivateRuntimeExecution {
-        terminal: PrivateRuntimeTerminal {
-            format: "memcordon.private-runtime-terminal".into(),
-            revision: 1,
-            provider: PublicProviderBindingV1 {
-                generation: BoundedText::new("1.2.3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                    .unwrap(),
-                source_commit: BoundedText::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                    .unwrap(),
-                runtime_manifest_sha256: DiagnosticSha256::from_bytes([6; 32]),
-            },
-            native_abi: "x86_64-unknown-linux-gnu".into(),
-            attempt_id: [1; 16],
-            request_sha256: DiagnosticSha256::from_bytes([2; 32]),
-            admission_metadata: metadata,
-            launch: LaunchStateV1::ExecObserved,
-            authorization_offset_millis: Some(2),
-            authorization_monotonic_millis: Some(1000),
-            target_pid: std::num::NonZeroU32::new(101),
-            network_namespace: Some(PrivateNetworkNamespaceIdentity {
-                device: 1,
-                inode: 2,
-            }),
-            exec_observed: true,
-            post_exec_descriptor_count: Some(3),
-            outcome: OutcomeKindV1::Deadline,
-            native_termination: None,
-            cleanup: CleanupStateV1::Complete,
-            account_reservation_retired: true,
-            namespace_references_closed: true,
-            error: None,
-        },
-        frontend_relay_drained: true,
-        frontend_interruption: None,
-    };
-    let mut source: MemcordonReport = serde_json::from_value(deadline_report_value(1)).unwrap();
-    source.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
-    source.policy.effective.boundary = memcordon_core::BoundaryClass::Sealed;
-    let attempt = &mut source.attempts[0];
-    attempt.launch.mechanism = "linux-tcp4-private-v1".into();
-    attempt.launch.boundary_requested = memcordon_core::BoundaryRequirement::Sealed;
-    attempt.launch.boundary_effective = memcordon_core::BoundaryClass::Sealed;
-    attempt.launch.boundary_assignment_verified = true;
-    attempt.launch.inherited_resources_restricted = true;
-    attempt.restart_safety.sealed_boundary_retired = true;
-    attempt.private_execution = Some(private.clone());
-    attempt.boundary_detail = BoundaryMechanismEvidence::LinuxPrivateTcp4(Box::new(private));
-    source
-}
-
 #[test]
-fn private_result_rejects_cross_carrier_and_runtime_fact_substitution() {
-    use memcordon_core::result_v1::ResultV1;
-    let source = private_report_fixture();
-    let result =
-        ResultV1::from_legacy(&source, vec!["sealed-runtime".into(), "private-tcp".into()])
-            .unwrap();
-    let original = serde_json::to_value(result).unwrap();
-    ResultV1::parse(&serde_json::to_vec(&original).unwrap()).unwrap();
-    for field in [
-        "profile_reference",
-        "identity_reference",
-        "identity_kind",
-        "activation_epoch",
-        "native_abi",
-        "private_namespace_observed",
-        "no_socket_at_entry",
-        "authorization",
-        "attempt_carrier",
-        "boundary_carrier",
-    ] {
-        let mut altered = original.clone();
-        match field {
-            "activation_epoch" => altered["runtime"][field] = serde_json::json!(2),
-            "private_namespace_observed" | "no_socket_at_entry" => {
-                altered["runtime"][field] = serde_json::json!(false)
-            }
-            "native_abi" => {
-                altered["runtime"][field] = serde_json::json!("aarch64-unknown-linux-gnu")
-            }
-            "authorization" => altered[field] = serde_json::json!("rejected-before-release"),
-            "attempt_carrier" => {
-                altered["attempts"][0]["private_execution"]["terminal"]["attempt_id"] =
-                    serde_json::to_value([3_u8; 16]).unwrap()
-            }
-            "boundary_carrier" => {
-                altered["private_execution"]["terminal"]["attempt_id"] =
-                    serde_json::to_value([3_u8; 16]).unwrap()
-            }
-            _ => altered["runtime"][field] = serde_json::json!("different"),
-        }
-        assert!(
-            ResultV1::parse(&serde_json::to_vec(&altered).unwrap()).is_err(),
-            "{field}"
-        );
-    }
-}
-
-#[test]
-fn private_attempt_failure_preserves_completed_retirement_and_native_diagnostic() {
-    use memcordon_core::result_v1::{CleanupStateV1, OutcomeKindV1, ResultV1};
-    let mut source = private_report_fixture();
-    let attempt = &mut source.attempts[0];
-    let private = attempt.private_execution.as_mut().unwrap();
-    private.terminal.outcome = OutcomeKindV1::ProviderFailure;
-    private.terminal.error =
-        Some(memcordon_core::BoundedText::new("native monitor failed").unwrap());
-    private.validate().unwrap();
-    let cleanup = private.cleanup_summary(None);
-    assert!(cleanup.errors.is_empty());
-    assert!(cleanup.direct_child_reaped);
-    assert_eq!(cleanup.workload_empty, Some(true));
-    attempt.boundary_detail =
-        BoundaryMechanismEvidence::LinuxPrivateTcp4(Box::new(private.clone()));
-    attempt.outcome = Some(RunOutcome::MonitorFailed {
-        error: private.terminal.error.as_ref().unwrap().as_str().to_owned(),
-        child_after_termination: private.terminal.native_termination.clone(),
-        cleanup,
-    });
-    synchronize_private_failure_fixture(&mut source);
-    let result =
-        ResultV1::from_legacy(&source, vec!["sealed-runtime".into(), "private-tcp".into()])
-            .unwrap();
-    assert_eq!(result.outcome.kind, OutcomeKindV1::ProviderFailure);
-    assert_eq!(result.cleanup.state, CleanupStateV1::Complete);
-    assert!(result.cleanup.failed_operations.is_empty());
-    assert_eq!(
-        result
-            .private_execution
-            .as_ref()
-            .unwrap()
-            .terminal
-            .error
-            .as_ref()
-            .unwrap()
-            .as_str(),
-        "native monitor failed"
-    );
-    let mut parsed = ResultV1::parse(&serde_json::to_vec(&result).unwrap()).unwrap();
-    parsed
-        .cleanup
-        .failed_operations
-        .push("private-native-retirement".into());
-    assert_eq!(
-        parsed.validate().unwrap_err(),
-        "inconsistent complete retirement"
-    );
-}
-
-#[test]
-fn private_native_retirement_and_frontend_relay_failures_remain_incomplete() {
-    use memcordon_core::result_v1::{CleanupStateV1, OutcomeKindV1, ResultV1};
-    for relay_failure in [false, true] {
-        let mut source = private_report_fixture();
-        let attempt = &mut source.attempts[0];
-        let private = attempt.private_execution.as_mut().unwrap();
-        private.terminal.outcome = OutcomeKindV1::ProviderFailure;
-        private.terminal.error =
-            Some(memcordon_core::BoundedText::new("native operation failed").unwrap());
-        let relay_error = if relay_failure {
-            private.frontend_relay_drained = false;
-            Some("actual relay I/O failure")
-        } else {
-            private.terminal.cleanup = CleanupStateV1::Incomplete;
-            private.terminal.account_reservation_retired = false;
-            private.terminal.namespace_references_closed = false;
-            None
-        };
-        private.validate().unwrap();
-        let cleanup = private.cleanup_summary(relay_error);
-        assert!(!cleanup.errors.is_empty());
-        assert_eq!(
-            cleanup.errors[0].operation,
-            if relay_failure {
-                "private-frontend-relay"
-            } else {
-                "private-native-retirement"
-            }
-        );
-        assert_eq!(
-            cleanup.errors[0].message,
-            if relay_failure {
-                "actual relay I/O failure"
-            } else {
-                "native operation failed"
-            }
-        );
-        attempt.boundary_detail =
-            BoundaryMechanismEvidence::LinuxPrivateTcp4(Box::new(private.clone()));
-        attempt.outcome = Some(RunOutcome::MonitorFailed {
-            error: private.terminal.error.as_ref().unwrap().as_str().to_owned(),
-            child_after_termination: private.terminal.native_termination.clone(),
-            cleanup,
-        });
-        synchronize_private_failure_fixture(&mut source);
-        let result =
-            ResultV1::from_legacy(&source, vec!["sealed-runtime".into(), "private-tcp".into()])
-                .unwrap();
-        assert_eq!(result.cleanup.state, CleanupStateV1::Incomplete);
-        assert!(!result.cleanup.failed_operations.is_empty());
-        ResultV1::parse(&serde_json::to_vec(&result).unwrap()).unwrap();
-    }
-}
-
-fn synchronize_private_failure_fixture(source: &mut MemcordonReport) {
-    use memcordon_core::result_v1::CleanupStateV1;
-    let attempt = &mut source.attempts[0];
-    let private = attempt.private_execution.as_ref().unwrap();
-    let complete = private.cleanup_state() == CleanupStateV1::Complete;
-    attempt.restart_safety = RestartSafetyProof {
-        direct_child_reaped: complete,
-        workload_empty: complete.then_some(true),
-        helpers_reaped: complete,
-        containment_removed: complete,
-        containment_incapable_of_live_members: complete,
-        sealed_boundary_retired: complete,
-        errors: vec![private.terminal.error.as_ref().unwrap().as_str().to_owned()],
-    };
-    let outcome = attempt.outcome.as_ref().unwrap().clone();
-    let summary = source.supervision.as_mut().unwrap();
-    summary.terminal = SupervisionTerminal::AttemptOutcome {
-        attempt_number: attempt.number,
-        outcome: outcome.clone(),
-    };
-    summary.wrapper_exit_code = 125;
-    summary.aggregate.deadlines = 0;
-    summary.aggregate.observe_outcome(&outcome).unwrap();
-}
-
-#[test]
-fn private_transaction_loss_without_terminal_never_claims_no_target_or_clean_retirement() {
-    use memcordon_core::result_v1::{AuthorizationV1, CleanupStateV1, LaunchStateV1, ResultV1};
-    let mut source = report();
-    source.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
-    let error = source.error.as_mut().expect("setup error fixture");
-    error.category = "monitor".into();
-    error.code = "MCSEALED-PRIVATE-TRANSACTION".into();
-    error.message = "authenticated exchange ended without a bound terminal".into();
-    error.workload_may_be_alive = true;
-    let result =
-        ResultV1::from_legacy(&source, vec!["sealed-runtime".into(), "private-tcp".into()])
-            .unwrap();
-    assert_eq!(result.launch.state, LaunchStateV1::Unknown);
-    assert_eq!(result.authorization, AuthorizationV1::Uncertain);
-    assert_eq!(result.cleanup.state, CleanupStateV1::Unknown);
-    assert_eq!(result.cleanup.workload_empty, None);
-    assert!(!result.cleanup.direct_child_reaped);
-    assert!(result.private_execution.is_none());
-    result.validate().unwrap();
-    let decoded = ResultV1::parse(&serde_json::to_vec(&result).unwrap()).unwrap();
-    assert_eq!(decoded.cleanup.state, CleanupStateV1::Unknown);
-}
-
-#[test]
-fn supervised_windows_failure_retains_receipt_without_top_level_error_or_clock_fabrication() {
-    use memcordon_core::result_v1::{
-        AuthorizationV1, CleanupStateV1, LaunchStateV1, OutcomeKindV1,
-        ProviderAttemptAssociationV1, ResultV1, RuntimeV1,
-    };
-    let rejection = windows_postauthorization_fixture::rejection();
-    let diagnostic = rejection.provider_failure.clone().unwrap();
-    let association = ProviderAttemptAssociationV1 {
-        provider: diagnostic.provider_binding.clone(),
-        attempt_id: diagnostic.attempt_id.clone(),
-        request_sha256: diagnostic.request_sha256.clone(),
-    };
-    let error = SupervisionErrorRecord {
-        native_startup: None,
-        category: "monitor".into(),
-        code: "MCSEALED-PROVIDER-REJECTION".into(),
-        message: rejection.detail.clone(),
-        os_code: None,
-        attempt_number: Some(1),
-        supervision_phase: SupervisionPhase::ActiveAttempt,
-        launch_phase: Some("monitoring".into()),
-        target_released: true,
-        workload_may_be_alive: false,
-        initial_spawn_failure: None,
-        provider_rejection: None,
-        backend_selection_drift: None,
-    };
-    let mut attempt = attempt_record(1, None, Some(error.clone()));
-    attempt.target_pid = Some(1234);
-    attempt.authorized_offset_ms = Some(7);
-    attempt.finished_offset_ms = 29;
-    attempt.launch.mechanism = "windows-job-object-v2".into();
-    attempt.launch.boundary_requested = memcordon_core::BoundaryRequirement::Sealed;
-    attempt.launch.boundary_effective = memcordon_core::BoundaryClass::Sealed;
-    attempt.launch.boundary_assignment_verified = true;
-    attempt.launch.boundary_reconfiguration_denied = true;
-    attempt.launch.inherited_resources_restricted = true;
-    attempt.launch.frontend_loss_cleanup_authority_verified = true;
-    attempt.restart_safety = rejection.restart_safety.clone();
-    attempt.boundary_detail = BoundaryMechanismEvidence::SetupFailure {
-        provider_mechanism: "windows-job-object-v2".into(),
-        requested: memcordon_core::BoundaryRequirement::Sealed,
-    };
-    attempt.operational_failure = Some(memcordon_core::OperationalAttemptFailure {
-        format: "memcordon.operational-attempt-failure".into(),
-        revision: 1,
-        private_rejection: None,
-        provider_failure: Some(diagnostic.clone()),
-        provider_association: Some(association.clone()),
-        windows_rejection: Some(rejection),
-        windows_terminal_delivery: None,
-    });
-    let mut history = AttemptHistory::default();
-    let mut aggregate = SupervisionAggregates::default();
-    history.append(attempt, &mut aggregate).unwrap();
-    let backend = BackendCapabilityReport {
-        boundary: memcordon_core::BoundaryCapability {
-            class: memcordon_core::BoundaryClass::Sealed,
-            mechanism: "windows-job-object-v2".into(),
-            target_gated: true,
-            boundary_verified_before_authorization: true,
-            target_can_reconfigure_boundary: false,
-            frontend_loss_cleanup_authority: true,
-            workload_empty_proof: true,
-            limitations: Vec::new(),
-        },
-        ..BackendCapabilityReport::default()
-    };
-    let execution = SupervisionExecution::new(
-        backend,
-        SupervisionTerminal::Error {
-            attempt_number: Some(1),
-            error: Box::new(error),
-        },
-        history,
-        aggregate,
-        coordinator().summary().clone(),
-        None,
-        29,
-        1,
-    )
-    .unwrap();
-    let mut report = report_from_execution(execution);
+fn ordinary_numeric_report_cannot_carry_a_sealed_request() {
+    let mut value = serde_json::to_value(report()).unwrap();
+    value["policy"]["requested"]["boundary"] = serde_json::json!("sealed");
+    assert!(serde_json::from_value::<MemcordonReport>(value).is_err());
+    let mut typed = report();
+    typed.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
+    assert!(serde_json::to_vec(&typed).is_err());
     assert!(
-        report.error.is_none(),
-        "normal supervise returns an Error terminal inside Ok"
-    );
-    assert!(report.attempts[0].runtime.is_none());
-    report.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
-    report.policy.effective.boundary = memcordon_core::BoundaryClass::Sealed;
-    let result = ResultV1::from_legacy(&report, vec!["windows-sealed-runtime".into()]).unwrap();
-    assert_eq!(result.outcome.kind, OutcomeKindV1::ProviderFailure);
-    assert_eq!(result.outcome.wrapper_status, 125);
-    assert_eq!(
-        result.outcome.native_termination,
-        Some(ChildTermination::ExitCode { code: 0 })
-    );
-    assert_eq!(result.authorization, AuthorizationV1::Granted);
-    assert_eq!(result.launch.state, LaunchStateV1::ReleaseIssued);
-    assert_eq!(result.launch.target_pid.unwrap().get(), 1234);
-    assert_eq!(result.cleanup.state, CleanupStateV1::Complete);
-    assert!(result.cleanup.direct_child_reaped);
-    assert_eq!(result.cleanup.workload_empty, Some(true));
-    assert!(matches!(result.runtime, RuntimeV1::WindowsSealed { .. }));
-    assert_eq!(result.diagnostics.as_ref(), Some(&diagnostic));
-    assert_eq!(result.provider_association.as_ref(), Some(&association));
-    let bytes = serde_json::to_vec(&result).unwrap();
-    ResultV1::parse(&bytes).unwrap();
-    assert!(
-        serde_json::to_vec(&report).is_err(),
-        "numeric report must refuse named operational facts"
-    );
-    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    for field in [
-        "native-outcome",
-        "runtime-observation",
-        "association",
-        "carrier-association",
-        "receipt-attempt",
-        "receipt-provider-generation",
-    ] {
-        let mut altered = original.clone();
-        match field {
-            "native-outcome" => {
-                altered["outcome"]["native_termination"]["code"] = serde_json::json!(9)
-            }
-            "runtime-observation" => {
-                altered["runtime"]["observation"]["guardian_reaped"] = serde_json::json!(false)
-            }
-            "association" => {
-                altered["provider_association"]["attempt_id"] = serde_json::json!("01".repeat(32))
-            }
-            "carrier-association" => {
-                altered["attempts"][0]["operational_failure"]["provider_association"]["request_sha256"] =
-                    serde_json::json!("02".repeat(32))
-            }
-            "receipt-attempt" => {
-                let receipt = &mut altered["attempts"][0]["operational_failure"]["windows_rejection"]
-                    ["disposition"]["receipt"];
-                receipt["attempt_id"] = serde_json::json!("03".repeat(32));
-                receipt["retirement_proof"]["attempt_id"] = receipt["attempt_id"].clone();
-            }
-            _ => {
-                altered["attempts"][0]["operational_failure"]["windows_rejection"]["disposition"]
-                    ["receipt"]["retirement_proof"]["provider_generation"] =
-                    serde_json::json!("other-generation");
-            }
-        }
-        assert!(
-            ResultV1::parse(&serde_json::to_vec(&altered).unwrap()).is_err(),
-            "{field}"
-        );
-    }
-    let attempt = &mut report.attempts[0];
-    attempt.target_pid = None;
-    attempt.authorized_offset_ms = None;
-    let failure = attempt.operational_failure.as_mut().unwrap();
-    let rejection = failure.windows_rejection.as_mut().unwrap();
-    let memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
-        &mut rejection.disposition
-    else {
-        panic!("strict fixture has a terminal receipt")
-    };
-    receipt.payload = memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
-        primary_failure: diagnostic.original.clone(),
-        target_creation_observed: true,
-        resume_attempted: true,
-    };
-    receipt.retirement_proof.source =
-        memcordon_core::WindowsRetirementProofSourceV2::GuardianRecovery;
-    receipt.retirement_proof.target_completion_observed = false;
-    receipt.retirement_proof.guardian_receipt_sha256 = Some("78".repeat(32));
-    assert!(rejection.is_consistent());
-    let recovered = ResultV1::from_legacy(&report, vec!["windows-sealed-runtime".into()]).unwrap();
-    assert_eq!(recovered.outcome.kind, OutcomeKindV1::ProviderFailure);
-    assert_eq!(recovered.outcome.wrapper_status, 125);
-    assert!(
-        recovered.outcome.native_termination.is_none(),
-        "recovery did not observe the original native wait outcome"
-    );
-    assert!(
-        recovered.attempts[0].authorized_offset_ms.is_none(),
-        "no authorization clock was observed"
-    );
-    assert_eq!(recovered.cleanup.state, CleanupStateV1::Complete);
-    ResultV1::parse(&serde_json::to_vec(&recovered).unwrap()).unwrap();
-    let mut copied = serde_json::to_value(&recovered).unwrap();
-    copied["outcome"]["native_termination"] = serde_json::json!({"kind":"exit-code", "code":0});
-    assert!(ResultV1::parse(&serde_json::to_vec(&copied).unwrap()).is_err());
-}
-
-#[test]
-fn supervised_private_rejection_remains_bound_without_top_level_error() {
-    use memcordon_core::private_runtime::PrivateRuntimeRejection;
-    use memcordon_core::result_v1::{AuthorizationV1, CleanupStateV1, LaunchStateV1, ResultV1};
-    let rejection = PrivateRuntimeRejection {
-        format: "memcordon.private-runtime-rejection".into(),
-        revision: 1,
-        provider: memcordon_core::PublicProviderBindingV1 {
-            generation: memcordon_core::BoundedText::new(
-                "1.2.3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-            .unwrap(),
-            source_commit: memcordon_core::BoundedText::new(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-            .unwrap(),
-            runtime_manifest_sha256: memcordon_core::DiagnosticSha256::from_bytes([7; 32]),
-        },
-        attempt_id: [1; 16],
-        request_sha256: memcordon_core::DiagnosticSha256::from_bytes([2; 32]),
-        invocation_sha256: memcordon_core::DiagnosticSha256::from_bytes([3; 32]),
-        contract: memcordon_core::workload_contract::WorkloadContractV2::parse(include_bytes!(
-            "../../../fuzz/corpus/workload-request/baseline-v2.json"
-        ))
-        .unwrap(),
-        boundary_allocated: false,
-        reservation_may_remain: true,
-        detail: memcordon_core::BoundedText::new(
-            "grant rejected before boundary allocation; reservation retirement unconfirmed",
-        )
-        .unwrap(),
-    };
-    rejection.validate().unwrap();
-    let error = SupervisionErrorRecord {
-        native_startup: None,
-        category: "setup".into(),
-        code: "MCSEALED-PRIVATE-REJECTED".into(),
-        message: rejection.detail.as_str().into(),
-        os_code: None,
-        attempt_number: Some(1),
-        supervision_phase: SupervisionPhase::AttemptSetup,
-        launch_phase: None,
-        target_released: false,
-        workload_may_be_alive: false,
-        initial_spawn_failure: None,
-        provider_rejection: None,
-        backend_selection_drift: None,
-    };
-    let mut attempt = attempt_record(1, None, Some(error.clone()));
-    attempt.operational_failure = Some(memcordon_core::OperationalAttemptFailure {
-        format: "memcordon.operational-attempt-failure".into(),
-        revision: 1,
-        private_rejection: Some(rejection.clone()),
-        provider_failure: None,
-        provider_association: None,
-        windows_rejection: None,
-        windows_terminal_delivery: None,
-    });
-    let mut history = AttemptHistory::default();
-    let mut aggregate = SupervisionAggregates::default();
-    history.append(attempt, &mut aggregate).unwrap();
-    let execution = SupervisionExecution::new(
-        BackendCapabilityReport::default(),
-        SupervisionTerminal::Error {
-            attempt_number: Some(1),
-            error: Box::new(error),
-        },
-        history,
-        aggregate,
-        coordinator().summary().clone(),
-        None,
-        29,
-        0,
-    )
-    .unwrap();
-    let mut report = report_from_execution(execution);
-    report.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
-    assert!(report.error.is_none());
-    let result =
-        ResultV1::from_legacy(&report, vec!["sealed-runtime".into(), "private-tcp".into()])
-            .unwrap();
-    assert_eq!(result.private_rejection.as_ref(), Some(&rejection));
-    assert_eq!(result.launch.state, LaunchStateV1::NotCreated);
-    assert_eq!(result.authorization, AuthorizationV1::RejectedBeforeRelease);
-    assert_eq!(
-        result.cleanup.state,
-        CleanupStateV1::Unknown,
-        "uncertain account reservation is not clean retirement"
-    );
-    let bytes = serde_json::to_vec(&result).unwrap();
-    ResultV1::parse(&bytes).unwrap();
-    let mut altered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    altered["private_rejection"]["attempt_id"] = serde_json::to_value([4_u8; 16]).unwrap();
-    assert!(ResultV1::parse(&serde_json::to_vec(&altered).unwrap()).is_err());
-}
-
-#[test]
-fn supervised_transaction_loss_without_bound_terminal_keeps_unknown_native_ownership() {
-    use memcordon_core::result_v1::{
-        AuthorizationV1, CleanupStateV1, LaunchStateV1, OutcomeKindV1, ResultV1,
-    };
-    let error = SupervisionErrorRecord {
-        native_startup: None,
-        category: "monitor".into(),
-        code: "MCSEALED-PRIVATE-TRANSACTION".into(),
-        message: "authenticated exchange ended without a bound terminal".into(),
-        os_code: None,
-        attempt_number: Some(1),
-        supervision_phase: SupervisionPhase::ActiveAttempt,
-        launch_phase: None,
-        target_released: false,
-        workload_may_be_alive: true,
-        initial_spawn_failure: None,
-        provider_rejection: None,
-        backend_selection_drift: None,
-    };
-    let mut attempt = attempt_record(1, None, Some(error.clone()));
-    attempt.restart_safety = RestartSafetyProof::default();
-    let mut history = AttemptHistory::default();
-    let mut aggregate = SupervisionAggregates::default();
-    history.append(attempt, &mut aggregate).unwrap();
-    let execution = SupervisionExecution::new(
-        BackendCapabilityReport::default(),
-        SupervisionTerminal::Error {
-            attempt_number: Some(1),
-            error: Box::new(error),
-        },
-        history,
-        aggregate,
-        coordinator().summary().clone(),
-        None,
-        29,
-        0,
-    )
-    .unwrap();
-    let mut report = report_from_execution(execution);
-    report.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
-    assert!(report.error.is_none());
-    let result =
-        ResultV1::from_legacy(&report, vec!["sealed-runtime".into(), "private-tcp".into()])
-            .unwrap();
-    assert_eq!(result.launch.state, LaunchStateV1::Unknown);
-    assert_eq!(result.authorization, AuthorizationV1::Uncertain);
-    assert_eq!(result.outcome.kind, OutcomeKindV1::Unknown);
-    assert_eq!(result.outcome.wrapper_status, 125);
-    assert_eq!(result.cleanup.state, CleanupStateV1::Unknown);
-    assert_eq!(result.cleanup.workload_empty, None);
-    assert!(!result.cleanup.direct_child_reaped);
-    assert!(result.outcome.native_termination.is_none());
-    let original = serde_json::to_value(&result).unwrap();
-    ResultV1::parse(&serde_json::to_vec(&original).unwrap()).unwrap();
-    for field in ["launch", "cleanup"] {
-        let mut altered = original.clone();
-        if field == "launch" {
-            altered["launch"]["state"] = serde_json::json!("not-created");
-            altered["authorization"] = serde_json::json!("rejected-before-release");
-        } else {
-            altered["cleanup"]["state"] = serde_json::json!("complete");
-            altered["cleanup"]["workload_empty"] = serde_json::json!(true);
-            altered["cleanup"]["direct_child_reaped"] = serde_json::json!(true);
-        }
-        assert!(
-            ResultV1::parse(&serde_json::to_vec(&altered).unwrap()).is_err(),
-            "{field}"
-        );
-    }
-}
-
-#[test]
-fn report11_rejects_unbound_windows_delivery_on_standard_backend() {
-    let mut report = report();
-    report.schema_version = memcordon_core::WINDOWS_EXECUTION_REPORT_SCHEMA_V11;
-    let bytes = serde_json::to_vec(&report).expect("report serializes");
-    MemcordonReport::parse_exact_schema(
-        &bytes,
-        memcordon_core::WINDOWS_EXECUTION_REPORT_SCHEMA_V11,
-    )
-    .expect("standard report does not require Windows authority");
-    report.windows_terminal_delivery = Some(memcordon_core::WindowsTerminalDeliveryEvidenceV1 {
-        schema_version: 1,
-        attempt_id: "a".repeat(64),
-        nonce: "nonce".to_owned(),
-        request_sha256: "b".repeat(64),
-        authority_sha256: "c".repeat(64),
-        retired_sha256: "d".repeat(64),
-        retired_confirmed: true,
-    });
-    let bytes = serde_json::to_vec(&report).expect("report serializes");
-    assert!(
-        MemcordonReport::parse_exact_schema(
-            &bytes,
-            memcordon_core::WINDOWS_EXECUTION_REPORT_SCHEMA_V11,
+        MemcordonReport::schema10(
+            typed.tool,
+            typed.invocation,
+            typed.policy,
+            typed.backend,
+            None,
+            typed.error
         )
         .is_err()
     );
 }
 
 #[test]
-fn successful_windows_result_preserves_authenticated_frontend_association() {
-    use memcordon_core::result_v1::{ProviderAttemptAssociationV1, ResultV1, RuntimeV1};
-    let association = ProviderAttemptAssociationV1 {
-        provider: windows_postauthorization_fixture::rejection()
-            .provider_failure
-            .unwrap()
-            .provider_binding,
-        attempt_id: memcordon_core::DiagnosticSha256::from_bytes([0xab; 32]),
-        request_sha256: memcordon_core::DiagnosticSha256::from_bytes([0xcd; 32]),
-    };
-    let delivery = memcordon_core::WindowsTerminalDeliveryEvidenceV1 {
-        schema_version: 1,
-        attempt_id: String::from(association.attempt_id.clone()),
-        nonce: "fixture-nonce".into(),
-        request_sha256: String::from(association.request_sha256.clone()),
-        authority_sha256: "01".repeat(32),
-        retired_sha256: "02".repeat(32),
-        retired_confirmed: true,
-    };
-    let mut attempt = attempt_record(
-        1,
-        Some(RunOutcome::Exited {
-            child: ChildTermination::WindowsStatus { status: 0 },
-            peak: None,
-            cleanup: cleanup(),
-        }),
-        None,
-    );
-    attempt.boundary_detail = BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
-        memcordon_core::WindowsSealedEvidenceV2 {
-            schema_version: 2,
-            service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".into(),
-            caller_token_authenticated: true,
-            initial_target_token_matches_caller: true,
-            credential_transition_disposition:
-                memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope,
-            job_membership_independent_of_token: true,
-            job_created: true,
-            job_limits_verified: true,
-            kill_on_close_verified: true,
-            breakaway_denied: true,
-            completion_port_associated: true,
-            guardian_ready: true,
-            target_created_suspended: true,
-            job_list_applied_at_creation: true,
-            handle_list_applied_at_creation: true,
-            target_job_membership_verified: true,
-            target_still_suspended_during_verification: true,
-            inherited_handles_verified: true,
-            target_released: true,
-            terminate_job_invoked: true,
-            active_processes_zero: true,
-            direct_target_reaped: true,
-            relays_retired: true,
-            guardian_reaped: true,
-            final_job_handles_closed: true,
-            frontend_delivery: Some(delivery),
-            frontend_provider_association: Some(association.clone()),
-            ..Default::default()
-        },
-    ));
-    attempt.launch.mechanism = "windows-job-object-v2".into();
-    attempt.launch.target_spawn_error_reported = true;
-    attempt.launch.boundary_requested = memcordon_core::BoundaryRequirement::Sealed;
-    attempt.launch.boundary_effective = memcordon_core::BoundaryClass::Sealed;
-    attempt.launch.boundary_assignment_verified = true;
-    attempt.launch.boundary_reconfiguration_denied = true;
-    attempt.launch.inherited_resources_restricted = true;
-    attempt.launch.frontend_loss_cleanup_authority_verified = true;
-    attempt.restart_safety.containment_incapable_of_live_members = true;
-    attempt.restart_safety.sealed_boundary_retired = true;
-    let outcome = attempt.outcome.clone().unwrap();
-    let mut history = AttemptHistory::default();
-    let mut aggregates = SupervisionAggregates::default();
-    history.append(attempt, &mut aggregates).unwrap();
-    let execution = SupervisionExecution::new(
-        BackendCapabilityReport {
-            boundary: memcordon_core::BoundaryCapability {
-                class: memcordon_core::BoundaryClass::Sealed,
-                mechanism: "windows-job-object-v2".into(),
-                target_gated: true,
-                boundary_verified_before_authorization: true,
-                target_can_reconfigure_boundary: false,
-                frontend_loss_cleanup_authority: true,
-                workload_empty_proof: true,
-                limitations: Vec::new(),
-            },
-            ..Default::default()
-        },
-        SupervisionTerminal::AttemptOutcome {
-            attempt_number: 1,
-            outcome,
-        },
-        history,
-        aggregates,
-        RestartSummary::default(),
-        None,
-        4,
-        1,
-    )
-    .unwrap();
-    let mut report = report_from_execution(execution);
-    report.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
-    report.policy.effective.boundary = memcordon_core::BoundaryClass::Sealed;
-    let result = ResultV1::from_legacy(&report, Vec::new()).unwrap();
-    assert_eq!(result.provider_association.as_ref(), Some(&association));
-    ResultV1::parse(&serde_json::to_vec(&result).unwrap()).unwrap();
-    for field in ["attempt_id", "request_sha256", "provider"] {
-        let mut changed = result.clone();
-        let RuntimeV1::WindowsSealed { observation } = &mut changed.runtime else {
-            panic!("Windows observation");
-        };
-        let observed = observation.frontend_provider_association.as_mut().unwrap();
-        match field {
-            "attempt_id" => {
-                observed.attempt_id = memcordon_core::DiagnosticSha256::from_bytes([9; 32])
-            }
-            "request_sha256" => {
-                observed.request_sha256 = memcordon_core::DiagnosticSha256::from_bytes([9; 32])
-            }
-            _ => {
-                observed.provider.generation =
-                    memcordon_core::BoundedText::new("substitution").unwrap()
-            }
-        }
-        let observation = observation.clone();
-        changed.attempts[0].boundary_detail =
-            BoundaryMechanismEvidence::WindowsJobObjectV2(observation);
-        assert!(changed.validate().is_err(), "{field}");
-    }
-    for field in ["schema_version", "authority_sha256", "retired_confirmed"] {
-        let mut changed = result.clone();
-        let RuntimeV1::WindowsSealed { observation } = &mut changed.runtime else {
-            panic!("Windows observation");
-        };
-        let delivery = observation.frontend_delivery.as_mut().unwrap();
-        match field {
-            "schema_version" => delivery.schema_version = 2,
-            "authority_sha256" => delivery.authority_sha256 = "invalid".into(),
-            _ => delivery.retired_confirmed = false,
-        }
-        changed.attempts[0].boundary_detail =
-            BoundaryMechanismEvidence::WindowsJobObjectV2(observation.clone());
-        assert!(changed.validate().is_err(), "{field}");
-    }
-    let mut missing_delivery = result;
-    let RuntimeV1::WindowsSealed { observation } = &mut missing_delivery.runtime else {
-        panic!("Windows observation");
-    };
-    observation.frontend_delivery = None;
-    missing_delivery.attempts[0].boundary_detail =
-        BoundaryMechanismEvidence::WindowsJobObjectV2(observation.clone());
-    assert!(missing_delivery.validate().is_err());
-}
-
-#[test]
-fn execution_report_rejects_corrupt_or_future_provider_diagnostics() {
+fn ordinary_execution_report_rejects_provider_diagnostic_projection() {
     let projection = memcordon_core::ProviderFailureDiagnosticV1::from_journal(
         memcordon_core::PublicProviderBindingV1 {
             generation: memcordon_core::BoundedText::new("1.0:test").unwrap(),
@@ -1075,7 +256,7 @@ fn execution_report_rejects_corrupt_or_future_provider_diagnostics() {
     .unwrap();
     let mut value = serde_json::to_value(report()).unwrap();
     value["error"]["provider_failure"] = serde_json::to_value(projection).unwrap();
-    assert!(serde_json::from_value::<MemcordonReport>(value.clone()).is_ok());
+    assert!(serde_json::from_value::<MemcordonReport>(value.clone()).is_err());
     for (field, invalid) in [
         ("schema_version", serde_json::json!(2)),
         ("diagnostic_sequence", serde_json::json!(20)),
@@ -1313,21 +494,6 @@ fn atomic_report_replaces_existing_relative_destination_and_ends_in_newline() {
 }
 
 #[test]
-fn historical_execution_report_requires_exact_trusted_schema() {
-    let bytes = serde_json::to_vec(&report()).expect("serialize current report");
-    let historical = MemcordonReport::parse_historical_v10(&bytes)
-        .expect("schema 10 remains explicitly decodable");
-    assert_eq!(historical.schema_version, 10);
-    assert!(MemcordonReport::parse_exact_schema(&bytes, 11).is_err());
-    let mut wrong: serde_json::Value = serde_json::from_slice(&bytes).expect("parse report JSON");
-    wrong["schema_version"] = serde_json::json!(11);
-    let wrong = serde_json::to_vec(&wrong).expect("serialize wrong version");
-    assert!(MemcordonReport::parse_historical_v10(&wrong).is_err());
-    assert!(MemcordonReport::supports_schema(11));
-    assert!(!MemcordonReport::supports_schema(12));
-}
-
-#[test]
 #[cfg_attr(
     miri,
     ignore = "requires host filesystem operations unavailable under Miri isolation"
@@ -1385,7 +551,7 @@ fn circuit_state_is_typed_in_schema_models() {
 }
 
 #[test]
-fn schema_five_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
+fn standard_report_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
     let cases = [
         (Vec::new(), None, None),
         (
@@ -1584,7 +750,7 @@ fn schema_five_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
 }
 
 #[test]
-fn schema_five_preserves_explicit_zero_budgets() {
+fn standard_report_preserves_explicit_zero_budgets() {
     let mut report = report();
     report.invocation.budget_tokens = vec![
         BudgetTokenReport {
@@ -1673,7 +839,7 @@ fn deadline_evidence_accepts_an_immediate_deadline() {
 }
 
 #[test]
-fn schema_five_rejects_envelope_history_and_budget_contradictions() {
+fn standard_report_rejects_envelope_history_and_budget_contradictions() {
     let mut value = serde_json::to_value(report()).expect("schema JSON");
     value["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<MemcordonReport>(value).is_err());
@@ -1697,450 +863,6 @@ fn safe_proof() -> RestartSafetyProof {
     }
 }
 
-fn strict_retired_sealed_report() -> MemcordonReport {
-    use memcordon_core::workload_contract::*;
-    use memcordon_core::workload_evidence::*;
-    use memcordon_core::workload_registry::*;
-    use memcordon_core::{
-        BoundaryCapability, BoundaryClass, BoundaryRequirement, BoundedText, BoundedVec,
-        DiagnosticSha256, LinuxSealedEvidenceV2, PublicProviderBindingV1,
-    };
-    use std::num::NonZeroU64;
-
-    let digest = DiagnosticSha256::from_bytes([7; 32]);
-    let profile = BaselineProfile::LinuxUnixCreate;
-    let request = WorkloadContractV1 {
-        schema_version: ContractVersionOne::default(),
-        workload_plan_digest: digest.clone(),
-        authorized_profile: profile.reference(),
-        authorization: AuthorizationRef {
-            grant_id: LogicalId::new("reviewed-plan".into()).unwrap(),
-            grant_revision: NonZeroU64::MIN,
-            approved_plan_digest: digest.clone(),
-        },
-        ceiling: profile.ceiling(),
-        requirements: BoundedVec::default(),
-        endpoints: BoundedVec::default(),
-        expected_epoch: PolicyEpoch {
-            service_instance: Nonce128([3; 16]),
-            revision: NonZeroU64::MIN,
-        },
-    };
-    let snapshot = RuntimeAdmissionSnapshot {
-        format: "memcordon.local-admission".into(),
-        revision: 1,
-        request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
-        request: request.clone(),
-        registry_digest: digest.clone(),
-        admission_nonce: Nonce128([4; 16]),
-        caller_invocation_reference: Nonce128([5; 16]),
-        private_invocation_digest: digest.clone(),
-        caller: CallerSelector::Linux { uid: 1000 },
-        native_profile: profile,
-    };
-    let binding = RuntimeAttemptBinding::from_snapshot(
-        &snapshot,
-        PublicProviderBindingV1 {
-            generation: BoundedText::new("test-provider").unwrap(),
-            source_commit: BoundedText::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
-            runtime_manifest_sha256: digest,
-        },
-        BoundedText::new("boot-a").unwrap(),
-        BoundedText::new("attempt-a").unwrap(),
-        0,
-    )
-    .unwrap();
-    let checkpoint = VerifiedCheckpointV1::observed(
-        &binding,
-        baseline_observation(profile),
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-    )
-    .unwrap();
-    let enforcement = RuntimePolicyEnforcement::retired(binding, checkpoint, true, true).unwrap();
-    assert!(enforcement.valid_native_terminal(Some(&request), profile, "attempt-a", 0, "boot-a"));
-
-    let outcome = RunOutcome::Exited {
-        child: ChildTermination::ExitCode { code: 0 },
-        peak: None,
-        cleanup: cleanup(),
-    };
-    let mut attempt = attempt_record(1, Some(outcome.clone()), None);
-    attempt.policy_enforcement = enforcement.clone();
-    attempt.launch = LaunchEvidence {
-        mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
-        boundary_requested: BoundaryRequirement::Sealed,
-        boundary_effective: BoundaryClass::Sealed,
-        target_released: true,
-        containment_verified_before_authorization: true,
-        guardian_started_before_authorization: true,
-        target_spawn_error_reported: true,
-        boundary_assignment_verified: true,
-        boundary_reconfiguration_denied: true,
-        inherited_resources_restricted: true,
-        frontend_loss_cleanup_authority_verified: true,
-    };
-    attempt.restart_safety.sealed_boundary_retired = true;
-    attempt.boundary_detail =
-        BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(LinuxSealedEvidenceV2 {
-            schema_version: 2,
-            provider_identity: "memcordon-sealed-agent-v2".to_owned(),
-            control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
-            launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
-            cgroup_identity_digest: "ab".repeat(32),
-            cgroup_created: true,
-            cgroup_owned_by_provider: true,
-            memory_configuration_verified: true,
-            init_created_into_cgroup: true,
-            pid_namespace_created: true,
-            mount_namespace_created: true,
-            cgroup_namespace_created: true,
-            target_pidfd_verified: true,
-            target_cgroup_membership_verified: true,
-            target_pid_namespace_verified: true,
-            target_initial_credentials_verified: true,
-            initial_provider_capabilities_absent: true,
-            caller_no_new_privs_reproduced: true,
-            caller_capability_bounding_set_reproduced: true,
-            caller_mount_context_reproduced: true,
-            credential_transition_disposition:
-                memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope,
-            boundary_independent_of_credentials: true,
-            inherited_descriptors_verified: true,
-            writable_ancestor_cgroup_denied: true,
-            parent_namespace_handles_denied: true,
-            recursive_provider_request_denied: true,
-            guardian_ready: true,
-            target_released: true,
-            cgroup_kill_invoked: true,
-            cgroup_empty_verified: true,
-            namespace_init_reaped: true,
-            guardian_reaped: true,
-            cgroup_removed: true,
-        });
-    assert!(memcordon_core::boundary_evidence_is_consistent(
-        &attempt.launch,
-        &attempt.restart_safety,
-        &attempt.boundary_detail
-    ));
-    let backend = BackendCapabilityReport {
-        boundary: BoundaryCapability {
-            class: BoundaryClass::Sealed,
-            mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
-            target_gated: true,
-            boundary_verified_before_authorization: true,
-            target_can_reconfigure_boundary: false,
-            frontend_loss_cleanup_authority: true,
-            workload_empty_proof: true,
-            limitations: Vec::new(),
-        },
-        ..BackendCapabilityReport::default()
-    };
-    let mut history = AttemptHistory::default();
-    let mut aggregates = SupervisionAggregates::default();
-    history.append(attempt, &mut aggregates).unwrap();
-    let execution = SupervisionExecution::new(
-        backend.clone(),
-        SupervisionTerminal::AttemptOutcome {
-            attempt_number: 1,
-            outcome,
-        },
-        history,
-        aggregates,
-        RestartSummary::default(),
-        None,
-        10,
-        1,
-    )
-    .unwrap();
-    let mut base = report();
-    base.policy.requested.boundary = BoundaryRequirement::Sealed;
-    base.policy.requested.workload = WorkloadRequestReport::StrictV1 {
-        contract: Box::new(request),
-    };
-    base.policy.effective.boundary = BoundaryClass::Sealed;
-    base.policy.effective.workload = enforcement.resolution().unwrap();
-    MemcordonReport::schema9(
-        base.tool,
-        base.invocation,
-        base.policy,
-        Some(backend),
-        Some(execution),
-        None,
-    )
-    .unwrap()
-}
-
-#[test]
-fn frozen_plan_reader_keeps_old_binding_without_creating_operational_plan() {
-    use memcordon_core::workload_evidence::{PENDING_PRELAUNCH_CHECKS, RuntimeWorkloadResolution};
-    let base = strict_retired_sealed_report();
-    let RuntimeWorkloadResolution::Admitted {
-        binding, effective, ..
-    } = &base.policy.effective.workload
-    else {
-        panic!("strict fixture must contain actual admitted facts");
-    };
-    let mut frozen_binding = serde_json::to_value(&binding.plan).unwrap();
-    frozen_binding.as_object_mut().unwrap().remove("format");
-    frozen_binding.as_object_mut().unwrap().remove("revision");
-    frozen_binding["qualification_digest"] = serde_json::json!("77".repeat(32));
-    let mut document = serde_json::json!({
-        "schema_version": 9,
-        "tool": base.tool,
-        "budget_tokens": base.invocation.budget_tokens,
-        "request": base.policy.requested,
-        "resolution": {
-            "backend": base.backend,
-            "effective": base.policy.effective,
-            "effects": [], "limitations": [], "launch_proof": false, "backoff_sample_ms": []
-        }
-    });
-    document["resolution"]["effective"]["workload"] = serde_json::json!({
-        "state": "planned", "binding": frozen_binding,
-        "effective": effective, "pending": PENDING_PRELAUNCH_CHECKS
-    });
-    let bytes = serde_json::to_vec(&document).unwrap();
-    let parsed = memcordon_core::HistoricalPlanReport::parse(&bytes).unwrap();
-    assert_eq!(parsed.document(), &document);
-    assert!(serde_json::from_slice::<memcordon_core::PlanReport>(&bytes).is_err());
-    let mut missing = document.clone();
-    missing["resolution"]["effective"]["workload"]["binding"]
-        .as_object_mut()
-        .unwrap()
-        .remove("qualification_digest");
-    assert!(
-        memcordon_core::HistoricalPlanReport::parse(&serde_json::to_vec(&missing).unwrap())
-            .is_err()
-    );
-    document["resolution"]["effective"]["workload"]["binding"] =
-        serde_json::to_value(&binding.plan).unwrap();
-    assert!(
-        memcordon_core::HistoricalPlanReport::parse(&serde_json::to_vec(&document).unwrap())
-            .is_err()
-    );
-}
-
-#[test]
-fn frozen_doctor_reader_requires_old_advisory_namespace_and_false_authority() {
-    use memcordon_core::workload_registry::{BaselineProfile, CallerSelector};
-    let base = strict_retired_sealed_report();
-    let memcordon_core::workload_evidence::RuntimeWorkloadResolution::Admitted { binding, .. } =
-        &base.policy.effective.workload
-    else {
-        panic!("strict fixture must contain admitted facts");
-    };
-    let discovery = memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
-        None,
-        &CallerSelector::Linux { uid: 1000 },
-        BaselineProfile::LinuxUnixCreate,
-        binding.plan.provider.clone(),
-        binding.plan.boot_identity.clone(),
-    )
-    .unwrap();
-    let mut frozen = serde_json::to_value(&discovery).unwrap();
-    frozen.as_object_mut().unwrap().remove("format");
-    frozen.as_object_mut().unwrap().remove("revision");
-    frozen["schema_version"] = serde_json::json!(1);
-    frozen["qualification_digest"] = serde_json::json!("77".repeat(32));
-    let mut document = serde_json::json!({
-        "schema_version": 6,
-        "tool": base.tool, "host": {"os":"linux", "architecture":"x86_64"},
-        "selected": null, "available": [], "unavailable": [],
-        "requirement": {"kind":null,"met":false,"reason":null,"workload":null},
-        "workload_discovery": {"state":"authenticated","discovery":frozen}
-    });
-    let bytes = serde_json::to_vec(&document).unwrap();
-    assert_eq!(
-        memcordon_core::HistoricalDoctorReport::parse(&bytes)
-            .unwrap()
-            .document(),
-        &document
-    );
-    assert!(serde_json::from_slice::<memcordon_core::DoctorReport>(&bytes).is_err());
-    document["workload_discovery"]["discovery"]["target_authorized"] = serde_json::json!(true);
-    assert!(
-        memcordon_core::HistoricalDoctorReport::parse(&serde_json::to_vec(&document).unwrap())
-            .is_err()
-    );
-    document["workload_discovery"]["discovery"] = serde_json::to_value(discovery).unwrap();
-    assert!(
-        memcordon_core::HistoricalDoctorReport::parse(&serde_json::to_vec(&document).unwrap())
-            .is_err()
-    );
-}
-
-#[test]
-fn retired_strict_policy_cannot_replace_native_retirement() {
-    let report = strict_retired_sealed_report();
-    assert!(serde_json::to_value(&report).is_err());
-    let valid = memcordon_core::ResultV1::from_legacy(&report, Vec::new()).unwrap();
-    assert!(memcordon_core::ResultV1::parse(&serde_json::to_vec(&valid).unwrap()).is_ok());
-    let mut invalid = report;
-    let BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(native) =
-        &mut invalid.attempts[0].boundary_detail
-    else {
-        panic!("Linux fixture");
-    };
-    native.cgroup_empty_verified = false;
-    assert!(invalid.attempts[0].policy_enforcement.is_consistent());
-    assert!(memcordon_core::ResultV1::from_legacy(&invalid, Vec::new()).is_err());
-}
-
-#[test]
-fn native_retirement_cannot_replace_strict_policy_terminal() {
-    use memcordon_core::workload_evidence::{
-        AdmissionAvailabilityFailure, PolicyTerminalEvidenceV1, RuntimePolicyEnforcement,
-    };
-    let report = strict_retired_sealed_report();
-    assert_eq!(report.supervision.as_ref().unwrap().wrapper_exit_code, 0);
-    for variant in ["missing", "invalid", "unavailable"] {
-        let mut invalid = report.clone();
-        let attempt = &mut invalid.attempts[0];
-        assert!(memcordon_core::boundary_evidence_is_consistent(
-            &attempt.launch,
-            &attempt.restart_safety,
-            &attempt.boundary_detail
-        ));
-        if variant == "missing" {
-            attempt.policy_enforcement = RuntimePolicyEnforcement::LegacyUnspecified;
-        } else {
-            let RuntimePolicyEnforcement::Authorized { terminal, .. } =
-                &mut attempt.policy_enforcement
-            else {
-                panic!("strict fixture");
-            };
-            if variant == "unavailable" {
-                *terminal = PolicyTerminalEvidenceV1::Unavailable {
-                    reason: AdmissionAvailabilityFailure::TerminalUnavailable,
-                };
-            } else {
-                let PolicyTerminalEvidenceV1::Retired {
-                    provider_resources_closed,
-                    ..
-                } = terminal
-                else {
-                    panic!("retired fixture");
-                };
-                *provider_resources_closed = false;
-            }
-        }
-        assert!(
-            memcordon_core::ResultV1::from_legacy(&invalid, Vec::new()).is_err(),
-            "accepted {variant} strict policy terminal"
-        );
-    }
-}
-
-#[test]
-fn failed_strict_attempt_can_report_unavailable_policy_terminal_without_restart() {
-    use memcordon_core::workload_evidence::{
-        AdmissionAvailabilityFailure, PolicyTerminalEvidenceV1, RuntimePolicyEnforcement,
-    };
-    for (outcome, status) in [
-        (
-            RunOutcome::MonitorFailed {
-                error: "policy retirement observation unavailable".to_owned(),
-                child_after_termination: Some(ChildTermination::ExitCode { code: 0 }),
-                cleanup: cleanup(),
-            },
-            125,
-        ),
-        (
-            RunOutcome::Interrupted {
-                signal: memcordon_core::Interruption { signal: 2 },
-                child_after_termination: Some(ChildTermination::UnixSignal { signal: 2 }),
-                cleanup: cleanup(),
-            },
-            130,
-        ),
-        (
-            RunOutcome::Exited {
-                child: ChildTermination::ExitCode { code: 17 },
-                peak: None,
-                cleanup: cleanup(),
-            },
-            17,
-        ),
-    ] {
-        let mut base = strict_retired_sealed_report();
-        let mut attempt = base.attempts.remove(0);
-        let retired_enforcement = serde_json::to_value(&attempt.policy_enforcement).unwrap();
-        let RuntimePolicyEnforcement::Authorized { terminal, .. } = &mut attempt.policy_enforcement
-        else {
-            panic!("strict fixture");
-        };
-        *terminal = PolicyTerminalEvidenceV1::Unavailable {
-            reason: AdmissionAvailabilityFailure::TerminalUnavailable,
-        };
-        attempt.outcome = Some(outcome.clone());
-        let original_outcome = outcome.clone();
-        let mut history = AttemptHistory::default();
-        let mut aggregates = SupervisionAggregates::default();
-        history.append(attempt, &mut aggregates).unwrap();
-        let backend = base.backend.clone().unwrap();
-        let execution = SupervisionExecution::new(
-            backend.clone(),
-            SupervisionTerminal::AttemptOutcome {
-                attempt_number: 1,
-                outcome,
-            },
-            history,
-            aggregates,
-            RestartSummary::default(),
-            None,
-            10,
-            1,
-        )
-        .unwrap();
-        let failed = MemcordonReport::schema9(
-            base.tool,
-            base.invocation,
-            base.policy,
-            Some(backend),
-            Some(execution),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            failed.supervision.as_ref().unwrap().wrapper_exit_code,
-            status
-        );
-        assert_eq!(failed.attempts[0].outcome.as_ref(), Some(&original_outcome));
-        assert!(serde_json::to_value(&failed).is_err());
-        let result = memcordon_core::ResultV1::from_legacy(&failed, Vec::new()).unwrap();
-        let value = serde_json::to_value(result).unwrap();
-        assert!(memcordon_core::ResultV1::parse(&serde_json::to_vec(&value).unwrap()).is_ok());
-
-        for decision in [
-            "half-life-logistic-backoff",
-            "circuit-cooldown",
-            "half-open-launch",
-        ] {
-            let mut restart_without_retirement = value.clone();
-            restart_without_retirement["attempts"][0]["restart_decision"]["decision"] =
-                serde_json::json!(decision);
-            let mut with_retirement = restart_without_retirement.clone();
-            with_retirement["attempts"][0]["policy_enforcement"] = retired_enforcement.clone();
-            assert!(
-                memcordon_core::ResultV1::parse(&serde_json::to_vec(&with_retirement).unwrap())
-                    .is_ok()
-            );
-            assert!(
-                memcordon_core::ResultV1::parse(
-                    &serde_json::to_vec(&restart_without_retirement).unwrap()
-                )
-                .is_err(),
-                "accepted restart {decision} without strict retirement"
-            );
-        }
-    }
-}
-
 fn cleanup() -> CleanupSummary {
     CleanupSummary {
         direct_child_reaped: true,
@@ -2158,8 +880,6 @@ fn attempt_record(
     AttemptRecord {
         operational_failure: None,
         runtime: None,
-        private_execution: None,
-        policy_enforcement: Default::default(),
         number,
         kind: if number == 1 {
             AttemptKind::Initial
@@ -2280,7 +1000,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema9(
+    MemcordonReport::schema10(
         base.tool,
         base.invocation,
         base.policy,
@@ -2384,7 +1104,7 @@ fn deadline_report_value(attempts: u64) -> serde_json::Value {
 }
 
 #[test]
-fn schema_five_active_attempt_success_is_exact_and_round_trips() {
+fn standard_report_active_attempt_success_is_exact_and_round_trips() {
     let evidence = DeadlineEvidence::new(
         1_000,
         DeadlineScope::Attempt,
@@ -2438,7 +1158,7 @@ fn schema_five_active_attempt_success_is_exact_and_round_trips() {
 }
 
 #[test]
-fn schema_five_outside_attempt_deadline_is_terminal_and_round_trips() {
+fn standard_report_outside_attempt_deadline_is_terminal_and_round_trips() {
     let outcome = RunOutcome::LimitExceeded {
         limit: ByteSize::from_bytes(1),
         observed: None,
@@ -2515,7 +1235,7 @@ fn schema_five_outside_attempt_deadline_is_terminal_and_round_trips() {
 }
 
 #[test]
-fn schema_five_later_helper_error_preserves_prior_attempt() {
+fn standard_report_later_helper_error_preserves_prior_attempt() {
     let first = RunOutcome::LimitExceeded {
         limit: ByteSize::from_bytes(1),
         observed: None,
@@ -2589,7 +1309,7 @@ fn schema_five_later_helper_error_preserves_prior_attempt() {
 }
 
 #[test]
-fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
+fn standard_report_initial_spawn_status_round_trips_typed_provenance() {
     for (failure, status) in [
         (InitialSpawnFailure::NotExecutable, 126),
         (InitialSpawnFailure::NotFound, 127),
@@ -2649,7 +1369,6 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         errors: Vec::new(),
     };
     let provider_rejection = memcordon_core::ProviderRejectionEvidence {
-        workload_admission: None,
         provider_failure: None,
         schema_version: 1,
         code: "MCSPAWN-NOT-FOUND".to_owned(),
@@ -2661,8 +1380,6 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         target_released: true,
         cleanup_attempted: true,
         restart_safety,
-        terminal_ack_required: false,
-        terminal_receipt: None,
     };
     let error = SupervisionErrorRecord {
         category: "spawn".to_owned(),
@@ -2711,9 +1428,8 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
 }
 
 #[test]
-fn request_validation_provider_rejection_round_trips_in_schema_eight() {
+fn request_validation_provider_rejection_round_trips_in_standard_report() {
     let provider_rejection = memcordon_core::ProviderRejectionEvidence {
-        workload_admission: None,
         provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-PACKAGE-LEASE".to_owned(),
@@ -2725,8 +1441,6 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
         target_released: false,
         cleanup_attempted: false,
         restart_safety: RestartSafetyProof::default(),
-        terminal_ack_required: false,
-        terminal_receipt: None,
     };
     let error = SupervisionErrorRecord {
         category: "setup".to_owned(),
@@ -3053,7 +1767,7 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
     miri,
     ignore = "bulk report JSON round trips exceed the interpreter budget; native coverage retains the full wire boundary, with typed capacity and compact wire checks under Miri"
 )]
-fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
+fn standard_report_truncates_three_hundred_attempts_but_aggregates_all() {
     let value = deadline_report_value(300);
     assert_eq!(value["supervision"]["attempt_history"]["retained"], 256);
     assert_eq!(value["supervision"]["attempt_history"]["omitted"], 44);
@@ -3077,7 +1791,7 @@ fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
 }
 
 #[test]
-fn schema_five_rejects_compact_history_contradictions() {
+fn standard_report_rejects_compact_history_contradictions() {
     let value = deadline_report_value(3);
     let _: MemcordonReport = serde_json::from_value(value.clone()).expect("compact valid report");
 
@@ -3109,7 +1823,7 @@ fn schema_five_rejects_compact_history_contradictions() {
 }
 
 #[test]
-fn schema_five_rejects_compact_supervision_contradictions() {
+fn standard_report_rejects_compact_supervision_contradictions() {
     let valid = serde_json::to_value(report_from_execution({
         let mut history = AttemptHistory::default();
         let mut aggregates = SupervisionAggregates::default();

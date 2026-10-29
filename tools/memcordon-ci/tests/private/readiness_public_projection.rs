@@ -6,7 +6,7 @@ fn cell(records: Vec<Artifact>) -> CellEvidence {
     CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
         revision: 1,
-        identity: crate::consumer_readiness_ledger::SourceIdentity {
+        identity: crate::readiness_identity::SourceIdentity {
             run_id: "1".into(),
             source_commit: "a".repeat(40),
             source_tree_sha256: "b".repeat(64),

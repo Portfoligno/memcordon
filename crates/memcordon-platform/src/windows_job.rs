@@ -571,8 +571,6 @@ pub fn run_attempt(
     let (launch, restart_safety, boundary_detail) =
         crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
     Ok(Execution {
-        policy_enforcement: Default::default(),
-        private_execution: None,
         outcome,
         backend,
         child_pid: std::num::NonZeroU32::new(child_pid),

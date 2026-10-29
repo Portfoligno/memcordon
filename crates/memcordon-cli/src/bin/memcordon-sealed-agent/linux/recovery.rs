@@ -8,13 +8,20 @@ use std::time::{Duration, Instant};
 
 use super::{CGROUP_ROOT, STATE_ROOT};
 
-pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024
-    + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
-    + memcordon_core::workload_limits::CONTRACT_BYTES as u64
-    + super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64;
+pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
 pub fn recover() -> Result<Vec<String>, String> {
-    recover_roots(Path::new(STATE_ROOT), Path::new(CGROUP_ROOT))
+    recover_until(Instant::now() + Duration::from_secs(10))
+}
+pub(crate) fn recover_until(cutoff: Instant) -> Result<Vec<String>, String> {
+    recover_roots(Path::new(STATE_ROOT), Path::new(CGROUP_ROOT), cutoff)
+}
+fn check_cutoff(cutoff: Instant) -> Result<(), String> {
+    if Instant::now() >= cutoff {
+        Err("original native recovery cutoff exhausted; ownership retained".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Administrative retry of persisted native obligations, without recreating
@@ -61,6 +68,16 @@ fn recover_authenticated_inner(
     deadline: Option<u64>,
     mut observation: Option<&mut AdministrationObservation>,
 ) -> Result<Vec<String>, String> {
+    let started = Instant::now();
+    let remaining = match deadline {
+        Some(deadline) => {
+            Duration::from_nanos(deadline.saturating_sub(super::clock::monotonic_nanos()?))
+        }
+        None => Duration::from_secs(10),
+    };
+    let cutoff = started
+        .checked_add(remaining)
+        .ok_or("native recovery cutoff exceeds range")?;
     // SAFETY: geteuid has no pointer preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err("native recovery requires authenticated root administration".into());
@@ -79,20 +96,35 @@ fn recover_authenticated_inner(
         observation.recovery_entered = true;
         observation.stage = "persisted-recovery";
     }
-    recover()
+    recover_until(cutoff)
 }
 
 #[cfg(feature = "test-support")]
 pub fn recover_test_roots(state_root: &Path, cgroup_root: &Path) -> Result<Vec<String>, String> {
-    recover_roots(state_root, cgroup_root)
+    recover_roots(
+        state_root,
+        cgroup_root,
+        Instant::now() + Duration::from_secs(10),
+    )
 }
 
-fn recover_roots(state_root: &Path, cgroup_root: &Path) -> Result<Vec<String>, String> {
+fn recover_roots(
+    state_root: &Path,
+    cgroup_root: &Path,
+    cutoff: Instant,
+) -> Result<Vec<String>, String> {
+    check_cutoff(cutoff)?;
     let mut ambiguous = Vec::new();
     let mut authenticated = BTreeSet::new();
     match fs::symlink_metadata(state_root) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            recover_records(state_root, cgroup_root, &mut authenticated, &mut ambiguous)?;
+            recover_records(
+                state_root,
+                cgroup_root,
+                &mut authenticated,
+                &mut ambiguous,
+                cutoff,
+            )?;
         }
         Ok(_) => {
             return Err("MCSEALED-RECOVERY: state root is not a no-follow directory".to_owned());
@@ -101,6 +133,7 @@ fn recover_roots(state_root: &Path, cgroup_root: &Path) -> Result<Vec<String>, S
         Err(error) => return Err(format!("MCSEALED-RECOVERY: {error}")),
     }
     inspect_cgroup_root(cgroup_root, &authenticated, &mut ambiguous)?;
+    check_cutoff(cutoff)?;
     ambiguous.sort();
     ambiguous.dedup();
     Ok(ambiguous)
@@ -111,51 +144,8 @@ fn recover_records(
     cgroup_root: &Path,
     authenticated: &mut BTreeSet<OsString>,
     ambiguous: &mut Vec<String>,
+    cutoff: Instant,
 ) -> Result<(), String> {
-    let reservations = fs::read_dir(state_root)
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    for entry in &reservations {
-        let name = entry.file_name();
-        let Some(identity) = name
-            .to_str()
-            .filter(|value| super::cgroup::valid_attempt_identity(value))
-        else {
-            continue;
-        };
-        let bytes = match read_record_no_follow(&entry.path()) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        let record = match super::private_attempt::PrivateAttemptRecordV4::parse(bytes.as_bytes()) {
-            Ok(record)
-                if record.attempt_id.as_str() == identity
-                    && record.mixed_admission_metadata.is_some() =>
-            {
-                record
-            }
-            _ => continue,
-        };
-        if let Err(error) = recover_mixed_record(state_root, cgroup_root, &record, &entry.path()) {
-            authenticated.insert(name.clone());
-            ambiguous.push(format!("{identity}: {error}"));
-        }
-    }
-    let reservations = fs::read_dir(state_root)
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    for entry in reservations {
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("account-") && name.ends_with(".reservation"))
-            && !recover_account_reservation(state_root, cgroup_root, &entry)?
-        {
-            ambiguous.push(name.to_string_lossy().into_owned());
-        }
-    }
     // Refresh after retiring a known pre-allocation journal, avoiding stale
     // directory entries and preserving every unreclaimed uncertain owner.
     let entries = fs::read_dir(state_root)
@@ -164,6 +154,7 @@ fn recover_records(
         .map_err(|error| error.to_string())?;
     let mut blocked_by_temporary = BTreeSet::new();
     for entry in &entries {
+        check_cutoff(cutoff)?;
         let name = entry.file_name();
         let Some(name_text) = name.to_str() else {
             continue;
@@ -174,7 +165,8 @@ fn recover_records(
         else {
             continue;
         };
-        if interrupted_transition_is_recoverable(state_root, cgroup_root, identity, entry)? {
+        if interrupted_transition_is_recoverable(state_root, cgroup_root, identity, entry, cutoff)?
+        {
             fs::remove_file(entry.path()).map_err(|error| {
                 format!("MCSEALED-RECOVERY: interrupted transition rollback failed: {error}")
             })?;
@@ -188,13 +180,8 @@ fn recover_records(
     }
 
     for entry in entries {
+        check_cutoff(cutoff)?;
         let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("account-") && name.ends_with(".reservation"))
-        {
-            continue;
-        }
         if name.to_str().is_some_and(|name| {
             name.strip_suffix(".new")
                 .is_some_and(super::cgroup::valid_attempt_identity)
@@ -224,18 +211,6 @@ fn recover_records(
             ambiguous.push(identity.to_owned());
             continue;
         }
-        if record.starts_with("format=memcordon.private-native-journal\nrevision=1\n") {
-            if super::private_attempt::PrivateAttemptRecordV4::parse(record.as_bytes())
-                .is_ok_and(|record| record.attempt_id.as_str() == identity)
-            {
-                // A V4 attempt may have released the target and owns more than
-                // a cgroup. Until its terminal ledger can be reconstructed,
-                // preserve every protected resource for explicit recovery.
-                authenticated.insert(name.clone());
-            }
-            ambiguous.push(identity.to_owned());
-            continue;
-        }
         authenticated.insert(name.clone());
         if record
             .lines()
@@ -249,8 +224,7 @@ fn recover_records(
         let cgroup_path = cgroup_root.join(&name);
         match fs::symlink_metadata(&cgroup_path) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                super::cgroup::AttemptCgroup::authenticated(cgroup_path)
-                    .kill_and_retire(Instant::now() + Duration::from_secs(10))?;
+                super::cgroup::AttemptCgroup::authenticated(cgroup_path).kill_and_retire(cutoff)?;
             }
             Ok(_) => {
                 return Err(format!(
@@ -265,689 +239,12 @@ fn recover_records(
     Ok(())
 }
 
-/// Authenticate exactly one durable V4 write. Constructing each permitted
-/// successor from the predecessor preserves every original identity/resource;
-/// a newer phase alone cannot authorize discarding an earlier obligation.
-pub(crate) fn validate_mixed_pending_transition(
-    current: &super::private_attempt::PrivateAttemptRecordV4,
-    pending: &super::private_attempt::PrivateAttemptRecordV4,
-) -> Result<(), String> {
-    use super::private_attempt::{PrivateAttemptPhase as Phase, ReleaseKnowledge};
-    current.validate()?;
-    pending.validate()?;
-    if current.mixed_admission_metadata.is_none() {
-        return Err("pending transition has no canonical mixed admission authority".into());
-    }
-    fn matches(
-        current: &super::private_attempt::PrivateAttemptRecordV4,
-        pending: &super::private_attempt::PrivateAttemptRecordV4,
-        edit: impl FnOnce(&mut super::private_attempt::PrivateAttemptRecordV4),
-    ) -> bool {
-        let mut expected = current.clone();
-        edit(&mut expected);
-        expected == *pending
-    }
-    let accepted = current == pending
-        || (current.phase == Phase::Allocated
-            && pending.phase == Phase::BoundaryCreated
-            && matches(current, pending, |next| next.phase = Phase::BoundaryCreated))
-        || (current.phase == Phase::BoundaryCreated
-            && pending.phase == Phase::GuardianReady
-            && pending.guardian.is_some()
-            && matches(current, pending, |next| {
-                next.phase = Phase::GuardianReady;
-                next.guardian = pending.guardian.clone();
-            }))
-        || (current.phase == Phase::GuardianReady
-            && pending.phase == Phase::TargetGated
-            && pending.target.is_some()
-            && pending.namespace_init.is_some()
-            && pending.network_namespace_inode.is_some()
-            && matches(current, pending, |next| {
-                next.phase = Phase::TargetGated;
-                next.target = pending.target.clone();
-                next.namespace_init = pending.namespace_init.clone();
-                next.network_namespace_inode = pending.network_namespace_inode;
-            }))
-        || (current.phase == Phase::TargetGated
-            && pending.phase == Phase::CheckpointCommitted
-            && pending.gated_facts.is_some()
-            && matches(current, pending, |next| {
-                next.phase = Phase::CheckpointCommitted;
-                next.gated_facts = pending.gated_facts.clone();
-            }))
-        || (current.phase == Phase::CheckpointCommitted
-            && pending.phase == Phase::ReleaseIntent
-            && matches(current, pending, |next| {
-                next.phase = Phase::ReleaseIntent;
-                next.release_knowledge = ReleaseKnowledge::PossiblyReleased;
-            }))
-        || (current.phase == Phase::ReleaseIntent
-            && pending.phase == Phase::ExecutionObserved
-            && matches(current, pending, |next| {
-                next.phase = Phase::ExecutionObserved;
-                next.release_knowledge = ReleaseKnowledge::ExecObserved;
-            }))
-        || (current.phase != Phase::Retired
-            && pending.phase == Phase::Retiring
-            && matches(current, pending, |next| next.phase = Phase::Retiring))
-        || (current.phase == Phase::Retiring
-            && pending.phase == Phase::Retired
-            && matches(current, pending, |next| next.phase = Phase::Retired))
-        || (current.phase != Phase::Retired
-            && pending.phase == Phase::CleanupIncomplete
-            && pending.cleanup_error.is_some()
-            && matches(current, pending, |next| {
-                next.phase = Phase::CleanupIncomplete;
-                next.cleanup_error = pending.cleanup_error.clone();
-            }))
-        || (current.phase == Phase::Allocated
-            && current.mixed_worker.is_none()
-            && pending.mixed_worker.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_worker = pending.mixed_worker.clone()
-            }))
-        || (current.phase == Phase::Allocated
-            && current.mixed_control.is_none()
-            && pending.mixed_control.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_control = pending.mixed_control.clone()
-            }))
-        || (current.phase == Phase::BoundaryCreated
-            && current.mixed_root_staging_intent.is_none()
-            && pending.mixed_root_staging_intent.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_root_staging_intent = pending.mixed_root_staging_intent.clone()
-            }))
-        || (current.phase == Phase::BoundaryCreated
-            && current.mixed_cgroup_identity.is_none()
-            && pending.mixed_cgroup_identity.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_cgroup_identity = pending.mixed_cgroup_identity.clone()
-            }))
-        || (current.phase == Phase::BoundaryCreated
-            && current.mixed_staging_identity.is_none()
-            && pending.mixed_staging_identity.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_staging_identity = pending.mixed_staging_identity.clone()
-            }))
-        || (current.phase == Phase::Retiring
-            && current.mixed_export_intent.is_none()
-            && pending.mixed_export_intent.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_export_intent = pending.mixed_export_intent.clone()
-            }))
-        || (current.phase == Phase::Retiring
-            && current.mixed_export_identity.is_none()
-            && pending.mixed_export_identity.is_some()
-            && matches(current, pending, |next| {
-                next.mixed_export_identity = pending.mixed_export_identity.clone()
-            }));
-    if !accepted {
-        return Err(format!(
-            "pending V4 transition is not an authenticated single write: canonical={:?} pending={:?}",
-            current.phase, pending.phase
-        ));
-    }
-    Ok(())
-}
-
-struct HeldMixedPending {
-    file: File,
-    bytes: Vec<u8>,
-    record: super::private_attempt::PrivateAttemptRecordV4,
-    observation: String,
-}
-
-#[cfg(test)]
-pub(crate) fn inspect_mixed_pending_for_test(
-    path: &Path,
-    current: &super::private_attempt::PrivateAttemptRecordV4,
-) -> Result<Option<super::private_attempt::PrivateAttemptRecordV4>, String> {
-    held_mixed_pending(path, current).map(|held| held.map(|held| held.record))
-}
-
-fn held_mixed_pending(
-    path: &Path,
-    current: &super::private_attempt::PrivateAttemptRecordV4,
-) -> Result<Option<HeldMixedPending>, String> {
-    use sha2::{Digest, Sha256};
-    let Some(file) = held_recovery_file(path)? else {
-        return Ok(None);
-    };
-    let before = file.metadata().map_err(|error| error.to_string())?;
-    let bytes = recovery_file_bytes(&file)?;
-    let digest = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let observation = format!(
-        "pending-present=true device={} inode={} size={} sha256={digest} canonical-phase={:?}",
-        before.dev(),
-        before.ino(),
-        bytes.len(),
-        current.phase
-    );
-    recheck_recovery_bytes(path, &file, &bytes)
-        .map_err(|error| format!("{observation}; pending-custody={error}"))?;
-    let record = super::private_attempt::PrivateAttemptRecordV4::parse(&bytes)
-        .map_err(|error| format!("{observation}; pending-parse={error}"))?;
-    validate_mixed_pending_transition(current, &record).map_err(|error| {
-        format!(
-            "{observation}; pending-phase={:?}; transition={error}",
-            record.phase
-        )
-    })?;
-    let observation = format!(
-        "{observation}; pending-parse=valid; pending-phase={:?}; transition=validated",
-        record.phase
-    );
-    Ok(Some(HeldMixedPending {
-        file,
-        bytes,
-        record,
-        observation,
-    }))
-}
-
-fn recovery_file_bytes(file: &File) -> Result<Vec<u8>, String> {
-    use std::os::unix::fs::FileExt;
-    let length = file.metadata().map_err(|error| error.to_string())?.len();
-    if length > MAX_RECORD_BYTES {
-        return Err("mixed recovery file grew beyond bound".into());
-    }
-    let mut bytes = vec![0; usize::try_from(length).map_err(|error| error.to_string())?];
-    file.read_exact_at(&mut bytes, 0)
-        .map_err(|error| error.to_string())?;
-    Ok(bytes)
-}
-
-fn recheck_recovery_bytes(path: &Path, original: &File, bytes: &[u8]) -> Result<(), String> {
-    let named = held_recovery_file(path)?.ok_or("mixed recovery named authority disappeared")?;
-    let held = original.metadata().map_err(|error| error.to_string())?;
-    let current = named.metadata().map_err(|error| error.to_string())?;
-    let stamp = |metadata: &fs::Metadata| {
-        (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-        )
-    };
-    if held.nlink() != 1
-        || held.uid() != 0
-        || held.mode() & 0o7777 != 0o600
-        || stamp(&held) != stamp(&current)
-        || recovery_file_bytes(original)? != bytes
-        || recovery_file_bytes(&named)? != bytes
-    {
-        return Err("mixed recovery held/named authority bytes or inode changed".into());
-    }
-    Ok(())
-}
-
-fn recover_mixed_record(
-    state_root: &Path,
-    cgroup_root: &Path,
-    record: &super::private_attempt::PrivateAttemptRecordV4,
-    journal: &Path,
-) -> Result<(), String> {
-    let metadata = record
-        .mixed_admission_metadata
-        .as_ref()
-        .ok_or("mixed recovery metadata absent")?;
-    let lease = crate::policy_registry::native::Lease::acquire()?;
-    let registry = lease.retained_registry_v3(&metadata.registry_digest)?;
-    let layout = registry
-        .root_layouts
-        .as_slice()
-        .iter()
-        .find(|layout| layout.reference().ok().as_ref() == Some(&metadata.request.root_layout))
-        .ok_or("retained recovery root layout absent")?;
-    let account = registry
-        .execution_identities
-        .as_slice()
-        .iter()
-        .find(|identity| {
-            identity.reference().ok().as_ref() == Some(&metadata.request.execution_identity)
-        })
-        .ok_or("retained recovery exclusive identity absent")?;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(state_root)
-        .map_err(|error| error.to_string())?;
-    let parent = directory.metadata().map_err(|error| error.to_string())?;
-    if parent.uid() != 0 || parent.mode() & 0o022 != 0 {
-        return Err("mixed recovery state ancestry differs".into());
-    }
-    let reference_path = state_root.join(format!("{}.mixed-admission", record.attempt_id.as_str()));
-    let reference = held_recovery_file(&reference_path)?;
-    if let Some(file) = &reference {
-        let mut bytes = Vec::new();
-        file.take(MAX_RECORD_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        if memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot::parse(&bytes)?
-            != *metadata
-        {
-            return Err("mixed recovery reference differs from journal".into());
-        }
-    }
-    let journal_file = held_recovery_file(journal)?.ok_or("mixed recovery journal disappeared")?;
-    let mut journal_bytes = Vec::new();
-    (&journal_file)
-        .take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut journal_bytes)
-        .map_err(|error| error.to_string())?;
-    if super::private_attempt::PrivateAttemptRecordV4::parse(&journal_bytes)? != *record {
-        return Err("mixed recovery held journal differs from parsed owner".into());
-    }
-    let pending_path = journal.with_extension("new");
-    let mut pending = held_mixed_pending(&pending_path, record)?;
-    // Every authenticated successor retains the predecessor's entire owner
-    // inventory. Settlement consumes their union under one original allowance,
-    // never a new five-second budget for a late-discovered pending write.
-    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
-    super::mixed_recovery::settle_native_until(
-        pending.as_ref().map_or(record, |pending| &pending.record),
-        cgroup_root,
-        layout.output_files.as_slice(),
-        cleanup_deadline,
-    )
-    .map_err(|error| {
-        format!(
-            "{}; settlement={error}",
-            pending
-                .as_ref()
-                .map_or("pending-present=false", |pending| pending
-                    .observation
-                    .as_str())
-        )
-    })?;
-    recheck_recovery_bytes(journal, &journal_file, &journal_bytes)?;
-    match &pending {
-        Some(held) => recheck_recovery_bytes(&pending_path, &held.file, &held.bytes)
-            .map_err(|error| format!("{}; pending-after-settlement={error}", held.observation))?,
-        None => {
-            // Original writers are now retired. A write interrupted during
-            // settlement is still authenticated against the retained canonical
-            // predecessor, and its additional obligations must also settle.
-            pending = held_mixed_pending(&pending_path, record)?;
-            if let Some(held) = &pending {
-                super::mixed_recovery::settle_native_until(
-                    &held.record,
-                    cgroup_root,
-                    layout.output_files.as_slice(),
-                    cleanup_deadline,
-                )
-                .map_err(|error| format!("{}; pending-settlement={error}", held.observation))?;
-                recheck_recovery_bytes(&pending_path, &held.file, &held.bytes)?;
-            }
-        }
-    }
-    super::mixed_admission::require_account_quiescent(account.uid.get(), None)?;
-    recheck_recovery_bytes(journal, &journal_file, &journal_bytes)?;
-    if let Some(held) = &pending {
-        recheck_recovery_bytes(&pending_path, &held.file, &held.bytes)?;
-        unlink_recovery_file(&pending_path, &held.file, &directory)?;
-    } else if held_recovery_file(&pending_path)?.is_some() {
-        return Err("mixed pending journal appeared after original writer settlement".into());
-    }
-    let record = pending.as_ref().map_or(record, |pending| &pending.record);
-    // Reservation deletion remains under the same retained native settlement;
-    // an unrelated or malformed reservation is never consumed by filename.
-    for entry in fs::read_dir(state_root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        if !entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with("account-") && name.ends_with(".reservation"))
-        {
-            continue;
-        }
-        let file =
-            held_recovery_file(&entry.path())?.ok_or("mixed recovery reservation disappeared")?;
-        let mut bytes = Vec::new();
-        (&file)
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        let expected_keys = std::collections::BTreeSet::from([
-            "format",
-            "revision",
-            "user_namespace_device",
-            "user_namespace_inode",
-            "uid",
-            "attempt",
-            "owner_pid",
-            "owner_birth",
-            "boot_identity",
-        ]);
-        if value
-            .as_object()
-            .ok_or("reservation is not an object")?
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            != expected_keys
-        {
-            return Err("mixed recovery reservation fields differ".into());
-        }
-        let attempt: Vec<u8> = serde_json::from_value(
-            value
-                .get("attempt")
-                .cloned()
-                .ok_or("reservation attempt absent")?,
-        )
-        .map_err(|error| error.to_string())?;
-        let expected = record.attempt_id.as_str();
-        let encoded = attempt
-            .iter()
-            .map(|value| format!("{value:02x}"))
-            .collect::<String>();
-        if encoded != expected {
-            continue;
-        }
-        let namespace_device = value
-            .get("user_namespace_device")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|value| *value != 0)
-            .ok_or("reservation namespace device absent")?;
-        let namespace_inode = value
-            .get("user_namespace_inode")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|value| *value != 0)
-            .ok_or("reservation namespace inode absent")?;
-        if entry.file_name()
-            != OsString::from(format!(
-                "account-{namespace_device}-{namespace_inode}-{}.reservation",
-                account.uid.get()
-            ))
-        {
-            return Err("mixed recovery reservation filename differs".into());
-        }
-        let worker = record
-            .mixed_worker
-            .as_ref()
-            .ok_or("mixed recovery reservation has no recorded creator")?;
-        if value.get("owner_pid").and_then(serde_json::Value::as_u64) != Some(u64::from(worker.pid))
-            || value.get("owner_birth").and_then(serde_json::Value::as_u64)
-                != Some(worker.start_time)
-        {
-            return Err("mixed recovery reservation creator differs".into());
-        }
-        if value.get("format").and_then(serde_json::Value::as_str)
-            != Some("memcordon.account-reservation")
-            || value.get("revision").and_then(serde_json::Value::as_u64) != Some(1)
-            || value.get("uid").and_then(serde_json::Value::as_u64)
-                != Some(u64::from(account.uid.get()))
-            || value
-                .get("boot_identity")
-                .and_then(serde_json::Value::as_str)
-                != Some(record.boot_identity.as_str())
-        {
-            return Err("mixed recovery reservation binding differs".into());
-        }
-        unlink_recovery_file(&entry.path(), &file, &directory)?;
-    }
-    recheck_recovery_bytes(journal, &journal_file, &journal_bytes)?;
-    if let Some(reference) = reference {
-        unlink_recovery_file(&reference_path, &reference, &directory)?;
-    }
-    unlink_recovery_file(journal, &journal_file, &directory)
-}
-
-fn held_recovery_file(path: &Path) -> Result<Option<File>, String> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o7777 != 0o600
-        || metadata.len() > MAX_RECORD_BYTES
-    {
-        return Err("mixed recovery record custody differs".into());
-    }
-    Ok(Some(file))
-}
-fn unlink_recovery_file(path: &Path, file: &File, directory: &File) -> Result<(), String> {
-    let held = file.metadata().map_err(|error| error.to_string())?;
-    let named = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !named.is_file()
-        || (
-            named.dev(),
-            named.ino(),
-            named.len(),
-            named.mtime(),
-            named.mtime_nsec(),
-        ) != (
-            held.dev(),
-            held.ino(),
-            held.len(),
-            held.mtime(),
-            held.mtime_nsec(),
-        )
-    {
-        return Err("mixed recovery named record changed".into());
-    }
-    fs::remove_file(path).map_err(|error| error.to_string())?;
-    if file.metadata().map_err(|error| error.to_string())?.nlink() != 0 {
-        return Err("mixed recovery removed inode remains linked".into());
-    }
-    directory.sync_all().map_err(|error| error.to_string())
-}
-
-/// Reclaim a fully written reservation only after creator loss and boundary absence.
-/// Its journal must be absent or validate as allocation-only state with no native
-/// resources. Malformed or torn records remain quarantined and grant no permission.
-fn recover_account_reservation(
-    state_root: &Path,
-    cgroup_root: &Path,
-    entry: &fs::DirEntry,
-) -> Result<bool, String> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Reservation {
-        format: String,
-        revision: u32,
-        user_namespace_device: u64,
-        user_namespace_inode: u64,
-        uid: u32,
-        attempt: [u8; 16],
-        owner_pid: libc::pid_t,
-        owner_birth: u64,
-        boot_identity: String,
-    }
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(state_root)
-        .map_err(|error| error.to_string())?;
-    let directory_metadata = directory.metadata().map_err(|error| error.to_string())?;
-    if directory_metadata.uid() != 0 || directory_metadata.mode() & 0o022 != 0 {
-        return Ok(false);
-    }
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(entry.path())
-    {
-        Ok(file) => file,
-        Err(_) => return Ok(false),
-    };
-    let held = file.metadata().map_err(|error| error.to_string())?;
-    if !held.is_file()
-        || held.uid() != 0
-        || held.nlink() != 1
-        || held.mode() & 0o7777 != 0o600
-        || held.len() > 4096
-    {
-        return Ok(false);
-    }
-    let mut bytes = Vec::new();
-    file.take(4097)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > 4096
-        || memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes).is_err()
-    {
-        return Ok(false);
-    }
-    let reservation: Reservation = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-    if reservation.format != "memcordon.account-reservation"
-        || reservation.revision != 1
-        || reservation.user_namespace_device == 0
-        || reservation.user_namespace_inode == 0
-        || reservation.uid == 0
-        || !canonical_boot_identity(&reservation.boot_identity)
-        || reservation.owner_pid <= 0
-        || reservation.owner_birth == 0
-        || reservation.attempt == [0; 16]
-        || entry.file_name()
-            != OsString::from(format!(
-                "account-{}-{}-{}.reservation",
-                reservation.user_namespace_device,
-                reservation.user_namespace_inode,
-                reservation.uid
-            ))
-    {
-        return Ok(false);
-    }
-    let boot =
-        fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| error.to_string())?;
-    if reservation.boot_identity == boot.trim() {
-        match super::envelope::process_start_time(reservation.owner_pid) {
-            Ok(birth) if birth == reservation.owner_birth => return Ok(false),
-            Ok(birth) if birth > reservation.owner_birth => (),
-            Ok(_) => return Ok(false),
-            Err(_)
-                if !Path::new("/proc")
-                    .join(reservation.owner_pid.to_string())
-                    .exists() => {}
-            Err(_) => return Ok(false),
-        }
-    }
-    let identity: String = reservation
-        .attempt
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    for path in [
-        state_root.join(format!("{identity}.new")),
-        cgroup_root.join(&identity),
-    ] {
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            _ => return Ok(false),
-        }
-    }
-    let journal = state_root.join(&identity);
-    match fs::symlink_metadata(&journal) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Ok(metadata)
-            if metadata.is_file()
-                && metadata.uid() == 0
-                && metadata.nlink() == 1
-                && metadata.mode() & 0o7777 == 0o600 =>
-        {
-            let bytes = read_record_no_follow(&journal)?;
-            let record =
-                match super::private_attempt::PrivateAttemptRecordV4::parse(bytes.as_bytes()) {
-                    Ok(record) => record,
-                    Err(_) => return Ok(false),
-                };
-            if record.attempt_id.as_str() != identity
-                || record.mixed_admission_metadata.is_some()
-                || record.boot_identity.as_str() != reservation.boot_identity
-                || record.phase != super::private_attempt::PrivateAttemptPhase::Allocated
-                || record.target.is_some()
-                || record.namespace_init.is_some()
-                || record.guardian.is_some()
-                || record.network_namespace_inode.is_some()
-                || record.gated_facts.is_some()
-            {
-                return Ok(false);
-            }
-            let current = fs::symlink_metadata(&journal).map_err(|error| error.to_string())?;
-            if (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.len(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-            ) != (
-                current.dev(),
-                current.ino(),
-                current.len(),
-                current.mtime(),
-                current.mtime_nsec(),
-            ) {
-                return Ok(false);
-            }
-            fs::remove_file(&journal).map_err(|error| error.to_string())?;
-            directory.sync_all().map_err(|error| error.to_string())?;
-        }
-        _ => return Ok(false),
-    }
-    let current = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
-    if (
-        current.dev(),
-        current.ino(),
-        current.len(),
-        current.mtime(),
-        current.mtime_nsec(),
-    ) != (
-        held.dev(),
-        held.ino(),
-        held.len(),
-        held.mtime(),
-        held.mtime_nsec(),
-    ) {
-        return Ok(false);
-    }
-    fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
-    directory.sync_all().map_err(|error| error.to_string())?;
-    Ok(true)
-}
-
-fn canonical_boot_identity(value: &str) -> bool {
-    let shape = "00000000-0000-0000-0000-000000000000";
-    value.len() == shape.len()
-        && value.bytes().zip(shape.bytes()).all(|(actual, expected)| {
-            if expected == b'-' {
-                actual == b'-'
-            } else {
-                actual.is_ascii_digit() || (b'a'..=b'f').contains(&actual)
-            }
-        })
-        && value
-            .bytes()
-            .any(|byte| (b'1'..=b'9').contains(&byte) || (b'a'..=b'f').contains(&byte))
-}
-
 fn interrupted_transition_is_recoverable(
     state_root: &Path,
     cgroup_root: &Path,
     identity: &str,
     temporary: &fs::DirEntry,
+    cutoff: Instant,
 ) -> Result<bool, String> {
     let canonical_path = state_root.join(identity);
     let canonical_metadata = match fs::symlink_metadata(&canonical_path) {
@@ -980,11 +277,6 @@ fn interrupted_transition_is_recoverable(
     {
         return Ok(false);
     }
-    if canonical.starts_with("version=4\n")
-        || canonical.starts_with("format=memcordon.private-native-journal\n")
-    {
-        return Ok(false);
-    }
     if canonical
         .lines()
         .find_map(|line| line.strip_prefix("frontend-pid="))
@@ -998,11 +290,6 @@ fn interrupted_transition_is_recoverable(
         Ok(record) => record,
         Err(_) => return Ok(false),
     };
-    if interrupted.starts_with("version=4\n")
-        || interrupted.starts_with("format=memcordon.private-native-journal\n")
-    {
-        return Ok(false);
-    }
     if interrupted
         .lines()
         .find_map(|line| line.strip_prefix("cgroup="))
@@ -1014,8 +301,7 @@ fn interrupted_transition_is_recoverable(
     let cgroup_path = cgroup_root.join(identity);
     match fs::symlink_metadata(&cgroup_path) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            super::cgroup::AttemptCgroup::authenticated(cgroup_path)
-                .kill_and_retire(Instant::now() + Duration::from_secs(10))?;
+            super::cgroup::AttemptCgroup::authenticated(cgroup_path).kill_and_retire(cutoff)?;
         }
         Ok(_) => return Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1100,9 +386,5 @@ pub(crate) fn read_record_no_follow(path: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn integrity_valid(record: &str) -> bool {
-    if record.starts_with("format=memcordon.private-native-journal\nrevision=1\n") {
-        super::private_attempt::PrivateAttemptRecordV4::parse(record.as_bytes()).is_ok()
-    } else {
-        super::attempt::parse_durable_policy(record).is_ok()
-    }
+    super::attempt::parse_native_record(record).is_ok()
 }

@@ -1,11 +1,5 @@
 //! Native target-identity transition for the private profile.
-//! Resolving administrator authority here is not an executable-file proof or
-//! permission to release the target; both remain separate prelaunch gates.
-
-use memcordon_core::workload_contract::ExecutionIdentityRequestV2;
-use memcordon_core::workload_registry_v2::LinuxExecutionIdentityV2;
-
-use crate::request::CallerExecutionEnvelopeV2;
+//! The fixed package account is selected only from verified native account state.
 
 // Linux UAPI securebits.h: NOROOT and NO_SETUID_FIXUP are set and locked;
 // KEEP_CAPS is off and locked; ambient raising is denied and locked.
@@ -21,24 +15,17 @@ pub struct ResolvedTargetIdentity {
 }
 
 impl ResolvedTargetIdentity {
-    pub(super) fn exclusive(
-        definition: &memcordon_core::workload_registry_v3::ExclusiveIdentityDefinitionV3,
+    pub(super) fn package_account(
+        account: &super::workload_account::VerifiedPackageAccount,
         caller_uid: u32,
     ) -> Result<Self, String> {
-        definition.reference()?;
-        if !definition.enabled || definition.uid.get() == caller_uid {
-            return Err("exclusive target must be enabled and distinct from frontend".into());
+        if account.uid() == caller_uid || account.uid() == 0 || account.gid() == 0 {
+            return Err("package account must differ from authenticated caller".into());
         }
-        let groups = definition
-            .supplementary_groups
-            .as_slice()
-            .iter()
-            .map(|group| group.get())
-            .collect();
         Ok(Self {
-            uid: definition.uid.get(),
-            gid: definition.gid.get(),
-            groups,
+            uid: account.uid(),
+            gid: account.gid(),
+            groups: Vec::new(),
             delegated: true,
         })
     }
@@ -70,71 +57,6 @@ impl ResolvedTargetIdentity {
 
     pub const fn delegated(&self) -> bool {
         self.delegated
-    }
-}
-
-/// `record` must be the one selected by an authenticated, exact V2 grant.
-/// The provider and guardian identities are explicit inputs so a dedicated
-/// candidate cannot silently reuse a trusted service principal. `caller`
-/// must come from the authenticated native capture path, which rejects active
-/// capability sets; the envelope itself does not carry those set values.
-pub fn resolve_target_identity(
-    request: &ExecutionIdentityRequestV2,
-    record: Option<&LinuxExecutionIdentityV2>,
-    caller: &CallerExecutionEnvelopeV2,
-    provider_uid: u32,
-    guardian_uid: u32,
-) -> Result<ResolvedTargetIdentity, String> {
-    match request {
-        ExecutionIdentityRequestV2::PreserveCaller => {
-            if record.is_some()
-                || caller.uid == 0
-                || caller.gid == 0
-                || !caller.no_new_privs
-                || caller.capability_bounding_set != 0
-                || caller.supplementary_groups.len() > 32
-                || caller.supplementary_groups.contains(&0)
-            {
-                return Err("MCSEALED-PRIVATE-IDENTITY: preserved caller is not eligible".into());
-            }
-            let mut groups = caller.supplementary_groups.clone();
-            groups.sort_unstable();
-            if groups.windows(2).any(|pair| pair[0] == pair[1]) {
-                return Err("MCSEALED-PRIVATE-IDENTITY: duplicate caller group".into());
-            }
-            Ok(ResolvedTargetIdentity {
-                uid: caller.uid,
-                gid: caller.gid,
-                groups,
-                delegated: false,
-            })
-        }
-        ExecutionIdentityRequestV2::AdministratorProfile { reference } => {
-            let record = record.ok_or("MCSEALED-PRIVATE-IDENTITY: identity record absent")?;
-            if !record.enabled
-                || &record.reference != reference
-                || record.semantic_digest()? != reference.semantic_digest
-            {
-                return Err("MCSEALED-PRIVATE-IDENTITY: identity authority mismatch".into());
-            }
-            let uid = record.uid.get();
-            if uid == caller.uid || uid == provider_uid || uid == guardian_uid {
-                return Err("MCSEALED-PRIVATE-IDENTITY: target uses a trusted principal".into());
-            }
-            let mut groups: Vec<_> = record
-                .supplementary_groups
-                .as_slice()
-                .iter()
-                .map(|group| group.get())
-                .collect();
-            groups.sort_unstable();
-            Ok(ResolvedTargetIdentity {
-                uid,
-                gid: record.gid.get(),
-                groups,
-                delegated: true,
-            })
-        }
     }
 }
 

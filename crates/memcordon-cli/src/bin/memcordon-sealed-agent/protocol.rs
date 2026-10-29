@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u16 = 3;
-pub const MIXED_PROTOCOL_VERSION: u16 = 4;
+pub const WORKLOAD_PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 const DIGEST_LENGTH: usize = 32;
 const HEADER_LENGTH: usize = 2 + 2 + 4 + 16 + 16 + DIGEST_LENGTH;
@@ -18,20 +18,25 @@ pub enum MessageKind {
     BrokerProbe = 5,
     BrokerLaunch = 6,
     BrokerAuthenticate = 7,
-    WorkloadPlan = 8,
-    WorkloadDiscovery = 9,
-    PrivateLaunch = 10,
-    PrivateBrokerLaunch = 11,
-    PrivatePlan = 12,
-    PrivateDiscovery = 13,
-    MixedLaunch = 14,
-    MixedBrokerLaunch = 15,
-    MixedPlan = 16,
-    MixedDiscovery = 17,
-    MixedPreparedAck = 18,
-    MixedReleaseAck = 19,
-    MixedPreparedRetirementAck = 20,
-    MixedRetirementAck = 21,
+    WorkloadStart = 30,
+    WorkloadBrokerStart = 31,
+    WorkloadManifestChunk = 32,
+    WorkloadMemberChunk = 33,
+    WorkloadInputComplete = 34,
+    WorkloadCancel = 35,
+    WorkloadProgress = 36,
+    WorkloadOutputInventory = 37,
+    WorkloadOutputChunk = 38,
+    WorkloadTerminal = 39,
+    WorkloadRecover = 40,
+    WorkloadRecovery = 41,
+    WorkloadPrepared = 42,
+    WorkloadBrokerRecover = 43,
+    WorkloadRejected = 44,
+    WorkloadAcknowledge = 45,
+    WorkloadBrokerAcknowledge = 46,
+    WorkloadAcknowledgment = 47,
+    WorkloadPreparedAck = 48,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -39,21 +44,6 @@ pub enum MessageKind {
     Terminal = 105,
     Rejected = 106,
     BrokerAuthenticated = 107,
-    WorkloadPlanReceipt = 108,
-    WorkloadDiscoveryReceipt = 109,
-    PrivateTerminal = 110,
-    PrivateRejected = 113,
-    PrivatePlanReceipt = 111,
-    PrivateDiscoveryReceipt = 112,
-    MixedTerminal = 114,
-    MixedRejected = 115,
-    MixedPlanReceipt = 116,
-    MixedDiscoveryReceipt = 117,
-    MixedPreparedObservation = 118,
-    MixedReleaseObservation = 119,
-    MixedRetirementObservation = 120,
-    MixedRetirementObserverResult = 121,
-    MixedRetirementEnrolled = 122,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -68,20 +58,25 @@ impl TryFrom<u16> for MessageKind {
             5 => Ok(Self::BrokerProbe),
             6 => Ok(Self::BrokerLaunch),
             7 => Ok(Self::BrokerAuthenticate),
-            8 => Ok(Self::WorkloadPlan),
-            9 => Ok(Self::WorkloadDiscovery),
-            10 => Ok(Self::PrivateLaunch),
-            11 => Ok(Self::PrivateBrokerLaunch),
-            12 => Ok(Self::PrivatePlan),
-            13 => Ok(Self::PrivateDiscovery),
-            14 => Ok(Self::MixedLaunch),
-            15 => Ok(Self::MixedBrokerLaunch),
-            16 => Ok(Self::MixedPlan),
-            17 => Ok(Self::MixedDiscovery),
-            18 => Ok(Self::MixedPreparedAck),
-            19 => Ok(Self::MixedReleaseAck),
-            20 => Ok(Self::MixedPreparedRetirementAck),
-            21 => Ok(Self::MixedRetirementAck),
+            30 => Ok(Self::WorkloadStart),
+            31 => Ok(Self::WorkloadBrokerStart),
+            32 => Ok(Self::WorkloadManifestChunk),
+            33 => Ok(Self::WorkloadMemberChunk),
+            34 => Ok(Self::WorkloadInputComplete),
+            35 => Ok(Self::WorkloadCancel),
+            36 => Ok(Self::WorkloadProgress),
+            37 => Ok(Self::WorkloadOutputInventory),
+            38 => Ok(Self::WorkloadOutputChunk),
+            39 => Ok(Self::WorkloadTerminal),
+            40 => Ok(Self::WorkloadRecover),
+            41 => Ok(Self::WorkloadRecovery),
+            42 => Ok(Self::WorkloadPrepared),
+            43 => Ok(Self::WorkloadBrokerRecover),
+            45 => Ok(Self::WorkloadAcknowledge),
+            46 => Ok(Self::WorkloadBrokerAcknowledge),
+            47 => Ok(Self::WorkloadAcknowledgment),
+            48 => Ok(Self::WorkloadPreparedAck),
+            44 => Ok(Self::WorkloadRejected),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
@@ -89,21 +84,6 @@ impl TryFrom<u16> for MessageKind {
             105 => Ok(Self::Terminal),
             106 => Ok(Self::Rejected),
             107 => Ok(Self::BrokerAuthenticated),
-            108 => Ok(Self::WorkloadPlanReceipt),
-            109 => Ok(Self::WorkloadDiscoveryReceipt),
-            110 => Ok(Self::PrivateTerminal),
-            113 => Ok(Self::PrivateRejected),
-            111 => Ok(Self::PrivatePlanReceipt),
-            112 => Ok(Self::PrivateDiscoveryReceipt),
-            114 => Ok(Self::MixedTerminal),
-            115 => Ok(Self::MixedRejected),
-            116 => Ok(Self::MixedPlanReceipt),
-            117 => Ok(Self::MixedDiscoveryReceipt),
-            118 => Ok(Self::MixedPreparedObservation),
-            119 => Ok(Self::MixedReleaseObservation),
-            120 => Ok(Self::MixedRetirementObservation),
-            121 => Ok(Self::MixedRetirementObserverResult),
-            122 => Ok(Self::MixedRetirementEnrolled),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }
@@ -173,12 +153,10 @@ pub(crate) fn read_frame_version(
     }
     if matches!(
         kind,
-        MessageKind::MixedPreparedRetirementAck
-            | MessageKind::MixedRetirementAck
-            | MessageKind::MixedRetirementObservation
-            | MessageKind::MixedRetirementObserverResult
-            | MessageKind::MixedRetirementEnrolled
-    ) && total > HEADER_LENGTH + memcordon_core::mixed_observation::RETIREMENT_OBSERVATION_BYTES
+        MessageKind::WorkloadManifestChunk
+            | MessageKind::WorkloadMemberChunk
+            | MessageKind::WorkloadOutputChunk
+    ) && total > HEADER_LENGTH + memcordon_core::workload_bundle::STREAM_BYTES
     {
         return Err(ProtocolError::FrameTooLarge(total));
     }
@@ -209,23 +187,25 @@ pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), Protoco
 impl MessageKind {
     pub(crate) fn protocol_version(self) -> u16 {
         match self {
-            Self::MixedLaunch
-            | Self::MixedBrokerLaunch
-            | Self::MixedPlan
-            | Self::MixedDiscovery
-            | Self::MixedPreparedAck
-            | Self::MixedReleaseAck
-            | Self::MixedPreparedRetirementAck
-            | Self::MixedRetirementAck
-            | Self::MixedTerminal
-            | Self::MixedRejected
-            | Self::MixedPlanReceipt
-            | Self::MixedDiscoveryReceipt
-            | Self::MixedPreparedObservation
-            | Self::MixedReleaseObservation
-            | Self::MixedRetirementObservation
-            | Self::MixedRetirementObserverResult
-            | Self::MixedRetirementEnrolled => MIXED_PROTOCOL_VERSION,
+            Self::WorkloadStart
+            | Self::WorkloadBrokerStart
+            | Self::WorkloadManifestChunk
+            | Self::WorkloadMemberChunk
+            | Self::WorkloadInputComplete
+            | Self::WorkloadCancel
+            | Self::WorkloadProgress
+            | Self::WorkloadOutputInventory
+            | Self::WorkloadOutputChunk
+            | Self::WorkloadTerminal
+            | Self::WorkloadRecover
+            | Self::WorkloadRecovery
+            | Self::WorkloadPrepared
+            | Self::WorkloadBrokerRecover
+            | Self::WorkloadAcknowledge
+            | Self::WorkloadBrokerAcknowledge
+            | Self::WorkloadAcknowledgment
+            | Self::WorkloadPreparedAck
+            | Self::WorkloadRejected => WORKLOAD_PROTOCOL_VERSION,
             _ => PROTOCOL_VERSION,
         }
     }
@@ -240,6 +220,15 @@ fn write_frame_version(
         .checked_add(frame.payload.len())
         .ok_or(ProtocolError::FrameTooLarge(usize::MAX))?;
     if total > MAX_FRAME_LENGTH {
+        return Err(ProtocolError::FrameTooLarge(total));
+    }
+    if matches!(
+        frame.kind,
+        MessageKind::WorkloadManifestChunk
+            | MessageKind::WorkloadMemberChunk
+            | MessageKind::WorkloadOutputChunk
+    ) && frame.payload.len() > memcordon_core::workload_bundle::STREAM_BYTES
+    {
         return Err(ProtocolError::FrameTooLarge(total));
     }
     let total = u32::try_from(total).map_err(|_| ProtocolError::FrameTooLarge(total))?;

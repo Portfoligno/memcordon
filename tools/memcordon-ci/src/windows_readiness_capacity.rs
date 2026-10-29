@@ -159,8 +159,7 @@ mod native {
             stdout_sha256: None,
             stderr_sha256: None,
             transcript_sha256: None,
-            contract_sha256: None,
-            policy_activation_sha256: None,
+            request_sha256: None,
             terminal_observation_sha256: None,
         }
     }
@@ -234,24 +233,12 @@ mod native {
                         ))?,
                     key.scenario
                 ));
-                input.workload_contract = config
-                    .output_directory
-                    .join("W-JOINT")
-                    .join("ordinary")
-                    .join("requested-contract.json");
-                let contract = read(&input.workload_contract, 256 * 1024)?;
-                memcordon_core::workload_contract::WorkloadContractV1::parse(&contract)
-                    .map_err(CiError::Message)?;
+                input.workload_request = base.workload_request.clone();
+                let contract = read(&input.workload_request, 256 * 1024)?;
+                memcordon_core::workload_request::WorkloadRequestV1::parse(&contract)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
                 let mut attempt = blank(key.clone());
-                attempt.contract_sha256 = Some(crate::windows_causal_acceptance::sha256(&contract));
-                let activation = read(
-                    &config
-                        .output_directory
-                        .join("windows-policy-activation.json"),
-                    256 * 1024,
-                )?;
-                attempt.policy_activation_sha256 =
-                    Some(crate::windows_causal_acceptance::sha256(&activation));
+                attempt.request_sha256 = Some(crate::windows_causal_acceptance::sha256(&contract));
                 let result = execute_until(&owned, &input, &mut attempt, work_deadline);
                 retain(
                     &directory.join(format!("attempt-{ordinal}.json")),
@@ -319,23 +306,12 @@ mod native {
                     .as_ref()
                     .ok_or_else(|| CiError::Message("capacity start gate missing".into()))?
             ));
-            input.workload_contract = config
-                .output_directory
-                .join("W-JOINT")
-                .join("ordinary")
-                .join("requested-contract.json");
+            input.workload_request = base.workload_request.clone();
             let mut assessment = blank(record.key.clone());
-            assessment.contract_sha256 = Some(crate::windows_causal_acceptance::sha256(&read(
-                &input.workload_contract,
+            assessment.request_sha256 = Some(crate::windows_causal_acceptance::sha256(&read(
+                &input.workload_request,
                 256 * 1024,
             )?));
-            assessment.policy_activation_sha256 =
-                Some(crate::windows_causal_acceptance::sha256(&read(
-                    &config
-                        .output_directory
-                        .join("windows-policy-activation.json"),
-                    256 * 1024,
-                )?));
             Ok((owned, input, assessment))
         };
         let (first_config, mut first_input, mut first_record) = prepare(0)?;

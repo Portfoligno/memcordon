@@ -68,7 +68,7 @@ pub(crate) fn collect(
             crate::windows_causal_acceptance::MAX_REPORT_BYTES,
         )?;
         let original =
-            memcordon_core::ResultV1::parse(&original_bytes).map_err(CiError::Message)?;
+            memcordon_core::ResultV3::parse(&original_bytes).map_err(CiError::Message)?;
         if !crate::support_loader_producer::installed_trigger(
             &original,
             &original_provider.provider,
@@ -249,7 +249,7 @@ pub(crate) fn retain(
         &input.descriptor.output_root.join("frontend-result.json"),
         crate::windows_causal_acceptance::MAX_REPORT_BYTES,
     )?;
-    let parsed = memcordon_core::ResultV1::parse(&original).map_err(CiError::Message)?;
+    let parsed = memcordon_core::ResultV3::parse(&original).map_err(CiError::Message)?;
     if !crate::support_loader_producer::installed_trigger(&parsed, &config.provider)? {
         return Err(CiError::Message(
             "pending diagnostic has no settled original refusal".into(),
@@ -279,7 +279,7 @@ pub(crate) fn retain(
     )?;
     persist(
         &directory.join("original-contract.json"),
-        &read(&input.workload_contract, 256 * 1024)?,
+        &read(&input.workload_request, 256 * 1024)?,
     )?;
     persist(
         &directory.join("association.json"),

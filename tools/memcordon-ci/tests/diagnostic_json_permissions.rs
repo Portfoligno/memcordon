@@ -44,12 +44,15 @@ fn oversized_diagnostic_does_not_replace_existing_observation() {
 
 #[test]
 fn readable_native_failure_snapshot_retains_unresolved_owner_state() {
-    use memcordon_ci::consumer_readiness_ledger::{CellEvidence, SourceIdentity};
+    use memcordon_ci::{
+        consumer_readiness_current::CellEvidenceV2 as CellEvidence,
+        readiness_identity::SourceIdentity,
+    };
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("component-failure.json");
     let cell = CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
+        revision: 2,
         identity: SourceIdentity {
             run_id: "failed-native-run".into(),
             source_commit: "1".repeat(40),

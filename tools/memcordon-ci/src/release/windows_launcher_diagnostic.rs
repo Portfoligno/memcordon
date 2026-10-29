@@ -1,7 +1,5 @@
 //! Historical startup-file telemetry. Never SCM, process or recovery authority.
-use crate::{
-    CiError, Result, ci_operation_time::ClockReading, consumer_readiness_ledger::SourceIdentity,
-};
+use crate::{CiError, Result, ci_operation_time::ClockReading, readiness_identity::SourceIdentity};
 use memcordon_core::{PublicProviderBindingV1, WindowsLauncherStartupDiagnosticV1};
 use serde::{Deserialize, Serialize};
 const EPOCH_BYTES: usize = 16 * 1024;

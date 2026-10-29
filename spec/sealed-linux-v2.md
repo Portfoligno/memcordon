@@ -4,11 +4,11 @@
 
 ## Split service boundary
 
-The public `memcordon-sealed-agent.service` is the hardened control plane. It owns `/run/memcordon/sealed-agent.sock`, authenticates the caller, parses bounded protocol v2, captures the caller execution envelope, rejects recursive attempts, owns durable records and recovery, and never executes caller code. It retains `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, a narrow capability bounding set, and no ambient capabilities.
+The public `memcordon-sealed-agent.service` is the hardened control plane. It owns `/run/memcordon/sealed-agent.sock`, authenticates the caller, parses bounded current transport, captures the caller execution envelope, rejects recursive attempts, owns durable records and recovery, and never executes caller code. It retains `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, a narrow capability bounding set, and no ambient capabilities.
 
 The private `memcordon-sealed-launcher.service` owns the root-only mode-`0600` `/run/memcordon/sealed-launcher.sock` and accepts only the exact authenticated control service. It uses `NoNewPrivileges=no` and no ambient capabilities. It omits `PrivateTmp`, `ProtectSystem`, `RestrictSUIDSGID`, and a guessed `CapabilityBoundingSet`; a child cannot undo those inherited restrictions, so the launcher must begin in a context capable of reproducing every supported caller envelope. Its implementation accepts only the fixed broker request and performs attempt bootstrap, never arbitrary workload CLI, shell, network, plugin, archive, Git, YAML, package mutation, or caller-selected cleanup operations.
 
-Package installation and verification cover the provider binary, both services, both sockets, and the tmpfiles declaration that recreates `/run/memcordon` as mode `0750` `root:memcordon` before socket activation, all with exact bytes, root ownership, exact modes, fixed endpoints, binary identity, and required/forbidden directives. Upgrade and uninstall stop and prove both roles inactive and refuse while a control attempt, broker attempt, guardian, or ambiguous recovery state exists. Protocol v1 attempts are terminally cleaned, never resumed with v2 semantics.
+Package installation and verification cover the provider binary, both services, both sockets, and the tmpfiles declaration that recreates `/run/memcordon` as mode `0750` `root:memcordon` before socket activation, all with exact bytes, root ownership, exact modes, fixed endpoints, binary identity, and required/forbidden directives. Current mutation stops and proves both roles inactive and refuses while a control attempt, broker attempt, guardian, or unknown recovery state exists. Incompatible occupied installations are refused without interpreting their state.
 
 ## Caller execution envelope
 
@@ -33,12 +33,11 @@ Unrelated privileged host brokers remain outside the process-lineage threat mode
 Current readiness is a named factual observation of the actual installation,
 authenticated services, native baseline setup and cleanup. It does not bind
 set-ID/sudo hashes or issue a saved permission token. Every launch independently
-checks the actual caller and installed components; workload admission also resolves
-the current protected local grant and epoch. The client rejects a provider whose
+checks the actual caller and installed components. The client rejects a provider whose
 package version differs before target authorization; an operator must explicitly
 install or upgrade the matching package.
 
-Execution report schema 10 carries `LinuxSealedEvidenceV2` and `preserve-caller-envelope`. Consistency requires caller envelope reproduction and boundary independence from credentials; it does not require permanently empty target capabilities or `NoNewPrivs: 1`. Plan and doctor schemas are 9 and 6. The native launch wire and generic provider contract are version 3; exact-grant admission is specified in [workload contract v1](../docs/spec-workload-contract-v1.md). V1 provider/mechanism/evidence is never accepted under the new schemas.
+Current result revision 3 carries ordinary Linux sealed native facts and `preserve-caller-envelope`. Consistency requires caller envelope reproduction and boundary independence from credentials; it does not require permanently empty target capabilities or `NoNewPrivs: 1`. Plans and capabilities use named revision 3. Ordinary native transport is version 3. No administrator contract or saved permission token is interpreted.
 
 Ordinary native regressions preserve actual caller NNP/CapBnd, credential
 transition, mount context, cgroup/PID membership, escape denial, recursive-provider
@@ -49,7 +48,6 @@ passing skipped cases. Passing regressions does not replace the runtime's live
 checks. All subprocesses use native structured argv.
 
 The private TCP feature has a distinct target identity and seccomp contract,
-authorization-started attempt timer and real ptrace exec-stop handshake. Its named
+release-started attempt timer and real ptrace exec-stop handshake. Its current
 gated and post-exec facts are described in the
-[V2 workload contract](../docs/spec-workload-contract-v2.md). They cannot be emitted
-under this historical numeric evidence domain.
+[workload request contract](../docs/spec-workload-request-v1.md).

@@ -144,13 +144,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "schema_four"
-path = "fuzz_targets/schema_four.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "caller-envelope-status"
 path = "fuzz_targets/caller_envelope_status.rs"
 test = false
@@ -358,13 +351,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "workload-registry"
-path = "fuzz_targets/workload_registry.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "workload-discovery"
 path = "fuzz_targets/workload_discovery.rs"
 test = false
@@ -374,20 +360,6 @@ bench = false
 [[bin]]
 name = "workload-receipt"
 path = "fuzz_targets/workload_receipt.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "workload-canonical"
-path = "fuzz_targets/workload_canonical.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "workload-transitions"
-path = "fuzz_targets/workload_transitions.rs"
 test = false
 doc = false
 bench = false

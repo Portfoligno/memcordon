@@ -6,8 +6,7 @@ use crate::{
     public_reads::map_public_reads_ordered,
 };
 use memcordon_core::{
-    ChildTermination,
-    result_v1::{CleanupStateV1, OutcomeKindV1, ResultV1},
+    ChildTermination, MemcordonReport, RunOutcome, execution_facts::OutcomeKindV1,
 };
 use std::{
     fs,
@@ -237,7 +236,7 @@ pub fn run(directory: &Path, toolchain: &str) -> Result<()> {
         }
         command = command
             .arg("--report-format")
-            .arg("result-v1")
+            .arg("standard")
             .arg("--report")
             .arg(&report_path)
             .arg("--")
@@ -255,17 +254,40 @@ pub fn run(directory: &Path, toolchain: &str) -> Result<()> {
         let output = observation?;
         let report_bytes = artifacts::read_file(&report_path)?;
         fs::write(diagnostics.join(name).with_extension("json"), &report_bytes)?;
-        let result = ResultV1::parse(&report_bytes).map_err(CiError::Message)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&report_bytes)
+            .map_err(CiError::Message)?;
+        let result: MemcordonReport = serde_json::from_slice(&report_bytes)?;
+        let outcome = result
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.outcome.as_ref())
+            .ok_or_else(|| {
+                CiError::Message("published consumer has no observed target outcome".into())
+            })?;
+        let kind = match outcome {
+            RunOutcome::Exited { .. } => OutcomeKindV1::Completed,
+            RunOutcome::DeadlineExceeded { .. } => OutcomeKindV1::Deadline,
+            _ => OutcomeKindV1::Unknown,
+        };
+        let wrapper = result
+            .supervision
+            .as_ref()
+            .map(|summary| summary.wrapper_exit_code);
         if result.tool.version != version.to_string()
-            || result.outcome.kind != expected
-            || output.status.code() != Some(result.outcome.wrapper_status)
-            || result.cleanup.state != CleanupStateV1::Complete
-            || !result.cleanup.direct_child_reaped
-            || result.cleanup.workload_empty != Some(true)
+            || kind != expected
+            || output.status.code() != wrapper
+            || !outcome.cleanup().errors.is_empty()
+            || !outcome.cleanup().direct_child_reaped
+            || outcome.cleanup().workload_empty != Some(true)
             || (expected == OutcomeKindV1::Completed
-                && (result.outcome.wrapper_status != 0
-                    || result.outcome.native_termination
-                        != Some(ChildTermination::ExitCode { code: 0 })))
+                && (wrapper != Some(0)
+                    || !matches!(
+                        outcome,
+                        RunOutcome::Exited {
+                            child: ChildTermination::ExitCode { code: 0 },
+                            ..
+                        }
+                    )))
         {
             return Err(CiError::Message(format!(
                 "published installed consumer {name} execution or retirement differs"

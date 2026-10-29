@@ -3,7 +3,8 @@ use memcordon_ci::{
     windows_causal_acceptance::InstalledChannel,
     windows_installed_cases::{InstalledWindowsPayload, SelectedArtifact},
 };
-use memcordon_core::runtime_manifest::{RuntimeComponentRole as Role, RuntimeManifest};
+use memcordon_core::runtime_components::RuntimeComponentRole as Role;
+use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
 use std::{fs, path::PathBuf};
 
 struct Fixture {
@@ -54,7 +55,7 @@ impl Fixture {
             binaries.push(binary.to_owned());
         }
         let manifest =
-            RuntimeManifest::windows(version.into(), source.into(), target.into(), records)
+            RuntimeManifestV2::windows(version.into(), source.into(), target.into(), records)
                 .unwrap();
         let bytes = serde_json::to_vec(&manifest).unwrap();
         fs::write(retained.join("runtime-manifest.json"), &bytes).unwrap();

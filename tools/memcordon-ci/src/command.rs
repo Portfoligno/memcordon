@@ -66,6 +66,8 @@ pub struct CommandSpec {
     miri_sysroot: Option<PathBuf>,
     clear_environment: bool,
     bootstrap_environment: bool,
+    #[cfg(target_os = "linux")]
+    workload_loader_path: Option<PathBuf>,
     output_limit: usize,
     defer_group_failure: bool,
     peer_stop_policy: Option<PeerStopPolicy>,
@@ -144,6 +146,8 @@ impl CommandSpec {
             miri_sysroot: None,
             clear_environment: false,
             bootstrap_environment: false,
+            #[cfg(target_os = "linux")]
+            workload_loader_path: None,
             output_limit: 16 * 1024 * 1024,
             defer_group_failure: false,
             peer_stop_policy: None,
@@ -273,6 +277,12 @@ impl CommandSpec {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn workload_loader_path(mut self, path: &Path) -> Self {
+        self.workload_loader_path = Some(path.into());
+        self
+    }
+
     pub fn apply_environment(&self, command: &mut Command) {
         if self.clear_environment {
             command.env_clear();
@@ -315,6 +325,10 @@ impl CommandSpec {
             .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL");
         command.env_remove("CARGO_REGISTRY_TOKEN");
         command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        #[cfg(target_os = "linux")]
+        if let Some(path) = &self.workload_loader_path {
+            command.env("LD_LIBRARY_PATH", path);
+        }
         command.env_remove("GITHUB_TOKEN");
         if crate::preparation::active_group().is_some()
             || matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
@@ -341,26 +355,11 @@ impl CommandSpec {
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
-        self.run_observing_failure(|_| {})
-    }
-
-    pub fn run_with_producer_failure_forwarding(
-        &self,
-        destination: &mut impl std::io::Write,
-    ) -> Result<Vec<u8>> {
-        self.run_observing_failure(|output| {
-            let _ = crate::producer_failure_forwarding::inspect(Some(&output.stderr))
-                .write_to(destination);
-        })
-    }
-
-    fn run_observing_failure(&self, observe: impl FnOnce(&ObservedOutput)) -> Result<Vec<u8>> {
         let mut command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let output = self.observe_with_progress(&mut command, true)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
-            observe(&output);
             Err(CiError::SettledCommandFailure(format!(
                 "subprocess failed with {}; stdout={:?}; stderr={:?}",
                 output.status,
@@ -582,7 +581,80 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, false)
+        self.output_quiet_with_creation_mode(observe_creation, false, None)
+    }
+
+    /// Keep the sole child wait owner and bounded capture while an installed
+    /// fixture controller operates actual stdin barriers and observes snapshots.
+    #[cfg(target_os = "linux")]
+    pub fn output_quiet_with_creation_and_io(
+        &self,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        io: impl FnOnce(
+            u32,
+            Option<std::process::ChildStdin>,
+            memcordon_testkit::OutputSnapshot,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> Result<ObservedOutput> {
+        self.output_quiet_with_creation_and_io_descriptor(None, observe_creation, io)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_with_creation_and_io_descriptor(
+        &self,
+        extra: Option<&std::fs::File>,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        io: impl FnOnce(
+            u32,
+            Option<std::process::ChildStdin>,
+            memcordon_testkit::OutputSnapshot,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> Result<ObservedOutput> {
+        let mut command = self.materialize()?;
+        command.stdin(std::process::Stdio::piped());
+        if let Some(extra) = extra {
+            crate::release::linux_current_phase_gate::configure_extra_descriptor(
+                &mut command,
+                extra,
+            )?;
+        }
+        let mut observation_error = None;
+        let cutoff = self
+            .operation_deadline
+            .unwrap_or(Instant::now() + self.available_budget()?);
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
+            command,
+            self.available_budget()?,
+            self.output_limit,
+            |mut command| {
+                memcordon_testkit::configure_native_exec_observation(&mut command);
+                let child = command.spawn()?;
+                let observed = (|| -> Result<()> {
+                    let stop = memcordon_testkit::NativeExecObservation::acquire(&child, cutoff)?;
+                    observe_creation(&child)?;
+                    stop.release()?;
+                    Ok(())
+                })();
+                if let Err(error) = observed {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            io,
+        );
+        let writers = crate::work_outcome::native_settlement(&output);
+        let result = match (output, observation_error) {
+            (Ok(output), None) => Ok(output),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "native creation observation={original:?}; native settlement={error}"
+            ))),
+        };
+        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
     }
 
     /// Observe the genuine executed image while the original child is stopped
@@ -592,7 +664,15 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true)
+        self.output_quiet_with_creation_mode(observe_creation, true, None)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_with_exec_release_observation(
+        &self,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        after_release: Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>,
+    ) -> Result<ObservedOutput> {
+        self.output_quiet_with_creation_mode(observe_creation, true, Some(after_release))
     }
 
     #[cfg(target_os = "linux")]
@@ -600,6 +680,7 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
         hold_exec: bool,
+        after_release: Option<Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>>,
     ) -> Result<ObservedOutput> {
         let command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
@@ -634,6 +715,9 @@ impl CommandSpec {
                         }
                         stop.release()?;
                     }
+                    if let Some(after_release) = after_release {
+                        after_release(&child)?;
+                    }
                     Ok(())
                 })();
                 if let Err(error) = observed {
@@ -656,6 +740,62 @@ impl CommandSpec {
 
     /// Supply an already retained finite input without blocking a pipe before
     /// the sole deadline owner starts. Creation failures still settle the child.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_with_native_socket_stdin_and_creation(
+        &self,
+        input: &std::fs::File,
+        extra: Option<&std::fs::File>,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+    ) -> Result<ObservedOutput> {
+        use std::os::unix::fs::FileTypeExt;
+        if !input.metadata()?.file_type().is_socket() {
+            return Err(CiError::Message(
+                "native stdin transport is not the original held socket".into(),
+            ));
+        }
+        let mut command = self.materialize()?;
+        command.stdin(std::process::Stdio::from(input.try_clone()?));
+        if let Some(extra) = extra {
+            crate::release::linux_current_phase_gate::configure_extra_descriptor(
+                &mut command,
+                extra,
+            )?;
+        }
+        let cutoff = self
+            .operation_deadline
+            .unwrap_or(Instant::now() + self.available_budget()?);
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
+            command,
+            self.available_budget()?,
+            self.output_limit,
+            |mut command| {
+                memcordon_testkit::configure_native_exec_observation(&mut command);
+                let child = command.spawn()?;
+                let observed = (|| -> Result<()> {
+                    let stop = memcordon_testkit::NativeExecObservation::acquire(&child, cutoff)?;
+                    observe_creation(&child)?;
+                    stop.release()?;
+                    Ok(())
+                })();
+                if let Err(error) = observed {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            |_| Ok(()),
+        );
+        let writers = crate::work_outcome::native_settlement(&output);
+        let result = match (output, observation_error) {
+            (Ok(output), None) => Ok(output),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "native stdin creation observation={original:?}; native settlement={error}"
+            ))),
+        };
+        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
+    }
+
     #[cfg(unix)]
     pub fn output_quiet_with_stdin_and_creation(
         &self,

@@ -4,11 +4,11 @@ use memcordon_core::{
     AttemptObservationPhaseV1, BoundaryMechanismEvidence, BoundarySetupPhase, CausalEventV1,
     CleanupSummary, DiagnosticOriginV1, FailureCategoryV1, FailureCodeV1, FailureOperationV1,
     ProcessObservationUnavailableReasonV1, ProviderFailureDiagnosticV1, RestartSafetyProof,
-    RunOutcome, SafeDiagnosticDetailV1, WindowsCapabilityOwnerEntryV1,
-    WindowsCapabilityOwnerManifestV1, WindowsCapabilityOwnerRoleV1, WindowsProcessIdentityV1,
-    WindowsProcessObservationV2, WindowsProviderRejectionDispositionV2, WindowsProviderRejectionV2,
-    WindowsRetirementProofSourceV2, WindowsRetirementProofV2, WindowsSealedEvidenceV2,
-    WindowsTerminalPayloadV2, WindowsTerminalReceiptV2, WindowsTerminalSeedV2,
+    RunOutcome, SafeDiagnosticDetailV1, WindowsCapabilityOwnerEntryV2,
+    WindowsCapabilityOwnerManifestV2, WindowsCapabilityOwnerRoleV2, WindowsProcessIdentityV1,
+    WindowsProcessObservationV2, WindowsProviderRejectionDispositionV3, WindowsProviderRejectionV3,
+    WindowsRetirementProofSourceV2, WindowsRetirementProofV3, WindowsSealedEvidenceV3,
+    WindowsTerminalPayloadV3, WindowsTerminalReceiptV3, WindowsTerminalSeedV2,
 };
 
 pub fn bind_owner_manifest(
@@ -16,20 +16,20 @@ pub fn bind_owner_manifest(
     target: &WindowsProcessIdentityV1,
 ) {
     let entries = std::array::from_fn(|index| {
-        let role = WindowsCapabilityOwnerRoleV1::ALL[index];
-        WindowsCapabilityOwnerEntryV1 {
+        let role = WindowsCapabilityOwnerRoleV2::ALL[index];
+        WindowsCapabilityOwnerEntryV2 {
             role,
             present: role.required(),
             process_identity: match role {
-                WindowsCapabilityOwnerRoleV1::DirectTargetProcess => Some(target.clone()),
-                WindowsCapabilityOwnerRoleV1::GuardianProcess => record.guardian_identity.clone(),
+                WindowsCapabilityOwnerRoleV2::DirectTargetProcess => Some(target.clone()),
+                WindowsCapabilityOwnerRoleV2::GuardianProcess => record.guardian_identity.clone(),
                 _ => None,
             },
             capability_binding_sha256: role.required().then(|| "ab".repeat(32)),
         }
     });
-    record.owner_manifest = Some(WindowsCapabilityOwnerManifestV1 {
-        schema_version: 1,
+    record.owner_manifest = Some(WindowsCapabilityOwnerManifestV2 {
+        schema_version: 2,
         attempt_id: record.attempt_id.clone(),
         provider_generation: record.provider_generation.clone(),
         launch_incarnation: record.launch_incarnation.clone(),
@@ -59,10 +59,9 @@ pub fn preauthorization_rejection(
     code: &str,
     phase: BoundarySetupPhase,
     target_created: bool,
-) -> WindowsProviderRejectionV2 {
-    WindowsProviderRejectionV2 {
-        schema_version: 2,
-        workload_admission: None,
+) -> WindowsProviderRejectionV3 {
+    WindowsProviderRejectionV3 {
+        schema_version: 3,
         provider_failure: None,
         guardian_causal_receipt: None,
         code: code.to_owned(),
@@ -74,7 +73,7 @@ pub fn preauthorization_rejection(
         target_released: false,
         cleanup_attempted: true,
         restart_safety: safe_restart(),
-        disposition: WindowsProviderRejectionDispositionV2::Preauthorization {
+        disposition: WindowsProviderRejectionDispositionV3::Preauthorization {
             terminal_ack_required: true,
         },
     }
@@ -86,7 +85,7 @@ pub fn postauthorization_failure(
     target_released: bool,
     code: &str,
     phase: BoundarySetupPhase,
-) -> WindowsProviderRejectionV2 {
+) -> WindowsProviderRejectionV3 {
     bind_owner_manifest(record, &target);
     let mut journal = memcordon_core::WindowsCausalDiagnosticsV1::default();
     journal
@@ -129,8 +128,8 @@ pub fn postauthorization_failure(
         .expect("manifest is bound")
         .canonical_sha256()
         .expect("manifest is canonical");
-    let proof = WindowsRetirementProofV2 {
-        schema_version: 2,
+    let proof = WindowsRetirementProofV3 {
+        schema_version: 3,
         source: WindowsRetirementProofSourceV2::LiveNative,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
@@ -149,16 +148,14 @@ pub fn postauthorization_failure(
         guardian_completion_observed: true,
         owner_capabilities_closed: true,
         launch_gate_closed: true,
-        policy_reference_bound: true,
     };
     let restart_safety = safe_restart();
-    let receipt = WindowsTerminalReceiptV2 {
-        policy_enforcement: None,
-        schema_version: 2,
+    let receipt = WindowsTerminalReceiptV3 {
+        schema_version: 3,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
         request_sha256: record.request_sha256.clone(),
-        payload: WindowsTerminalPayloadV2::Execution {
+        payload: WindowsTerminalPayloadV3::Execution {
             child_pid: target.process_id,
             duration_millis: 2,
             authorization_offset_millis: 1,
@@ -172,8 +169,29 @@ pub fn postauthorization_failure(
                     ..CleanupSummary::default()
                 },
             },
-            boundary_detail: Box::new(BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
-                WindowsSealedEvidenceV2 {
+            boundary_detail: Box::new(BoundaryMechanismEvidence::WindowsJobObjectV3(Box::new(
+                WindowsSealedEvidenceV3 {
+                    schema_version: 3,
+                    service_identity: "synthetic-native-transport-fixture".into(),
+                    target_identity: Some(target.clone()),
+                    process_observation: Some(Box::new(observation.clone())),
+                    caller_token_authenticated: true,
+                    initial_target_token_matches_caller: true,
+                    credential_transition_disposition:
+                        memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope,
+                    job_membership_independent_of_token: true,
+                    job_created: true,
+                    job_limits_verified: true,
+                    kill_on_close_verified: true,
+                    breakaway_denied: true,
+                    completion_port_associated: true,
+                    guardian_ready: true,
+                    target_created_suspended: true,
+                    job_list_applied_at_creation: true,
+                    handle_list_applied_at_creation: true,
+                    target_job_membership_verified: true,
+                    target_still_suspended_during_verification: true,
+                    inherited_handles_verified: true,
                     target_released,
                     terminate_job_invoked: true,
                     active_processes_zero: true,
@@ -181,7 +199,7 @@ pub fn postauthorization_failure(
                     relays_retired: true,
                     guardian_reaped: true,
                     final_job_handles_closed: true,
-                    ..WindowsSealedEvidenceV2::default()
+                    ..WindowsSealedEvidenceV3::default()
                 },
             ))),
         },
@@ -201,9 +219,8 @@ pub fn postauthorization_failure(
     });
     record.retirement_proof = Some(proof);
     record.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::ProofReady;
-    let rejection = WindowsProviderRejectionV2 {
-        schema_version: 2,
-        workload_admission: None,
+    let rejection = WindowsProviderRejectionV3 {
+        schema_version: 3,
         provider_failure: Some(failure),
         guardian_causal_receipt: None,
         code: code.to_owned(),
@@ -215,7 +232,7 @@ pub fn postauthorization_failure(
         target_released,
         cleanup_attempted: true,
         restart_safety,
-        disposition: WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+        disposition: WindowsProviderRejectionDispositionV3::PostauthorizationFailure {
             receipt: Box::new(receipt),
         },
     };

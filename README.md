@@ -5,12 +5,11 @@ and elapsed-time limits. Use it when builds, tests, workers, or other commands
 can spawn child processes and need one containment boundary with reliable
 cleanup and exit-status reporting.
 
-Sealed providers can additionally enforce an explicitly granted workload
-contract with `--sealed --workload-contract contract.json`. See the
-[workload contract documentation](docs/spec-workload-contract-v1.md).
-
-Linux schema-3 image workloads select an administrator-approved entrypoint with
-`--image-entrypoint ID` and use `--report-format result-v2`.
+Sealed workloads describe their needs with `--sealed --workload-request request.json`.
+Linux private workloads stream caller-readable input bytes into a fresh private
+root; Windows workloads run with the authenticated caller's effective token.
+See [workload requests](docs/spec-workload-request-v1.md) for the platform
+boundaries, input transport, and current observation formats.
 
 ![MemCordon command containment overview](docs/assets/banner.png)
 

@@ -15,7 +15,7 @@ pub(super) fn event(operation: FailureOperationV1, captured_native: Option<i32>)
         | Operation::QueryPeakMemory
         | Operation::ReadJobNotification => (Category::Monitor, Code::JobQuery),
         Operation::ResumeTarget => (Category::Launch, Code::TargetResume),
-        Operation::VerifySuspendedTarget => (Category::Launch, Code::PolicyReadback),
+        Operation::VerifySuspendedTarget => (Category::Launch, Code::JobConfigurationReadback),
         Operation::PollTarget | Operation::ReadTargetExit => (Category::Monitor, Code::TargetQuery),
         Operation::CheckGuardian => (Category::Monitor, Code::GuardianLoss),
         Operation::TerminateJob => (Category::Cleanup, Code::UnexpectedProviderFailure),

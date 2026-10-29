@@ -605,7 +605,7 @@ fn run_spawner(
 pub fn run_workload(request: &Path, result: &Path, request_sha256: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let held = memcordon_windows_loader_lab::workload::HeldWorkloadRequest::open(
+        let held = memcordon_windows_loader_lab::current_workload::HeldWorkloadRequest::open(
             request,
             Some(request_sha256),
         )?;
@@ -680,7 +680,7 @@ mod windows_service {
         executable: &Path,
         request: &Path,
         result: &Path,
-        input: &memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1,
+        input: &memcordon_windows_loader_lab::current_workload::WorkloadDiagnosticRequestV2,
         request_sha256: &str,
     ) -> Result<(), String> {
         let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };

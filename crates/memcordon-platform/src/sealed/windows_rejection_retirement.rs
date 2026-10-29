@@ -1,7 +1,7 @@
 //! The same bound rejection delivery applies before and after stream setup.
 use memcordon_core::{
-    Error, ErrorCategory, PublicProviderBindingV1, WindowsProviderResponseV3,
-    WindowsTerminalDeliveryEvidenceV1,
+    Error, ErrorCategory, PublicProviderBindingV1, WindowsFrontendDeliveryV3,
+    WindowsProviderResponseV4,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,7 +29,7 @@ pub(crate) fn observed_terminal_delivery(
     request_sha256: &str,
     authority: &[u8],
     retired: &[u8],
-) -> Result<WindowsTerminalDeliveryEvidenceV1, Box<Error>> {
+) -> Result<WindowsFrontendDeliveryV3, Box<Error>> {
     if authority.is_empty()
         || authority.len() > memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
         || retired.is_empty()
@@ -39,14 +39,14 @@ pub(crate) fn observed_terminal_delivery(
             "terminal response exceeds its native frame bound",
         )));
     }
-    let delivery = WindowsTerminalDeliveryEvidenceV1 {
-        schema_version: 1,
+    let delivery = WindowsFrontendDeliveryV3 {
         attempt_id: attempt_id.to_owned(),
         nonce: nonce.to_owned(),
         request_sha256: request_sha256.to_owned(),
-        authority_sha256: digest_bytes(authority),
+        terminal_sha256: digest_bytes(authority),
         retired_sha256: digest_bytes(retired),
-        retired_confirmed: true,
+        terminal_validated: true,
+        acknowledgement_observed: true,
     };
     if !delivery.is_consistent() {
         return Err(Box::new(transport_error(
@@ -58,13 +58,13 @@ pub(crate) fn observed_terminal_delivery(
 
 pub(crate) fn complete_rejection_ack(
     mut primary: Error,
-    response: &WindowsProviderResponseV3,
-    response_raw: &[u8],
+    response: &WindowsProviderResponseV4,
+    _response_raw: &[u8],
     context: &RejectionContext<'_>,
     acknowledge: impl FnOnce(&str) -> Result<Vec<u8>, Box<Error>>,
 ) -> Error {
-    let completion = (|| -> Result<Option<WindowsTerminalDeliveryEvidenceV1>, Box<Error>> {
-        let WindowsProviderResponseV3::Reject {
+    let completion = (|| -> Result<Option<WindowsFrontendDeliveryV3>, Box<Error>> {
+        let WindowsProviderResponseV4::Reject {
             schema_version,
             attempt_id,
             nonce,
@@ -76,7 +76,7 @@ pub(crate) fn complete_rejection_ack(
                 "terminal acknowledgment requires an exact rejection",
             )));
         };
-        if *schema_version != memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+        if *schema_version != memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
             || attempt_id != context.attempt_id
             || nonce != context.nonce
             || request_sha256 != context.request_sha256
@@ -110,9 +110,9 @@ pub(crate) fn complete_rejection_ack(
             .map_err(|error| Box::new(transport_error(error.to_string())))?;
         let digest = digest_bytes(authority.as_bytes());
         let retired_raw = acknowledge(&digest)?;
-        let retired: WindowsProviderResponseV3 = serde_json::from_slice(&retired_raw)
+        let retired: WindowsProviderResponseV4 = serde_json::from_slice(&retired_raw)
             .map_err(|error| Box::new(transport_error(error.to_string())))?;
-        if !matches!(&retired, WindowsProviderResponseV3::TerminalRetiredV2(retired)
+        if !matches!(&retired, WindowsProviderResponseV4::TerminalRetiredV2(retired)
             if retired.provider_generation == context.provider.generation.as_str()
                 && retired.is_consistent_for(context.attempt_id, context.nonce,
                     context.request_sha256, &digest))
@@ -125,13 +125,13 @@ pub(crate) fn complete_rejection_ack(
             context.attempt_id,
             context.nonce,
             context.request_sha256,
-            response_raw,
+            authority.as_bytes(),
             &retired_raw,
         )
         .map(Some)
     })();
     match completion {
-        Ok(Some(delivery)) => primary.windows_terminal_delivery = Some(delivery),
+        Ok(Some(delivery)) => primary.windows_frontend_delivery = Some(delivery),
         Ok(None) => {}
         Err(acknowledgment) => {
             if primary.provider_failure.is_none() {

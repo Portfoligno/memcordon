@@ -9,7 +9,6 @@ fn error_indirects_large_rejections_without_losing_evidence() {
     assert!(std::mem::size_of::<Error>() <= 2 * 1024);
 
     let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
         provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-TARGET-DESCRIPTORS-READBACK".to_owned(),
@@ -21,8 +20,6 @@ fn error_indirects_large_rejections_without_losing_evidence() {
         target_released: false,
         cleanup_attempted: true,
         restart_safety: RestartSafetyProof::default(),
-        terminal_ack_required: false,
-        terminal_receipt: None,
     };
     let error = Error::new(
         ErrorCategory::Setup,

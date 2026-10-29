@@ -78,13 +78,13 @@ pub struct WindowsAttemptRecordV1 {
     pub resume_attempted: bool,
     pub target_released: bool,
     pub cleanup_state: WindowsCleanupStateV1,
-    pub owner_manifest: Option<memcordon_core::WindowsCapabilityOwnerManifestV1>,
+    pub owner_manifest: Option<memcordon_core::WindowsCapabilityOwnerManifestV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job_closure_contract: Option<memcordon_core::WindowsJobClosureContractV1>,
+    pub job_closure_contract: Option<memcordon_core::WindowsJobClosureContractV2>,
     pub recovery_authorization: Option<memcordon_core::WindowsRecoveryAuthorizationV1>,
     pub terminal_publication_reserved: bool,
     pub terminal_seed: Option<memcordon_core::WindowsTerminalSeedV2>,
-    pub retirement_proof: Option<memcordon_core::WindowsRetirementProofV2>,
+    pub retirement_proof: Option<memcordon_core::WindowsRetirementProofV3>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -96,11 +96,6 @@ pub struct WindowsAttemptRecordV1 {
     pub terminalization: WindowsTerminalizationStatusV1,
     pub causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1,
     pub diagnostic_retention: memcordon_core::DiagnosticRetentionV1,
-    pub workload_admission: Option<memcordon_core::workload_registry::RuntimeAdmissionSnapshot>,
-    pub workload_checkpoint: Option<(
-        memcordon_core::workload_evidence::RuntimeAttemptBinding,
-        memcordon_core::workload_evidence::VerifiedCheckpointV1,
-    )>,
     pub record_revision: u64,
     #[serde(deserialize_with = "memcordon_core::deserialize_bounded_record_text::<_, 256>")]
     pub provider_incarnation: String,
@@ -256,12 +251,12 @@ impl WindowsAttemptRecordV1 {
         job_identity_sha256: String,
     ) -> Result<Self, String> {
         Ok(Self {
-            schema_version: 4,
+            schema_version: 5,
             attempt_id,
             provider_generation: provider_generation(),
             boot_identity: boot_identity()?,
-            launch_incarnation: digest(&super::policy_registry::random_nonce()?.0),
-            nonce: digest(&super::policy_registry::random_nonce()?.0),
+            launch_incarnation: digest(&super::random::random_nonce()?.0),
+            nonce: digest(&super::random::random_nonce()?.0),
             request_sha256,
             caller_process_identity,
             caller_token_sha256,
@@ -294,8 +289,6 @@ impl WindowsAttemptRecordV1 {
             },
             integrity_sha256: String::new(),
             causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
-            workload_admission: None,
-            workload_checkpoint: None,
             diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(unsafe {
                 windows_sys::Win32::System::SystemInformation::GetTickCount64()
             })
@@ -307,55 +300,6 @@ impl WindowsAttemptRecordV1 {
 
     pub fn store(&mut self) -> Result<(), String> {
         super::attempt_store::commit(self)
-    }
-
-    pub fn bind_workload_admission(
-        &mut self,
-        snapshot: memcordon_core::workload_registry::RuntimeAdmissionSnapshot,
-    ) -> Result<(), String> {
-        if self.authorization_unix_millis.is_some()
-            || self.resume_attempted
-            || self.workload_admission.is_some()
-        {
-            return Err(
-                "workload admission must be frozen exactly once before authorization".to_owned(),
-            );
-        }
-        snapshot.validate()?;
-        if String::from(snapshot.private_invocation_digest.clone()) != self.request_sha256
-            || !matches!(
-                snapshot.caller,
-                memcordon_core::workload_registry::CallerSelector::Windows { .. }
-            )
-        {
-            return Err(
-                "workload admission invocation or caller platform differs from durable attempt"
-                    .to_owned(),
-            );
-        }
-        self.workload_admission = Some(snapshot);
-        self.store()
-    }
-
-    pub(super) fn bind_workload_checkpoint(
-        &mut self,
-        binding: memcordon_core::workload_evidence::RuntimeAttemptBinding,
-        checkpoint: memcordon_core::workload_evidence::VerifiedCheckpointV1,
-    ) -> Result<(), String> {
-        if !self
-            .workload_admission
-            .as_ref()
-            .is_some_and(|snapshot| binding.matches_snapshot(snapshot))
-            || self.workload_checkpoint.is_some()
-            || self.authorization_unix_millis.is_some()
-            || self.resume_attempted
-            || binding.attempt_id.as_str() != self.attempt_id
-            || !checkpoint.matches_binding(&binding)
-        {
-            return Err("workload checkpoint must bind the frozen attempt exactly once before authorization".to_owned());
-        }
-        self.workload_checkpoint = Some((binding, checkpoint));
-        self.store()
     }
 
     fn snapshot_violation(
@@ -383,26 +327,6 @@ impl WindowsAttemptRecordV1 {
         refuse!(
             previous.record_revision != expected_revision,
             ExpectedRevision
-        );
-        refuse!(
-            previous.workload_checkpoint.is_some()
-                && previous.workload_checkpoint != self.workload_checkpoint,
-            FrozenWorkloadCheckpoint
-        );
-        refuse!(
-            previous.authorization_unix_millis.is_some()
-                && previous.workload_checkpoint != self.workload_checkpoint,
-            AuthorizedWorkloadCheckpoint
-        );
-        refuse!(
-            previous.workload_admission.is_some()
-                && previous.workload_admission != self.workload_admission,
-            FrozenWorkloadAdmission
-        );
-        refuse!(
-            previous.authorization_unix_millis.is_some()
-                && previous.workload_admission != self.workload_admission,
-            AuthorizedWorkloadAdmission
         );
         refuse!(
             previous.diagnostic_retention.admitted_monotonic_millis
@@ -705,9 +629,7 @@ impl WindowsAttemptRecordV1 {
         self.store()?;
         super::attempt_store::retire(&self.attempt_id)?;
         let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
-        if self.workload_admission.is_some() {
-            super::policy_registry::retire_reference(&self.attempt_id)?;
-        }
+
         fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
         remove_guardian_receipt(&self.attempt_id)
     }
@@ -720,7 +642,7 @@ impl WindowsAttemptRecordV1 {
 
     pub fn stage_terminal_proof(
         &mut self,
-        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        receipt: &memcordon_core::WindowsTerminalReceiptV3,
         primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
     ) -> Result<(), String> {
         self.stage_terminal_proof_with_store(receipt, primary_failure, &mut |record| record.store())
@@ -728,7 +650,7 @@ impl WindowsAttemptRecordV1 {
 
     fn stage_terminal_proof_with_store<F>(
         &mut self,
-        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        receipt: &memcordon_core::WindowsTerminalReceiptV3,
         primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
         store: &mut F,
     ) -> Result<(), String>
@@ -754,7 +676,7 @@ impl WindowsAttemptRecordV1 {
             process_observation: receipt.process_observation.clone(),
             primary_failure,
             premature_release: match &receipt.payload {
-                memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure {
+                memcordon_core::WindowsTerminalPayloadV3::PrematureReleaseFailure {
                     witness,
                     ..
                 } => Some(witness.clone()),
@@ -777,7 +699,7 @@ impl WindowsAttemptRecordV1 {
     #[cfg(test)]
     pub fn stage_terminal_proof_for_test<F>(
         &mut self,
-        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        receipt: &memcordon_core::WindowsTerminalReceiptV3,
         primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
         mut store: F,
     ) -> Result<(), String>
@@ -841,7 +763,6 @@ impl WindowsAttemptRecordV1 {
             || self.target_released
             || self.terminal_disposition.is_some()
             || self.owner_manifest.is_none()
-            || self.workload_checkpoint.is_some()
             || self.target_identity.is_none()
         {
             return Err("premature-release intent conflicts with native attempt".to_owned());
@@ -868,7 +789,6 @@ impl WindowsAttemptRecordV1 {
             || !self.target_released
             || self.state != WindowsAttemptStateV1::Terminating
             || self.owner_manifest.is_none()
-            || self.workload_checkpoint.is_some()
             || self.terminal_seed.is_some()
             || self.retirement_proof.is_some()
             || self.terminal_response_json.is_some()
@@ -1072,7 +992,7 @@ impl WindowsAttemptRecordV1 {
 
     pub fn stage_terminal_response(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV3,
+        response: &memcordon_core::WindowsLauncherResponseV4,
     ) -> Result<(), String> {
         self.stage_terminal_response_with_store(response, &mut |record| record.store())?;
         // The exact relay event remains queryable until the outbox and its
@@ -1082,7 +1002,7 @@ impl WindowsAttemptRecordV1 {
 
     fn stage_terminal_response_with_store<F>(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV3,
+        response: &memcordon_core::WindowsLauncherResponseV4,
         store: &mut F,
     ) -> Result<(), String>
     where
@@ -1299,7 +1219,7 @@ impl WindowsAttemptRecordV1 {
             code,
             native_code: error
                 .native_code
-                .map(memcordon_core::NativeFailureCodeV1::LegacyUntyped),
+                .map(memcordon_core::NativeFailureCodeV1::Unclassified),
             observed_phase: memcordon_core::AttemptObservationPhaseV1::Terminalizing,
             safe_detail: memcordon_core::SafeDiagnosticDetailV1::NoAdditionalDetail,
             detail_redacted: true,
@@ -1350,12 +1270,12 @@ impl WindowsAttemptRecordV1 {
 
     fn prepare_terminal_response(
         &self,
-        response: &memcordon_core::WindowsLauncherResponseV3,
+        response: &memcordon_core::WindowsLauncherResponseV4,
     ) -> Result<String, String> {
         if self.state != WindowsAttemptStateV1::Empty || self.terminal_response_json.is_some() {
             return Err("attempt is not ready for a create-once terminal outbox".to_owned());
         }
-        if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(self), response) {
+        if !memcordon_core::windows_terminal_outbox_is_bound_v4(&decoded_v4(self), response) {
             return Err(
                 "terminal outbox response is not bound and consistent for the attempt".to_owned(),
             );
@@ -1372,7 +1292,7 @@ impl WindowsAttemptRecordV1 {
     #[cfg(test)]
     pub fn stage_terminal_response_for_test(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV3,
+        response: &memcordon_core::WindowsLauncherResponseV4,
     ) -> Result<(), String> {
         self.terminal_response_json = Some(self.prepare_terminal_response(response)?.into());
         self.advance_terminalization(
@@ -1385,7 +1305,7 @@ impl WindowsAttemptRecordV1 {
     #[cfg(test)]
     pub fn stage_terminal_response_with_store_for_test<F>(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV3,
+        response: &memcordon_core::WindowsLauncherResponseV4,
         mut store: F,
     ) -> Result<(), String>
     where
@@ -1412,9 +1332,7 @@ impl WindowsAttemptRecordV1 {
         remove_guardian_receipt(&self.attempt_id)?;
         super::attempt_store::retire(&self.attempt_id)?;
         let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
-        if self.workload_admission.is_some() {
-            super::policy_registry::retire_reference(&self.attempt_id)?;
-        }
+
         fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
         complete_ack_tombstone(&self.attempt_id, &self.request_sha256)?;
         Ok(())
@@ -1423,7 +1341,7 @@ impl WindowsAttemptRecordV1 {
     pub fn terminal_retired_receipt(
         &self,
         nonce: &str,
-    ) -> Result<memcordon_core::WindowsTerminalRetiredV1, String> {
+    ) -> Result<memcordon_core::WindowsRetirementMetadata, String> {
         if nonce != self.nonce {
             return Err("terminal ACK nonce does not match durable attempt".to_owned());
         }
@@ -1434,8 +1352,7 @@ impl WindowsAttemptRecordV1 {
         let disposition = self
             .terminal_disposition
             .ok_or_else(|| "attempt terminal disposition is absent".to_owned())?;
-        Ok(memcordon_core::WindowsTerminalRetiredV1 {
-            schema_version: 1,
+        Ok(memcordon_core::WindowsRetirementMetadata {
             attempt_id: self.attempt_id.clone(),
             nonce: nonce.to_owned(),
             request_sha256: self.request_sha256.clone(),
@@ -2073,9 +1990,7 @@ fn reconcile_until(
         if no_live_processes && (prior_boot || durably_empty || kill_on_close_reconciled) {
             super::attempt_store::retire(&record.attempt_id)?;
             let _owner = super::attempt_store::PublicationGuard::acquire(&record.attempt_id)?;
-            if record.workload_admission.is_some() {
-                super::policy_registry::retire_reference(&record.attempt_id)?;
-            }
+
             fs::remove_file(path).map_err(|error| error.to_string())?;
             remove_guardian_receipt(&record.attempt_id)?;
             continue;
@@ -2125,9 +2040,7 @@ fn reconcile_until(
         }
         super::attempt_store::retire(&record.attempt_id)?;
         let _owner = super::attempt_store::PublicationGuard::acquire(&record.attempt_id)?;
-        if record.workload_admission.is_some() {
-            super::policy_registry::retire_reference(&record.attempt_id)?;
-        }
+
         fs::remove_file(path).map_err(|error| error.to_string())?;
         remove_guardian_receipt(&record.attempt_id)?;
     }
@@ -2498,11 +2411,32 @@ enum AdmissionRecordFormat {
     Native,
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(try_from = "u32", into = "u32")]
+struct AdmissionRecordRevision;
+
+impl TryFrom<u32> for AdmissionRecordRevision {
+    type Error = &'static str;
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value == 1 {
+            Ok(Self)
+        } else {
+            Err("unsupported native admission record revision")
+        }
+    }
+}
+
+impl From<AdmissionRecordRevision> for u32 {
+    fn from(_: AdmissionRecordRevision) -> Self {
+        1
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AdmissionRecordV1 {
     format: AdmissionRecordFormat,
-    revision: memcordon_core::workload_contract::ContractVersionOne,
+    revision: AdmissionRecordRevision,
     attempt_id: String,
     request_sha256: String,
     owner_process_identities: Vec<memcordon_core::WindowsProcessIdentityV1>,
@@ -2522,7 +2456,7 @@ struct ReplayRecordV1 {
 #[serde(deny_unknown_fields)]
 struct TerminalAckTombstoneV1 {
     schema_version: u32,
-    retired: memcordon_core::WindowsTerminalRetiredV1,
+    retired: memcordon_core::WindowsRetirementMetadata,
     provider_generation: String,
     launch_incarnation: String,
     original_boot_id: String,
@@ -2899,7 +2833,7 @@ fn stage_ack_tombstone_at(
 
 fn ack_tombstone_for(
     record: &WindowsAttemptRecordV1,
-    retired: &memcordon_core::WindowsTerminalRetiredV1,
+    retired: &memcordon_core::WindowsRetirementMetadata,
 ) -> Result<TerminalAckTombstoneV1, String> {
     let preauthorization_retirement_proof = if retired.disposition
         == WindowsAttemptTerminalDispositionV1::PreauthorizationAbort
@@ -2917,22 +2851,22 @@ fn ack_tombstone_for(
                 "preauthorization ACK conflicts with durable execution authority".to_owned(),
             );
         }
-        let response: memcordon_core::WindowsLauncherResponseV3 = serde_json::from_str(
+        let response: memcordon_core::WindowsLauncherResponseV4 = serde_json::from_str(
             record
                 .terminal_response_json
                 .as_deref()
                 .ok_or("preauthorization ACK has no original outbox")?,
         )
         .map_err(|error| error.to_string())?;
-        if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(record), &response) {
+        if !memcordon_core::windows_terminal_outbox_is_bound_v4(&decoded_v4(record), &response) {
             return Err("preauthorization ACK outbox is not bound".to_owned());
         }
-        let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = response else {
+        let memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. } = response else {
             return Err("preauthorization ACK requires original rejection".to_owned());
         };
         if !matches!(
             rejection.disposition,
-            memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization {
+            memcordon_core::WindowsProviderRejectionDispositionV3::Preauthorization {
                 terminal_ack_required: true
             }
         ) || !rejection.cleanup_attempted
@@ -3140,7 +3074,6 @@ fn recover_incomplete_ack_tombstone(
         }
         remove_guardian_receipt(attempt_id)?;
         super::attempt_store::retire(attempt_id)?;
-        super::policy_registry::retire_reference(attempt_id)?;
     }
     complete_ack_tombstone(attempt_id, request_sha256)
 }
@@ -3273,7 +3206,7 @@ pub fn recover_attempt_for_caller(
     nonce: &str,
     request_sha256: &str,
     caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
-) -> Result<Option<memcordon_core::WindowsLauncherResponseV3>, String> {
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV4>, String> {
     if !caller.is_consistent() || caller.current_boot_identity != boot_identity()? {
         return Err("recovery caller does not match the trusted current boot".to_owned());
     }
@@ -3288,7 +3221,7 @@ pub fn recover_attempt_for_caller(
                 return Err("recovery request differs from durable attempt binding".to_owned());
             }
             let authorization = record.recovery_authorization.as_ref().ok_or_else(|| {
-                "legacy attempt has no admitted recovery authorization".to_owned()
+                "current attempt has no original recovery authorization".to_owned()
             })?;
             let same_boot = record.boot_identity == caller.current_boot_identity;
             if !authorization.admits_recovery(
@@ -3373,7 +3306,7 @@ pub fn recover_attempt_for_caller(
             }
             let retired = recover_incomplete_ack_tombstone(attempt_id, request_sha256)?;
             Ok(Some(
-                memcordon_core::WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+                memcordon_core::WindowsLauncherResponseV4::TerminalRetiredV2(retired),
             ))
         }
         Err(error) => Err(error.to_string()),
@@ -3383,16 +3316,16 @@ pub fn recover_attempt_for_caller(
 fn bound_recovery_terminal_response(
     record: &WindowsAttemptRecordV1,
     outbox: &str,
-) -> Result<memcordon_core::WindowsLauncherResponseV3, String> {
-    let mut response: memcordon_core::WindowsLauncherResponseV3 =
+) -> Result<memcordon_core::WindowsLauncherResponseV4, String> {
+    let mut response: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(outbox).map_err(|error| error.to_string())?;
-    if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(record), &response) {
+    if !memcordon_core::windows_terminal_outbox_is_bound_v4(&decoded_v4(record), &response) {
         return Err("recovery outbox is not bound to durable attempt".to_owned());
     }
     // The immutable outbox intentionally excludes expirable diagnostics. Export
     // the authenticated record's current projection separately, as live replay
     // does, without changing terminal authority or its acknowledgement digest.
-    if let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = &mut response {
+    if let memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. } = &mut response {
         rejection.provider_failure = provider_projection(Some(record)).0;
         rejection.guardian_causal_receipt = guardian_causal_projection(record)?;
     }
@@ -3405,7 +3338,7 @@ fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<boo
 
 fn capability_extinction(
     record: &WindowsAttemptRecordV1,
-) -> Result<Option<memcordon_core::WindowsCapabilityExtinctionProofV1>, String> {
+) -> Result<Option<memcordon_core::WindowsCapabilityExtinctionProofV2>, String> {
     let Some(contract) = record.job_closure_contract.as_ref() else {
         return Ok(None);
     };
@@ -3433,7 +3366,7 @@ fn capability_extinction(
         }
     }
     for entry in &manifest.entries {
-        if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::DesktopBootstrapProcess
+        if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV2::DesktopBootstrapProcess
             && entry.present
         {
             let Some(identity) = entry.process_identity.as_ref() else {
@@ -3449,7 +3382,7 @@ fn capability_extinction(
     {
         return Ok(None);
     }
-    let proof = memcordon_core::WindowsCapabilityExtinctionProofV1 {
+    let proof = memcordon_core::WindowsCapabilityExtinctionProofV2 {
         contract: contract.clone(),
         owner_manifest: manifest.clone(),
         current_boot_id: boot_identity()?,
@@ -3470,9 +3403,7 @@ fn frozen_manifest_owner_blocker(
         .as_ref()
         .ok_or_else(|| "live recovery has no frozen owner manifest".to_owned())?;
     for entry in &manifest.entries {
-        if !entry.present
-            || entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::PolicyReference
-        {
+        if !entry.present {
             continue;
         }
         let Some(identity) = entry.process_identity.as_ref() else {
@@ -3482,7 +3413,7 @@ fn frozen_manifest_owner_blocker(
             )));
         };
         if process_identity_is_live(identity.clone())? {
-            if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::FrontendRelay
+            if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV2::FrontendRelay
                 && identity == &record.caller_process_identity
                 && super::launcher_service::frontend_relay_retired_for_recovery(
                     &record.attempt_id,
@@ -3500,11 +3431,11 @@ fn frozen_manifest_owner_blocker(
             // must be absent before its stack and registry handles are closed.
             if matches!(
                 entry.role,
-                memcordon_core::WindowsCapabilityOwnerRoleV1::LauncherJob
-                    | memcordon_core::WindowsCapabilityOwnerRoleV1::ActiveRegistryDuplicate
-                    | memcordon_core::WindowsCapabilityOwnerRoleV1::ControlRelay
-                    | memcordon_core::WindowsCapabilityOwnerRoleV1::LaunchGate
-                    | memcordon_core::WindowsCapabilityOwnerRoleV1::DesktopBootstrapJob
+                memcordon_core::WindowsCapabilityOwnerRoleV2::LauncherJob
+                    | memcordon_core::WindowsCapabilityOwnerRoleV2::ActiveRegistryDuplicate
+                    | memcordon_core::WindowsCapabilityOwnerRoleV2::ControlRelay
+                    | memcordon_core::WindowsCapabilityOwnerRoleV2::LaunchGate
+                    | memcordon_core::WindowsCapabilityOwnerRoleV2::DesktopBootstrapJob
             ) && record.worker_identity.as_ref() == Some(identity)
                 && record
                     .worker_thread_identity
@@ -3574,7 +3505,7 @@ fn stage_recovered_closure_with_extinction(
     record: &mut WindowsAttemptRecordV1,
     current_boot_identity: &str,
     guardian_receipt: Option<&memcordon_core::WindowsGuardianReceiptV2>,
-    extinction: Option<memcordon_core::WindowsCapabilityExtinctionProofV1>,
+    extinction: Option<memcordon_core::WindowsCapabilityExtinctionProofV2>,
 ) -> Result<(), String> {
     if current_boot_identity.is_empty()
         || (current_boot_identity == record.boot_identity)
@@ -3630,8 +3561,8 @@ fn stage_recovered_closure_with_extinction(
         process_observation.root_identity = record.target_identity.clone();
     }
     let guardian_recovery = guardian_receipt.is_some();
-    let proof = memcordon_core::WindowsRetirementProofV2 {
-        schema_version: 2,
+    let proof = memcordon_core::WindowsRetirementProofV3 {
+        schema_version: 3,
         source: if extinction.is_some() {
             memcordon_core::WindowsRetirementProofSourceV2::CapabilityExtinction
         } else if guardian_recovery {
@@ -3655,8 +3586,6 @@ fn stage_recovered_closure_with_extinction(
         guardian_completion_observed: guardian_recovery,
         owner_capabilities_closed: true,
         launch_gate_closed: true,
-        policy_reference_bound: record.workload_admission.is_none()
-            || record.workload_checkpoint.is_some(),
         guardian_receipt_sha256: guardian_receipt.map(|receipt| receipt.integrity_sha256.clone()),
         current_boot_id: (!guardian_recovery && extinction.is_none())
             .then(|| current_boot_identity.to_owned()),
@@ -3671,13 +3600,12 @@ fn stage_recovered_closure_with_extinction(
         sealed_boundary_retired: false,
         errors: Vec::new(),
     };
-    let receipt = memcordon_core::WindowsTerminalReceiptV2 {
-        policy_enforcement: None,
-        schema_version: 2,
+    let receipt = memcordon_core::WindowsTerminalReceiptV3 {
+        schema_version: 3,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
         request_sha256: record.request_sha256.clone(),
-        payload: memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+        payload: memcordon_core::WindowsTerminalPayloadV3::RecoveredClosure {
             primary_failure: original,
             target_creation_observed: true,
             resume_attempted: record.resume_attempted,
@@ -3688,9 +3616,8 @@ fn stage_recovered_closure_with_extinction(
         retirement_proof: proof,
     };
     receipt.validate_for_attempt().map_err(str::to_owned)?;
-    let rejection = memcordon_core::WindowsProviderRejectionV2 {
-        schema_version: 2,
-        workload_admission: None,
+    let rejection = memcordon_core::WindowsProviderRejectionV3 {
+        schema_version: 3,
         provider_failure: Some(provider_failure.clone()),
         guardian_causal_receipt: None,
         code: "MCSEALED-WINDOWS-OWNER-LOST".to_owned(),
@@ -3710,7 +3637,7 @@ fn stage_recovered_closure_with_extinction(
         cleanup_attempted: true,
         restart_safety,
         disposition:
-            memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+            memcordon_core::WindowsProviderRejectionDispositionV3::PostauthorizationFailure {
                 receipt: Box::new(receipt.clone()),
             },
     };
@@ -3746,8 +3673,8 @@ fn stage_recovered_closure_with_extinction(
         (Some(_), Some(proof)) if proof == &receipt.retirement_proof => {}
         _ => return Err("recovered closure proof conflicts with durable terminal seed".to_owned()),
     }
-    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
-        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = memcordon_core::WindowsLauncherResponseV4::Reject {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
         request_sha256: record.request_sha256.clone(),
@@ -4057,8 +3984,8 @@ pub fn rejection_evidence(
     phase_override: Option<memcordon_core::BoundarySetupPhase>,
     os_code: Option<i32>,
     loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
-    terminal_receipt: Option<Box<memcordon_core::WindowsTerminalReceiptV2>>,
-) -> Result<memcordon_core::WindowsProviderRejectionV2, String> {
+    terminal_receipt: Option<Box<memcordon_core::WindowsTerminalReceiptV3>>,
+) -> Result<memcordon_core::WindowsProviderRejectionV3, String> {
     super::attempt_store::wait_for_pending(attempt_id)?;
     let detail = bounded_rejection_detail(detail);
     let path = match record_path(attempt_id) {
@@ -4138,11 +4065,10 @@ pub fn rejection_evidence(
             memcordon_core::BoundarySetupPhase::Retirement
         }
     });
-    Ok(memcordon_core::WindowsProviderRejectionV2 {
+    Ok(memcordon_core::WindowsProviderRejectionV3 {
         provider_failure: provider_projection(Some(&record)).0,
         guardian_causal_receipt: guardian_causal_projection(&record)?,
-        workload_admission: None,
-        schema_version: 2,
+        schema_version: 3,
         code: code.to_owned(),
         phase,
         detail,
@@ -4156,19 +4082,19 @@ pub fn rejection_evidence(
             Some(receipt)
                 if matches!(
                     receipt.payload,
-                    memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure { .. }
+                    memcordon_core::WindowsTerminalPayloadV3::PrematureReleaseFailure { .. }
                 ) =>
             {
-                memcordon_core::WindowsProviderRejectionDispositionV2::PrematureReleaseFailure {
+                memcordon_core::WindowsProviderRejectionDispositionV3::PrematureReleaseFailure {
                     receipt,
                 }
             }
             Some(receipt) => {
-                memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+                memcordon_core::WindowsProviderRejectionDispositionV3::PostauthorizationFailure {
                     receipt,
                 }
             }
-            None => memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization {
+            None => memcordon_core::WindowsProviderRejectionDispositionV3::Preauthorization {
                 terminal_ack_required: record.terminal_disposition.is_some(),
             },
         },
@@ -4196,13 +4122,12 @@ fn posttarget_rejection(
     detail: String,
     phase: Option<memcordon_core::BoundarySetupPhase>,
     os_code: Option<i32>,
-    terminal: Box<memcordon_core::WindowsTerminalReceiptV2>,
-) -> memcordon_core::WindowsProviderRejectionV2 {
-    memcordon_core::WindowsProviderRejectionV2 {
+    terminal: Box<memcordon_core::WindowsTerminalReceiptV3>,
+) -> memcordon_core::WindowsProviderRejectionV3 {
+    memcordon_core::WindowsProviderRejectionV3 {
         provider_failure: None,
         guardian_causal_receipt: None,
-        workload_admission: None,
-        schema_version: 2,
+        schema_version: 3,
         code: code.to_owned(),
         phase: phase.unwrap_or(memcordon_core::BoundarySetupPhase::Retirement),
         detail: bounded_rejection_detail(detail),
@@ -4213,7 +4138,7 @@ fn posttarget_rejection(
         cleanup_attempted: true,
         restart_safety: terminal.restart_safety.clone(),
         disposition:
-            memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+            memcordon_core::WindowsProviderRejectionDispositionV3::PostauthorizationFailure {
                 receipt: terminal,
             },
     }
@@ -4221,7 +4146,7 @@ fn posttarget_rejection(
 
 pub fn stage_terminal_response(
     attempt_id: &str,
-    response: &memcordon_core::WindowsLauncherResponseV3,
+    response: &memcordon_core::WindowsLauncherResponseV4,
 ) -> Result<bool, String> {
     let path = record_path(attempt_id)?;
     let bytes = match read_record_bounded(&path) {
@@ -4237,11 +4162,11 @@ pub fn stage_terminal_response(
 }
 
 pub struct LeasedTerminalResponse {
-    response: Option<memcordon_core::WindowsLauncherResponseV3>,
+    response: Option<memcordon_core::WindowsLauncherResponseV4>,
     _reader: RecordReaderReservation,
 }
 impl std::ops::Deref for LeasedTerminalResponse {
-    type Target = memcordon_core::WindowsLauncherResponseV3;
+    type Target = memcordon_core::WindowsLauncherResponseV4;
     fn deref(&self) -> &Self::Target {
         self.response
             .as_ref()
@@ -4301,14 +4226,14 @@ pub fn pending_terminal_response(
     }))
 }
 
-fn bound_pending_terminal_response(
+fn bound_pending_terminal_authority(
     record: &WindowsAttemptRecordV1,
     attempt_id: &str,
     nonce: &str,
     request_sha256: &str,
     caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
     caller_token_sha256: &str,
-) -> Result<Option<memcordon_core::WindowsLauncherResponseV3>, String> {
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV4>, String> {
     if record.request_sha256 != request_sha256
         || record.caller_process_identity != *caller_process_identity
         || record.caller_token_sha256 != caller_token_sha256
@@ -4320,15 +4245,15 @@ fn bound_pending_terminal_response(
     let Some(response_json) = record.terminal_response_json.as_ref() else {
         return Ok(None);
     };
-    let mut response: memcordon_core::WindowsLauncherResponseV3 =
+    let response: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(response_json).map_err(|error| error.to_string())?;
     let binding_matches = match &response {
-        memcordon_core::WindowsLauncherResponseV3::Terminal(receipt) => {
+        memcordon_core::WindowsLauncherResponseV4::Terminal(receipt) => {
             receipt.attempt_id == attempt_id
                 && receipt.nonce == nonce
                 && receipt.request_sha256 == request_sha256
         }
-        memcordon_core::WindowsLauncherResponseV3::Reject {
+        memcordon_core::WindowsLauncherResponseV4::Reject {
             attempt_id: response_attempt_id,
             nonce: response_nonce,
             request_sha256: response_request_sha256,
@@ -4345,11 +4270,31 @@ fn bound_pending_terminal_response(
     if !binding_matches {
         return Err("pending terminal response is not bound to the replay request".to_owned());
     }
-    if let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = &mut response {
+    Ok(Some(response))
+}
+
+fn bound_pending_terminal_response(
+    record: &WindowsAttemptRecordV1,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV4>, String> {
+    let mut response = bound_pending_terminal_authority(
+        record,
+        attempt_id,
+        nonce,
+        request_sha256,
+        caller_process_identity,
+        caller_token_sha256,
+    )?;
+    if let Some(memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. }) = &mut response
+    {
         rejection.provider_failure = provider_projection(Some(record)).0;
         rejection.guardian_causal_receipt = guardian_causal_projection(record)?;
     }
-    Ok(Some(response))
+    Ok(response)
 }
 
 /// Exercises the same authenticated decoder against a test's own tempfile.
@@ -4362,12 +4307,12 @@ pub(crate) fn pending_owned_component_response_for_test(
     request_sha256: &str,
     caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
     caller_token_sha256: &str,
-) -> Result<Option<memcordon_core::WindowsLauncherResponseV3>, String> {
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV4>, String> {
     let bytes = read_record_bounded(path).map_err(|error| error.to_string())?;
     let record: WindowsAttemptRecordV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     authenticate(&record, attempt_id)?;
-    bound_pending_terminal_response(
+    bound_pending_terminal_authority(
         &record,
         attempt_id,
         nonce,
@@ -4414,8 +4359,7 @@ pub fn replay_unavailable_evidence(
     });
     let (provider_failure, diagnostic_availability) = provider_projection(record.as_ref());
     Ok(retained_v2(
-        memcordon_core::WindowsAttemptRetainedV1 {
-            schema_version: 2,
+        memcordon_core::WindowsRetainedMetadata {
             causal_diagnostics: record.as_ref().map_or_else(
                 memcordon_core::WindowsCausalDiagnosticsV1::default,
                 exportable_journal,
@@ -4482,7 +4426,7 @@ fn missing_retirement_proofs(
 }
 
 fn retained_v2(
-    old: memcordon_core::WindowsAttemptRetainedV1,
+    old: memcordon_core::WindowsRetainedMetadata,
     record: Option<&WindowsAttemptRecordV1>,
     unavailable_reason: memcordon_core::WindowsRetainedRecordUnavailableReasonV1,
 ) -> memcordon_core::WindowsAttemptRetainedV2 {
@@ -4528,11 +4472,11 @@ fn retained_v2(
 }
 
 fn pending_v2(
-    old: memcordon_core::WindowsReplayPendingV1,
+    old: memcordon_core::WindowsReplayMetadata,
     record: &WindowsAttemptRecordV1,
 ) -> memcordon_core::WindowsReplayPendingV2 {
     memcordon_core::WindowsReplayPendingV2 {
-        schema_version: 4,
+        schema_version: 5,
         attempt_id: old.attempt_id,
         nonce: old.nonce,
         request_sha256: old.request_sha256,
@@ -4602,8 +4546,7 @@ fn classify_replay_unstaged_evidence(
             },
         );
         return ReplayUnstagedEvidence::Retained(retained_v2(
-            memcordon_core::WindowsAttemptRetainedV1 {
-                schema_version: 2,
+            memcordon_core::WindowsRetainedMetadata {
                 causal_diagnostics: exportable_journal(record),
                 provider_failure,
                 diagnostic_availability,
@@ -4651,8 +4594,7 @@ fn classify_replay_unstaged_evidence(
         },
     );
     ReplayUnstagedEvidence::Pending(pending_v2(
-        memcordon_core::WindowsReplayPendingV1 {
-            schema_version: 3,
+        memcordon_core::WindowsReplayMetadata {
             causal_diagnostics: exportable_journal(record),
             provider_failure,
             diagnostic_availability,
@@ -4889,8 +4831,7 @@ fn retained_attempt_evidence_from_snapshot(
             && record.cleanup_state.final_handles_closed
     });
     retained_v2(
-        memcordon_core::WindowsAttemptRetainedV1 {
-            schema_version: 2,
+        memcordon_core::WindowsRetainedMetadata {
             causal_diagnostics: record.map_or_else(
                 memcordon_core::WindowsCausalDiagnosticsV1::default,
                 exportable_journal,
@@ -5147,7 +5088,7 @@ fn acknowledge_terminal_response_reserved(
 pub fn pretarget_rejection(
     code: &str,
     detail: String,
-) -> memcordon_core::WindowsProviderRejectionV2 {
+) -> memcordon_core::WindowsProviderRejectionV3 {
     pretarget_rejection_at(
         code,
         memcordon_core::BoundarySetupPhase::ProviderConnection,
@@ -5159,12 +5100,11 @@ pub fn pretarget_rejection_at(
     code: &str,
     phase: memcordon_core::BoundarySetupPhase,
     detail: String,
-) -> memcordon_core::WindowsProviderRejectionV2 {
-    memcordon_core::WindowsProviderRejectionV2 {
+) -> memcordon_core::WindowsProviderRejectionV3 {
+    memcordon_core::WindowsProviderRejectionV3 {
         provider_failure: None,
         guardian_causal_receipt: None,
-        workload_admission: None,
-        schema_version: 2,
+        schema_version: 3,
         code: code.to_owned(),
         phase,
         detail: bounded_rejection_detail(detail),
@@ -5174,7 +5114,7 @@ pub fn pretarget_rejection_at(
         target_released: false,
         cleanup_attempted: false,
         restart_safety: memcordon_core::RestartSafetyProof::default(),
-        disposition: memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization {
+        disposition: memcordon_core::WindowsProviderRejectionDispositionV3::Preauthorization {
             terminal_ack_required: false,
         },
     }
@@ -5188,7 +5128,7 @@ pub fn attempts_root() -> PathBuf {
 /// mutating an admission. Called only by the authenticated launcher owner.
 pub fn observe_live_guardian_attempt(
     expected: &WindowsProcessIdentityV1,
-) -> Result<memcordon_core::result_v1::ProviderAttemptAssociationV1, String> {
+) -> Result<memcordon_core::execution_facts::ProviderAttemptAssociationV1, String> {
     observe_live_guardian_details(expected).map(|details| details.0)
 }
 
@@ -5196,7 +5136,7 @@ pub fn observe_live_guardian_details(
     expected: &WindowsProcessIdentityV1,
 ) -> Result<
     (
-        memcordon_core::result_v1::ProviderAttemptAssociationV1,
+        memcordon_core::execution_facts::ProviderAttemptAssociationV1,
         String,
         WindowsProcessIdentityV1,
         WindowsWorkerThreadIdentityV1,
@@ -5245,7 +5185,7 @@ pub fn observe_live_guardian_details(
             return Err("live guardian association is ambiguous or not released".into());
         }
         selected = Some((
-            memcordon_core::result_v1::ProviderAttemptAssociationV1 {
+            memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
                 provider: provider.clone(),
                 attempt_id: memcordon_core::DiagnosticSha256::try_from(
                     memcordon_core::BoundedText::new(&record.attempt_id).map_err(str::to_owned)?,
@@ -5861,8 +5801,8 @@ pub(super) fn relay_retirement_event_name(record: &WindowsAttemptRecordV1) -> St
     )
 }
 
-fn decoded_v4(record: &WindowsAttemptRecordV1) -> memcordon_core::WindowsDurableAttemptRecordV4 {
-    memcordon_core::WindowsDurableAttemptRecordV4 {
+fn decoded_v4(record: &WindowsAttemptRecordV1) -> memcordon_core::WindowsDurableAttemptRecordV5 {
+    memcordon_core::WindowsDurableAttemptRecordV5 {
         schema_version: record.schema_version,
         attempt_id: record.attempt_id.clone(),
         provider_generation: record.provider_generation.clone(),
@@ -5899,8 +5839,6 @@ fn decoded_v4(record: &WindowsAttemptRecordV1) -> memcordon_core::WindowsDurable
         terminalization: record.terminalization.clone(),
         causal_diagnostics: record.causal_diagnostics.clone(),
         diagnostic_retention: record.diagnostic_retention.clone(),
-        workload_admission: record.workload_admission.clone(),
-        workload_checkpoint: record.workload_checkpoint.clone(),
         record_revision: record.record_revision,
         provider_incarnation: record.provider_incarnation.clone(),
         integrity_sha256: record.integrity_sha256.clone(),
@@ -5909,7 +5847,7 @@ fn decoded_v4(record: &WindowsAttemptRecordV1) -> memcordon_core::WindowsDurable
 
 fn authenticate(record: &WindowsAttemptRecordV1, file_attempt_id: &str) -> Result<(), String> {
     let mut decoded = decoded_v4(record);
-    memcordon_core::authenticate_decoded_windows_attempt_record_v4(
+    memcordon_core::authenticate_decoded_windows_attempt_record_v5(
         &mut decoded,
         file_attempt_id,
         &provider_generation(),

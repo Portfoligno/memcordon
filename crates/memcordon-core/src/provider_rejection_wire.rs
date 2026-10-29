@@ -59,8 +59,6 @@ pub struct RejectionCleanupV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RejectionWireV1 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workload_admission: Option<crate::workload_evidence::WorkloadAdmissionRejectionV1>,
     pub schema_version: u32,
     pub code: String,
     pub phase: RejectionPhaseV1,
@@ -76,7 +74,7 @@ impl RejectionWireV1 {
         if raw.is_empty() || raw.len() > crate::workload_limits::PUBLIC_OBJECT_BYTES {
             return Err("provider rejection raw response is absent or oversized".into());
         }
-        crate::workload_contract::reject_duplicate_json_keys(raw)?;
+        crate::canonical_json::reject_duplicate_json_keys(raw)?;
         let wire: Self = serde_json::from_slice(raw).map_err(|error| error.to_string())?;
         wire.validate()?;
         Ok(wire)
@@ -129,7 +127,6 @@ impl RejectionWireV1 {
     pub fn into_evidence(self) -> Result<ProviderRejectionEvidence, String> {
         self.validate()?;
         let evidence = ProviderRejectionEvidence {
-            workload_admission: self.workload_admission,
             provider_failure: None,
             schema_version: self.schema_version,
             code: self.code,
@@ -149,8 +146,6 @@ impl RejectionWireV1 {
                 sealed_boundary_retired: self.cleanup.sealed_boundary_retired,
                 errors: self.cleanup.errors,
             },
-            terminal_ack_required: false,
-            terminal_receipt: None,
         };
         if !evidence.is_consistent() {
             return Err("projected rejection evidence is inconsistent".into());

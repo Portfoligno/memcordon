@@ -683,16 +683,16 @@ pub fn run_private_namespace_init(
 }
 
 pub(super) struct MixedNamespacePreparation {
-    pub runtime: super::runtime_image::InstalledRuntimeImage,
-    pub input: super::runtime_image::InstalledRuntimeImage,
-    pub layout: memcordon_core::workload_registry_v3::RootLayoutDefinitionV1,
+    pub runtime: super::workload_snapshot::HeldSnapshot,
+    pub input: super::workload_snapshot::HeldSnapshot,
+    pub layout: memcordon_core::workload_request::PrivateRootLayoutV1,
     pub staging: super::private_root::NativeRootStaging,
-    pub entry: memcordon_core::workload_registry_v3::ImageEntryV1,
-    pub working_directory: memcordon_core::workload_contract_v3::RootRelativePath,
+    pub entry: memcordon_core::workload_files::ImageEntryV1,
+    pub working_directory: Option<memcordon_core::workload_files::RootRelativePath>,
     pub root_channel: std::os::unix::net::UnixStream,
     pub nonce: [u8; 16],
     pub attempt: [u8; 16],
-    pub identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
+    pub identity: super::private_root::RootOwnership,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,6 +773,10 @@ fn run_namespace_init(
                 startup.progress(Phase::WorkingDirectoryAfter);
             }
             (None, Some(preparation)) => {
+                let validation_cutoff = preparation
+                    .runtime
+                    .validation_cutoff()
+                    .min(preparation.input.validation_cutoff());
                 startup.progress(Phase::RootEnterBefore);
                 let root = super::private_root::MountedPrivateRoot::enter(
                     preparation.runtime,
@@ -786,7 +790,14 @@ fn run_namespace_init(
                 )?;
                 startup.progress(Phase::RootEnterAfter);
                 startup.progress(Phase::WorkingDirectoryBefore);
-                let directory = root.open_working_directory(&preparation.working_directory)?;
+                let directory = match &preparation.working_directory {
+                    Some(path) => root.open_working_directory(path)?,
+                    None => File::from(
+                        root.as_fd()
+                            .try_clone_to_owned()
+                            .map_err(|e| e.to_string())?,
+                    ),
+                };
                 if unsafe { libc::fchdir(directory.as_raw_fd()) } < 0 {
                     return Err(format!(
                         "private root cwd: {}",
@@ -796,14 +807,11 @@ fn run_namespace_init(
                 drop(directory);
                 startup.progress(Phase::WorkingDirectoryAfter);
                 startup.progress(Phase::EntrypointBefore);
-                target.entrypoint = root.open_entrypoint(&preparation.entry)?;
+                target.entrypoint = root.open_entrypoint(&preparation.entry, validation_cutoff)?;
                 startup.progress(Phase::EntrypointAfter);
                 startup.progress(Phase::FilterAndIdentityBefore);
-                target.mixed_root_filter = true;
-                let program = super::network_filter::select_mixed_filter(
-                    target.native_abi,
-                    target.expected_filter_digest,
-                )?;
+                let program =
+                    super::network_filter::compile_mixed_seqpacket_filter(target.native_abi);
                 let digest = super::network_filter::filter_instruction_digest(&program)
                     .map_err(str::to_owned)?;
                 if digest != target.expected_filter_digest {

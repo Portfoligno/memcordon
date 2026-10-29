@@ -2,13 +2,13 @@
 
 use libfuzzer_sys::fuzz_target;
 use memcordon_core::{
-    WindowsCertificationPhaseV1, parse_and_authenticate_windows_attempt_record,
+    WindowsCertificationPhaseV1, parse_and_authenticate_windows_attempt_record_v5,
     windows_certification_transition_allowed,
 };
 
 fuzz_target!(|data: (Vec<u8>, String, String, Vec<u8>,)| {
     let (bytes, expected_attempt_id, expected_generation, states) = data;
-    if let Ok(record) = parse_and_authenticate_windows_attempt_record(
+    if let Ok(record) = parse_and_authenticate_windows_attempt_record_v5(
         &bytes,
         &expected_attempt_id,
         &expected_generation,
@@ -17,7 +17,7 @@ fuzz_target!(|data: (Vec<u8>, String, String, Vec<u8>,)| {
         assert_eq!(record.provider_generation, expected_generation);
         let canonical = serde_json::to_vec(&record).expect("authenticated record must serialize");
         assert!(
-            parse_and_authenticate_windows_attempt_record(
+            parse_and_authenticate_windows_attempt_record_v5(
                 &canonical,
                 &record.attempt_id,
                 &record.provider_generation,

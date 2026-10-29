@@ -1,6 +1,6 @@
 use memcordon_core::{
     BoundedText, DiagnosticSha256, PublicProviderBindingV1, WindowsGuardianAttemptObservation,
-    WindowsProcessIdentityV1, result_v1::ProviderAttemptAssociationV1,
+    WindowsProcessIdentityV1, execution_facts::ProviderAttemptAssociationV1,
 };
 
 fn observation() -> WindowsGuardianAttemptObservation {
@@ -42,39 +42,39 @@ fn failure() -> memcordon_core::WindowsReadOnlyQueryFailure {
 
 #[test]
 fn authenticated_owner_query_roundtrip_keeps_public_facts_and_private_frame_bounds() {
-    use memcordon_core::{WindowsLauncherRequestV3, WindowsLauncherResponseV3};
+    use memcordon_core::{WindowsLauncherRequestV4, WindowsLauncherResponseV4};
 
     let expected = observation();
-    let request = WindowsLauncherRequestV3::ObserveGuardianAttempt {
-        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let request = WindowsLauncherRequestV4::ObserveGuardianAttempt {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         challenge: expected.challenge.clone(),
         guardian_identity: expected.guardian_identity.clone(),
     };
     let bytes = serde_json::to_vec(&request).unwrap();
     assert_eq!(
-        serde_json::from_slice::<WindowsLauncherRequestV3>(&bytes).unwrap(),
+        serde_json::from_slice::<WindowsLauncherRequestV4>(&bytes).unwrap(),
         request
     );
-    assert!(serde_json::from_slice::<memcordon_core::WindowsLauncherRequestV1>(&bytes).is_err());
+    assert!(serde_json::from_slice::<memcordon_core::WindowsLauncherRequestV4>(&bytes).is_err());
     let mut oversized = serde_json::to_value(&request).unwrap();
     fn above_bound<const N: usize>(_: &BoundedText<N>) -> String {
         "x".repeat(N + 1)
     }
     oversized["challenge"] = serde_json::json!(above_bound(&expected.challenge));
     assert!(
-        serde_json::from_slice::<WindowsLauncherRequestV3>(
+        serde_json::from_slice::<WindowsLauncherRequestV4>(
             &serde_json::to_vec(&oversized).unwrap()
         )
         .is_err()
     );
-    let response = WindowsLauncherResponseV3::GuardianAttemptObservation(expected.clone());
+    let response = WindowsLauncherResponseV4::GuardianAttemptObservation(expected.clone());
     let bytes = serde_json::to_vec(&response).unwrap();
     assert_eq!(
         memcordon_core::windows_launcher_response_frame_limit(&bytes).unwrap(),
         WindowsGuardianAttemptObservation::MAX_FRAME_BYTES
     );
     let bound = WindowsGuardianAttemptObservation::from_launcher_query_response(
-        serde_json::from_slice(&bytes).unwrap(),
+        serde_json::from_slice::<WindowsLauncherResponseV4>(&bytes).unwrap(),
         expected.challenge.as_str(),
         &expected.association.provider,
         &expected.guardian_identity,
@@ -95,16 +95,16 @@ fn authenticated_owner_query_roundtrip_keeps_public_facts_and_private_frame_boun
 
 #[test]
 fn owner_reply_rejects_substituted_challenge_provider_and_both_guardian_identity_fields() {
-    use memcordon_core::WindowsLauncherResponseV3;
+    use memcordon_core::WindowsLauncherResponseV4;
 
     let expected = observation();
     let validate = |value| {
-        let bytes = serde_json::to_vec(&WindowsLauncherResponseV3::GuardianAttemptObservation(
+        let bytes = serde_json::to_vec(&WindowsLauncherResponseV4::GuardianAttemptObservation(
             value,
         ))
         .unwrap();
         WindowsGuardianAttemptObservation::from_launcher_query_response(
-            serde_json::from_slice(&bytes).unwrap(),
+            serde_json::from_slice::<WindowsLauncherResponseV4>(&bytes).unwrap(),
             expected.challenge.as_str(),
             &expected.association.provider,
             &expected.guardian_identity,
@@ -130,11 +130,11 @@ fn owner_reply_rejects_substituted_challenge_provider_and_both_guardian_identity
 
 #[test]
 fn private_owner_failure_never_becomes_observation_or_exposes_unbound_native_detail() {
-    use memcordon_core::{WindowsLauncherResponseV3, WindowsReadOnlyQueryFailure};
+    use memcordon_core::{WindowsLauncherResponseV4, WindowsReadOnlyQueryFailure};
 
     let expected = observation();
     let value = failure();
-    let bytes = serde_json::to_vec(&WindowsLauncherResponseV3::ReadOnlyQueryFailure(
+    let bytes = serde_json::to_vec(&WindowsLauncherResponseV4::ReadOnlyQueryFailure(
         value.clone(),
     ))
     .unwrap();
@@ -165,12 +165,12 @@ fn private_owner_failure_never_becomes_observation_or_exposes_unbound_native_det
             }
             _ => unreachable!(),
         }
-        let error = validate(WindowsLauncherResponseV3::ReadOnlyQueryFailure(altered)).unwrap_err();
+        let error = validate(WindowsLauncherResponseV4::ReadOnlyQueryFailure(altered)).unwrap_err();
         assert!(!error.contains(value.detail.as_str()), "{field}");
     }
     assert!(
-        validate(WindowsLauncherResponseV3::Membership {
-            schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        validate(WindowsLauncherResponseV4::Membership {
+            schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
             attempt_id: "unrelated".into(),
             nonce: "unrelated".into(),
             request_sha256: "unrelated".into(),
@@ -268,7 +268,7 @@ fn failed_query_wire_requires_exact_operation_challenge_provider_and_finite_shap
 #[test]
 fn recovery_failure_has_ordinary_kind_framing_and_bounded_explicit_truncation() {
     use memcordon_core::{
-        WindowsProviderResponseV3, WindowsReadOnlyQueryFailure,
+        WindowsProviderResponseV4, WindowsReadOnlyQueryFailure,
         WindowsReadOnlyQueryOperation as Operation, WindowsReadOnlyQueryPhase as Phase,
     };
     let expected = observation();
@@ -284,14 +284,14 @@ fn recovery_failure_has_ordinary_kind_framing_and_bounded_explicit_truncation() 
     assert!(value.detail_truncated);
     assert!(detail.starts_with(value.detail.as_str()));
     let payload =
-        serde_json::to_vec(&WindowsProviderResponseV3::ReadOnlyQueryFailure(value)).unwrap();
+        serde_json::to_vec(&WindowsProviderResponseV4::ReadOnlyQueryFailure(value)).unwrap();
     assert!(payload.len() < WindowsReadOnlyQueryFailure::MAX_FRAME_BYTES);
     assert_eq!(
         memcordon_core::windows_response_frame_limit(&payload).unwrap(),
         WindowsReadOnlyQueryFailure::MAX_FRAME_BYTES
     );
-    let decoded: WindowsProviderResponseV3 = serde_json::from_slice(&payload).unwrap();
-    let WindowsProviderResponseV3::ReadOnlyQueryFailure(value) = decoded else {
+    let decoded: WindowsProviderResponseV4 = serde_json::from_slice(&payload).unwrap();
+    let WindowsProviderResponseV4::ReadOnlyQueryFailure(value) = decoded else {
         panic!("failure changed kind")
     };
     let error = value

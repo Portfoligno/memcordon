@@ -38,6 +38,12 @@ pub fn error_exit_code(error: &Error) -> i32 {
         || error.workload_may_be_alive
     {
         125
+    } else if let Some(cancellation) = &error.windows_preallocation_cancellation {
+        if cancellation.validate().is_ok() && !error.target_released && error.target_pid.is_none() {
+            cancellation.exit_code()
+        } else {
+            125
+        }
     } else if error.code == "MCINTERRUPT-SPAWN-GATE" {
         error.os_code.map_or(125, |signal| 128 + signal)
     } else if error.code == "MCSPAWN-NOT-FOUND" {

@@ -72,6 +72,7 @@ pub enum Case {
     EndpointMismatch,
     Toolchain,
     EmptyStreams,
+    EmptyInput,
     BinaryStreams,
     BinaryFiles,
     NativeArgv,

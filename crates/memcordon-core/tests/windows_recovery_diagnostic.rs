@@ -1,4 +1,4 @@
-use memcordon_core::{WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsProviderResponseV3};
+use memcordon_core::{WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION, WindowsProviderResponseV4};
 
 #[test]
 fn unavailable_recovery_preserves_context_without_terminal_authority() {
@@ -6,11 +6,11 @@ fn unavailable_recovery_preserves_context_without_terminal_authority() {
     let challenge = "fresh-recovery-challenge";
     let native = "launcher response read failed: native pipe error 233";
     let response =
-        WindowsProviderResponseV3::recovery_attempt_unavailable(&attempt, challenge, native, true)
+        WindowsProviderResponseV4::recovery_attempt_unavailable(&attempt, challenge, native, true)
             .unwrap();
     let bytes = serde_json::to_vec(&response).unwrap();
-    let decoded: WindowsProviderResponseV3 = serde_json::from_slice(&bytes).unwrap();
-    let WindowsProviderResponseV3::RecoveryAttemptUnavailable {
+    let decoded: WindowsProviderResponseV4 = serde_json::from_slice(&bytes).unwrap();
+    let WindowsProviderResponseV4::RecoveryAttemptUnavailable {
         schema_version,
         attempt_id,
         challenge: returned_challenge,
@@ -19,7 +19,7 @@ fn unavailable_recovery_preserves_context_without_terminal_authority() {
     else {
         panic!("preparation failure must remain unavailable");
     };
-    assert_eq!(schema_version, WINDOWS_PUBLIC_PROTOCOL_VERSION);
+    assert_eq!(schema_version, WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION);
     assert_eq!(attempt_id, attempt);
     assert_eq!(returned_challenge, challenge);
     assert_eq!(detail, native);
@@ -37,14 +37,14 @@ fn unavailable_recovery_preserves_context_without_terminal_authority() {
 
 #[test]
 fn unelevated_recovery_never_discloses_native_preparation_detail() {
-    let response = WindowsProviderResponseV3::recovery_attempt_unavailable(
+    let response = WindowsProviderResponseV4::recovery_attempt_unavailable(
         &"cd".repeat(32),
         "original-challenge",
         "private-other-attempt-owner-path: native error 5",
         false,
     )
     .unwrap();
-    let WindowsProviderResponseV3::RecoveryAttemptUnavailable { detail, .. } = response else {
+    let WindowsProviderResponseV4::RecoveryAttemptUnavailable { detail, .. } = response else {
         panic!("unavailable must not become terminal authority");
     };
     assert_eq!(detail, "recovery preparation unavailable");
@@ -57,19 +57,19 @@ fn unavailable_recovery_bounds_utf8_detail_and_rejects_invalid_context() {
     let challenge = "bound-challenge";
     let long = "λ".repeat(900);
     let response =
-        WindowsProviderResponseV3::recovery_attempt_unavailable(&attempt, challenge, &long, true)
+        WindowsProviderResponseV4::recovery_attempt_unavailable(&attempt, challenge, &long, true)
             .unwrap();
-    let WindowsProviderResponseV3::RecoveryAttemptUnavailable { detail, .. } = &response else {
+    let WindowsProviderResponseV4::RecoveryAttemptUnavailable { detail, .. } = &response else {
         panic!("bounded detail must remain unavailable");
     };
     assert!(detail.len() <= 1024);
     assert!(detail.starts_with('λ'));
     assert!(detail.contains("truncated"));
-    let roundtrip: WindowsProviderResponseV3 =
+    let roundtrip: WindowsProviderResponseV4 =
         serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
     assert!(matches!(
         roundtrip,
-        WindowsProviderResponseV3::RecoveryAttemptUnavailable { .. }
+        WindowsProviderResponseV4::RecoveryAttemptUnavailable { .. }
     ));
     for (invalid_attempt, invalid_challenge) in [
         (String::new(), challenge.into()),
@@ -78,7 +78,7 @@ fn unavailable_recovery_bounds_utf8_detail_and_rejects_invalid_context() {
         (attempt.clone(), "c".repeat(129)),
     ] {
         assert!(
-            WindowsProviderResponseV3::recovery_attempt_unavailable(
+            WindowsProviderResponseV4::recovery_attempt_unavailable(
                 &invalid_attempt,
                 &invalid_challenge,
                 "native failure",
@@ -88,7 +88,7 @@ fn unavailable_recovery_bounds_utf8_detail_and_rejects_invalid_context() {
         );
     }
     assert!(
-        WindowsProviderResponseV3::recovery_attempt_unavailable(&attempt, challenge, "", true,)
+        WindowsProviderResponseV4::recovery_attempt_unavailable(&attempt, challenge, "", true,)
             .is_err()
     );
 }

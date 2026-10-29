@@ -64,7 +64,8 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
     };
     use memcordon_ci::windows_causal_acceptance::InstalledChannel;
     use memcordon_ci::windows_installed_cases::{InstalledWindowsPayload, SelectedArtifact};
-    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+    use memcordon_core::runtime_components::RuntimeComponentRole;
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
 
     let directory = tempfile::tempdir().unwrap();
     let source = SelectedSource {
@@ -105,7 +106,7 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
             role, name, &pe,
         ));
     }
-    let manifest = RuntimeManifest::windows(
+    let manifest = RuntimeManifestV2::windows(
         source.version.to_string(),
         source.commit.clone(),
         distribution.target.clone(),
@@ -444,13 +445,13 @@ fn report_from_another_invocation_cannot_replace_independently_observed_live_ass
             process_id: 42,
             creation_time_100ns: 1234,
         },
-        association: memcordon_core::result_v1::ProviderAttemptAssociationV1 {
+        association: memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
             provider: provider(),
             attempt_id: DiagnosticSha256::from_bytes([2; 32]),
             request_sha256: DiagnosticSha256::from_bytes([3; 32]),
         },
     };
-    let validate = |reported: &memcordon_core::result_v1::ProviderAttemptAssociationV1| {
+    let validate = |reported: &memcordon_core::execution_facts::ProviderAttemptAssociationV1| {
         memcordon_ci::windows_causal_acceptance::validate_live_guardian_association(
             reported,
             &observed,

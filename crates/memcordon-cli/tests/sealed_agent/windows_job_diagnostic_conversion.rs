@@ -104,7 +104,7 @@ fn job_observation_mapping_covers_emitted_operations() {
         (
             Operation::VerifySuspendedTarget,
             Category::Launch,
-            Code::PolicyReadback,
+            Code::JobConfigurationReadback,
             "MCSEALED-WINDOWS-JOB-QUERY",
         ),
         (
@@ -208,7 +208,7 @@ fn job_string_conversion_preserves_semantics() {
         (
             Operation::VerifySuspendedTarget,
             Category::Launch,
-            Code::PolicyReadback,
+            Code::JobConfigurationReadback,
             Phase::ResumeAttempted,
         ),
         (

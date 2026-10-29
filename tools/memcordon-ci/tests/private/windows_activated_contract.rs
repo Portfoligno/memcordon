@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn activated_contract_selection_is_absolute_exclusive_and_shared_by_both_frontends() {
+fn workload_request_selection_is_absolute_exclusive_and_shared_by_both_frontends() {
     let cwd = std::env::current_dir().unwrap();
     let owned = tempfile::tempdir_in(&cwd).unwrap();
     let relative = owned.path().strip_prefix(&cwd).unwrap();
@@ -12,18 +12,18 @@ fn activated_contract_selection_is_absolute_exclusive_and_shared_by_both_fronten
     };
     // This helper preserves serialized bytes; contract validation belongs to
     // the activation caller, not to this path-selection regression.
-    let bytes = b"original activated contract bytes\n";
-    let selected = write_activated_contract(relative, &key, bytes).unwrap();
+    let bytes = b"original caller request bytes\n";
+    let selected = write_workload_request(relative, &key, bytes).unwrap();
     assert!(selected.is_absolute());
     assert_eq!(
         selected,
         cwd.join(relative)
             .join("W-ENVELOPE")
             .join("restricted")
-            .join("requested-contract.json")
+            .join("workload-request.json")
     );
     assert_eq!(std::fs::read(&selected).unwrap(), bytes);
-    assert!(write_activated_contract(relative, &key, b"replacement").is_err());
+    assert!(write_workload_request(relative, &key, b"replacement").is_err());
     assert_eq!(std::fs::read(&selected).unwrap(), bytes);
     let root = owned.path().to_path_buf();
     let descriptor = descriptor::Descriptor {
@@ -53,7 +53,7 @@ fn activated_contract_selection_is_absolute_exclusive_and_shared_by_both_fronten
         key,
         descriptor,
         descriptor_path: root.join("input.json"),
-        workload_contract: selected.clone(),
+        workload_request: selected.clone(),
         expected_token: TokenObservation {
             user_sid: vec![1],
             restricted: true,
@@ -106,12 +106,12 @@ fn activated_contract_selection_is_absolute_exclusive_and_shared_by_both_fronten
     for args in [&original_args, &diagnostic_args] {
         let contract = args
             .iter()
-            .position(|arg| arg == "--workload-contract")
+            .position(|arg| arg == "--workload-request")
             .unwrap();
         assert_eq!(args[contract + 1], selected.as_os_str());
         assert_eq!(args[1], "system-restricted-frontend");
     }
-    case.workload_contract = relative.join("contract.json");
+    case.workload_request = relative.join("contract.json");
     assert!(
         installed_support_loader_command(
             &cli,
@@ -124,7 +124,7 @@ fn activated_contract_selection_is_absolute_exclusive_and_shared_by_both_fronten
         )
         .is_err()
     );
-    case.workload_contract = selected;
+    case.workload_request = selected;
     case.descriptor_path = relative.join("input.json");
     assert!(
         installed_support_loader_command(

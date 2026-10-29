@@ -12,7 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::request::{NamespaceIdentity, NativePrivateLaunchInput};
+use crate::request::NamespaceIdentity;
 
 use super::descriptor_custody::{
     ExpectedGatedDescriptorInventory, GatedDescriptorProof, TargetPipeStdio,
@@ -20,7 +20,7 @@ use super::descriptor_custody::{
 };
 use super::entrypoint::VerifiedEntrypoint;
 use super::execution_identity::{ResolvedTargetIdentity, apply_target_identity};
-use super::network_filter::{NativeAbi, install_gated_private_filter};
+use super::network_filter::{NativeAbi, install_gated_mixed_filter};
 use super::network_profile::{PrivateNetworkSetup, prepare_private_ipv4_network};
 
 const CONTROL_VERSION: u8 = 2;
@@ -411,9 +411,6 @@ pub struct PrivateExecArguments {
 }
 
 impl PrivateExecArguments {
-    pub fn from_request(request: &NativePrivateLaunchInput) -> Result<Self, String> {
-        Self::from_native_launch(&request.launch)
-    }
     pub(super) fn from_native_launch(
         launch: &crate::request::LaunchRequestV2,
     ) -> Result<Self, String> {
@@ -466,7 +463,6 @@ pub struct PrivateGatedTarget {
     pub command: PrivateExecArguments,
     pub native_abi: NativeAbi,
     pub expected_filter_digest: [u8; 32],
-    pub mixed_root_filter: bool,
 }
 
 impl PrivateGatedTarget {
@@ -506,12 +502,8 @@ impl PrivateGatedTarget {
         if let Err(error) = apply_target_identity(&self.identity) {
             fail(&mut control, FAILURE_IDENTITY, &error);
         }
-        let install = if self.mixed_root_filter {
-            super::network_filter::install_gated_mixed_filter
-        } else {
-            install_gated_private_filter
-        };
-        let filter = match install(self.native_abi, self.expected_filter_digest) {
+        let filter = match install_gated_mixed_filter(self.native_abi, self.expected_filter_digest)
+        {
             Ok(filter) => filter,
             Err(error) => fail(&mut control, FAILURE_FILTER, &error),
         };

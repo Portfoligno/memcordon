@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use memcordon_ci::release::linux_recovery_diagnostic::{contract::*, failure, receipt};
 
 #[test]

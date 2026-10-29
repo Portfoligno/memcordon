@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use memcordon_readiness_verifier::{PROFILE, VerificationScope, validate_manifest, verify_scoped};
+use memcordon_readiness_verifier::{
+    VerificationScope,
+    current::{PROFILE, validate_manifest},
+};
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -77,7 +80,8 @@ fn execute(cli: Cli) -> Result<bool, String> {
             if !metadata.is_file() || metadata.len() > 1024 * 1024 {
                 return Err("manifest is not a bounded ordinary file".into());
             }
-            let cases = validate_manifest(&std::fs::read(&manifest).map_err(|e| e.to_string())?)?;
+            let bytes = std::fs::read(&manifest).map_err(|e| e.to_string())?;
+            let cases = validate_manifest(&bytes)?;
             println!("{PROFILE}: {} required evidence rows", cases.len());
             Ok(true)
         }
@@ -104,13 +108,41 @@ fn execute(cli: Cli) -> Result<bool, String> {
                         .to_path_buf()
                 }
             });
-            let result = verify_scoped(&manifest, &index, &root, scope);
+            let metadata = std::fs::symlink_metadata(&manifest).map_err(|e| e.to_string())?;
+            if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+                return Err("manifest is not a bounded ordinary file".into());
+            }
+            let result = {
+                use memcordon_readiness_verifier::current::{assessment, linux, windows};
+                assessment::verify_scoped(
+                    &manifest,
+                    &index,
+                    &root,
+                    scope,
+                    &|evidence, input, product, build, version, repository, resolver| {
+                        if evidence.key.target.ends_with("-unknown-linux-gnu") {
+                            linux::verify_case(evidence, input, product, build, version, resolver)
+                        } else {
+                            windows::verify_case(
+                                evidence, input, product, build, version, repository, resolver,
+                            )
+                        }
+                    },
+                    &|product, resolver| {
+                        if product.key.target.ends_with("-unknown-linux-gnu") {
+                            linux::verify_lifecycle(product, resolver)
+                        } else {
+                            windows::verify_lifecycle(product, resolver)
+                        }
+                    },
+                )
+            };
             let accepted = result.as_ref().is_ok_and(|verdict| verdict.accepted);
             let bytes = match &result {
                 Ok(verdict) => serde_json::to_vec_pretty(verdict).map_err(|e| e.to_string())?,
                 Err(error) => serde_json::to_vec_pretty(&InvalidEvidence {
                     format: "memcordon.consumer-readiness.invalid-evidence",
-                    revision: 1,
+                    revision: 2,
                     profile: PROFILE,
                     scope,
                     profile_ready: false,

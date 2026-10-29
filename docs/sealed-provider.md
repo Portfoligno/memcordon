@@ -60,11 +60,10 @@ download or compile a component.
 Linux mechanism v2 uses the fixed public local socket `/run/memcordon/sealed-agent.sock` and the root-only private broker socket `/run/memcordon/sealed-launcher.sock`. The hardened `memcordon-sealed-agent.service` control plane owns the public socket, runs with `NoNewPrivileges=yes`, authenticates the peer, captures its execution envelope, rejects callers already inside an active attempt, and never executes caller code. The minimally scoped `memcordon-sealed-launcher.service` accepts only the authenticated control service, runs with `NoNewPrivileges=no`, and creates the target from the caller's mount and privilege-transition context. A packaged tmpfiles declaration recreates `/run/memcordon` as mode `0750` `root:memcordon` before either socket activates, so reboot cannot replace the traversable public endpoint parent with a root-only directory.
 
 The optional network launcher units are selected with the Linux private-tcp
-feature. Installed files alone do not grant a workload. The authenticated launcher
-independently captures the caller, resolves the current protected local grant and
-epoch, pins the approved ELF and reserves the exact target account before creating
-its private boundary. Discovery reports actual package, service and local profile
-state as advisory data.
+feature. The authenticated launcher captures the caller, verifies the fixed locked
+package account and receives fresh caller-readable snapshot bytes. It pins the
+immutable executable and loader objects in a new private root before release.
+Discovery reports actual package, service and profile state as advisory data.
 
 Windows uses the restricted LocalService control service and restricted
 LocalSystem launcher, with authenticated local pipes. Installation provisions eight
@@ -77,7 +76,7 @@ verifies installed component bytes, authenticated server identity and current
 native readiness. Caller identity and native state come from authenticated kernel
 objects; saved self-test output never grants launch permission.
 
-Linux messages use the bounded binary [provider protocol v2](../spec/sealed-provider-protocol-v2.md); Windows messages use the bounded [Windows provider protocol v1](../spec/sealed-windows-provider-v1.md). Unknown versions, kinds, oversized lengths, replayed launch identities, transferred-handle mismatches, and caller-envelope mismatches are rejected before target authorization. Post-launch Windows frames bind the attempt id, nonce, and request digest. The public launch payload remains mechanism-free. Programs and arguments remain separate native values and are never represented as shell commands.
+Linux messages use the bounded binary [current Linux transport](../spec/sealed-linux-transport.md); Windows messages use the bounded [current Windows protocol](../spec/sealed-windows-current-token-v1.md). Unknown versions, kinds, oversized lengths, replayed launch identities, transferred-handle mismatches, and caller-envelope mismatches are rejected before target release. Post-launch Windows frames bind the attempt id, nonce, and request digest. Programs and arguments remain separate native values and are never represented as shell commands.
 
 ## Attempts and recovery
 

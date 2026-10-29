@@ -4,10 +4,9 @@ use super::{
     installed_consumer::{MaterializedPayload, binary_path},
     source,
 };
-use crate::{CiError, Result, command::CommandSpec, consumer_readiness_ledger::SourceIdentity};
+use crate::{CiError, Result, command::CommandSpec, readiness_identity::SourceIdentity};
 use memcordon_readiness_verifier::{
-    Artifact, Component, HostObservation, InstalledLifecycleJournal, InstalledLifecycleReceipt,
-    LifecycleObservation, ProductKey, ProductObservation, RegistryGraph,
+    Artifact, Component, HostObservation, InstalledLifecycleJournal, ProductKey, RegistryGraph,
 };
 use std::{
     fs,
@@ -32,27 +31,37 @@ fn retain(source: &Path, destination: &Path) -> Result<()> {
     file.sync_all()?;
     Ok(())
 }
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "Selected product evidence binds identity, payload generations, and independent custody roots"
+    reason = "Actual selected bytes and native lease evidence have independent custody roots"
 )]
-pub fn collect(
+pub fn collect_current(
     identity: &SourceIdentity,
     key: &ProductKey,
     payload: &MaterializedPayload,
-    predecessor: &MaterializedPayload,
     root: &Path,
     cell_root: &Path,
     artifact_root: &Path,
     target: &Path,
     packages: &Path,
     deadline: Instant,
-) -> Result<(ProductObservation, Vec<Artifact>)> {
+) -> Result<(
+    memcordon_readiness_verifier::current::ProductObservationV2,
+    Vec<Artifact>,
+)> {
+    use memcordon_readiness_verifier::current::{
+        InstalledLifecycleReceiptV2, LifecycleObservationV2, ProductObservationV2, WireVersion,
+    };
     let journal_path = cell_root.join("lifetime/installed-journal.json");
     let receipt_path = cell_root.join("lifetime/installed-retirement.json");
     let journal: InstalledLifecycleJournal = source::read_json(&journal_path)?;
-    let receipt: InstalledLifecycleReceipt = source::read_json(&receipt_path)?;
-    if journal.run_id != identity.run_id
+    let receipt: InstalledLifecycleReceiptV2 = source::read_json(&receipt_path)?;
+    memcordon_readiness_verifier::current::validate_native_inventory(&key.target, &receipt.native)
+        .map_err(CiError::Message)?;
+    if receipt.format != "memcordon.installed-lifecycle.receipt"
+        || receipt.revision != 2
+        || journal.run_id != identity.run_id
         || journal.key != *key
         || receipt.run_id != identity.run_id
         || receipt.key != *key
@@ -60,11 +69,21 @@ pub fn collect(
         || receipt.journal_sha256 != artifacts::checksum(&artifacts::read_file(&journal_path)?)
     {
         return Err(CiError::Message(
-            "actual outer installed receipt association differs".into(),
+            "current native lifecycle receipt binding differs".into(),
         ));
     }
     let destination = cell_root.join("selected-product");
     fs::create_dir(&destination)?;
+    let readback = journal
+        .events
+        .iter()
+        .rfind(|event| {
+            event.operation == "actual-installed-package-readback"
+                && event.phase == "upgrade"
+                && event.succeeded
+        })
+        .ok_or_else(|| CiError::Message("current installed upgrade byte readback absent".into()))?;
+    let raw: serde_json::Value = source::read_json(&artifact_root.join(&readback.native_receipt))?;
     let mut components = Vec::new();
     for binary in &payload.distribution.binaries {
         let role = match binary.as_str() {
@@ -72,30 +91,11 @@ pub fn collect(
             "memcordon-sealed-agent" => "sealed-agent",
             "memcordon-target-desktop-bootstrap" => "desktop-bootstrap",
             "memcordon-session-broker" => "session-broker",
-            _ => {
-                return Err(CiError::Message(
-                    "unknown selected operational component".into(),
-                ));
-            }
+            _ => return Err(CiError::Message("unknown current product component".into())),
         };
-        let selected = binary_path(&payload.directory, binary, &key.target);
         let copy = destination.join(super::target::binary_name(binary, &key.target));
-        retain(&selected, &copy)?;
+        retain(&binary_path(&payload.directory, binary, &key.target), &copy)?;
         let hash = artifacts::checksum(&artifacts::read_file(&copy)?);
-        // The outer verify/upgrade phase retained its actual installed-byte
-        // readback. Preserve that raw receipt rather than taking another sample
-        // after the one uninstall has already completed.
-        let readback = journal
-            .events
-            .iter()
-            .rfind(|event| {
-                event.operation == "actual-installed-package-readback"
-                    && event.phase == "upgrade"
-                    && event.succeeded
-            })
-            .ok_or_else(|| CiError::Message("selected upgrade native readback absent".into()))?;
-        let raw: serde_json::Value =
-            source::read_json(&artifact_root.join(&readback.native_receipt))?;
         if !raw["binaries"].as_array().is_some_and(|records| {
             records.iter().any(|record| {
                 record["binary"].as_str() == Some(binary)
@@ -103,7 +103,7 @@ pub fn collect(
             })
         }) {
             return Err(CiError::Message(
-                "selected component differs from actual installed upgrade readback".into(),
+                "current installed component byte association differs".into(),
             ));
         }
         components.push(Component {
@@ -114,145 +114,153 @@ pub fn collect(
     }
     let runtime = destination.join("runtime-manifest.json");
     retain(&payload.directory.join("runtime-manifest.json"), &runtime)?;
-    let (bundle, _) = super::target::TargetBundle::load(target)?;
+    let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(
+        &artifacts::read_file(&runtime)?,
+    )
+    .map_err(CiError::Message)?;
     let package = if key.channel.ends_with("native") {
-        target.join(&bundle.archive.name)
+        let (bundle, _) = super::target::TargetBundle::load(target)?;
+        target.join(bundle.archive.name)
     } else {
         let (bundle, _) = super::packages::PackageBundle::load(packages)?;
-        let selected = bundle
-            .files
-            .iter()
-            .find(|file| file.package.as_deref() == Some("memcordon"))
-            .ok_or_else(|| CiError::Message("selected final CLI crate absent".into()))?;
-        packages.join(&selected.name)
+        packages.join(
+            &bundle
+                .files
+                .iter()
+                .find(|file| file.package.as_deref() == Some("memcordon"))
+                .ok_or_else(|| CiError::Message("current selected CLI crate absent".into()))?
+                .name,
+        )
     };
     let materialization = destination.join(
         package
             .file_name()
-            .ok_or_else(|| CiError::Message("selected materialization filename absent".into()))?,
+            .ok_or_else(|| CiError::Message("selected package filename absent".into()))?,
     );
     retain(&package, &materialization)?;
     let graph = if key.channel.ends_with("cargo") {
-        let graph_path = cell_root.join(if key.channel.starts_with("public-") {
+        let path = cell_root.join(if key.channel.starts_with("public-") {
             "public-cargo/registry-graph.json"
         } else {
             "candidate-cargo-lineage/registry-graph.json"
         });
-        let mut graph: RegistryGraph = source::read_json(&graph_path)?;
-        if key.channel.starts_with("public-") {
-            let parent = graph_path.parent().expect("graph parent");
+        let mut graph: RegistryGraph = source::read_json(&path)?;
+        let path = if key.channel.starts_with("public-") {
+            let parent = path
+                .parent()
+                .ok_or_else(|| CiError::Message("current registry graph parent absent".into()))?;
             graph.raw_metadata = relative(artifact_root, &parent.join(&graph.raw_metadata))?;
             graph.raw_lock = relative(artifact_root, &parent.join(&graph.raw_lock))?;
             for package in &mut graph.packages {
                 package.crate_artifact =
                     relative(artifact_root, &parent.join(&package.crate_artifact))?;
             }
-            source::write_json(&graph_path, &graph)?;
-        }
+            let projected = destination.join("registry-graph.json");
+            source::write_json(&projected, &graph)?;
+            projected
+        } else {
+            path
+        };
         Some((
-            relative(artifact_root, &graph_path)?,
-            artifacts::checksum(&artifacts::read_file(&graph_path)?),
+            relative(artifact_root, &path)?,
+            artifacts::checksum(&artifacts::read_file(&path)?),
         ))
     } else {
         None
     };
-    let host = native_host(root, &key.target, deadline)?;
-    let predecessor_name = format!("memcordon-{}.crate", predecessor.source.version());
-    let predecessor_archive = predecessor
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.path.file_name() == Some(std::ffi::OsStr::new(&predecessor_name)))
-        .ok_or_else(|| {
-            CiError::Message("actual predecessor CLI archive measurement absent".into())
-        })?;
-    if artifacts::checksum(&artifacts::read_file(&predecessor_archive.path)?)
-        != predecessor_archive.sha256
-    {
-        return Err(CiError::Message(
-            "actual predecessor CLI archive changed".into(),
-        ));
-    }
-    let lifecycle = LifecycleObservation {
+    let lifecycle = LifecycleObservationV2 {
         lease_id: journal.lease_id.clone(),
         journal: relative(artifact_root, &journal_path)?,
         receipt: relative(artifact_root, &receipt_path)?,
         journal_before_mutation: journal
             .events
             .first()
-            .is_some_and(|event| event.phase == "owned-before-mutation" && event.succeeded),
+            .is_some_and(|e| e.phase == "owned-before-mutation" && e.succeeded),
         installed_verified: journal
             .events
             .iter()
-            .any(|event| event.phase == "verify" && event.succeeded),
+            .any(|e| e.phase == "verify" && e.succeeded),
         all_cases_inside_lease: journal
             .events
             .iter()
-            .any(|event| event.phase == "cases" && event.succeeded),
+            .any(|e| e.phase == "cases" && e.succeeded),
         explicit_finalization: receipt.explicit_finalization_count == 1,
         finalization_records: receipt.explicit_finalization_count,
         package_absent: receipt.package_absent,
-        policy_retired: receipt.policy_retired,
-        native_resources_retired: receipt.native_resources_retired,
+        native: receipt.native,
         cleanup_failures: receipt.cleanup_failures,
         outstanding: receipt.outstanding,
-        predecessor_version: predecessor.source.version().to_string(),
-        predecessor_package_sha256: predecessor_archive.sha256.clone(),
     };
-    let (request_revision, result_revision, runtime_profile) =
-        if key.target.ends_with("-pc-windows-msvc") {
-            (1, 1, "windows-host-network-external-v1")
-        } else {
-            (3, 2, "linux-tcp4-unix-private-v2")
-        };
-    let product = ProductObservation {
+    let product = ProductObservationV2 {
         key: key.clone(),
         source_commit: identity.source_commit.clone(),
         source_tree_sha256: identity.source_tree_sha256.clone(),
         version: identity.version.clone(),
-        host,
+        host: native_host(root, &key.target, deadline)?,
         features: payload.distribution.features.clone(),
         components,
         materialization: relative(artifact_root, &materialization)?,
         runtime_manifest: relative(artifact_root, &runtime)?,
         package_sha256: artifacts::checksum(&artifacts::read_file(&materialization)?),
-        registry_graph: graph.as_ref().map(|graph| graph.0.clone()),
-        registry_graph_sha256: graph.map(|graph| graph.1),
-        request_revision,
-        result_revision,
-        runtime_profile: runtime_profile.into(),
+        registry_graph: graph.as_ref().map(|g| g.0.clone()),
+        registry_graph_sha256: graph.map(|g| g.1),
+        request: WireVersion {
+            format: "memcordon.workload-request".into(),
+            revision: 1,
+        },
+        result: WireVersion {
+            format: "memcordon.result".into(),
+            revision: 3,
+        },
+        native_protocols: match &manifest.sealed {
+            memcordon_core::runtime_manifest_v2::SealedRuntimeV2::Included {
+                native_protocols,
+                ..
+            } => serde_json::from_value(serde_json::to_value(native_protocols)?)?,
+            _ => {
+                return Err(CiError::Message(
+                    "current readiness native protocol table absent".into(),
+                ));
+            }
+        },
+        runtime_profile: match manifest.sealed {
+            memcordon_core::runtime_manifest_v2::SealedRuntimeV2::Included { profile, .. } => {
+                profile
+            }
+            _ => {
+                return Err(CiError::Message(
+                    "current readiness requires an included request runtime".into(),
+                ));
+            }
+        },
         lifecycle,
     };
     let mut retained = Vec::new();
     let mut pending = vec![cell_root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.path() == cell_root.join("cell-owner.json") {
+            let path = entry?.path();
+            if path == cell_root.join("cell-owner.json") {
                 continue;
             }
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if metadata.file_type().is_symlink() {
-                return Err(CiError::Message(
-                    "cell artifact tree contains symlink".into(),
-                ));
-            }
+            let metadata = fs::symlink_metadata(&path)?;
             if metadata.is_dir() {
-                pending.push(entry.path());
+                pending.push(path);
             } else if metadata.is_file() {
-                let bytes = artifacts::read_file(&entry.path())?;
+                let bytes = artifacts::read_file(&path)?;
                 retained.push(Artifact {
-                    path: relative(artifact_root, &entry.path())?,
+                    path: relative(artifact_root, &path)?,
                     length: bytes.len() as u64,
                     sha256: artifacts::checksum(&bytes),
                 });
             } else {
                 return Err(CiError::Message(
-                    "cell artifact tree contains special file".into(),
+                    "current cell artifact is not a regular file or directory".into(),
                 ));
             }
             if retained.len() + pending.len() > 65536 {
                 return Err(CiError::Message(
-                    "cell artifact inventory exceeds finite bound".into(),
+                    "current cell artifact inventory exceeds bound".into(),
                 ));
             }
         }

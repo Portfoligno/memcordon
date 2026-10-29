@@ -184,17 +184,6 @@ const ARM64: &[u32] = &[
 ];
 
 pub fn frozen_linux_filter_program(abi: &str) -> VerificationResult<Vec<Instruction>> {
-    frozen_linux_filter_program_for_profile(abi, "linux-tcp4-unix-private-v1")
-}
-pub fn frozen_linux_filter_program_for_profile(
-    abi: &str,
-    profile: &str,
-) -> VerificationResult<Vec<Instruction>> {
-    let seqpacket_pair = match profile {
-        "linux-tcp4-unix-private-v1" => false,
-        "linux-tcp4-unix-private-v2" => true,
-        _ => return Err("unknown mixed filter profile".into()),
-    };
     let (arch, numbers, catalogue, rights) = match abi {
         "x86_64" => (
             0xc000003e,
@@ -249,7 +238,7 @@ pub fn frozen_linux_filter_program_for_profile(
     if abi == "x86_64" {
         dispatch(&mut program, 158, commands(16, &[0x1002, 0x1003]));
     }
-    dispatch(&mut program, numbers[14], socket(true, seqpacket_pair));
+    dispatch(&mut program, numbers[14], socket(true, true));
     let unix = socket(true, false);
     let mut mixed = vec![load(16), equal(1, 1, 0), w(5, 0, 0, unix.len() as u32)];
     mixed.extend(unix);

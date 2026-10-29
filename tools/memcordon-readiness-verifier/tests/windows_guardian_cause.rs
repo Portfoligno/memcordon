@@ -1,4 +1,4 @@
-#[path = "../../../crates/memcordon-core/tests/support/windows_frontend_guardian.rs"]
+#[path = "../../../crates/memcordon-core/tests/support/windows_current_frontend_guardian.rs"]
 mod support;
 use memcordon_readiness_verifier::windows_guardian_cause::frontend_path;
 use serde_json::{Value, json};

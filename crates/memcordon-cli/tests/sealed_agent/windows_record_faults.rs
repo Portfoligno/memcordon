@@ -19,10 +19,6 @@ fn expired_guardian_causal_projection_never_reads_or_exports_native_receipt() {
 mod terminal_fixture;
 
 fn snapshot_predicate_fixture() -> WindowsAttemptRecordV1 {
-    use memcordon_core::workload_contract::*;
-    use memcordon_core::workload_evidence::*;
-    use memcordon_core::workload_registry::*;
-    use std::num::NonZeroU64;
     let mut record = observed_record();
     let _rejection = terminal_fixture::postauthorization_failure(
         &mut record,
@@ -34,67 +30,6 @@ fn snapshot_predicate_fixture() -> WindowsAttemptRecordV1 {
         "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
         memcordon_core::BoundarySetupPhase::TargetCreation,
     );
-    let profile = BaselineProfile::WindowsHostNetworkExternal;
-    let digest = memcordon_core::DiagnosticSha256::from_bytes([7; 32]);
-    let request = WorkloadContractV1 {
-        schema_version: ContractVersionOne::default(),
-        workload_plan_digest: digest.clone(),
-        authorized_profile: profile.reference(),
-        authorization: AuthorizationRef {
-            grant_id: LogicalId::new("fixture".into()).unwrap(),
-            grant_revision: NonZeroU64::MIN,
-            approved_plan_digest: digest.clone(),
-        },
-        ceiling: profile.ceiling(),
-        requirements: memcordon_core::BoundedVec::default(),
-        endpoints: memcordon_core::BoundedVec::default(),
-        expected_epoch: PolicyEpoch {
-            service_instance: Nonce128([1; 16]),
-            revision: NonZeroU64::MIN,
-        },
-    };
-    let provider = serde_json::from_value(serde_json::json!({"generation":"fixture-generation", "source_commit":"ab".repeat(20), "runtime_manifest_sha256":"cd".repeat(32)})).unwrap();
-    let binding = RuntimeAttemptBinding {
-        format: "memcordon.local-attempt-binding".into(),
-        revision: 1,
-        plan: RuntimePlanBinding::from_local_grant(
-            &request,
-            digest.clone(),
-            provider,
-            memcordon_core::BoundedText::new(&record.boot_identity).unwrap(),
-        )
-        .unwrap(),
-        attempt_id: memcordon_core::BoundedText::new(&record.attempt_id).unwrap(),
-        restart_attempt: 0,
-        admission_nonce: Nonce128([2; 16]),
-        caller_invocation_reference: Nonce128([3; 16]),
-    };
-    let checkpoint = VerifiedCheckpointV1::observed(
-        &binding,
-        baseline_observation(profile),
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-    )
-    .unwrap();
-    record.workload_checkpoint = Some((binding, checkpoint));
-    record.workload_admission = Some(RuntimeAdmissionSnapshot {
-        format: "memcordon.local-admission".into(),
-        revision: 1,
-        private_invocation_digest: digest.clone(),
-        caller_invocation_reference: Nonce128([3; 16]),
-        request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
-        request,
-        registry_digest: digest,
-        admission_nonce: Nonce128([2; 16]),
-        caller: CallerSelector::Windows {
-            sid: memcordon_core::BoundedText::new("S-1-5-21-1").unwrap(),
-        },
-        native_profile: profile,
-    });
     record.authorization_unix_millis = Some(1);
     record.worker_thread_identity = Some(memcordon_core::WindowsWorkerThreadIdentityV1 {
         thread_id: 1,
@@ -122,18 +57,6 @@ fn snapshot_classifier_distinguishes_every_ordered_invariant_without_values() {
             assert_eq!($candidate.snapshot_violation(&$previous, $previous.record_revision), Some(SnapshotInvariant::$kind), stringify!($kind));
         }};
     }
-    case!(FrozenWorkloadCheckpoint, |p, c| {
-        c.workload_checkpoint = None;
-    });
-    case!(AuthorizedWorkloadCheckpoint, |p, c| {
-        p.workload_checkpoint = None;
-    });
-    case!(FrozenWorkloadAdmission, |p, c| {
-        c.workload_admission = None;
-    });
-    case!(AuthorizedWorkloadAdmission, |p, c| {
-        p.workload_admission = None;
-    });
     case!(RetentionAdmittedTime, |p, c| {
         c.diagnostic_retention.admitted_monotonic_millis += 1;
     });
@@ -600,6 +523,139 @@ fn native_publisher_process_exit_preserves_atomic_old_or_new_record() {
     }
 }
 
+#[test]
+#[ignore = "outbox crash fixture invoked through its exclusive stdin pipe"]
+fn native_outbox_crash_child() {
+    let (path, after_rename, response): (PathBuf, bool, memcordon_core::WindowsLauncherResponseV4) =
+        serde_json::from_reader(std::io::stdin()).unwrap();
+    let mut record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&read_record_bounded(&path).unwrap()).unwrap();
+    record
+        .stage_terminal_response_with_store_for_test(&response, |candidate| {
+            let expected = candidate.record_revision;
+            candidate.record_revision = expected.checked_add(1).unwrap();
+            let terminal = candidate.terminal_response_json.is_some();
+            candidate.publish_at(&path, expected, |phase| {
+                if terminal
+                    && phase
+                        == if after_rename {
+                            PublicationPhase::AfterRename
+                        } else {
+                            PublicationPhase::Rename
+                        }
+                {
+                    std::process::exit(73);
+                }
+                Ok(())
+            })
+        })
+        .unwrap();
+    panic!("actual terminal outbox publication crash was not reached");
+}
+
+#[test]
+#[ignore = "requires explicit isolated native component receipt input"]
+fn native_terminal_outbox_crash_preserves_exact_replay_boundary() {
+    let receipt=super::super::readiness_receipt::begin("windows::record::record_fault_tests::native_terminal_outbox_crash_preserves_exact_replay_boundary").expect("explicit native component input required");
+    let mut observations = Vec::new();
+    for after_rename in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned-outbox.json");
+        let mut record = observed_record();
+        let identity = memcordon_core::WindowsProcessIdentityV1 {
+            process_id: 412,
+            creation_time_100ns: 991337,
+        };
+        record.guardian_identity = Some(identity.clone());
+        record.target_identity = Some(identity.clone());
+        record.nonce = "native-outbox-crash".into();
+        terminal_fixture::bind_owner_manifest(&mut record, &identity);
+        record.state = WindowsAttemptStateV1::Authorized;
+        record.authorization_unix_millis = Some(1);
+        record
+            .begin_postauthorization_retirement_for_test()
+            .unwrap();
+        record.cleanup_state.active_processes_zero = true;
+        record.cleanup_state.guardian_reaped = true;
+        record.complete_rejection_cleanup_for_test().unwrap();
+        let rejection = terminal_fixture::postauthorization_failure(
+            &mut record,
+            identity,
+            false,
+            "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+            memcordon_core::BoundarySetupPhase::Authorization,
+        );
+        let response = memcordon_core::WindowsLauncherResponseV4::Reject {
+            schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+            attempt_id: record.attempt_id.clone(),
+            nonce: record.nonce.clone(),
+            request_sha256: record.request_sha256.clone(),
+            rejection,
+        };
+        let authority = response.terminal_authority_json().unwrap();
+        record.record_revision = 1;
+        record.publish_at(&path, 0, |_| Ok(())).unwrap();
+        let before = read_record_bounded(&path).unwrap();
+        let mut publisher = ChildLifetime(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows::record::record_fault_tests::native_outbox_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let held = super::super::readiness_receipt::HeldNativeProcess::open(publisher.0.id());
+        assert!(!held.exited());
+        serde_json::to_writer(
+            publisher.0.stdin.as_mut().unwrap(),
+            &(&path, after_rename, &response),
+        )
+        .unwrap();
+        drop(publisher.0.stdin.take());
+        assert_eq!(publisher.0.wait().unwrap().code(), Some(73));
+        assert!(held.exited());
+        let after = read_record_bounded(&path).unwrap();
+        let retained: WindowsAttemptRecordV1 = serde_json::from_slice(&after).unwrap();
+        authenticate(&retained, &retained.attempt_id).unwrap();
+        assert_eq!(retained.record_revision, if after_rename { 3 } else { 2 });
+        assert_eq!(
+            retained.causal_diagnostics.original,
+            record.causal_diagnostics.original
+        );
+        let replay = super::super::record::pending_owned_component_response_for_test(
+            &path,
+            &record.attempt_id,
+            &record.nonce,
+            &record.request_sha256,
+            &record.caller_process_identity,
+            &record.caller_token_sha256,
+        )
+        .unwrap();
+        if after_rename {
+            assert_eq!(
+                replay.as_ref().unwrap().terminal_authority_json().unwrap(),
+                authority
+            );
+        } else {
+            assert!(replay.is_none());
+        }
+        assert_eq!(
+            read_record_bounded(&path).unwrap(),
+            after,
+            "query-only replay cannot rewrite the crash boundary"
+        );
+        let prefix = if after_rename { "after" } else { "before" };
+        observations.push(serde_json::json!({"after_rename":after_rename,"before_record":receipt.retain(&format!("{prefix}.before.json"),&before),"after_record":receipt.retain(&format!("{prefix}.after.json"),&after),"authority":receipt.retain(&format!("{prefix}.authority.json"),authority.as_bytes()),"replayed_response":replay.map(|response|receipt.retain(&format!("{prefix}.replayed.json"),&serde_json::to_vec(&response).unwrap())),"publisher_identity":held.identity,"publisher_held_before_input":true,"publisher_exit_status":73,"publisher_retired":true}));
+    }
+    receipt.finish_payload(serde_json::json!({"kind":"replay-crash","observations":observations,"fixture_resource_claims":false,"installed_attempt_store_accessed":false}));
+}
+
 fn observed_record() -> WindowsAttemptRecordV1 {
     let digest = "19".repeat(32);
     let mut record = WindowsAttemptRecordV1::new(
@@ -665,7 +721,7 @@ fn worker_thread_identity_is_in_authenticated_durable_record() {
     });
     record.validate_for_store_for_test().unwrap();
     authenticate(&record, &record.attempt_id).unwrap();
-    let decoded: memcordon_core::WindowsDurableAttemptRecordV4 =
+    let decoded: memcordon_core::WindowsDurableAttemptRecordV5 =
         serde_json::from_slice(&canonical_record_bytes(&record).unwrap()).unwrap();
     assert_eq!(
         decoded.worker_thread_identity,
@@ -1253,7 +1309,7 @@ fn native_durable_record_rejects_provider_generation_substitution() {
     record.publish_at(&path, 0, |_| Ok(())).unwrap();
     let bytes = read_record_bounded(&path).unwrap();
     authenticate(&record, &record.attempt_id).unwrap();
-    memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+    memcordon_core::parse_and_authenticate_windows_attempt_record_v5(
         &bytes,
         &record.attempt_id,
         &record.provider_generation,
@@ -1261,7 +1317,7 @@ fn native_durable_record_rejects_provider_generation_substitution() {
     .unwrap();
     let wrong_generation = digest(record.provider_generation.as_bytes());
     assert_ne!(wrong_generation, record.provider_generation);
-    let refusal = memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+    let refusal = memcordon_core::parse_and_authenticate_windows_attempt_record_v5(
         &bytes,
         &record.attempt_id,
         &wrong_generation,
@@ -1354,24 +1410,24 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
         &recovered_record.causal_diagnostics,
     )
     .unwrap();
-    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
-        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = memcordon_core::WindowsLauncherResponseV4::Reject {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: recovered_record.attempt_id.clone(),
         nonce: recovered_record.nonce.clone(),
         request_sha256: recovered_record.request_sha256.clone(),
         rejection,
     };
     let authority = response.terminal_authority_json().unwrap();
-    let stripped: memcordon_core::WindowsLauncherResponseV3 =
+    let stripped: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(&authority).unwrap();
     assert!(
-        matches!(&stripped, memcordon_core::WindowsLauncherResponseV3::Reject {
+        matches!(&stripped, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..
     } if rejection.provider_failure.is_none())
     );
     let recovered = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
     assert!(
-        matches!(&recovered, memcordon_core::WindowsLauncherResponseV3::Reject {
+        matches!(&recovered, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..
     } if rejection.provider_failure.as_ref() == Some(&transport_projection))
     );
@@ -1383,7 +1439,7 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
         Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
     let expired = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
     assert!(
-        matches!(&expired, memcordon_core::WindowsLauncherResponseV3::Reject {
+        matches!(&expired, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..
     } if rejection.provider_failure.is_none())
     );

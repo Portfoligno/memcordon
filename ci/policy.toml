@@ -182,7 +182,7 @@ allowed_run_commands = [
   "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json",
   "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
   "./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
-  "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+  "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
   "./target/ci/release/memcordon-ci release consumer-cache",
   "./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard candidate",
   "./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard public",

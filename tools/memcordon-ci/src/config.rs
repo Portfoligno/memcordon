@@ -282,7 +282,7 @@ pub struct AssetExecutable {
     pub role: RuntimeComponentRole,
 }
 
-pub use memcordon_core::runtime_manifest::RuntimeComponentRole;
+pub use memcordon_core::runtime_components::RuntimeComponentRole;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]

@@ -9,8 +9,9 @@ processes; applications that need execution use `memcordon-platform` or the
 contract without exposing platform mechanisms. Certified Linux mechanism v2
 satisfies the request only through a matching, qualified provider. A missing or
 mismatched provider rejects execution before authorization and never falls
-back to a standard backend. Execution reports use schema 10; strict workload
-admission binds the request, exact grant, policy epoch, and native checkpoint.
+back to a standard backend. Ordinary nonsealed execution reports use schema 10.
+Current sealed results use named revision 3 and retain the original request,
+authenticated provider, native execution, cleanup and delivery observations.
 
 ## Install
 

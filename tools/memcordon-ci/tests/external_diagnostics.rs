@@ -39,7 +39,7 @@ fn partial_raw_observations_are_retained_and_unexpected_or_oversized_entries_rej
     for (name, maximum) in [
         (
             "result.json",
-            memcordon_core::result_v1::RESULT_MAX_BYTES as u64,
+            memcordon_core::execution_facts::RESULT_MAX_BYTES as u64,
         ),
         ("assessment.json", 1024 * 1024),
         ("requested-contract.json", 1024 * 1024),

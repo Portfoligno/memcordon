@@ -221,8 +221,8 @@ fn complete_wrong_binding_acknowledgment_remains_a_refusal() {
     let (read, write) = anonymous_control_pipe();
     pipe::write_frame(
         write.raw(),
-        &WindowsLauncherRequestV3::RelaysRetired {
-            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        &WindowsLauncherRequestV4::RelaysRetired {
+            schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
             attempt_id: "wrong".into(),
             nonce: "nonce".into(),
             request_sha256: "request".into(),

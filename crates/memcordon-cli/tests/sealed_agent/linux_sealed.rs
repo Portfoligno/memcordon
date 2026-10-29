@@ -1,7 +1,6 @@
 #![cfg(target_os = "linux")]
 
 mod support;
-pub(crate) use support::StagedFixture;
 
 #[path = "support/retained_streams.rs"]
 mod retained_streams;

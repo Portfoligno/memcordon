@@ -40,7 +40,7 @@ pub fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), String> {
                     Ok(Unique)
                 }
                 fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Unique, E> {
-                    Err(E::custom("floating JSON numbers are forbidden"))
+                    Ok(Unique)
                 }
                 fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Unique, E> {
                     Ok(Unique)

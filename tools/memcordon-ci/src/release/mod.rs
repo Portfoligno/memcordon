@@ -5,71 +5,62 @@ pub mod compatibility;
 pub mod consumer_readiness_cell;
 pub mod distribution;
 pub mod finalize;
-#[cfg(target_os = "linux")]
-mod fixture_export_retirement;
-#[cfg(target_os = "linux")]
-mod frontend_invocation_custody;
 pub mod git;
 pub mod http;
 pub mod installed_consumer;
 #[cfg(any(windows, test))]
 mod installed_loader_support;
+pub mod linux_current_capture;
 #[cfg(target_os = "linux")]
-pub mod linux_account_normalize;
+pub mod linux_current_case_capture;
 #[cfg(target_os = "linux")]
-pub mod linux_cross_attempt_cases;
+pub mod linux_current_component_lifetime;
 #[cfg(target_os = "linux")]
-pub mod linux_export_recovery;
+pub mod linux_current_components;
+pub mod linux_current_consumer;
 #[cfg(target_os = "linux")]
-mod linux_fixture_memory_budget;
+pub mod linux_current_exports;
 #[cfg(target_os = "linux")]
-pub mod linux_image_custodian;
+pub mod linux_current_image_cases;
 #[cfg(target_os = "linux")]
-pub(crate) mod linux_image_custody;
+pub mod linux_current_inputs;
 #[cfg(target_os = "linux")]
-pub(crate) mod linux_image_custody_completion;
+pub mod linux_current_installed;
 #[cfg(target_os = "linux")]
-pub mod linux_image_normalize;
+pub mod linux_current_isolation_cases;
 #[cfg(target_os = "linux")]
-pub mod linux_import_normalize;
-pub mod linux_installed_consumer;
+pub mod linux_current_lease;
+pub mod linux_current_network;
 #[cfg(target_os = "linux")]
-pub mod linux_isolation_cases;
+pub mod linux_current_owner_cases;
 #[cfg(target_os = "linux")]
-pub mod linux_isolation_recovery;
+pub mod linux_current_package;
+#[cfg(target_os = "linux")]
+pub mod linux_current_package_fault;
+#[cfg(target_os = "linux")]
+pub mod linux_current_phase_gate;
+#[cfg(target_os = "linux")]
+pub mod linux_current_provider_state;
+#[cfg(target_os = "linux")]
+pub mod linux_current_refusals;
+#[cfg(target_os = "linux")]
+pub mod linux_current_relay;
+#[cfg(target_os = "linux")]
+pub mod linux_current_snapshot_cases;
 #[cfg(unix)]
 pub mod linux_lifecycle_diagnostics;
 #[cfg(target_os = "linux")]
-pub mod linux_malformed_ingress;
-pub mod linux_memory_worker_checkpoint;
-#[cfg(target_os = "linux")]
-pub mod linux_mixed_installed;
-#[cfg(target_os = "linux")]
 pub mod linux_native_component;
-#[cfg(target_os = "linux")]
-pub mod linux_native_package;
-pub mod linux_network_observation;
-pub mod linux_network_topology;
-#[cfg(target_os = "linux")]
-pub(super) mod linux_original_recovery;
 #[cfg(unix)]
-pub mod linux_phase_journal;
-#[cfg(target_os = "linux")]
-pub mod linux_readiness_image_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_readiness_lease;
-#[cfg(target_os = "linux")]
-pub mod linux_readiness_legacy_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_readiness_lifecycle_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_readiness_limits_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_readiness_policy_cases;
 pub mod linux_recovery_diagnostic;
-#[cfg(unix)]
-pub mod linux_recovery_harness;
 pub mod linux_recovery_owners;
+#[cfg(unix)]
+pub mod linux_request_fixture;
+#[cfg(target_os = "linux")]
+pub mod linux_request_launch;
+#[cfg(unix)]
+pub mod linux_snapshot_budget;
+pub mod linux_unit_diagnostics;
 #[cfg(target_os = "linux")]
 mod native_cargo_aliases;
 pub mod native_component_harness;
@@ -78,8 +69,6 @@ pub mod native_coverage_owner;
 mod native_executable;
 #[cfg(target_os = "linux")]
 mod native_execution_association;
-#[cfg(target_os = "linux")]
-mod native_package_diagnostics;
 #[cfg(unix)]
 pub mod native_recipe_case;
 #[cfg(target_os = "linux")]
@@ -127,6 +116,14 @@ pub enum ConsumerChannel {
 
 #[derive(Subcommand)]
 pub enum ReleaseCommand {
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    CurrentMaterializedSmoke {
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        cleanup_only: bool,
+    },
     ConsumerReadinessReport(readiness_report::ReportArguments),
     SelectPreparation,
     PrepareReadinessTools {
@@ -377,6 +374,10 @@ fn repository(root: &Path, supplied: Option<String>) -> Result<String> {
 
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
+        #[cfg(target_os = "linux")]
+        ReleaseCommand::CurrentMaterializedSmoke { spec, cleanup_only } => {
+            installed_consumer::run_current_smoke_spec(root, &spec, cleanup_only)
+        }
         ReleaseCommand::PrepareReadinessTools { build_source } => {
             target::prepare_readiness_tools(root, &build_source)
         }

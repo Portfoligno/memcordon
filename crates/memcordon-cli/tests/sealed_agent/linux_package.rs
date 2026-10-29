@@ -77,16 +77,16 @@ fn helper_bytes() -> Option<&'static [u8]> {
 
 #[cfg(target_env = "gnu")]
 fn with_helper(
-    mut components: Vec<memcordon_core::runtime_manifest::RuntimeComponentRecord>,
-) -> Vec<memcordon_core::runtime_manifest::RuntimeComponentRecord> {
+    mut components: Vec<memcordon_core::runtime_components::RuntimeComponentRecord>,
+) -> Vec<memcordon_core::runtime_components::RuntimeComponentRecord> {
     if let Some(bytes) = helper_bytes() {
-        components.push(memcordon_core::runtime_manifest::RuntimeComponentRecord {
+        components.push(memcordon_core::runtime_components::RuntimeComponentRecord {
             id: "arm32-abi-helper".into(),
             path: "memcordon-arm32-abi-helper".into(),
-            role: memcordon_core::runtime_manifest::RuntimeComponentRole::Arm32AbiHelper,
+            role: memcordon_core::runtime_components::RuntimeComponentRole::Arm32AbiHelper,
             size: bytes.len() as u64,
             mode: 0o755,
-            sha256: String::from(memcordon_core::workload_codec::hash_bytes(bytes)),
+            sha256: String::from(memcordon_core::hash_bytes(bytes)),
         });
     }
     components
@@ -109,7 +109,7 @@ fn install_cannot_replace_a_live_generation_without_upgrade_quiescence() {
 }
 
 #[test]
-fn redundant_install_is_rejected_before_epoch_change() {
+fn redundant_install_is_rejected_before_package_mutation() {
     let install = std::ffi::OsStr::new("install");
     let upgrade = std::ffi::OsStr::new("upgrade");
     let uninstall = std::ffi::OsStr::new("uninstall");
@@ -122,8 +122,44 @@ fn redundant_install_is_rejected_before_epoch_change() {
 }
 
 #[test]
+fn unmanaged_current_state_directory_is_refused_without_changing_unknown_bytes_or_mode() {
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("opaque-root");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o771)).unwrap();
+    let bytes = b"opaque bytes\0\xff, not a provider record";
+    std::fs::write(directory.join("unrecognized-state"), bytes).unwrap();
+    let before = std::fs::symlink_metadata(&directory).unwrap();
+    assert!(
+        crate::package::validate_current_state_directory(&directory, false, &["current-role"])
+            .is_err()
+    );
+    let after = std::fs::symlink_metadata(&directory).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.mode()),
+        (after.dev(), after.ino(), after.mode())
+    );
+    assert_eq!(
+        std::fs::read(directory.join("unrecognized-state")).unwrap(),
+        bytes
+    );
+    let link = temporary.path().join("linked-root");
+    std::os::unix::fs::symlink(&directory, &link).unwrap();
+    assert!(crate::package::validate_current_state_directory(&link, false, &[]).is_err());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
-    use crate::package::{PackageJournal, PackageJournalEntry, validate_package_journal};
+    use crate::package::{
+        PackageJournal, PackageJournalEntry, PackageJournalFile, PackageJournalPhase,
+        validate_package_journal,
+    };
     use memcordon_core::DiagnosticSha256;
     let target = std::path::PathBuf::from("/usr/libexec/memcordon-runtime-manifest.json");
     let entry = PackageJournalEntry {
@@ -134,15 +170,25 @@ fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
         old_sha256: Some(DiagnosticSha256::from_bytes([1; 32])),
         old_device: Some(1),
         old_inode: Some(2),
+        stage: None,
+        placeholder: Some(PackageJournalFile {
+            path: "/usr/libexec/.memcordon-backup-example".into(),
+            device: 1,
+            inode: 3,
+            mode: 0o600,
+            sha256: memcordon_core::hash_bytes(&[]),
+        }),
     };
     let journal = PackageJournal {
-        schema_version: 1,
+        format: "memcordon.current-package-transaction".into(),
+        revision: 1,
+        phase: PackageJournalPhase::Preparing,
         entries: vec![entry.clone()],
     };
     assert!(validate_package_journal(&journal).is_ok());
     for proof in [
-        "/usr/libexec/memcordon/certification/workload/x64-private-build-v1.json",
-        "/usr/libexec/memcordon/certification/workload/arm64-native-q-grant-v1.json",
+        "/usr/libexec/unmanaged/opaque.json",
+        "/tmp/unmanaged-current-file",
     ] {
         let mut proof_entry = entry.clone();
         proof_entry.path = proof.into();
@@ -152,7 +198,9 @@ fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
         proof_entry.old_inode = None;
         assert!(
             validate_package_journal(&PackageJournal {
-                schema_version: 1,
+                format: "memcordon.current-package-transaction".into(),
+                revision: 1,
+                phase: PackageJournalPhase::Preparing,
                 entries: vec![proof_entry],
             })
             .is_err()
@@ -165,7 +213,9 @@ fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
     wrong_target.path = "/etc/passwd".into();
     assert!(
         validate_package_journal(&PackageJournal {
-            schema_version: 1,
+            format: "memcordon.current-package-transaction".into(),
+            revision: 1,
+            phase: PackageJournalPhase::Preparing,
             entries: vec![wrong_target],
         })
         .is_err()
@@ -174,7 +224,9 @@ fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
     wrong_backup.backup = Some("/tmp/.memcordon-backup-example".into());
     assert!(
         validate_package_journal(&PackageJournal {
-            schema_version: 1,
+            format: "memcordon.current-package-transaction".into(),
+            revision: 1,
+            phase: PackageJournalPhase::Preparing,
             entries: vec![wrong_backup],
         })
         .is_err()
@@ -183,11 +235,163 @@ fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
     missing_identity.old_inode = None;
     assert!(
         validate_package_journal(&PackageJournal {
-            schema_version: 1,
+            format: "memcordon.current-package-transaction".into(),
+            revision: 1,
+            phase: PackageJournalPhase::Preparing,
             entries: vec![missing_identity],
         })
         .is_err()
     );
+}
+
+#[test]
+fn expired_package_commit_retains_original_backup_inode_and_bytes() {
+    use std::io::Write;
+    let mut backup = tempfile::NamedTempFile::new().unwrap();
+    backup
+        .write_all(b"original package backup custody")
+        .unwrap();
+    let path = backup.path().to_path_buf();
+    let before = backup.as_file().metadata().unwrap();
+    let error =
+        crate::package::expired_package_commit_with_backup_for_test(backup.into_temp_path())
+            .unwrap_err();
+    assert!(error.contains("original package operation cutoff exhausted"));
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"original package backup custody"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn native_package_command_wait_and_capture_share_one_original_cutoff() {
+    use std::time::Duration;
+    let started = std::time::Instant::now();
+    let error = crate::package::package_command_until(
+        "/usr/bin/sleep",
+        &["30"],
+        started + Duration::from_millis(40),
+    )
+    .unwrap_err();
+    assert!(error.contains("original package command cutoff expired"));
+    assert!(error.contains("actual wait="));
+    assert!(started.elapsed() < Duration::from_secs(7));
+    let expired =
+        crate::package::package_command_until("/nonexistent/package-command", &[], started)
+            .unwrap_err();
+    assert!(expired.contains("before spawn"));
+    let output = crate::package::package_command_until(
+        "/usr/bin/printf",
+        &["%s", "native package output"],
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"native package output");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn expired_native_recovery_refuses_before_inspecting_or_retiring_owners() {
+    let error = crate::linux::recovery::recover_until(std::time::Instant::now()).unwrap_err();
+    assert!(error.contains("original native recovery cutoff exhausted; ownership retained"));
+}
+
+#[test]
+#[ignore = "requires the privileged Linux current-package filesystem fixture"]
+fn current_package_recovery_retains_replaced_stage_placeholder_and_unrelated_target() {
+    use crate::package::{
+        PackageJournal, PackageJournalEntry, PackageJournalFile, PackageJournalPhase,
+        validate_package_recovery_files,
+    };
+    use std::io::Write;
+    assert_eq!(
+        rustix::process::geteuid().as_raw(),
+        0,
+        "current package native custody test requires real root"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("current-image");
+    let stage = directory.path().join(".memcordon-stage-native");
+    let placeholder = directory.path().join(".memcordon-backup-native");
+    let write = |path: &std::path::Path, value: &[u8], mode| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.write_all(value).unwrap();
+        file.sync_all().unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .unwrap();
+    };
+    write(&original, b"original current bytes", 0o555);
+    write(&stage, b"selected current bytes", 0o555);
+    write(&placeholder, b"", 0o600);
+    let proof = |path: &std::path::Path| {
+        let metadata = std::fs::metadata(path).unwrap();
+        PackageJournalFile {
+            path: path.into(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode() & 0o7777,
+            sha256: memcordon_core::hash_bytes(&std::fs::read(path).unwrap()),
+        }
+    };
+    let old = proof(&original);
+    let journal = PackageJournal {
+        format: "memcordon.current-package-transaction".into(),
+        revision: 1,
+        phase: PackageJournalPhase::Preparing,
+        entries: vec![PackageJournalEntry {
+            path: original.clone(),
+            backup: Some(placeholder.clone()),
+            old_sha256: Some(old.sha256),
+            old_device: Some(old.device),
+            old_inode: Some(old.inode),
+            stage: Some(proof(&stage)),
+            placeholder: Some(proof(&placeholder)),
+        }],
+    };
+    validate_package_recovery_files(&journal).unwrap();
+    let stage_pin = std::fs::File::open(&stage).unwrap();
+    std::fs::remove_file(&stage).unwrap();
+    write(&stage, b"selected current bytes", 0o555);
+    assert!(validate_package_recovery_files(&journal).is_err());
+    assert_eq!(std::fs::read(&stage).unwrap(), b"selected current bytes");
+    assert_eq!(std::fs::read(&original).unwrap(), b"original current bytes");
+    drop(stage_pin);
+    let mut current = journal.clone();
+    current.entries[0].stage = Some(proof(&stage));
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&stage, b"changed digest on same inode").unwrap();
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(validate_package_recovery_files(&current).is_err());
+    assert_eq!(
+        std::fs::read(&stage).unwrap(),
+        b"changed digest on same inode"
+    );
+    current.entries[0].stage = Some(proof(&stage));
+    std::fs::write(&placeholder, b"unrelated occupied placeholder").unwrap();
+    assert!(validate_package_recovery_files(&current).is_err());
+    assert_eq!(
+        std::fs::read(&placeholder).unwrap(),
+        b"unrelated occupied placeholder"
+    );
+    std::fs::write(&placeholder, b"").unwrap();
+    let original_pin = std::fs::File::open(&original).unwrap();
+    std::fs::remove_file(&original).unwrap();
+    write(&original, b"unrelated occupied rollback target", 0o555);
+    assert!(validate_package_recovery_files(&current).is_err());
+    assert_eq!(
+        std::fs::read(&original).unwrap(),
+        b"unrelated occupied rollback target"
+    );
+    assert_eq!(std::fs::read(&placeholder).unwrap(), b"");
+    drop(original_pin);
 }
 
 #[test]
@@ -263,47 +467,28 @@ fn package_failed_compensation_never_claims_successful_restoration() {
     );
 }
 
-#[test]
-fn installation_epoch_advances_even_for_byte_identical_package_replacement() {
-    let first = crate::package::next_installation_epoch(None, [1; 32]).unwrap();
-    let second = crate::package::next_installation_epoch(Some(&first), [2; 32]).unwrap();
-    assert_eq!(first.counter, 1);
-    assert_eq!(second.counter, 2);
-    assert_ne!(first.nonce_digest, second.nonce_digest);
-    let same_nonce = crate::package::next_installation_epoch(Some(&first), [1; 32]).unwrap();
-    assert_eq!(same_nonce.counter, 2);
-    assert_ne!(
-        serde_json::to_vec(&first).unwrap(),
-        serde_json::to_vec(&same_nonce).unwrap()
-    );
-    let exhausted = crate::package::PackageInstallationEpochV1 {
-        counter: u64::MAX,
-        ..first
-    };
-    assert!(crate::package::next_installation_epoch(Some(&exhausted), [3; 32]).is_err());
-}
-
 fn source_runtime_manifest(
-    components: Vec<memcordon_core::runtime_manifest::RuntimeComponentRecord>,
-) -> memcordon_core::runtime_manifest::RuntimeManifest {
-    use memcordon_core::runtime_manifest::RuntimeManifest;
+    components: Vec<memcordon_core::runtime_components::RuntimeComponentRecord>,
+) -> memcordon_core::runtime_manifest_v2::RuntimeManifestV2 {
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
     let version = env!("CARGO_PKG_VERSION").into();
     let source_commit = crate::SOURCE_COMMIT.into();
     let target = crate::linux::runtime_manifest::target().unwrap().into();
-    if cfg!(feature = "private-tcp") {
-        RuntimeManifest::linux_combined(version, source_commit, target, components)
-    } else {
-        RuntimeManifest::linux_selected(version, source_commit, target, components, false)
-    }
+    RuntimeManifestV2::linux(
+        version,
+        source_commit,
+        target,
+        components,
+        cfg!(feature = "private-tcp"),
+    )
     .unwrap()
 }
 
 #[test]
 #[cfg(target_env = "gnu")]
 fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
-    use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-    };
+    use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
     let directory = tempfile::tempdir().unwrap();
     let agent = b"exact provider image";
     let public = b"exact public image";
@@ -395,9 +580,8 @@ fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
 
 #[test]
 fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
-    use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-    };
+    use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
     let agent = b"exact installed provider image";
     let public = b"exact public image";
     let directory = tempfile::tempdir().unwrap();
@@ -413,7 +597,7 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
             role: RuntimeComponentRole::PublicCli,
             size: public.len() as u64,
             mode: 0o755,
-            sha256: memcordon_core::workload_codec::hash_bytes(public).into(),
+            sha256: memcordon_core::hash_bytes(public).into(),
         },
         RuntimeComponentRecord {
             id: "sealed-agent".into(),
@@ -421,7 +605,7 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
             role: RuntimeComponentRole::SealedAgent,
             size: agent.len() as u64,
             mode: 0o755,
-            sha256: memcordon_core::workload_codec::hash_bytes(agent).into(),
+            sha256: memcordon_core::hash_bytes(agent).into(),
         },
     ]);
     let validate = |manifest: &RuntimeManifest, image: &[u8]| {
@@ -431,22 +615,6 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
         crate::package::linux_source_snapshot(&source)
     };
     validate(&manifest, agent).unwrap();
-    if cfg!(feature = "private-tcp") {
-        let obsolete = RuntimeManifest::linux_selected(
-            manifest.version.clone(),
-            manifest.source_commit.clone(),
-            manifest.target.clone(),
-            manifest.components.clone(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            validate(&obsolete, agent).err().as_deref(),
-            Some("source runtime manifest differs from exact copied images"),
-            "obsolete private-only contract must fail the exact source inventory comparison"
-        );
-        validate(&manifest, agent).unwrap();
-    }
     assert!(validate(&manifest, b"different installed image").is_err());
     let mut same_size_image = agent.to_vec();
     same_size_image[0] ^= 1;
@@ -528,43 +696,6 @@ impl Drop for AttemptRecordCleanup {
         if let Some(record) = self.record.take() {
             let _ = record.retire();
         }
-    }
-}
-
-fn load_legacy_runtime_directory_units() {
-    for path in [
-        "/usr/lib/systemd/system/memcordon-sealed-agent.service",
-        "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
-    ] {
-        let current = std::fs::read_to_string(path).unwrap();
-        assert!(!current.contains("RuntimeDirectory="));
-        let legacy = current.replacen(
-            "KillMode=process\n",
-            "KillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\n",
-            1,
-        );
-        assert_ne!(legacy, current);
-        std::fs::write(path, legacy).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    }
-    let reload = Command::new("/usr/bin/systemctl")
-        .arg("daemon-reload")
-        .status()
-        .unwrap();
-    assert!(reload.success());
-    // Restarting would run package verification against the deliberately legacy
-    // on-disk units and turn both services into delayed startup failures. The
-    // reload alone installs those definitions in the running manager, while the
-    // still-active processes keep the currently verified executable running.
-    for service in [
-        "memcordon-sealed-launcher.service",
-        "memcordon-sealed-agent.service",
-    ] {
-        let active = Command::new("/usr/bin/systemctl")
-            .args(["is-active", service])
-            .status()
-            .unwrap();
-        assert!(active.success());
     }
 }
 
@@ -715,17 +846,12 @@ fn sealed_package_identity_rejects_tampered_provider() {
 
 #[test]
 #[ignore = "requires privileged Linux sealed certification"]
-fn sealed_package_stable_lease_survives_legacy_inode_replacement() {
+fn sealed_package_stable_lease_excludes_current_shared_launches() {
     let stable = crate::linux::service::acquire_package_lease().unwrap();
-    let legacy = crate::linux::service::acquire_legacy_package_lease().unwrap();
-    std::fs::remove_file("/run/memcordon/sealed-package.lock").unwrap();
-    let replacement = crate::linux::service::acquire_legacy_package_lease().unwrap();
 
     assert!(crate::linux::service::acquire_package_lease().is_err());
     assert!(crate::linux::service::acquire_shared_package_lease().is_err());
 
-    drop(replacement);
-    drop(legacy);
     drop(stable);
     let shared = crate::linux::service::acquire_shared_package_lease().unwrap();
     assert!(crate::linux::service::acquire_package_lease().is_err());
@@ -779,7 +905,6 @@ fn sealed_package_deadline_lease_waits_for_actual_shared_owner() {
 #[test]
 #[ignore = "requires privileged Linux sealed certification"]
 fn sealed_package_upgrade_recovers_before_advertising() {
-    load_legacy_runtime_directory_units();
     let identity = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2".to_owned();
     let record_path = std::path::Path::new(crate::linux::STATE_ROOT).join(&identity);
     let cgroup_path = std::path::Path::new(crate::linux::CGROUP_ROOT).join(&identity);
@@ -868,6 +993,7 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         command: memcordon_core::CommandSpec::new("/usr/bin/true"),
         memcordon_executable: None,
         resolved_backend: Some(backend_capabilities),
+        workload_frontend: None,
     })
     .expect("typed provider rejection must remain a supervision result");
     assert_active_capability_caller_rejected(&execution);
@@ -951,23 +1077,25 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
         String::from_utf8_lossy(&retained.stderr)
     );
     assert!(retained.stderr.is_empty());
-    let typed: crate::inspection_schema::InstalledProviderInspection =
+    let typed: crate::inspection_schema::InstalledProviderInspectionV2 =
         serde_json::from_slice(&retained.stdout).expect("strict current installed inspection");
-    assert_eq!(u32::from(typed.revision), 1);
-    assert_eq!(u32::from(typed.agent.revision), 1);
-    assert_eq!(typed.agent.runtime_manifest_schema, 1);
-    assert_eq!(typed.agent.workload_contract_schema, 1);
+    assert_eq!(u32::from(typed.revision), 2);
+    assert_eq!(u32::from(typed.agent.revision), 2);
+    assert_eq!(typed.agent.runtime_manifest_revision, 2);
     assert_eq!(
-        typed.agent.profile_catalog_sha256,
-        memcordon_core::runtime_manifest::baseline_catalog_digest(false)
+        typed.agent.workload_request.format,
+        "memcordon.workload-request"
     );
+    assert_eq!(typed.agent.workload_request.revision, 1);
+    assert_eq!(typed.agent.result.format, "memcordon.result");
+    assert_eq!(typed.agent.result.revision, 3);
     let inspection: serde_json::Value = serde_json::from_slice(&retained.stdout)
         .expect("retained installed-provider inspection should be JSON");
     assert_eq!(
         inspection["format"],
         "memcordon.installed-provider-inspection"
     );
-    assert_eq!(inspection["revision"], 1);
+    assert_eq!(inspection["revision"], 2);
     assert_eq!(inspection["installed_artifacts_valid"], true);
     assert_eq!(inspection["provider_reachable"], true);
     assert_eq!(

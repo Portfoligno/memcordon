@@ -2,7 +2,7 @@
 //! certification authority to either partial frames or a cleanup response.
 
 use memcordon_core::{
-    PublicProviderBindingV1, WindowsGuardianAttemptObservation, WindowsProviderResponseV3,
+    PublicProviderBindingV1, WindowsGuardianAttemptObservation, WindowsProviderResponseV4,
 };
 
 #[path = "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/publication_wait.rs"]
@@ -42,8 +42,8 @@ impl RecoveryBinding {
         })
     }
 
-    pub fn validate_response(&self, response: &WindowsProviderResponseV3) -> Result<(), String> {
-        if let WindowsProviderResponseV3::TerminalRetiredV2(retired) = response {
+    pub fn validate_response(&self, response: &WindowsProviderResponseV4) -> Result<(), String> {
+        if let WindowsProviderResponseV4::TerminalRetiredV2(retired) = response {
             if retired.provider_generation != self.provider.generation.as_str()
                 || !retired.is_consistent_for(
                     &self.attempt,
@@ -57,14 +57,14 @@ impl RecoveryBinding {
             return Ok(());
         }
         let receipt = match response {
-            WindowsProviderResponseV3::Terminal(receipt) => Some(receipt),
-            WindowsProviderResponseV3::Reject {
+            WindowsProviderResponseV4::Terminal(receipt) => Some(receipt),
+            WindowsProviderResponseV4::Reject {
                 schema_version,
                 attempt_id,
                 nonce,
                 request_sha256,
                 rejection,
-            } if *schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+            } if *schema_version == memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
                 && attempt_id == &self.attempt
                 && nonce == &self.nonce
                 && request_sha256 == &self.request =>
@@ -90,7 +90,7 @@ impl RecoveryBinding {
 /// The caller still independently verifies the selected held guardian's native
 /// termination and retirement; a later receipt-free tombstone is not authority.
 pub fn guardian_loss_original_authority(
-    response: &WindowsProviderResponseV3,
+    response: &WindowsProviderResponseV4,
     selected: memcordon_core::WindowsSealedFault,
     held: &WindowsGuardianAttemptObservation,
     provider: &PublicProviderBindingV1,
@@ -99,7 +99,7 @@ pub fn guardian_loss_original_authority(
     if selected != WindowsSealedFault::GuardianKilledAfterAuthorization {
         return Ok(false);
     }
-    let WindowsProviderResponseV3::Reject { rejection, .. } = response else {
+    let WindowsProviderResponseV4::Reject { rejection, .. } = response else {
         return Ok(false);
     };
     if rejection.code != "MCSEALED-WINDOWS-JOB-QUERY"
@@ -137,7 +137,7 @@ pub fn guardian_loss_original_authority(
         && receipt.process_observation.root_identity.as_ref() == held.live_target_identity.as_ref()
         && matches!(
             &receipt.payload,
-            WindowsTerminalPayloadV2::Execution {
+            WindowsTerminalPayloadV3::Execution {
                 outcome: RunOutcome::MonitorFailed { .. },
                 ..
             }
@@ -147,11 +147,11 @@ pub fn guardian_loss_original_authority(
 /// Certifies only the actual authenticated worker-loss recovery response,
 /// after the caller has independently required a complete original capture.
 pub fn worker_loss_recovery_authority(
-    response: &WindowsProviderResponseV3,
+    response: &WindowsProviderResponseV4,
     held: &WindowsGuardianAttemptObservation,
     provider: &PublicProviderBindingV1,
 ) -> Result<bool, String> {
-    let WindowsProviderResponseV3::Reject { rejection, .. } = response else {
+    let WindowsProviderResponseV4::Reject { rejection, .. } = response else {
         return Ok(false);
     };
     if rejection.code != "MCSEALED-WINDOWS-OWNER-LOST" {
@@ -178,7 +178,7 @@ pub fn worker_loss_recovery_authority(
             == Some(guardian.integrity_sha256.as_str())
         && matches!(
             &receipt.payload,
-            memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+            memcordon_core::WindowsTerminalPayloadV3::RecoveredClosure {
                 primary_failure: memcordon_core::OriginalFailureV1::Unavailable {
                     reason:
                         memcordon_core::OriginalUnavailableReasonV1::WorkerLostBeforeObservation
@@ -210,21 +210,21 @@ pub fn pending_original_frontend_relay(
         return Err("original frontend recovery identity is invalid".into());
     }
     let binding = RecoveryBinding::from_held(held, provider)?;
-    if wrapper.get("schema_version") != Some(&serde_json::json!(1))
+    if wrapper.get("schema_version") != Some(&serde_json::json!(2))
         || !wrapper
             .get("frontend_delivery")
             .is_some_and(serde_json::Value::is_null)
     {
         return Ok(false);
     }
-    let request: memcordon_core::WindowsProviderRequestV3 = serde_json::from_value(
+    let request: memcordon_core::WindowsProviderRequestV4 = serde_json::from_value(
         wrapper
             .get("provider_request")
             .cloned()
             .ok_or("recovery request absent")?,
     )
     .map_err(|error| error.to_string())?;
-    let memcordon_core::WindowsProviderRequestV3::RecoverAttempt {
+    let memcordon_core::WindowsProviderRequestV4::RecoverAttempt {
         schema_version,
         attempt_id,
         nonce,
@@ -234,7 +234,7 @@ pub fn pending_original_frontend_relay(
     else {
         return Ok(false);
     };
-    if schema_version != memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+    if schema_version != memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
         || attempt_id != binding.attempt
         || nonce != binding.nonce
         || request_sha256 != binding.request
@@ -242,14 +242,14 @@ pub fn pending_original_frontend_relay(
     {
         return Ok(false);
     }
-    let response: WindowsProviderResponseV3 = serde_json::from_value(
+    let response: WindowsProviderResponseV4 = serde_json::from_value(
         wrapper
             .get("provider_response")
             .cloned()
             .ok_or("recovery response absent")?,
     )
     .map_err(|error| error.to_string())?;
-    let WindowsProviderResponseV3::RecoveryAttemptUnavailable {
+    let WindowsProviderResponseV4::RecoveryAttemptUnavailable {
         schema_version,
         attempt_id,
         challenge: response_challenge,
@@ -266,7 +266,7 @@ pub fn pending_original_frontend_relay(
         publication_wait::failure_detail(publication_wait::WAIT_TIMEOUT_STATUS, None)
             .expect("WAIT_TIMEOUT has a publication dependency detail");
     Ok(
-        schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+        schema_version == memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
             && attempt_id == binding.attempt
             && response_challenge == challenge
             && (detail == expected || detail == publication_busy),

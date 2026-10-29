@@ -1,4 +1,7 @@
-use memcordon_ci::consumer_readiness_ledger::{CellEvidence, SourceIdentity, ingest, initialize};
+use memcordon_ci::{
+    consumer_readiness_current::{CellEvidenceV2 as CellEvidence, ingest_resolved, initialize},
+    readiness_identity::SourceIdentity,
+};
 use memcordon_readiness_verifier::{CaseState, ProductKey};
 
 fn identity() -> SourceIdentity {
@@ -13,7 +16,7 @@ fn identity() -> SourceIdentity {
 #[test]
 fn plan_keeps_all_channels_and_component_rows_without_claiming_observation() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ci/consumer-readiness-v1.toml");
+        .join("../../ci/consumer-readiness-v2.toml");
     let index = initialize(&manifest, identity()).unwrap();
     assert_eq!(index.workflow_cells.len(), 16);
     assert!(index.products.is_empty());
@@ -35,14 +38,14 @@ fn plan_keeps_all_channels_and_component_rows_without_claiming_observation() {
 #[test]
 fn full_manifest_evidence_uses_verifier_bound_and_refuses_oversize_before_creation() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ci/consumer-readiness-v1.toml");
+        .join("../../ci/consumer-readiness-v2.toml");
     let mut index = initialize(&manifest, identity()).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let evidence = directory.path().join("evidence.json");
-    memcordon_ci::consumer_readiness_ledger::persist(&index, &evidence).unwrap();
+    memcordon_ci::consumer_readiness_current::persist(&index, &evidence).unwrap();
     let bytes = std::fs::read(&evidence).unwrap();
     assert!(bytes.len() > 1024 * 1024);
-    let restored: memcordon_readiness_verifier::EvidenceIndex =
+    let restored: memcordon_readiness_verifier::current::EvidenceIndexV2 =
         serde_json::from_slice(&bytes).unwrap();
     assert_eq!(restored.records.len(), index.records.len());
     assert!(
@@ -52,11 +55,17 @@ fn full_manifest_evidence_uses_verifier_bound_and_refuses_oversize_before_creati
             .all(|row| row.state == CaseState::NotRun)
     );
     // Exercise the exact reader boundary, including the persisted newline.
-    index.assessment_failures.push(String::new());
+    index.assessment_failures = vec![String::new(); 32];
     let base = serde_json::to_vec_pretty(&index).unwrap().len() + 1;
-    index.assessment_failures[0] = "x".repeat(memcordon_readiness_verifier::MAX_INDEX_BYTES - base);
+    let mut remaining = memcordon_readiness_verifier::MAX_INDEX_BYTES - base;
+    for failure in &mut index.assessment_failures {
+        let size = remaining.min(512 * 1024);
+        *failure = "x".repeat(size);
+        remaining -= size;
+    }
+    assert_eq!(remaining, 0);
     let boundary = directory.path().join("boundary.json");
-    memcordon_ci::consumer_readiness_ledger::persist(&index, &boundary).unwrap();
+    memcordon_ci::consumer_readiness_current::persist(&index, &boundary).unwrap();
     assert_eq!(
         std::fs::metadata(boundary).unwrap().len(),
         memcordon_readiness_verifier::MAX_INDEX_BYTES as u64
@@ -64,8 +73,8 @@ fn full_manifest_evidence_uses_verifier_bound_and_refuses_oversize_before_creati
     index.assessment_failures[0].push('x');
     let oversized = directory.path().join("oversized.json");
     assert_eq!(
-        memcordon_ci::consumer_readiness_ledger::persist(&index, &oversized).unwrap_err(),
-        "consumer readiness evidence exceeds index byte bound"
+        memcordon_ci::consumer_readiness_current::persist(&index, &oversized).unwrap_err(),
+        "current index exceeds metadata bound"
     );
     assert!(!oversized.exists());
 }
@@ -73,13 +82,13 @@ fn full_manifest_evidence_uses_verifier_bound_and_refuses_oversize_before_creati
 #[test]
 fn wrong_source_and_channel_cannot_reassociate_existing_plan() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ci/consumer-readiness-v1.toml");
+        .join("../../ci/consumer-readiness-v2.toml");
     let mut index = initialize(&manifest, identity()).unwrap();
     let mut other = identity();
     other.source_commit = "3".repeat(40);
     let cell = CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
+        revision: 2,
         identity: other,
         key: ProductKey {
             target: "x86_64-unknown-linux-gnu".into(),
@@ -92,15 +101,14 @@ fn wrong_source_and_channel_cannot_reassociate_existing_plan() {
         cleanup_failures: vec![],
         cache_quiescent: true,
     };
-    let directory = tempfile::tempdir().unwrap();
-    assert!(ingest(&mut index, cell, directory.path(), directory.path()).is_err());
+    assert!(ingest_resolved(&mut index, cell, |_| Ok(())).is_err());
     assert!(index.records.iter().all(|r| r.state == CaseState::NotRun));
 }
 
 #[test]
 fn failed_cleanup_cannot_leave_a_producer_passed_row() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ci/consumer-readiness-v1.toml");
+        .join("../../ci/consumer-readiness-v2.toml");
     let mut index = initialize(&manifest, identity()).unwrap();
     let key = ProductKey {
         target: "x86_64-unknown-linux-gnu".into(),
@@ -119,7 +127,7 @@ fn failed_cleanup_cannot_leave_a_producer_passed_row() {
     let record_key = record.key.clone();
     let cell = CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
+        revision: 2,
         identity: identity(),
         key,
         product: None,
@@ -129,8 +137,7 @@ fn failed_cleanup_cannot_leave_a_producer_passed_row() {
         cleanup_failures: vec!["native recovery uncertain".into()],
         cache_quiescent: false,
     };
-    let directory = tempfile::tempdir().unwrap();
-    ingest(&mut index, cell, directory.path(), directory.path()).unwrap();
+    ingest_resolved(&mut index, cell, |_| Ok(())).unwrap();
     let row = index
         .records
         .iter()
@@ -149,7 +156,7 @@ fn failed_cleanup_cannot_leave_a_producer_passed_row() {
 #[test]
 fn earlier_producer_run_is_preserved_when_current_assessment_merges_it() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ci/consumer-readiness-v1.toml");
+        .join("../../ci/consumer-readiness-v2.toml");
     let mut index = initialize(&manifest, identity()).unwrap();
     let mut original = identity();
     original.run_id = "original-candidate-run".into();
@@ -172,8 +179,8 @@ fn earlier_producer_run_is_preserved_when_current_assessment_merges_it() {
     let record_key = record.key.clone();
     let cell = CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
-        identity: original,
+        revision: 2,
+        identity: original.clone(),
         key,
         product: None,
         component_build: None,
@@ -182,8 +189,22 @@ fn earlier_producer_run_is_preserved_when_current_assessment_merges_it() {
         cleanup_failures: vec![],
         cache_quiescent: true,
     };
-    let directory = tempfile::tempdir().unwrap();
-    ingest(&mut index, cell, directory.path(), directory.path()).unwrap();
+    assert!(ingest_resolved(&mut index, cell.clone(), |_| Ok(())).is_err());
+    let origin = memcordon_readiness_verifier::ProducerOrigin {
+        job: "candidate-linux-x64-native".into(),
+        run_id: original.run_id,
+        run_attempt: 1,
+        artifact_id: "1".into(),
+        artifact_sha256: "3".repeat(64),
+        bundle_artifact: "original.bundle".into(),
+        source_commit: original.source_commit,
+        source_tree_sha256: original.source_tree_sha256,
+        version: original.version,
+        manifest_sha256: index.manifest_sha256.clone(),
+        repository: None,
+    };
+    memcordon_ci::consumer_readiness_current::record_origin(&mut index, origin).unwrap();
+    ingest_resolved(&mut index, cell, |_| Ok(())).unwrap();
     assert_eq!(index.run_id, "ledger-test");
     let merged = index
         .records
@@ -196,7 +217,7 @@ fn earlier_producer_run_is_preserved_when_current_assessment_merges_it() {
 
 #[test]
 fn job_operands_preserve_actual_non_success_and_reject_ambiguous_inputs() {
-    use memcordon_ci::consumer_readiness_ledger::parse_job_outcomes;
+    use memcordon_ci::readiness_identity::parse_job_outcomes;
     use memcordon_readiness_verifier::JobResult;
     let rows = parse_job_outcomes(&[
         "candidate-linux-x64-native=failure".into(),

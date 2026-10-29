@@ -1,9 +1,7 @@
 # macOS native launch contract
 
-This document keeps its original path for existing links. The current private
-guardian framing is revision 2; execution reports are schema 10 and plan reports
-are schema 9. Revision 1 reports remain historical observations and must not be
-upgraded by inventing authorization, custody, or clock evidence.
+The current private guardian framing is revision 2. Ordinary execution reports
+use schema 10; capabilities and plan reports use their named revision 3 formats.
 
 This contract describes the macOS standard watchdog launch path implemented in
 `crates/memcordon-platform/src/macos_launch.rs` and
@@ -195,7 +193,7 @@ they are distinct from the closed public Windows causal projection.
 
 ## Explicit doctor execution probe
 
-Ordinary `memcordon doctor --json` remains schema 6 and does not execute a target.
+Ordinary `memcordon doctor --json` emits named capabilities revision 3 and does not execute a target.
 `memcordon doctor --probe-execution --json` explicitly runs the macOS native
 helper and internal probe target with a five-second deadline. It emits a
 separate envelope:

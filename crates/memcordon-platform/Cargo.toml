@@ -25,6 +25,9 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tempfile.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 memcordon-windows-launch-core = { path = "../memcordon-windows-launch-core", version = "=0.5.8-dev", optional = true }
 windows-sys = { workspace = true, features = [

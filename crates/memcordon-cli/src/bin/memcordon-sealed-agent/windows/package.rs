@@ -14,15 +14,13 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::inspection_schema::{
-    AgentPackageInspection, InspectionRevision, InstalledInspectionFormat,
-    InstalledProviderInspection, ProviderPackageMetadataV4, TargetDesktopBootstrapRuntimeV4,
+    AgentPackageInspectionV2, InspectionRevisionTwo, InstalledInspectionFormat,
+    InstalledProviderInspectionV2, ProviderPackageMetadataV5, TargetDesktopBootstrapRuntimeV4,
 };
 
 use super::security::{
     SecurityDescriptor, admission_state_sddl, certification_marker_state_sddl, launcher_state_sddl,
-    package_state_sddl, pre_destructive_authority_hardening_certification_marker_state_sddl,
-    pre_write_restricted_certification_marker_state_sddl, replay_state_sddl, state_bootstrap_sddl,
-    state_parent_sddl, state_sddl,
+    package_state_sddl, replay_state_sddl, state_bootstrap_sddl, state_parent_sddl, state_sddl,
 };
 use super::service_manager::{
     self, GuardianSlotConfig, ServiceConfig, ServiceSidType, SessionBrokerConfig,
@@ -78,7 +76,7 @@ pub(crate) fn installed_public_provider_binding()
     let path = install_root().join("runtime-manifest.json");
     SecurityDescriptor::from_sddl(INSTALL_SDDL)?.verify_path(&install_root())?;
     let bytes = read_regular_no_follow_bounded(&path, "runtime-manifest", 128 * 1024)?;
-    let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(&bytes)?;
+    let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&bytes)?;
     if manifest.version != env!("CARGO_PKG_VERSION")
         || manifest.source_commit != crate::SOURCE_COMMIT
     {
@@ -94,23 +92,23 @@ pub(crate) fn installed_public_provider_binding()
 }
 
 fn validate_runtime_components(
-    manifest: &memcordon_core::runtime_manifest::RuntimeManifest,
+    manifest: &memcordon_core::runtime_manifest_v2::RuntimeManifestV2,
     agent: &Path,
     bootstrap: &Path,
     broker: &Path,
 ) -> Result<(), String> {
     let artifacts = capture_package_artifacts(agent, bootstrap, broker)?;
-    validate_runtime_snapshot(manifest, &artifacts)
+    validate_current_runtime_snapshot(manifest, &artifacts)
 }
 
-fn validate_runtime_snapshot(
-    manifest: &memcordon_core::runtime_manifest::RuntimeManifest,
+fn validate_current_runtime_snapshot(
+    manifest: &memcordon_core::runtime_manifest_v2::RuntimeManifestV2,
     artifacts: &CapturedPackageArtifacts,
 ) -> Result<(), String> {
-    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
     if manifest.components.len() != 4
         || *manifest
-            != RuntimeManifest::windows(
+            != RuntimeManifestV2::windows(
                 manifest.version.clone(),
                 manifest.source_commit.clone(),
                 native_runtime_target().into(),
@@ -118,9 +116,17 @@ fn validate_runtime_snapshot(
             )?
     {
         return Err(
-            "installed runtime manifest schema, platform, profile or protocol differs".into(),
+            "installed current manifest schema, platform, profile or protocol differs".into(),
         );
     }
+    validate_runtime_component_records(&manifest.components, artifacts)
+}
+
+fn validate_runtime_component_records(
+    components: &[memcordon_core::runtime_components::RuntimeComponentRecord],
+    artifacts: &CapturedPackageArtifacts,
+) -> Result<(), String> {
+    use memcordon_core::runtime_components::RuntimeComponentRole;
     for (role, id, bytes, name) in [
         (
             RuntimeComponentRole::SealedAgent,
@@ -141,8 +147,7 @@ fn validate_runtime_snapshot(
             "memcordon-session-broker.exe",
         ),
     ] {
-        let records: Vec<_> = manifest
-            .components
+        let records: Vec<_> = components
             .iter()
             .filter(|record| record.role == role)
             .collect();
@@ -159,8 +164,7 @@ fn validate_runtime_snapshot(
             return Err("installed runtime component digest differs".into());
         }
     }
-    let public: Vec<_> = manifest
-        .components
+    let public: Vec<_> = components
         .iter()
         .filter(|record| record.role == RuntimeComponentRole::PublicCli)
         .collect();
@@ -172,6 +176,16 @@ fn validate_runtime_snapshot(
         return Err("runtime public CLI inventory differs".into());
     }
     Ok(())
+}
+
+fn validate_stored_runtime_snapshot(
+    bytes: &[u8],
+    artifacts: &CapturedPackageArtifacts,
+) -> Result<(), String> {
+    validate_current_runtime_snapshot(
+        &memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(bytes)?,
+        artifacts,
+    )
 }
 
 fn native_runtime_target() -> &'static str {
@@ -187,9 +201,8 @@ fn source_runtime_manifest(
     bootstrap: &Path,
     broker: &Path,
 ) -> Result<Vec<u8>, String> {
-    use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-    };
+    use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
     let directory = agent.parent().ok_or("provider source has no parent")?;
     let manifest_path = directory.join("runtime-manifest.json");
     let bytes = if manifest_path.exists() {
@@ -233,7 +246,7 @@ fn source_runtime_manifest(
                 sha256: crate::package::sha256_bytes(&content),
             });
         }
-        let manifest = RuntimeManifest::windows(
+        let manifest = RuntimeManifestV2::windows(
             env!("CARGO_PKG_VERSION").into(),
             crate::SOURCE_COMMIT.into(),
             native_runtime_target().into(),
@@ -243,7 +256,7 @@ fn source_runtime_manifest(
         bytes.push(b'\n');
         bytes
     };
-    let manifest = RuntimeManifest::parse(&bytes)?;
+    let manifest = RuntimeManifestV2::parse(&bytes)?;
     validate_runtime_components(&manifest, agent, bootstrap, broker)?;
     if manifest.version != env!("CARGO_PKG_VERSION")
         || manifest.source_commit != crate::SOURCE_COMMIT
@@ -354,7 +367,8 @@ pub(crate) fn require_native_pe_machine_for_test(machine: u16) -> Result<(), Str
     .map(|_| ())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackageArtifactDigests {
     agent_sha256: String,
     target_desktop_bootstrap_sha256: String,
@@ -510,7 +524,7 @@ pub(crate) fn validate_installed_session_broker() -> Result<String, String> {
     Ok(crate::package::sha256_bytes(&bytes))
 }
 
-pub fn compiled_metadata() -> Result<ProviderPackageMetadataV4, String> {
+pub fn compiled_metadata() -> Result<ProviderPackageMetadataV5, String> {
     let executable = installed_binary().to_string_lossy().into_owned();
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
@@ -558,7 +572,7 @@ pub fn compiled_metadata() -> Result<ProviderPackageMetadataV4, String> {
         })
         .collect::<Result<Vec<_>, String>>()?
         .join("\u{1e}");
-    Ok(ProviderPackageMetadataV4::WindowsService {
+    Ok(ProviderPackageMetadataV5::WindowsService {
         control_service_name: WINDOWS_CONTROL_SERVICE_NAME.to_owned(),
         launcher_service_name: WINDOWS_LAUNCHER_SERVICE_NAME.to_owned(),
         session_broker_service_name: WINDOWS_SESSION_BROKER_SERVICE_NAME.to_owned(),
@@ -594,7 +608,7 @@ pub fn compiled_metadata() -> Result<ProviderPackageMetadataV4, String> {
         session_broker_install_path: installed_session_broker().to_string_lossy().into_owned(),
         session_broker_sha256: crate::package::sha256_regular_no_follow(&source_broker)?,
         state_root: state_root().to_string_lossy().into_owned(),
-        policy_root: super::policy_registry::root().to_string_lossy().into_owned(),
+        diagnostics_root: super::startup_diagnostics::root().to_string_lossy().into_owned(),
         control_service_sid_type: "restricted".to_owned(),
         launcher_service_sid_type: "restricted".to_owned(),
         session_broker_service_sid_type: "unrestricted".to_owned(),
@@ -720,15 +734,18 @@ fn service_config_record(
 pub fn mutate(operation: &OsStr) -> Result<(), String> {
     if operation == "install" {
         let lease = PackageLease::acquire()?;
+        recover_interrupted_upgrade()?;
         let transition = install()?;
         verify_ready_package(lease, ActivationRollback::Fresh(transition))
     } else if operation == "upgrade" {
         let lease = PackageLease::acquire()?;
+        recover_interrupted_upgrade()?;
         reconcile_services_from_installed()?;
         let installation = upgrade()?;
         verify_ready_package(lease, ActivationRollback::Upgrade(installation))
     } else if operation == "uninstall" {
         let _lease = PackageLease::acquire()?;
+        recover_interrupted_upgrade()?;
         reconcile_services_from_installed()?;
         uninstall()
     } else {
@@ -866,6 +883,11 @@ fn rollback_fresh_install(rollback: FreshRollback) -> Result<(), String> {
 
 fn service_owned_cleanup_barrier() -> Result<(), String> {
     let deadline = Instant::now() + PACKAGE_CLEANUP_DEADLINE;
+    let installed = validate_existing_installed_artifacts()?;
+    let manifest = captured_installed_manifest(&installed)?
+        .ok_or("installed current runtime inventory is absent")?;
+    let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&manifest)?;
+    validate_current_runtime_snapshot(&manifest, &installed)?;
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -877,7 +899,8 @@ fn service_owned_cleanup_barrier() -> Result<(), String> {
         let deadline_millis = u64::try_from((deadline - now).as_millis())
             .unwrap_or(u64::MAX)
             .max(1);
-        match super::qualification::prepare_package_cleanup(deadline_millis) {
+        let cleanup = super::qualification::prepare_package_cleanup(deadline_millis);
+        match cleanup {
             Ok(()) => return Ok(()),
             Err(super::record::PackageCleanupError::Active(detail)) => {
                 let recovery_empty = super::qualification::recovery_status()?;
@@ -1133,12 +1156,253 @@ impl InstallTransition {
 }
 
 struct UpgradeRollback {
+    operation: CurrentPackageOperation,
     runtime_manifest: Option<Vec<u8>>,
     binary: PathBuf,
     target_desktop_bootstrap: PathBuf,
     session_broker: PathBuf,
     artifact_digests: PackageArtifactDigests,
     scm_connect_ace_owned: bool,
+    diagnostics: Option<super::startup_diagnostics::DiagnosticsSnapshot>,
+    current_state_backup: PathBuf,
+    replacement_manifest: Vec<u8>,
+    replacement_artifact_digests: PackageArtifactDigests,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentPackageStateBackup {
+    format: String,
+    revision: u32,
+    operation: CurrentPackageOperation,
+    runtime_manifest: Option<Vec<u8>>,
+    diagnostics: Option<super::startup_diagnostics::DiagnosticsSnapshot>,
+    artifact_digests: PackageArtifactDigests,
+    scm_connect_ace_owned: bool,
+    replacement_manifest: Vec<u8>,
+    replacement_artifact_digests: PackageArtifactDigests,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CurrentPackageOperation {
+    #[default]
+    Upgrade,
+    Uninstall,
+    UninstallCommitted,
+}
+
+fn persist_current_package_state(rollback: &UpgradeRollback) -> Result<(), String> {
+    write_current_package_state(rollback, &rollback.current_state_backup)
+}
+
+fn write_current_package_state(
+    rollback: &UpgradeRollback,
+    destination: &Path,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    let snapshot = CurrentPackageStateBackup {
+        format: "memcordon.windows-current-package-state".into(),
+        revision: 1,
+        operation: rollback.operation,
+        runtime_manifest: rollback.runtime_manifest.clone(),
+        diagnostics: rollback.diagnostics.clone(),
+        artifact_digests: rollback.artifact_digests.clone(),
+        scm_connect_ace_owned: rollback.scm_connect_ace_owned,
+        replacement_manifest: rollback.replacement_manifest.clone(),
+        replacement_artifact_digests: rollback.replacement_artifact_digests.clone(),
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err("retired package rollback data exceeds aggregate ceiling".into());
+    }
+    reject_reparse_components(destination)?;
+    // Current rollback diagnostics are private from the creation instant.
+    let security = SecurityDescriptor::from_sddl("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)")?;
+    let attributes = security.attributes(false);
+    let wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: live NUL-terminated path and security attributes; CREATE_NEW
+    // never follows or replaces an existing object.
+    let handle = unsafe {
+        windows_sys::Win32::Storage::FileSystem::CreateFileW(
+            wide.as_ptr(),
+            0x4000_0000 | 0x0002_0000,
+            0,
+            &raw const attributes,
+            windows_sys::Win32::Storage::FileSystem::CREATE_NEW,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: this successful CREATE_NEW handle has one native owner.
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+    security.verify_file_object(file.as_raw_handle() as _)?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+/// Resume only this package's fixed rollback objects under its mutation lease.
+/// The decoded record contains cleanup bytes, never a launch owner or grant.
+fn recover_interrupted_upgrade() -> Result<(), String> {
+    let current_state_backup = install_root().join("current-package-state.rollback.json");
+    if path_absent_no_follow(&current_state_backup, "recover-upgrade-journal")? {
+        return recover_unjournaled_upgrade_backups();
+    }
+    SecurityDescriptor::from_sddl(INSTALL_SDDL)?.verify_path(&install_root())?;
+    SecurityDescriptor::from_sddl("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)")?
+        .verify_path(&current_state_backup)?;
+    let bytes = read_regular_no_follow_bounded(
+        &current_state_backup,
+        "recover-upgrade-journal",
+        128 * 1024 * 1024,
+    )?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
+    let snapshot: CurrentPackageStateBackup = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid retained package rollback record: {error}"))?;
+    if snapshot.format != "memcordon.windows-current-package-state"
+        || snapshot.revision != 1
+        || snapshot
+            .runtime_manifest
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES)
+        || snapshot.replacement_manifest.len()
+            > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+    {
+        return Err("retained package rollback record version or inventory ceiling differs".into());
+    }
+    if let Some(diagnostics) = &snapshot.diagnostics {
+        diagnostics.validate_for_restore()?;
+    }
+    let replacement = if snapshot.operation == CurrentPackageOperation::Upgrade {
+        Some(
+            memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(
+                &snapshot.replacement_manifest,
+            )?,
+        )
+    } else {
+        if !snapshot.replacement_manifest.is_empty() {
+            return Err("uninstall rollback carries unexpected replacement manifest".into());
+        }
+        None
+    };
+    let rollback = UpgradeRollback {
+        operation: snapshot.operation,
+        runtime_manifest: snapshot.runtime_manifest,
+        binary: installed_binary().with_extension("exe.rollback"),
+        target_desktop_bootstrap: installed_target_desktop_bootstrap()
+            .with_extension("exe.rollback"),
+        session_broker: installed_session_broker().with_extension("exe.rollback"),
+        artifact_digests: snapshot.artifact_digests,
+        scm_connect_ace_owned: snapshot.scm_connect_ace_owned,
+        diagnostics: snapshot.diagnostics,
+        current_state_backup,
+        replacement_manifest: snapshot.replacement_manifest,
+        replacement_artifact_digests: snapshot.replacement_artifact_digests,
+    };
+    if rollback.operation == CurrentPackageOperation::UninstallCommitted {
+        require_removed_service_identities()?;
+        for path in [
+            installed_binary(),
+            installed_target_desktop_bootstrap(),
+            installed_session_broker(),
+            install_root().join("runtime-manifest.json"),
+            state_root(),
+            super::startup_diagnostics::root(),
+        ] {
+            if !path_absent_no_follow(&path, "recover-committed-uninstall")? {
+                return Err(format!(
+                    "committed uninstall still has unresolved native path: {}",
+                    path.display()
+                ));
+            }
+        }
+        cleanup_upgrade_rollback(&rollback)?;
+        return remove_empty_install_root();
+    }
+    if let Some(replacement) = replacement
+        && let Ok(current) = validate_existing_installed_artifacts()
+    {
+        if current.digests == rollback.replacement_artifact_digests
+            && captured_installed_manifest(&current)?.as_deref()
+                == Some(rollback.replacement_manifest.as_slice())
+        {
+            validate_current_runtime_snapshot(&replacement, &current)?;
+            reconcile_services_from_installed()?;
+            service_owned_cleanup_barrier()?;
+            verify_live_installed_state()?;
+            return cleanup_upgrade_rollback(&rollback);
+        }
+    }
+    // An incomplete replacement cannot be adopted. Validate every exact old
+    // artifact before restoration; failed native cleanup retains all rollback
+    // bytes and the current real owners for another bounded recovery attempt.
+    validate_artifact_pair(
+        &rollback.binary,
+        &rollback.target_desktop_bootstrap,
+        &rollback.session_broker,
+        Some(&rollback.artifact_digests),
+    )?;
+    restore_upgrade(&rollback, None)?;
+    retire_uninstall_commit_staging(&rollback)?;
+    cleanup_upgrade_rollback(&rollback)
+}
+
+fn retire_uninstall_commit_staging(rollback: &UpgradeRollback) -> Result<(), String> {
+    let path = install_root().join("current-package-state.rollback-commit.json");
+    if path_absent_no_follow(&path, "recover-uninstall-commit-staging")? {
+        return Ok(());
+    }
+    if rollback.operation != CurrentPackageOperation::Uninstall {
+        return Err("unexpected uninstall commit staging beside upgrade rollback".into());
+    }
+    SecurityDescriptor::from_sddl("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)")?.verify_path(&path)?;
+    let bytes = read_regular_no_follow_bounded(
+        &path,
+        "recover-uninstall-commit-staging",
+        128 * 1024 * 1024,
+    )?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
+    let actual: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let original = read_regular_no_follow_bounded(
+        &rollback.current_state_backup,
+        "recover-uninstall-original",
+        128 * 1024 * 1024,
+    )?;
+    let mut expected: serde_json::Value =
+        serde_json::from_slice(&original).map_err(|error| error.to_string())?;
+    expected["operation"] = serde_json::Value::String("uninstall-committed".into());
+    if actual != expected {
+        return Err("uninstall commit staging differs from exact original rollback".into());
+    }
+    std::fs::remove_file(path).map_err(|error| error.to_string())
+}
+
+fn recover_unjournaled_upgrade_backups() -> Result<(), String> {
+    let paths = [
+        installed_binary().with_extension("exe.rollback"),
+        installed_target_desktop_bootstrap().with_extension("exe.rollback"),
+        installed_session_broker().with_extension("exe.rollback"),
+    ];
+    for path in &paths {
+        if !path_absent_no_follow(path, "recover-unjournaled-upgrade-backup")? {
+            return Err(format!(
+                "MCSEALED-WINDOWS-UPGRADE-RECOVERY-REQUIRED: rollback object has no current ownership journal: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct UpgradeInstallation {
@@ -1177,23 +1441,44 @@ fn upgrade() -> Result<UpgradeInstallation, String> {
 }
 
 fn upgrade_from(source: &Path) -> Result<UpgradeInstallation, String> {
+    let source_bootstrap = packaged_target_desktop_bootstrap(source)?;
+    let source_broker = packaged_session_broker(source)?;
+    let replacement_artifacts =
+        capture_package_artifacts(source, &source_bootstrap, &source_broker)?;
+    let replacement_manifest = source_runtime_manifest(source, &source_bootstrap, &source_broker)?;
+    validate_current_runtime_snapshot(
+        &memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&replacement_manifest)?,
+        &replacement_artifacts,
+    )?;
     let scm_connect_ace_owned = scm_ownership_marker_present()?;
     let installed = installed_binary();
     let captured = validate_existing_installed_artifacts()?;
     let runtime_manifest = captured_installed_manifest(&captured)?;
     let backup = installed.with_extension("exe.rollback");
+    let bootstrap_backup = installed_target_desktop_bootstrap().with_extension("exe.rollback");
+    let broker_backup = installed_session_broker().with_extension("exe.rollback");
+    let current_state_backup = install_root().join("current-package-state.rollback.json");
+    for path in [
+        &backup,
+        &bootstrap_backup,
+        &broker_backup,
+        &current_state_backup,
+    ] {
+        if !path_absent_no_follow(path, "preserve-interrupted-upgrade")? {
+            return Err(format!(
+                "MCSEALED-WINDOWS-UPGRADE-RECOVERY-REQUIRED: retained prior rollback object must be recovered before replacement: {}",
+                path.display()
+            ));
+        }
+    }
     copy_atomically_bytes(&captured.agent_bytes, &backup).map_err(|error| {
         format!("cannot preserve the working Windows provider for rollback: {error}")
     })?;
-    let installed_bootstrap = installed_target_desktop_bootstrap();
-    let bootstrap_backup = installed_bootstrap.with_extension("exe.rollback");
     copy_atomically_bytes(&captured.target_desktop_bootstrap_bytes, &bootstrap_backup).map_err(
         |error| {
             format!("cannot preserve the working target desktop bootstrap for rollback: {error}")
         },
     )?;
-    let installed_broker = installed_session_broker();
-    let broker_backup = installed_broker.with_extension("exe.rollback");
     copy_atomically_bytes(&captured.session_broker_bytes, &broker_backup).map_err(|error| {
         format!("cannot preserve the working session broker for rollback: {error}")
     })?;
@@ -1203,30 +1488,54 @@ fn upgrade_from(source: &Path) -> Result<UpgradeInstallation, String> {
         &broker_backup,
         Some(&captured.digests),
     )?;
-    let rollback = UpgradeRollback {
+    let mut rollback = UpgradeRollback {
+        operation: CurrentPackageOperation::Upgrade,
         runtime_manifest,
         binary: backup,
         target_desktop_bootstrap: bootstrap_backup,
         session_broker: broker_backup,
         artifact_digests: captured.digests,
         scm_connect_ace_owned,
+        diagnostics: None,
+        current_state_backup,
+        replacement_manifest,
+        replacement_artifact_digests: replacement_artifacts.digests,
     };
-    let source_broker = packaged_session_broker(&source)?;
     if let Err(cleanup_error) = service_owned_cleanup_barrier() {
-        cleanup_upgrade_rollback(&rollback);
-        return Err(format!(
-            "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: service-owned state cleanup failed before replacement: {cleanup_error}"
+        return Err(cleanup_upgrade_rollback_after_failure(
+            &rollback,
+            format!(
+                "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: service-owned state cleanup failed before replacement: {cleanup_error}"
+            ),
+        ));
+    }
+    let retired = (|| {
+        rollback.diagnostics = super::startup_diagnostics::capture_current()?;
+        persist_current_package_state(&rollback)?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = retired {
+        return Err(cleanup_upgrade_rollback_after_failure(
+            &rollback,
+            format!(
+                "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: retired state could not be captured before replacement: {error}"
+            ),
         ));
     }
     if let Err(remove_error) = uninstall_services() {
         let reconcile = reconcile_services_from_installed();
-        cleanup_upgrade_rollback(&rollback);
         return match reconcile {
-            Ok(()) => Err(format!(
-                "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: service removal failed before replacement and the installed pair was restored: {remove_error}"
+            Ok(()) => Err(cleanup_upgrade_rollback_after_failure(
+                &rollback,
+                format!(
+                    "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: service removal failed before replacement and the installed pair was restored: {remove_error}"
+                ),
             )),
-            Err(reconcile_error) => Err(format!(
-                "MCSEALED-WINDOWS-UPGRADE-ROLLBACK-FAILED: remove={remove_error}; reconcile={reconcile_error}"
+            Err(reconcile_error) => Err(cleanup_upgrade_rollback_after_failure(
+                &rollback,
+                format!(
+                    "MCSEALED-WINDOWS-UPGRADE-ROLLBACK-FAILED: remove={remove_error}; reconcile={reconcile_error}"
+                ),
             )),
         };
     }
@@ -1237,19 +1546,18 @@ fn upgrade_from(source: &Path) -> Result<UpgradeInstallation, String> {
     }) {
         let rollback_result = restore_upgrade(&rollback, None);
         return match rollback_result {
-            Ok(()) => {
-                cleanup_upgrade_rollback(&rollback);
-                Err(format!(
+            Ok(()) => Err(cleanup_upgrade_rollback_after_failure(
+                &rollback,
+                format!(
                     "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: filesystem cleanup failed and the installed pair was restored: {remove_error}"
-                ))
-            }
+                ),
+            )),
             Err(rollback_error) => Err(format!(
                 "MCSEALED-WINDOWS-UPGRADE-ROLLBACK-FAILED: remove={remove_error}; rollback={rollback_error}; rollback artifacts were preserved"
             )),
         };
     }
     let mut transition = InstallTransition::new(InstallIntent::Normal);
-    let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
     match install_transaction(
         &source,
         &source_bootstrap,
@@ -1273,12 +1581,10 @@ fn upgrade_from(source: &Path) -> Result<UpgradeInstallation, String> {
         Err(upgrade_error) => {
             let rollback_result = restore_upgrade(&rollback, Some(transition));
             match rollback_result {
-                Ok(()) => {
-                    cleanup_upgrade_rollback(&rollback);
-                    Err(format!(
-                        "MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: {upgrade_error}"
-                    ))
-                }
+                Ok(()) => Err(cleanup_upgrade_rollback_after_failure(
+                    &rollback,
+                    format!("MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: {upgrade_error}"),
+                )),
                 Err(rollback_error) => Err(format!(
                     "MCSEALED-WINDOWS-UPGRADE-ROLLBACK-FAILED: upgrade={upgrade_error}; rollback={rollback_error}; rollback artifacts were preserved"
                 )),
@@ -1312,12 +1618,17 @@ fn verify_ready_package_with_observation(
     // Live readiness creates no target or admission lease. Keep package custody
     // held through observation and any compensation of this exact generation.
     let _lease = lease;
-    let ready = observe();
+    let ready = observe().and_then(|()| {
+        if matches!(&rollback, ActivationRollback::Upgrade(_)) {
+            // The original installed runtime has drained and the new pair is
+            // ready. The current transaction can now retire its rollback data.
+        }
+        Ok(())
+    });
     match (ready, rollback) {
         (Ok(()), ActivationRollback::Upgrade(installation)) => {
             drop(installation.transition);
-            cleanup_upgrade_rollback(&installation.rollback);
-            Ok(())
+            cleanup_upgrade_rollback(&installation.rollback)
         }
         (Ok(()), ActivationRollback::Fresh(transition)) => {
             drop(transition);
@@ -1327,10 +1638,10 @@ fn verify_ready_package_with_observation(
             let rollback = installation.rollback;
             let restored = restore_upgrade(&rollback, Some(installation.transition));
             match restored {
-                Ok(()) => {
-                    cleanup_upgrade_rollback(&rollback);
-                    Err(format!("MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: {error}"))
-                }
+                Ok(()) => Err(cleanup_upgrade_rollback_after_failure(
+                    &rollback,
+                    format!("MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: {error}"),
+                )),
                 Err(rollback_error) => Err(format!(
                     "MCSEALED-WINDOWS-UPGRADE-ROLLBACK-FAILED: upgrade={error}; rollback={rollback_error}; rollback artifacts were preserved"
                 )),
@@ -1400,6 +1711,21 @@ fn restore_upgrade(
             owned: rollback.scm_connect_ace_owned,
         },
     })?;
+    // A failed final retirement can have removed only part of the old area.
+    // Restore exact captured bytes before starting the original components.
+    super::startup_diagnostics::remove_current()?;
+    let parent = state_root()
+        .parent()
+        .expect("sealed state has parent")
+        .to_path_buf();
+    create_secure_directory(
+        &parent,
+        &SecurityDescriptor::from_sddl(&state_parent_sddl()?)?,
+        "restore upgrade state parent",
+    )?;
+    if let Some(snapshot) = rollback.diagnostics.as_ref() {
+        super::startup_diagnostics::restore_current(snapshot)?;
+    }
     let mut restored_transition = InstallTransition::new(InstallIntent::Normal);
     install_transaction(
         &rollback.binary,
@@ -1424,21 +1750,51 @@ fn restore_upgrade(
     }
 }
 
-fn cleanup_upgrade_rollback(rollback: &UpgradeRollback) {
+fn cleanup_upgrade_rollback_after_failure(rollback: &UpgradeRollback, primary: String) -> String {
+    match cleanup_upgrade_rollback(rollback) {
+        Ok(()) => primary,
+        Err(secondary) => format!("{primary}; rollback-artifact-cleanup={secondary}"),
+    }
+}
+
+fn cleanup_upgrade_rollback(rollback: &UpgradeRollback) -> Result<(), String> {
+    let mut failures = Vec::new();
     for path in std::iter::once(&rollback.binary)
         .chain(std::iter::once(&rollback.target_desktop_bootstrap))
         .chain(std::iter::once(&rollback.session_broker))
     {
-        if path_absent_no_follow(path, "cleanup-upgrade-rollback") == Ok(false) {
-            let _ = std::fs::remove_file(path);
+        match path_absent_no_follow(path, "cleanup-upgrade-rollback") {
+            Ok(true) => (),
+            Ok(false) => {
+                if let Err(error) = std::fs::remove_file(path) {
+                    failures.push(format!("{}: {error}", path.display()));
+                }
+            }
+            Err(error) => failures.push(error),
         }
+    }
+    if failures.is_empty() {
+        // The durable record is retired last. A partial artifact cleanup must
+        // retain the exact state association needed by the next recovery.
+        match path_absent_no_follow(&rollback.current_state_backup, "cleanup-upgrade-journal")? {
+            true => Ok(()),
+            false => std::fs::remove_file(&rollback.current_state_backup).map_err(|error| {
+                format!(
+                    "MCSEALED-WINDOWS-UPGRADE-RETAINED-ROLLBACK: {}: {error}",
+                    rollback.current_state_backup.display()
+                )
+            }),
+        }
+    } else {
+        Err(format!(
+            "MCSEALED-WINDOWS-UPGRADE-RETAINED-ROLLBACK: {}",
+            failures.join("; ")
+        ))
     }
 }
 
 enum RuntimeManifestInput<'a> {
     Source,
-    // Absence preserves a drained historical package's real inventory. It is
-    // never synthesized into evidence of support for current admission schemas.
     Rollback(Option<&'a [u8]>),
 }
 
@@ -1447,15 +1803,14 @@ fn captured_installed_manifest(
 ) -> Result<Option<Vec<u8>>, String> {
     let path = install_root().join("runtime-manifest.json");
     if path_absent_no_follow(&path, "capture-installed-runtime-manifest")? {
-        return Ok(None);
+        return Err("installed current runtime inventory is absent".into());
     }
     let bytes = read_regular_no_follow_bounded(
         &path,
         "capture-installed-runtime-manifest",
         memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
     )?;
-    let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(&bytes)?;
-    validate_runtime_snapshot(&manifest, artifacts)?;
+    validate_stored_runtime_snapshot(&bytes, artifacts)?;
     Ok(Some(bytes))
 }
 
@@ -1483,10 +1838,8 @@ fn install_captured_transaction(
     manifest_bytes: Option<&[u8]>,
     transition: &mut InstallTransition,
 ) -> Result<(), String> {
-    if let Some(bytes) = manifest_bytes {
-        let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(bytes)?;
-        validate_runtime_snapshot(&manifest, source_artifacts)?;
-    }
+    let manifest_bytes = manifest_bytes.ok_or("current package inventory is required")?;
+    validate_stored_runtime_snapshot(manifest_bytes, source_artifacts)?;
     let install_root = install_root();
     let state_root = state_root();
     reject_reparse_components(&install_root)?;
@@ -1508,14 +1861,7 @@ fn install_captured_transaction(
         &source_artifacts.session_broker_bytes,
         &installed_session_broker(),
     )?;
-    if let Some(bytes) = manifest_bytes {
-        copy_atomically_bytes(bytes, &install_root.join("runtime-manifest.json"))?;
-    } else {
-        let path = install_root.join("runtime-manifest.json");
-        if !path_absent_no_follow(&path, "restore-legacy-manifest-absence")? {
-            std::fs::remove_file(path).map_err(|error| error.to_string())?;
-        }
-    }
+    copy_atomically_bytes(manifest_bytes, &install_root.join("runtime-manifest.json"))?;
     let bootstrap_security = SecurityDescriptor::from_sddl(&state_bootstrap_sddl()?)?;
     let state_parent = state_root
         .parent()
@@ -1526,7 +1872,7 @@ fn install_captured_transaction(
         "create package state parent",
     )?;
     transition.retain(state_parent, &state_parent_sddl()?)?;
-    super::policy_registry::install()?;
+    super::startup_diagnostics::install()?;
     create_secure_directory(
         &state_root,
         &bootstrap_security,
@@ -2092,40 +2438,59 @@ fn reconcile_runtime_state_security() -> Result<(), String> {
 
 pub(crate) fn reconcile_certification_marker_security(path: &Path) -> Result<(), String> {
     let expected = SecurityDescriptor::from_sddl(&certification_marker_state_sddl()?)?;
-    let expected_error = match expected.verify_path(path) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-
-    // Accept only exact historical descriptors for a one-way transition. The
-    // immediate predecessor granted BA delete-child and reopenable producer
-    // DELETE; the earlier predecessor predated Write Restricted Code.
-    let pre_destructive_authority = SecurityDescriptor::from_sddl(
-        &pre_destructive_authority_hardening_certification_marker_state_sddl()?,
-    )?;
-    let pre_destructive_authority_error = pre_destructive_authority.verify_path(path).err();
-    let pre_write_restricted =
-        SecurityDescriptor::from_sddl(&pre_write_restricted_certification_marker_state_sddl()?)?;
-    if let Some(pre_destructive_authority_error) = pre_destructive_authority_error {
-        if let Err(pre_write_restricted_error) = pre_write_restricted.verify_path(path) {
-            let package_legacy = SecurityDescriptor::from_sddl(&package_state_sddl()?)?;
-            package_legacy.verify_path(path).map_err(|package_legacy_error| {
-                format!(
-                    "certification marker security matched neither current nor recognized legacy policy: current={expected_error}; pre-destructive-authority={pre_destructive_authority_error}; pre-write-restricted={pre_write_restricted_error}; package={package_legacy_error}"
-                )
-            })?;
-        }
-    }
-    // SetFileSecurityW does not rewrite inherited ACEs on existing children.
-    // Attempt directories are nonce-bound and never reused; package removal
-    // retires only its exact protocol-owned descendant inventory after the
-    // service-owned cleanup barrier, rejecting unexpected or reparse entries.
-    expected.apply_to_path(path)?;
     expected.verify_path(path)
 }
 
 fn uninstall() -> Result<(), String> {
     uninstall_with_removal(remove_provider_files)
+}
+
+fn preserve_uninstall_rollback(
+    captured: &CapturedPackageArtifacts,
+    runtime_manifest: Option<Vec<u8>>,
+    diagnostics: Option<super::startup_diagnostics::DiagnosticsSnapshot>,
+) -> Result<UpgradeRollback, String> {
+    let rollback = UpgradeRollback {
+        operation: CurrentPackageOperation::Uninstall,
+        runtime_manifest,
+        binary: installed_binary().with_extension("exe.rollback"),
+        target_desktop_bootstrap: installed_target_desktop_bootstrap()
+            .with_extension("exe.rollback"),
+        session_broker: installed_session_broker().with_extension("exe.rollback"),
+        artifact_digests: captured.digests.clone(),
+        scm_connect_ace_owned: scm_ownership_marker_present()?,
+        diagnostics,
+        current_state_backup: install_root().join("current-package-state.rollback.json"),
+        replacement_manifest: Vec::new(),
+        replacement_artifact_digests: captured.digests.clone(),
+    };
+    for path in [
+        &rollback.binary,
+        &rollback.target_desktop_bootstrap,
+        &rollback.session_broker,
+        &rollback.current_state_backup,
+    ] {
+        if !path_absent_no_follow(path, "preserve-uninstall-rollback")? {
+            return Err(format!(
+                "uninstall retains interrupted rollback object: {}",
+                path.display()
+            ));
+        }
+    }
+    copy_atomically_bytes(&captured.agent_bytes, &rollback.binary)?;
+    copy_atomically_bytes(
+        &captured.target_desktop_bootstrap_bytes,
+        &rollback.target_desktop_bootstrap,
+    )?;
+    copy_atomically_bytes(&captured.session_broker_bytes, &rollback.session_broker)?;
+    validate_artifact_pair(
+        &rollback.binary,
+        &rollback.target_desktop_bootstrap,
+        &rollback.session_broker,
+        Some(&rollback.artifact_digests),
+    )?;
+    persist_current_package_state(&rollback)?;
+    Ok(rollback)
 }
 
 fn uninstall_with_removal(
@@ -2134,12 +2499,23 @@ fn uninstall_with_removal(
     service_owned_cleanup_barrier()?;
     let captured = validate_existing_installed_artifacts()?;
     let runtime_manifest = captured_installed_manifest(&captured)?;
-    let policy_snapshot = super::policy_registry::capture_retired()?;
+    let diagnostic_snapshot = super::startup_diagnostics::capture_current()?;
+    // Persist exact old bytes before stopping or deleting any native owner.
+    // A new package controller reauthenticates these protected fixed objects
+    // under the mutation lease and restores the old package after a crash.
+    let mut durable = preserve_uninstall_rollback(
+        &captured,
+        runtime_manifest.clone(),
+        diagnostic_snapshot.clone(),
+    )?;
     if let Err(remove_error) = uninstall_services() {
         let reconcile = reconcile_services_from_installed();
         return match reconcile {
-            Ok(()) => Err(format!(
-                "MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK: service removal failed and the installed pair was restored: {remove_error}"
+            Ok(()) => Err(cleanup_upgrade_rollback_after_failure(
+                &durable,
+                format!(
+                    "MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK: service removal failed and the installed pair was restored: {remove_error}"
+                ),
             )),
             Err(reconcile_error) => Err(format!(
                 "MCSEALED-WINDOWS-UNINSTALL-ROLLBACK-FAILED: remove={remove_error}; reconcile={reconcile_error}"
@@ -2160,7 +2536,7 @@ fn uninstall_with_removal(
             // reopened with bootstrap authority. Retire that remaining state
             // before rebuilding through the normal installation transition.
             remove_provider_state(ProviderRemovalContext { scm_ace })?;
-            if let Some(snapshot) = policy_snapshot.as_ref() {
+            if diagnostic_snapshot.is_some() {
                 let parent = state_root()
                     .parent()
                     .expect("sealed state has parent")
@@ -2168,27 +2544,37 @@ fn uninstall_with_removal(
                 create_secure_directory(
                     &parent,
                     &SecurityDescriptor::from_sddl(&state_parent_sddl()?)?,
-                    "restore package policy parent",
+                    "restore package state parent",
                 )?;
-                super::policy_registry::restore_retired(snapshot)?;
+            }
+            if let Some(snapshot) = diagnostic_snapshot.as_ref() {
+                super::startup_diagnostics::remove_current()?;
+                super::startup_diagnostics::restore_current(snapshot)?;
             }
             install_captured_transaction(&captured, runtime_manifest.as_deref(), &mut transition)
         })();
         return match rollback {
-            Ok(()) => Err(format!(
-                "MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK: filesystem removal failed and the installed pair was restored: {remove_error}"
+            Ok(()) => Err(cleanup_upgrade_rollback_after_failure(
+                &durable,
+                format!(
+                    "MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK: filesystem removal failed and the installed pair was restored: {remove_error}"
+                ),
             )),
             Err(rollback_error) => Err(format!(
                 "MCSEALED-WINDOWS-UNINSTALL-ROLLBACK-FAILED: remove={remove_error}; rollback={rollback_error}"
             )),
         };
     }
-    Ok(())
+    // Commit deletion before retiring any rollback member. A crash during the
+    // following bounded file cleanup can finish deletion without attempting to
+    // restore from a partially retired backup set.
+    durable.operation = CurrentPackageOperation::UninstallCommitted;
+    let committed = install_root().join("current-package-state.rollback-commit.json");
+    write_current_package_state(&durable, &committed)?;
+    super::record::replace_atomically(&committed, &durable.current_state_backup)?;
+    cleanup_upgrade_rollback(&durable)?;
+    remove_empty_install_root()
 }
-
-#[cfg(test)]
-#[path = "../../../../tests/sealed_agent/windows_package_policy_rollback.rs"]
-mod policy_rollback_tests;
 
 fn scm_ownership_marker_present() -> Result<bool, String> {
     use std::os::windows::fs::MetadataExt;
@@ -2243,7 +2629,12 @@ fn remove_provider_files(context: ProviderRemovalContext) -> Result<(), String> 
     )?;
     let install = install_root();
     reject_reparse_components(&install)?;
-    if !path_absent_no_follow(&install, "remove-install-root")? {
+    if !path_absent_no_follow(&install, "remove-install-root")?
+        && path_absent_no_follow(
+            &install.join("current-package-state.rollback.json"),
+            "retained-uninstall-rollback",
+        )?
+    {
         std::fs::remove_dir(&install).map_err(|error| {
             format!(
                 "MCSEALED-WINDOWS-REMOVE: cannot remove install root {}: {error}",
@@ -2251,13 +2642,28 @@ fn remove_provider_files(context: ProviderRemovalContext) -> Result<(), String> 
             )
         })?;
     }
-    super::policy_registry::remove_retired()?;
+    super::startup_diagnostics::remove_current()?;
     let parent = state_root()
         .parent()
         .expect("sealed state has parent")
         .to_path_buf();
     remove_directory_if_present(&parent, StateDirectory::StateParent, context)?;
     Ok(())
+}
+
+fn remove_empty_install_root() -> Result<(), String> {
+    let root = install_root();
+    reject_reparse_components(&root)?;
+    if path_absent_no_follow(&root, "finish-uninstall-root")? {
+        return Ok(());
+    }
+    SecurityDescriptor::from_sddl(INSTALL_SDDL)?.verify_path(&root)?;
+    std::fs::remove_dir(&root).map_err(|error| {
+        format!(
+            "cannot retire empty uninstall root {}: {error}",
+            root.display()
+        )
+    })
 }
 
 fn require_removed_service_identities() -> Result<(), String> {
@@ -2458,8 +2864,8 @@ fn remove_provider_state(context: ProviderRemovalContext) -> Result<(), String> 
         .parent()
         .ok_or_else(|| "Windows sealed state root has no parent".to_owned())?;
     if path_absent_no_follow(
-        &super::policy_registry::root(),
-        "preserve-policy-during-runtime-replacement",
+        &super::startup_diagnostics::root(),
+        "preserve-diagnostics-during-runtime-replacement",
     )? {
         remove_directory_if_present(parent, StateDirectory::StateParent, context)?;
     }
@@ -2597,32 +3003,6 @@ pub(crate) fn retired_certification_workspace_paths_for_test(
     workspace: &Path,
 ) -> Vec<std::path::PathBuf> {
     retired_certification_workspace_paths(workspace)
-}
-
-fn seed_retired_certification_workspace() -> Result<(), String> {
-    let _low_integrity = super::token::impersonate_low_integrity_current_thread()?;
-    let workspace = state_root()
-        .join("package")
-        .join("certification-markers")
-        .join(format!(
-            "attempt-{}",
-            "0".repeat(super::record::digest(&[]).len())
-        ));
-    std::fs::create_dir(&workspace).map_err(|error| {
-        format!(
-            "MCSEALED-WINDOWS-CERTIFICATION-WORKSPACE: create stale workspace {}: {error}",
-            workspace.display()
-        )
-    })?;
-    for path in retired_certification_workspace_paths(&workspace) {
-        std::fs::write(&path, b"retired certification evidence\n").map_err(|error| {
-            format!(
-                "MCSEALED-WINDOWS-CERTIFICATION-WORKSPACE: seed stale leaf {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn remove_file_if_present(
@@ -2994,6 +3374,11 @@ fn path_absent_no_follow(path: &Path, phase: &str) -> Result<bool, String> {
 
 fn require_fresh_filesystem_absence() -> Result<(), String> {
     let inventory = [
+        ("installed-image-root", install_root()),
+        (
+            "installed-diagnostics-root",
+            super::startup_diagnostics::root(),
+        ),
         ("installed-agent", installed_binary()),
         (
             "installed-target-desktop-bootstrap",
@@ -3002,10 +3387,16 @@ fn require_fresh_filesystem_absence() -> Result<(), String> {
         ("installed-session-broker", installed_session_broker()),
         ("installed-state-root", state_root()),
     ];
+    require_absent_install_inventory(&inventory)
+}
+
+pub(crate) fn require_absent_install_inventory(
+    inventory: &[(&str, PathBuf)],
+) -> Result<(), String> {
     for (role, path) in inventory {
-        reject_reparse_components(&path)?;
-        if !path_absent_no_follow(&path, "fresh-install-filesystem-preflight")? {
-            let actual = std::fs::symlink_metadata(&path)
+        reject_reparse_components(path)?;
+        if !path_absent_no_follow(path, "fresh-install-filesystem-preflight")? {
+            let actual = std::fs::symlink_metadata(path)
                 .map(|metadata| file_kind(&metadata))
                 .unwrap_or("unreadable");
             return Err(format!(
@@ -3186,26 +3577,20 @@ fn verify_service_process_protection(manager: &service_manager::ScHandle) -> Res
 }
 
 pub fn installed_inspection(
-    agent: AgentPackageInspection,
-) -> Result<InstalledProviderInspection, String> {
+    agent: AgentPackageInspectionV2,
+) -> Result<InstalledProviderInspectionV2, String> {
     verify_installed()?;
     let installed_executable_sha256 =
         crate::package::sha256_regular_no_follow(&installed_binary())?;
     let qualification = super::qualification::probe().ok();
     let provider_reachable = qualification.is_some();
-    let policy = match super::policy_registry::Lease::acquire().and_then(|lease| lease.read()) {
-        Ok(Some(activation)) => activation.inspection()?,
-        Ok(None) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unconfigured,
-        Err(_) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
-    };
-    Ok(InstalledProviderInspection {
+    Ok(InstalledProviderInspectionV2 {
         format: InstalledInspectionFormat::Ordinary,
-        revision: InspectionRevision,
+        revision: InspectionRevisionTwo,
         agent,
         installed_executable_sha256,
         installed_artifacts_valid: true,
         provider_identity: qualification.map(|receipt| receipt.provider_identity),
         provider_reachable,
-        policy,
     })
 }

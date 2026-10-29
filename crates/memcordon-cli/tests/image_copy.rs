@@ -32,7 +32,13 @@ fn positional_copy_preserves_shared_offset_after_entrypoint_hashing() {
     let (directory, source, mut destination) = files();
     let mut duplicate = source.try_clone().unwrap();
     let size = duplicate.seek(SeekFrom::End(0)).unwrap();
-    image_copy::copy_exact(&source, &mut destination, size).unwrap();
+    image_copy::copy_exact(
+        &source,
+        &mut destination,
+        size,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .unwrap();
     assert_eq!(duplicate.stream_position().unwrap(), size);
     assert_eq!(
         fs::read(directory.join("destination")).unwrap(),
@@ -50,10 +56,28 @@ fn positional_copy_refuses_short_long_and_overflowing_declared_size() {
         let (directory, source, mut destination) = files();
         let actual = source.metadata().unwrap().len();
         let declared = actual.checked_add_signed(adjustment).unwrap();
-        assert!(image_copy::copy_exact(&source, &mut destination, declared).is_err());
-        assert!(image_copy::copy_exact(&source, &mut destination, u64::MAX).is_err());
+        let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(image_copy::copy_exact(&source, &mut destination, declared, cutoff).is_err());
+        assert!(image_copy::copy_exact(&source, &mut destination, u64::MAX, cutoff).is_err());
         drop(destination);
         drop(source);
         fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn exhausted_original_copy_cutoff_does_not_publish_partial_bytes() {
+    let (directory, source, mut destination) = files();
+    let error = image_copy::copy_exact(
+        &source,
+        &mut destination,
+        source.metadata().unwrap().len(),
+        std::time::Instant::now(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(fs::read(directory.join("destination")).unwrap().is_empty());
+    drop(destination);
+    drop(source);
+    fs::remove_dir_all(directory).unwrap();
 }

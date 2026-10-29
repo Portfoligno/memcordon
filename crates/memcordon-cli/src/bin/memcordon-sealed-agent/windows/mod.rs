@@ -10,10 +10,10 @@ pub mod launcher_service;
 pub(crate) mod loader_access;
 pub mod package;
 pub mod pipe;
-pub mod policy_registry;
 pub mod process;
 mod process_impl;
 pub mod qualification;
+pub mod random;
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_readiness_receipt.rs"]
 pub(crate) mod readiness_receipt;

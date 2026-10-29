@@ -5,9 +5,8 @@ use super::{
     source::{self, BuildSourceIdentity, SelectedSource},
 };
 use crate::{CiError, Result, command::rustup_cargo};
-use memcordon_core::runtime_manifest::{
-    RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-};
+use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -393,21 +392,41 @@ impl TargetBundle {
                 &bundle.distribution.target,
             )?;
         }
-        let manifest =
-            RuntimeManifest::parse(&members["runtime-manifest.json"]).map_err(CiError::Message)?;
+        let manifest_bytes = &members["runtime-manifest.json"];
+        memcordon_core::canonical_json::reject_duplicate_json_keys(manifest_bytes)
+            .map_err(CiError::Message)?;
+        let header: serde_json::Value = serde_json::from_slice(manifest_bytes)?;
+        let (manifest_target, manifest_commit, manifest_version, manifest_components) =
+            match header["revision"].as_u64() {
+                Some(2) => {
+                    let manifest =
+                        RuntimeManifest::parse(manifest_bytes).map_err(CiError::Message)?;
+                    (
+                        manifest.target,
+                        manifest.source_commit,
+                        manifest.version,
+                        manifest.components,
+                    )
+                }
+                _ => {
+                    return Err(CiError::Message(
+                        "unsupported selected runtime manifest revision".into(),
+                    ));
+                }
+            };
         super::compatibility::NativePackage::verify(
             &members["package.json"],
             &bundle.source,
             &bundle.distribution,
             &members,
         )?;
-        if manifest.target != bundle.distribution.target
-            || manifest.source_commit != bundle.source.commit()
-            || manifest.version != bundle.source.version().to_string()
+        if manifest_target != bundle.distribution.target
+            || manifest_commit != bundle.source.commit()
+            || manifest_version != bundle.source.version().to_string()
         {
             return Err(CiError::Message("runtime manifest source differs".into()));
         }
-        for component in &manifest.components {
+        for component in &manifest_components {
             let bytes = members
                 .get(&component.path)
                 .ok_or_else(|| CiError::Message("manifest component absent".into()))?;
@@ -1333,14 +1352,15 @@ fn validate_and_package_native(
                 components,
             )
         } else if runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp {
-            RuntimeManifest::linux_combined(
+            RuntimeManifest::linux(
                 selected.version().to_string(),
                 selected.commit().to_owned(),
                 distribution.target.clone(),
                 components,
+                true,
             )
         } else {
-            RuntimeManifest::linux_selected(
+            RuntimeManifest::linux(
                 selected.version().to_string(),
                 selected.commit().to_owned(),
                 distribution.target.clone(),

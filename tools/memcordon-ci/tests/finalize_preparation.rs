@@ -2,7 +2,7 @@
 use memcordon_ci::release::{
     artifacts::{self, FileRecord},
     bundle::{CandidateBundle, CandidateManifest, NotesSelection, PreparedBundle, PublicManifest},
-    compatibility::{Compatibility, NativePackage},
+    compatibility::{CompatibilityV2 as Compatibility, NativePackage},
     distribution::Distribution,
     finalize::finalize_preparation,
     installed_consumer,
@@ -134,7 +134,8 @@ fn fixture_profile(root: &Path, candidate: bool, readiness: bool) -> (PathBuf, P
             );
         }
         let manifest =
-            installed_consumer::measured_manifest(&build, selection, native.path()).unwrap();
+            installed_consumer::measured_current_manifest(&build, selection, native.path())
+                .unwrap();
         members.insert(
             "runtime-manifest.json".into(),
             serde_json::to_vec(&manifest).unwrap(),

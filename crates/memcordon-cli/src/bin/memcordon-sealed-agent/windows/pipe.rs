@@ -1,3 +1,4 @@
+pub(crate) use memcordon_platform::WindowsSynchronousIoDeadline as SynchronousIoDeadline;
 use std::io;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1386,25 +1387,23 @@ pub fn disconnect(handle: HANDLE) {
     unsafe { DisconnectNamedPipe(handle) };
 }
 
-/// Completes a normal server response before releasing its named-pipe instance.
-///
-/// `DisconnectNamedPipe` discards unread bytes, so successful response writers
-/// must use this helper rather than disconnecting directly. Certification paths
-/// that deliberately model abrupt authority loss continue to call `disconnect`.
+/// Frame writers already drain their bytes under their original transport
+/// cutoff. Releasing the instance must not start another unbounded flush.
 pub fn finish_server_response(handle: HANDLE) -> Result<(), String> {
-    // SAFETY: caller provides a connected synchronous named-pipe server handle.
-    // FlushFileBuffers blocks until the client consumes every buffered byte.
-    let result = if unsafe { FlushFileBuffers(handle) } == 0 {
-        Err(io::Error::last_os_error().to_string())
-    } else {
-        Ok(())
-    };
     disconnect(handle);
-    result
+    Ok(())
 }
 
 pub fn write_frame<T: Serialize>(handle: HANDLE, value: &T) -> Result<(), String> {
     write_frame_detailed(handle, value).map_err(|error| error.to_string())
+}
+
+pub fn write_frame_until<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+    cutoff: std::time::Instant,
+) -> Result<(), String> {
+    write_frame_detailed_until(handle, value, cutoff).map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1412,6 +1411,7 @@ pub enum FrameWritePhase {
     Serialize,
     Length,
     Payload,
+    Drain,
 }
 
 #[derive(Debug)]
@@ -1462,6 +1462,60 @@ fn frame_write_error(
 }
 
 pub fn write_frame_detailed<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+) -> Result<(), FrameWriteError> {
+    write_frame_detailed_until(
+        handle,
+        value,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+fn write_frame_detailed_until<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+    cutoff: std::time::Instant,
+) -> Result<(), FrameWriteError> {
+    let transport = SynchronousIoDeadline::start(cutoff)
+        .map_err(|detail| frame_write_error(FrameWritePhase::Serialize, 0, 0, None, detail))?;
+    let result = write_frame_detailed_inner(handle, value).and_then(|()| {
+        // SAFETY: the exact live pipe is drained only while its own-thread
+        // transport cancellation guard is active; no record mutation occurs.
+        if unsafe { FlushFileBuffers(handle) } == 0 {
+            let error = io::Error::last_os_error();
+            Err(frame_write_error(
+                FrameWritePhase::Drain,
+                0,
+                0,
+                error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok()),
+                error.to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    match (result, transport.finish()) {
+        (Err(mut primary), Err(secondary)) => {
+            primary.detail.push_str("; transport settlement: ");
+            primary.detail.push_str(&secondary);
+            Err(primary)
+        }
+        (Err(primary), _) => Err(primary),
+        (Ok(()), Err(detail)) => Err(frame_write_error(
+            FrameWritePhase::Drain,
+            0,
+            0,
+            None,
+            detail,
+        )),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn write_frame_detailed_inner<T: Serialize>(
     handle: HANDLE,
     value: &T,
 ) -> Result<(), FrameWriteError> {
@@ -1640,6 +1694,51 @@ fn read_frame_with_kind_limit<T: DeserializeOwned>(
     handle: HANDLE,
     response_limit: Option<ResponseFrameLimit>,
 ) -> Result<T, FrameReadError> {
+    read_frame_with_kind_limit_until(
+        handle,
+        response_limit,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+pub fn read_frame_until<T: DeserializeOwned>(
+    handle: HANDLE,
+    cutoff: std::time::Instant,
+) -> Result<T, String> {
+    read_frame_with_kind_limit_until(handle, None, cutoff).map_err(|error| error.to_string())
+}
+
+fn read_frame_with_kind_limit_until<T: DeserializeOwned>(
+    handle: HANDLE,
+    response_limit: Option<ResponseFrameLimit>,
+    cutoff: std::time::Instant,
+) -> Result<T, FrameReadError> {
+    let failure = |detail| FrameReadError {
+        phase: FrameReadPhase::Decode,
+        expected_bytes: 0,
+        transferred_bytes: 0,
+        native_code: None,
+        peer_closed: false,
+        detail,
+    };
+    let transport = SynchronousIoDeadline::start(cutoff).map_err(failure)?;
+    let result = read_frame_with_kind_limit_inner(handle, response_limit);
+    match (result, transport.finish()) {
+        (Err(mut primary), Err(secondary)) => {
+            primary.detail.push_str("; transport settlement: ");
+            primary.detail.push_str(&secondary);
+            Err(primary)
+        }
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(detail)) => Err(failure(detail)),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn read_frame_with_kind_limit_inner<T: DeserializeOwned>(
+    handle: HANDLE,
+    response_limit: Option<ResponseFrameLimit>,
+) -> Result<T, FrameReadError> {
     let mut length = [0_u8; 4];
     read_exact_detailed(handle, &mut length, FrameReadPhase::Length)?;
     let length = u32::from_le_bytes(length) as usize;
@@ -1691,7 +1790,7 @@ fn read_frame_with_kind_limit<T: DeserializeOwned>(
         &mut payload[prefix_length..],
         FrameReadPhase::Payload,
     )?;
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&payload).map_err(|detail| {
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&payload).map_err(|detail| {
         FrameReadError {
             phase: FrameReadPhase::Decode,
             expected_bytes: length,
@@ -1739,19 +1838,29 @@ pub fn read_control_release(
     handle: HANDLE,
     peer_process: HANDLE,
     deadline: std::time::Instant,
-) -> Result<memcordon_core::WindowsProviderRequestV3, String> {
+) -> Result<memcordon_core::WindowsProviderRequestV4, String> {
+    read_bound_control_frame(handle, peer_process, deadline)
+}
+
+/// The sole reader waits for the entire small frame under the original cutoff
+/// before using synchronous reads, so a partial header/body cannot renew it.
+pub fn read_bound_control_frame<T: DeserializeOwned>(
+    handle: HANDLE,
+    peer_process: HANDLE,
+    deadline: std::time::Instant,
+) -> Result<T, String> {
     const MAX_RELEASE_BYTES: u32 = 4096;
     loop {
         if std::time::Instant::now() >= deadline {
-            return Err("support control release deadline expired".into());
+            return Err("bound control frame original deadline expired".into());
         }
         // SAFETY: the original frontend handle remains held by relay_protocol.
         match unsafe { WaitForSingleObject(peer_process, 0) } {
             WAIT_TIMEOUT => {}
-            WAIT_OBJECT_0 => return Err("support control release frontend retired".into()),
+            WAIT_OBJECT_0 => return Err("bound control frame frontend retired".into()),
             _ => {
                 return Err(format!(
-                    "support control release frontend wait: {}",
+                    "bound control frame frontend wait: {}",
                     io::Error::last_os_error()
                 ));
             }
@@ -1772,14 +1881,14 @@ pub fn read_control_release(
         } == 0
         {
             return Err(format!(
-                "support control release peek: {}",
+                "bound control frame peek: {}",
                 io::Error::last_os_error()
             ));
         }
         if copied == 4 {
             let length = u32::from_le_bytes(prefix);
             if length > MAX_RELEASE_BYTES {
-                return Err("support control release exceeds fixed frame bound".into());
+                return Err("bound control frame exceeds fixed frame bound".into());
             }
             if available >= 4 + length {
                 // This relay is the sole reader. The complete bounded frame is

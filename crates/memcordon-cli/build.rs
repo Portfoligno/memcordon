@@ -2,28 +2,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[path = "build_support/private_policy_fixture.rs"]
-mod private_policy_fixture_build;
-#[path = "src/bin/memcordon-sealed-agent/private_policy_fixture_schema.rs"]
-mod private_policy_fixture_schema;
-
 #[path = "build_support/source_identity.rs"]
 mod source_identity;
-
-fn generate_private_policy_fixture(manifest: &Path, output: &Path) -> Result<(), String> {
-    let source = manifest.join(private_policy_fixture_build::SOURCE_RELATIVE);
-    let destination = output.join(private_policy_fixture_build::OUTPUT_NAME);
-    println!("cargo:rerun-if-changed={}", source.display());
-    println!(
-        "cargo:rerun-if-changed=src/bin/memcordon-sealed-agent/private_policy_fixture_schema.rs"
-    );
-    println!("cargo:rerun-if-changed=build_support/private_policy_fixture.rs");
-    let source_bytes =
-        fs::read(&source).map_err(|error| format!("read {}: {error}", source.display()))?;
-    let canonical = private_policy_fixture_build::canonicalize(&source_bytes)?;
-    fs::write(&destination, canonical)
-        .map_err(|error| format!("write {}: {error}", destination.display()))
-}
 
 fn packaged_commit(manifest: &Path) -> Option<String> {
     let bytes = fs::read(manifest.join(".cargo_vcs_info.json")).ok()?;
@@ -106,8 +86,6 @@ fn main() {
     }
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output_directory = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    generate_private_policy_fixture(&manifest, &output_directory)
-        .unwrap_or_else(|error| panic!("{error}"));
     let output = output_directory.join("source_commit.rs");
     let commit = packaged_commit(&manifest)
         .or_else(|| workspace_commit(&manifest))

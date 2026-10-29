@@ -11,10 +11,7 @@ use std::{
     time::Duration,
 };
 
-use memcordon_core::{
-    result_v1::{CleanupStateV1, OutcomeKindV1, ResultV1},
-    runtime_manifest::{RuntimeComponentRole, RuntimeManifest},
-};
+use memcordon_core::{MemcordonReport, runtime_components::RuntimeComponentRole};
 
 use super::{
     artifacts,
@@ -48,6 +45,292 @@ impl MaterializedPayload {
             self.distribution.binaries.len(),
         )
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SmokePayload {
+    channel: InstalledChannel,
+    source: BuildSourceIdentity,
+    distribution: TargetDistribution,
+    directory: PathBuf,
+    artifacts: Vec<SelectedArtifact>,
+    selected_artifact_count: usize,
+    fixture: SelectedArtifact,
+}
+#[cfg(target_os = "linux")]
+impl SmokePayload {
+    fn describe(payload: &MaterializedPayload) -> Self {
+        Self {
+            channel: payload.channel,
+            source: payload.source.clone(),
+            distribution: payload.distribution.clone(),
+            directory: payload.directory.clone(),
+            artifacts: payload.artifacts.clone(),
+            selected_artifact_count: payload.selected_artifact_count,
+            fixture: payload.fixture.clone(),
+        }
+    }
+    fn reopen(self, parent: &Path) -> Result<MaterializedPayload> {
+        self.source.validate()?;
+        self.distribution.validate()?;
+        if !self.distribution.target.ends_with("-unknown-linux-gnu")
+            || self.artifacts.len() > 64
+            || self.selected_artifact_count > self.artifacts.len()
+        {
+            return Err(CiError::Message(
+                "current Linux smoke descriptive inventory differs".into(),
+            ));
+        }
+        let owner = tempfile::Builder::new()
+            .prefix("current-smoke-payload-")
+            .tempdir_in(parent)?;
+        let directory = owner.path().join("payload");
+        fs::create_dir(&directory)?;
+        for name in self
+            .distribution
+            .binaries
+            .iter()
+            .map(|binary| binary_path(&self.directory, binary, &self.distribution.target))
+            .chain(
+                self.distribution
+                    .units
+                    .iter()
+                    .map(|unit| self.directory.join(unit)),
+            )
+            .chain(std::iter::once(
+                self.directory.join("runtime-manifest.json"),
+            ))
+        {
+            let bytes = artifacts::read_file(&name)?;
+            let destination = directory.join(name.file_name().ok_or_else(|| {
+                CiError::Message("current smoke component filename absent".into())
+            })?);
+            fs::write(&destination, bytes)?;
+            if self.distribution.binaries.iter().any(|binary| {
+                binary_path(&self.directory, binary, &self.distribution.target) == name
+            }) {
+                executable(&destination)?;
+            }
+        }
+        let mut copied = Vec::new();
+        for (index, artifact) in self.artifacts.into_iter().enumerate() {
+            let bytes = artifacts::read_file(&artifact.path)?;
+            if artifacts::checksum(&bytes) != artifact.sha256 {
+                return Err(CiError::Message(
+                    "current smoke retained artifact changed".into(),
+                ));
+            }
+            let destination = owner.path().join(format!("artifact-{index}"));
+            fs::create_dir(&destination)?;
+            let path = destination.join(artifact.path.file_name().ok_or_else(|| {
+                CiError::Message("current smoke artifact filename absent".into())
+            })?);
+            fs::write(&path, bytes)?;
+            copied.push(SelectedArtifact {
+                path,
+                sha256: artifact.sha256,
+            });
+        }
+        let bytes = artifacts::read_file(&self.fixture.path)?;
+        if artifacts::checksum(&bytes) != self.fixture.sha256 {
+            return Err(CiError::Message("current smoke fixture changed".into()));
+        }
+        target::validate_executable(&bytes, &self.distribution.target)?;
+        let path = owner.path().join("fixture");
+        fs::write(&path, bytes)?;
+        executable(&path)?;
+        Ok(MaterializedPayload {
+            channel: self.channel,
+            source: self.source,
+            distribution: self.distribution,
+            directory,
+            artifacts: copied,
+            selected_artifact_count: self.selected_artifact_count,
+            fixture: SelectedArtifact {
+                path,
+                sha256: self.fixture.sha256,
+            },
+            workload_diagnostic: None,
+            _owner: owner,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentSmokeSpec {
+    format: String,
+    revision: u32,
+    payload: SmokePayload,
+    output: PathBuf,
+    operation_deadline_unix_millis: u64,
+    workflow_run: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_current_smoke_spec(root: &Path, path: &Path, cleanup_only: bool) -> Result<()> {
+    if !rustix::process::geteuid().is_root() {
+        return Err(CiError::Message(
+            "current native smoke reentry requires the actual privileged controller".into(),
+        ));
+    }
+    let bytes = artifacts::read_file(path)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(CiError::Message(
+            "current smoke metadata bound exceeded".into(),
+        ));
+    }
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes).map_err(CiError::Message)?;
+    let spec: CurrentSmokeSpec = serde_json::from_slice(&bytes)?;
+    if spec.format != "memcordon.current-materialized-smoke" || spec.revision != 1 {
+        return Err(CiError::Message("current smoke format differs".into()));
+    }
+    let sampled = std::time::Instant::now();
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CiError::Message(e.to_string()))?
+            .as_millis(),
+    )
+    .map_err(|e| CiError::Message(e.to_string()))?;
+    let remaining = spec
+        .operation_deadline_unix_millis
+        .checked_sub(now)
+        .filter(|ms| *ms > 0 && *ms <= 150 * 60 * 1000)
+        .ok_or_else(|| {
+            CiError::Message(
+                "current smoke original absolute deadline exhausted/out of bound".into(),
+            )
+        })?;
+    let cleanup = sampled
+        .checked_add(Duration::from_millis(remaining))
+        .ok_or_else(|| CiError::Message("current smoke deadline overflow".into()))?;
+    if cleanup_only {
+        spec.payload.source.validate()?;
+        spec.payload.distribution.validate()?;
+        let key = memcordon_readiness_verifier::ProductKey {
+            target: spec.payload.distribution.target.clone(),
+            channel: match spec.payload.channel {
+                InstalledChannel::NativeBundle => "candidate-native",
+                InstalledChannel::CargoPackage => "candidate-cargo",
+            }
+            .into(),
+        };
+        let lifetime = spec
+            .output
+            .join(&key.target)
+            .join(&key.channel)
+            .join("lifetime");
+        let artifacts = super::linux_current_installed::recover_current_smoke(
+            root,
+            &lifetime,
+            &spec.output,
+            spec.payload.source.commit(),
+            &spec.payload.source.version().to_string(),
+            &key,
+            cleanup,
+        )?;
+        let pid = std::process::id();
+        let birth =
+            crate::linux_consumer_readiness::process_birth(pid).map_err(CiError::Message)?;
+        source::write_json(
+            &spec.output.join(format!(
+                "local-smoke-cleanup-observations-{pid}-{birth}.json"
+            )),
+            &serde_json::json!({"format":"memcordon.local-current-smoke-cleanup","revision":1,"workflow_qualification":false,"artifacts":artifacts}),
+        )?;
+        return Ok(());
+    }
+    let work = cleanup
+        .checked_sub(Duration::from_secs(15 * 60))
+        .filter(|time| *time > std::time::Instant::now())
+        .ok_or_else(|| CiError::Message("original current smoke work budget exhausted".into()))?;
+    let payload = spec.payload.reopen(Path::new("/tmp"))?;
+    require_current_runtime(&payload)?;
+    let head = CommandSpec::new("git", root, Duration::from_secs(30))
+        .args(["rev-parse", "--verify", "HEAD"])
+        .bounded_until(work)
+        .run()?;
+    if std::str::from_utf8(&head)
+        .map_err(|e| CiError::Message(e.to_string()))?
+        .trim()
+        != payload.source.commit()
+    {
+        return Err(CiError::Message(
+            "current smoke source HEAD differs from selected bytes".into(),
+        ));
+    }
+    let archive = CommandSpec::new("git", root, Duration::from_secs(60))
+        .args(["archive", "--format=tar", payload.source.commit()])
+        .output_limit(source::MAX_SOURCE_ARCHIVE_BYTES)
+        .bounded_until(work)
+        .output_quiet()?;
+    if !archive.status.success() {
+        return Err(CiError::Message(
+            "actual current smoke source archive failed".into(),
+        ));
+    }
+    let pid = std::process::id();
+    let birth = crate::linux_consumer_readiness::process_birth(pid).map_err(CiError::Message)?;
+    let run_id = match spec.workflow_run {
+        Some(run)
+            if run.parse::<u64>().ok().is_some_and(|id| id > 0)
+                && run.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            run
+        }
+        Some(_) => {
+            return Err(CiError::Message(
+                "native workflow run identity invalid".into(),
+            ));
+        }
+        None => format!("local-controller-{pid}-{birth}"),
+    };
+    let identity = crate::readiness_identity::SourceIdentity {
+        run_id,
+        source_commit: payload.source.commit().into(),
+        source_tree_sha256: artifacts::checksum(&archive.stdout),
+        version: payload.source.version().to_string(),
+    };
+    let key = memcordon_readiness_verifier::ProductKey {
+        target: payload.distribution.target.clone(),
+        channel: match payload.channel {
+            InstalledChannel::NativeBundle => "candidate-native",
+            InstalledChannel::CargoPackage => "candidate-cargo",
+        }
+        .into(),
+    };
+    fs::create_dir(&spec.output)?;
+    let namespace = std::path::absolute(&spec.output)?;
+    let publication = std::sync::Arc::new(
+        super::linux_lifecycle_diagnostics::HeldCellPublication::create(
+            &namespace, &identity, &key,
+        )?,
+    );
+    let lifetime = namespace
+        .join(&key.target)
+        .join(&key.channel)
+        .join("lifetime");
+    let (records, artifacts) = super::linux_current_installed::run_current_cell(
+        root,
+        &payload,
+        &identity,
+        &key,
+        &lifetime,
+        &namespace,
+        work,
+        cleanup,
+        spec.operation_deadline_unix_millis,
+        publication,
+    )?;
+    source::write_json(
+        &namespace.join("local-smoke-observations.json"),
+        &serde_json::json!({"format":"memcordon.local-current-smoke","revision":1,"workflow_qualification":false,"identity":identity,"records":records,"artifacts":artifacts}),
+    )?;
+    Ok(())
 }
 
 /// Verify the complete retained acquisition before selecting its original channel
@@ -127,14 +410,25 @@ pub fn materialized_windows_components(
     }
     let manifest_path = std::path::absolute(directory.join("runtime-manifest.json"))?;
     let bytes = artifacts::read_file(&manifest_path)?;
-    let manifest = RuntimeManifest::parse(&bytes).map_err(CiError::Message)?;
-    if manifest != measured_manifest(source, distribution, directory)? {
-        return Err(CiError::Message(
-            "selected agent manifest differs from measured payload".into(),
-        ));
-    }
-    let components = manifest
-        .components
+    let revision: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let measured = match revision["revision"].as_u64() {
+        Some(2) => {
+            let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&bytes)
+                .map_err(CiError::Message)?;
+            if manifest != measured_current_manifest(source, distribution, directory)? {
+                return Err(CiError::Message(
+                    "current selected manifest differs from measured bytes".into(),
+                ));
+            }
+            manifest.components
+        }
+        _ => {
+            return Err(CiError::Message(
+                "unsupported selected manifest revision".into(),
+            ));
+        }
+    };
+    let components = measured
         .into_iter()
         .map(|component| {
             Ok(SelectedArtifact {
@@ -161,13 +455,12 @@ fn executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Inventory generated from the Cargo channel's own binaries. It never copies
-/// the native channel's hashes and cannot grant execution permission.
-pub fn measured_manifest(
+pub fn measured_current_manifest(
     source: &BuildSourceIdentity,
     distribution: &TargetDistribution,
     directory: &Path,
-) -> Result<RuntimeManifest> {
+) -> Result<memcordon_core::runtime_manifest_v2::RuntimeManifestV2> {
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
     source.validate()?;
     distribution.validate()?;
     let mut components = Vec::new();
@@ -182,42 +475,60 @@ pub fn measured_manifest(
             "memcordon-session-broker" => RuntimeComponentRole::SessionBroker,
             _ => {
                 return Err(CiError::Message(
-                    "unexpected selected consumer binary".into(),
+                    "unknown current selected component".into(),
                 ));
             }
         };
         components.push(target::runtime_component(
             role,
             path.file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| CiError::Message("consumer filename is not UTF-8".into()))?
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    CiError::Message("current component filename encoding differs".into())
+                })?
                 .into(),
             &bytes,
         ));
     }
-    let args = (
-        source.version().to_string(),
-        source.commit().to_owned(),
-        distribution.target.clone(),
-        components,
-    );
     let runtime = distribution.runtime_selection()?;
     let result = if runtime == super::distribution::RuntimeSelection::CliOnly {
-        RuntimeManifest::cli_only(args.0, args.1, args.2, args.3)
+        RuntimeManifestV2::cli_only(
+            source.version().to_string(),
+            source.commit().into(),
+            distribution.target.clone(),
+            components,
+        )
     } else if runtime == super::distribution::RuntimeSelection::WindowsSealed {
-        RuntimeManifest::windows(args.0, args.1, args.2, args.3)
-    } else if runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp {
-        RuntimeManifest::linux_combined(args.0, args.1, args.2, args.3)
+        RuntimeManifestV2::windows(
+            source.version().to_string(),
+            source.commit().into(),
+            distribution.target.clone(),
+            components,
+        )
     } else {
-        RuntimeManifest::linux_selected(
-            args.0,
-            args.1,
-            args.2,
-            args.3,
+        RuntimeManifestV2::linux(
+            source.version().to_string(),
+            source.commit().into(),
+            distribution.target.clone(),
+            components,
             runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp,
         )
     };
     result.map_err(CiError::Message)
+}
+
+pub fn require_current_runtime(payload: &MaterializedPayload) -> Result<()> {
+    let bytes = artifacts::read_file(&payload.directory.join("runtime-manifest.json"))?;
+    let actual = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&bytes)
+        .map_err(|_| CiError::Message("UnsupportedProductInterface".into()))?;
+    let measured =
+        measured_current_manifest(&payload.source, &payload.distribution, &payload.directory)?;
+    if actual != measured {
+        return Err(CiError::Message(
+            "current selected runtime differs from measured inventory".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn fixture(
@@ -317,256 +628,7 @@ pub fn materialize_cargo(
         &consumer.bundle,
         &consumer.install_root,
         temporary_parent,
-        false,
     )
-}
-
-/// Public delivery uses Cargo's ordinary registry installation. Downloaded
-/// archive metadata is measured separately and never patches the install graph.
-pub fn acquire_cargo_predecessor(
-    root: &Path,
-    current_target: &Path,
-    current: &TargetBundle,
-    temporary_parent: &Path,
-    receipts: &Path,
-    deadline: std::time::Instant,
-) -> Result<MaterializedPayload> {
-    let version = semver::Version::parse("0.5.7-rc.19")?;
-    if current.source.version() <= &version {
-        return Err(CiError::Message(
-            "selected runtime has no strictly older rc19 predecessor".into(),
-        ));
-    }
-    fs::create_dir(receipts)?;
-    let repository = crate::config::release(root)?.repository;
-    source::validate_repository(&repository)?;
-    let selected = source::SelectedSource {
-        format: "memcordon.selected-source".into(),
-        revision: 1,
-        repository: repository.clone(),
-        tag_ref: format!("refs/tags/{version}"),
-        commit: "a02e8f1e845349e27706c11d6d57acb27090223a".into(),
-        version: version.clone(),
-    };
-    selected.validate()?;
-    let mut url = url::Url::parse("https://github.com/")
-        .map_err(|_| CiError::Message("predecessor origin URL invalid".into()))?;
-    {
-        let mut path = url
-            .path_segments_mut()
-            .map_err(|_| CiError::Message("predecessor origin cannot hold path".into()))?;
-        path.pop_if_empty();
-        for part in repository.split('/') {
-            path.push(part);
-        }
-        path.push("releases")
-            .push("download")
-            .push(&version.to_string())
-            .push("release-manifest.json");
-    }
-    let budget = super::http::ReadBudget::new(deadline);
-    let bytes = super::http::download(
-        &super::http::HttpsTransport,
-        &budget,
-        &url,
-        &[],
-        artifacts::MAX_FILE_BYTES,
-    )?;
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)
-        .map_err(CiError::Message)?;
-    let manifest: super::bundle::PublicManifest = serde_json::from_slice(&bytes)?;
-    if manifest.schema != 1
-        || manifest.version != version
-        || manifest.tag != version.to_string()
-        || manifest.commit != selected.commit
-    {
-        return Err(CiError::Message(
-            "actual predecessor publication source/version differs".into(),
-        ));
-    }
-    fs::write(receipts.join("predecessor-release-manifest.json"), &bytes)?;
-    let packages_directory = receipts.join("packages");
-    fs::create_dir(&packages_directory)?;
-    let mut records = Vec::new();
-    let mut payloads = Vec::new();
-    for name in source::PUBLIC_PACKAGES {
-        let expected = format!("{name}-{version}.crate");
-        let matches = manifest
-            .files
-            .iter()
-            .filter(|record| {
-                record.kind == "crate"
-                    && record.package.as_deref() == Some(name)
-                    && record.name == expected
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(CiError::Message(
-                "predecessor publication omits or duplicates a required crate".into(),
-            ));
-        }
-        let record = matches[0];
-        let mut url = url::Url::parse("https://static.crates.io/crates/")
-            .map_err(|_| CiError::Message("predecessor registry URL invalid".into()))?;
-        url.path_segments_mut()
-            .map_err(|_| CiError::Message("predecessor registry URL cannot hold path".into()))?
-            .pop_if_empty()
-            .push(name)
-            .push(&record.name);
-        let bytes = super::http::download(
-            &super::http::HttpsTransport,
-            &budget,
-            &url,
-            &[],
-            artifacts::MAX_FILE_BYTES,
-        )?;
-        artifacts::check_bytes(record, &bytes)?;
-        let members = artifacts::crate_members(&bytes)?;
-        let vcs = members
-            .get(".cargo_vcs_info.json")
-            .ok_or_else(|| CiError::Message("predecessor crate source identity absent".into()))?;
-        memcordon_core::workload_contract::reject_duplicate_json_keys(vcs)
-            .map_err(CiError::Message)?;
-        let vcs: serde_json::Value = serde_json::from_slice(vcs)?;
-        if vcs["git"]["sha1"].as_str() != Some(selected.commit.as_str()) {
-            return Err(CiError::Message(
-                "predecessor registry crate came from a different source commit".into(),
-            ));
-        }
-        fs::write(packages_directory.join(&record.name), &bytes)?;
-        payloads.push(bytes);
-        records.push(record.clone());
-    }
-    let mut packages = super::packages::PackageBundle {
-        format: "memcordon.packages".into(),
-        revision: 1,
-        source: selected.clone().into(),
-        files: records,
-    };
-    let order = super::packages::archive_order(&packages, &payloads)?;
-    packages.files.sort_by_key(|record| {
-        order
-            .iter()
-            .position(|name| Some(name) == record.package.as_ref())
-            .expect("validated predecessor archive order")
-    });
-    source::write_json(&packages_directory.join("packages.json"), &packages)?;
-    super::packages::PackageBundle::load(&packages_directory)?;
-    let acquisition = tempfile::Builder::new()
-        .prefix("older-cargo-runtime-")
-        .tempdir()?;
-    public_registry_location::require_independent(acquisition.path()).map_err(CiError::Message)?;
-    let home = acquisition.path().join("cargo-home");
-    fs::create_dir(&home)?;
-    crate::cache_inputs::seed_current_downloads(&home, true)?;
-    let install = acquisition.path().join("install");
-    let stable = crate::config::toolchains(root)?.stable;
-    // A fresh target scope requires every selected executable to originate in
-    // this install's synchronous compiler capture, including on cache hits.
-    let cache = root.join("target/ci-predecessor");
-    fs::create_dir_all(&cache)?;
-    let install_target = tempfile::Builder::new()
-        .prefix("public-install-target-")
-        .tempdir_in(std::path::absolute(&cache)?)?;
-    let capture = prepare_public_install_capture(
-        root,
-        acquisition.path(),
-        install_target.path(),
-        &home,
-        receipts,
-        &stable,
-        &current.distribution,
-        &packages.source,
-        deadline,
-    )?;
-    let mut command = crate::command::rustup_cargo(
-        acquisition.path(),
-        &stable,
-        [
-            "install",
-            "memcordon",
-            "--registry",
-            "crates-io",
-            "--locked",
-        ],
-        Duration::from_secs(7200),
-    )
-    .arg("--version")
-    .arg(format!("={version}"))
-    .arg("--target")
-    .arg(&current.distribution.target)
-    .arg("--root")
-    .arg(&install)
-    .arg("--target-dir")
-    .arg(install_target.path())
-    .arg("--config")
-    .arg(format!(
-        "build.rustc-wrapper={}",
-        serde_json::to_string(&capture.wrapper)?
-    ))
-    .arg("--config")
-    .arg(format!(
-        "build.rustc={}",
-        serde_json::to_string(&capture.descriptor.compiler)?
-    ))
-    .arg("--message-format=json")
-    .isolated_cargo(&home)
-    .bounded_until(deadline);
-    for feature in &current.distribution.features {
-        command = command.arg("--features").arg(feature);
-    }
-    for binary in &current.distribution.binaries {
-        command = command.arg("--bin").arg(binary);
-    }
-    source::write_json(
-        &receipts.join("predecessor-install-intent.json"),
-        &serde_json::json!({"source":selected,"target":current.distribution.target,"features":current.distribution.features,"binaries":current.distribution.binaries,"registry":"crates-io","locked":true,"patches":false}),
-    )?;
-    let observed = command.output_quiet()?;
-    crate::cache_inputs::export_current_downloads(&home);
-    fs::write(
-        receipts.join("predecessor-cargo.stdout.jsonl"),
-        &observed.stdout,
-    )?;
-    fs::write(
-        receipts.join("predecessor-cargo.stderr.bin"),
-        &observed.stderr,
-    )?;
-    if !observed.status.success() {
-        return Err(CiError::Message(
-            "actual older Cargo runtime build/install failed".into(),
-        ));
-    }
-    let native_manifest = verify_public_install_artifacts(
-        &observed.stdout,
-        &home,
-        &install,
-        &current.distribution,
-        &packages.source,
-        &capture.descriptor,
-    )?;
-    verify_cached_public_packages(&home, &packages, receipts)?;
-    retain_public_registry_graph(
-        root,
-        &home,
-        &native_manifest,
-        &current.distribution,
-        &packages,
-        receipts,
-        deadline,
-    )?;
-    let mut payload = materialize_cargo_install(
-        root,
-        current_target,
-        &packages_directory,
-        current,
-        &packages,
-        &install,
-        temporary_parent,
-        true,
-    )?;
-    retain_public_install_capture(&mut payload, &capture.descriptor, receipts)?;
-    Ok(payload)
 }
 
 #[expect(
@@ -701,7 +763,6 @@ pub fn materialize_public_cargo(
         &packages,
         &install,
         temporary_parent,
-        false,
     )?;
     payload.artifacts.extend(cached_packages);
     retain_public_install_capture(&mut payload, &capture.descriptor, receipts)?;
@@ -712,7 +773,7 @@ pub fn materialize_public_cargo(
         let path = receipts.join(name);
         payload.artifacts.push(SelectedArtifact {
             path,
-            sha256: String::from(memcordon_core::workload_codec::hash_bytes(&bytes)),
+            sha256: String::from(memcordon_core::hash_bytes(&bytes)),
         });
     }
     Ok(payload)
@@ -1157,7 +1218,7 @@ fn verify_public_install_artifacts(
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
-        memcordon_core::workload_contract::reject_duplicate_json_keys(line)
+        memcordon_core::canonical_json::reject_duplicate_json_keys(line)
             .map_err(CiError::Message)?;
         let value: serde_json::Value = serde_json::from_slice(line)?;
         if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
@@ -1320,7 +1381,7 @@ fn retain_public_registry_graph(
         ));
     }
     fs::write(receipts.join("public-packaged-Cargo.lock"), &before)?;
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&observed.stdout)
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&observed.stdout)
         .map_err(CiError::Message)?;
     let metadata: serde_json::Value = serde_json::from_slice(&observed.stdout)?;
     let packages = metadata["packages"]
@@ -1372,7 +1433,7 @@ fn retain_public_registry_graph(
             ));
         }
         let bytes = artifacts::read_file(&paths[0])?;
-        let hash = String::from(memcordon_core::workload_codec::hash_bytes(&bytes));
+        let hash = String::from(memcordon_core::hash_bytes(&bytes));
         let locked = lock_value["package"]
             .as_array()
             .ok_or_else(|| CiError::Message("public packaged lock entries absent".into()))?
@@ -1439,7 +1500,6 @@ fn materialize_cargo_install(
     packages: &super::packages::PackageBundle,
     install_root: &Path,
     temporary_parent: &Path,
-    legacy_predecessor: bool,
 ) -> Result<MaterializedPayload> {
     let owner = tempfile::Builder::new()
         .prefix("cargo-consumer-")
@@ -1458,21 +1518,10 @@ fn materialize_cargo_install(
         fs::write(&to, bytes)?;
         executable(&to)?;
     }
-    let mut manifest = measured_manifest(&packages.source, &bundle.distribution, &directory)?;
-    if legacy_predecessor
-        && bundle.distribution.runtime_selection()?
-            == super::distribution::RuntimeSelection::LinuxPrivateTcp
-    {
-        manifest = RuntimeManifest::linux_selected(
-            manifest.version,
-            manifest.source_commit,
-            manifest.target,
-            manifest.components,
-            true,
-        )
-        .map_err(CiError::Message)?;
-    }
-    source::write_json(&directory.join("runtime-manifest.json"), &manifest)?;
+    source::write_json(
+        &directory.join("runtime-manifest.json"),
+        &measured_current_manifest(&packages.source, &bundle.distribution, &directory)?,
+    )?;
     if !bundle.distribution.units.is_empty() {
         let units = target::unit_export_directory(owner.path())?;
         CommandSpec::new(
@@ -1495,12 +1544,7 @@ fn materialize_cargo_install(
         }
     }
     let fixture = fixture(bundle, target_directory, owner.path())?;
-    // Historical packages never borrow a current helper and label it older.
-    let workload_diagnostic = if legacy_predecessor {
-        None
-    } else {
-        workload_diagnostic(bundle, target_directory, owner.path())?
-    };
+    let workload_diagnostic = workload_diagnostic(bundle, target_directory, owner.path())?;
     let artifacts: Vec<_> = packages
         .files
         .iter()
@@ -1546,7 +1590,7 @@ pub fn cli_case_command(
     .args(wrapper_arguments)
     .args([
         OsString::from("--report-format"),
-        OsString::from("result-v1"),
+        OsString::from("standard"),
         OsString::from("--report"),
         report_path.as_os_str().to_os_string(),
         OsString::from("--"),
@@ -1562,7 +1606,7 @@ pub fn run_cli_case(
     name: &str,
     wrapper_arguments: &[OsString],
     fixture_arguments: &[&str],
-) -> Result<ResultV1> {
+) -> Result<MemcordonReport> {
     let (command, report_path) = cli_case_command(
         &payload.directory,
         &payload.distribution.target,
@@ -1596,9 +1640,20 @@ pub fn run_cli_case(
     .map_err(|error| CiError::Message(error.to_string()))?;
     #[cfg(not(target_os = "linux"))]
     capture(&output)?;
-    let result = ResultV1::parse(&artifacts::read_file(&report_path)?).map_err(CiError::Message)?;
+    let bytes = artifacts::read_file(&report_path)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(CiError::Message(
+            "ordinary execution report exceeds byte bound".into(),
+        ));
+    }
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes).map_err(CiError::Message)?;
+    let result: MemcordonReport = serde_json::from_slice(&bytes)?;
     if result.tool.version != payload.source.version().to_string()
-        || output.status.code() != Some(result.outcome.wrapper_status)
+        || output.status.code()
+            != result
+                .supervision
+                .as_ref()
+                .map(|summary| summary.wrapper_exit_code)
     {
         return Err(CiError::Message(
             "selected CLI native exit/report association differs".into(),
@@ -1610,9 +1665,15 @@ pub fn run_cli_case(
 pub fn run_materialized_channel(
     root: &Path,
     payload: &MaterializedPayload,
-    predecessor: Option<&MaterializedPayload>,
     output: &Path,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let original_cleanup_deadline = std::time::SystemTime::now()
+        .checked_add(Duration::from_secs(105 * 60))
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or_else(|| CiError::Message("current consumer original deadline overflow".into()))?;
+    require_current_runtime(payload)?;
     fs::create_dir(output)?;
     let mut version = CommandSpec::new(
         binary_path(
@@ -1648,9 +1709,25 @@ pub fn run_materialized_channel(
         &[],
         &["exit", "--code", "0"],
     )?;
-    if success.outcome.kind != OutcomeKindV1::Completed
-        || success.outcome.wrapper_status != 0
-        || success.cleanup.state != CleanupStateV1::Complete
+    let success_outcome = success
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.outcome.as_ref());
+    if !matches!(
+        success_outcome,
+        Some(memcordon_core::RunOutcome::Exited {
+            child: memcordon_core::ChildTermination::ExitCode { code: 0 },
+            ..
+        })
+    ) || success
+        .supervision
+        .as_ref()
+        .is_none_or(|summary| summary.wrapper_exit_code != 0)
+        || success_outcome.is_none_or(|outcome| {
+            !outcome.cleanup().direct_child_reaped
+                || !outcome.cleanup().errors.is_empty()
+                || outcome.cleanup().workload_empty == Some(false)
+        })
     {
         return Err(CiError::Message(
             "actual selected CLI success/retirement failed".into(),
@@ -1663,8 +1740,22 @@ pub fn run_materialized_channel(
         &["+200ms".into()],
         &["hold", "--duration", "10s"],
     )?;
-    if deadline.outcome.kind != OutcomeKindV1::Deadline
-        || deadline.cleanup.state != CleanupStateV1::Complete
+    let deadline_outcome = deadline
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.outcome.as_ref());
+    if !matches!(
+        deadline_outcome,
+        Some(memcordon_core::RunOutcome::DeadlineExceeded { .. })
+    ) || deadline
+        .supervision
+        .as_ref()
+        .is_none_or(|summary| summary.wrapper_exit_code != 124)
+        || deadline_outcome.is_none_or(|outcome| {
+            !outcome.cleanup().direct_child_reaped
+                || !outcome.cleanup().errors.is_empty()
+                || outcome.cleanup().workload_empty == Some(false)
+        })
     {
         return Err(CiError::Message(
             "actual selected CLI deadline/retirement failed".into(),
@@ -1691,37 +1782,7 @@ pub fn run_materialized_channel(
             &installed,
             output.join("windows-installed"),
         )?;
-        let predecessor = predecessor.ok_or_else(|| {
-            CiError::Message(
-                "installed Windows lifecycle requires its acquired rc19 predecessor".into(),
-            )
-        })?;
-        let older = crate::windows_installed_cases::InstalledWindowsPayload::from_materialized(
-            predecessor.channel,
-            &predecessor.source,
-            &predecessor.distribution,
-            installed_case_artifacts(
-                &predecessor.artifacts,
-                predecessor.selected_artifact_count,
-                predecessor.distribution.binaries.len(),
-            )?,
-            &predecessor.directory,
-            predecessor.fixture.clone(),
-            predecessor.workload_diagnostic.clone(),
-            &installed,
-            output.join("windows-predecessor"),
-        )?;
         fs::create_dir_all(&config.output_directory)?;
-        source::write_json(
-            &config
-                .output_directory
-                .join("windows-upgrade-predecessor.json"),
-            &crate::windows_installed_cases::WindowsUpgradePredecessor {
-                format: "memcordon.windows-upgrade-predecessor".into(),
-                revision: 1,
-                payload: older,
-            },
-        )?;
         let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::finite_default();
         let assessment = crate::windows_installed_cases::run_from_source_with_observer_until(
             root,
@@ -1749,7 +1810,80 @@ pub fn run_materialized_channel(
         super::distribution::RuntimeSelection::LinuxBaseline
             | super::distribution::RuntimeSelection::LinuxPrivateTcp
     ) {
-        super::linux_installed_consumer::run(root, payload, &output.join("linux-installed"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let spec = CurrentSmokeSpec {
+                format: "memcordon.current-materialized-smoke".into(),
+                revision: 1,
+                payload: SmokePayload::describe(payload),
+                output: std::path::absolute(output.join("linux-installed"))?,
+                operation_deadline_unix_millis: original_cleanup_deadline,
+                workflow_run: std::env::var("GITHUB_RUN_ID").ok(),
+            };
+            let path = std::path::absolute(output.join("current-linux-smoke.json"))?;
+            source::write_json(&path, &spec)?;
+            if rustix::process::geteuid().is_root() {
+                run_current_smoke_spec(root, &path, false)?;
+            } else {
+                let toolchain = super::consumer_readiness_cell::selected_toolchain_environment()?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| CiError::Message(e.to_string()))?
+                    .as_millis();
+                let remaining = u128::from(original_cleanup_deadline)
+                    .checked_sub(now)
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .filter(|ms| *ms > 0)
+                    .ok_or_else(|| {
+                        CiError::Message(
+                            "current smoke original deadline exhausted before root reentry".into(),
+                        )
+                    })?;
+                let result = CommandSpec::new("sudo", root, Duration::from_millis(remaining))
+                    .args(["-n", "--", "/usr/bin/env"])
+                    .args(toolchain.clone())
+                    .arg(std::env::current_exe()?)
+                    .args(["release", "current-materialized-smoke", "--spec"])
+                    .arg(&path)
+                    .run();
+                if let Err(primary) = result {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| CiError::Message(e.to_string()))?
+                        .as_millis();
+                    let cleanup_remaining = u128::from(original_cleanup_deadline)
+                        .checked_sub(now)
+                        .and_then(|ms| u64::try_from(ms).ok())
+                        .filter(|ms| *ms > 0);
+                    let retired = if let Some(ms) = cleanup_remaining {
+                        CommandSpec::new("sudo", root, Duration::from_millis(ms))
+                            .args(["-n", "--", "/usr/bin/env"])
+                            .args(toolchain)
+                            .arg(std::env::current_exe()?)
+                            .args([
+                                "release",
+                                "current-materialized-smoke",
+                                "--cleanup-only",
+                                "--spec",
+                            ])
+                            .arg(&path)
+                            .run()
+                            .map(|_| ())
+                    } else {
+                        Err(CiError::Message("original current smoke cleanup cutoff exhausted; original native owner retained".into()))
+                    };
+                    return crate::work_outcome::join_completed(
+                        crate::work_outcome::WorkOutcome::<()>::from_result(Err(primary)),
+                        crate::work_outcome::WorkOutcome::from_result(retired),
+                    )
+                    .into_result();
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(CiError::Message(
+            "Linux installed consumer requires its native host".into(),
+        ));
     }
     Ok(())
 }
@@ -1941,26 +2075,7 @@ pub fn run_channel_with_cache(
                 payload
             }
         };
-        let predecessor = if payload.distribution.runtime_selection()?
-            == super::distribution::RuntimeSelection::WindowsSealed
-        {
-            Some(acquire_cargo_predecessor(
-                root,
-                target_directory,
-                &bundle,
-                destination,
-                &destination.join("predecessor"),
-                std::time::Instant::now() + Duration::from_secs(7200),
-            )?)
-        } else {
-            None
-        };
-        run_materialized_channel(
-            root,
-            &payload,
-            predecessor.as_ref(),
-            &destination.join("cases"),
-        )?;
+        run_materialized_channel(root, &payload, &destination.join("cases"))?;
         if let Some(input) = external_input {
             let spec = crate::external_consumer::ExternalConsumerSpec::parse(
                 &super::artifacts::read_file(input)?,

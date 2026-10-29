@@ -4,10 +4,10 @@
 use memcordon_windows_launch_core::{
     NativeSecurityDescriptorV1 as Security, ProductionJobV1 as Job,
 };
+use memcordon_windows_loader_lab::current_workload::WorkloadDiagnosticRequestV2 as Request;
 use memcordon_windows_loader_lab::holder_protocol::{
     self, Binding, Frame, Outcome, ReadyPolicy, Stage,
 };
-use memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1 as Request;
 use memcordon_windows_loader_lab::{
     module_observation::{self, EventKind, ModuleTable},
     selected_policy::{self, Domain},
@@ -123,8 +123,8 @@ fn read(path: &Path, bound: usize) -> Result<Vec<u8>, String> {
 fn request(
     path: &Path,
     expected_sha256: Option<&str>,
-) -> Result<memcordon_windows_loader_lab::workload::HeldWorkloadRequest, String> {
-    memcordon_windows_loader_lab::workload::HeldWorkloadRequest::open(path, expected_sha256)
+) -> Result<memcordon_windows_loader_lab::current_workload::HeldWorkloadRequest, String> {
+    memcordon_windows_loader_lab::current_workload::HeldWorkloadRequest::open(path, expected_sha256)
 }
 fn publish(path: &Path, value: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;

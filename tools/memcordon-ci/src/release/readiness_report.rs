@@ -1,10 +1,7 @@
 //! Independently gathered CI assessment of fixed original producer owners.
 //! Publication and operational workload admission never consume this report.
 use super::{artifacts, http, readiness_transport, source};
-use crate::{
-    CiError, Result,
-    consumer_readiness_ledger::{self, SourceIdentity},
-};
+use crate::{CiError, Result, consumer_readiness_current, readiness_identity::SourceIdentity};
 use clap::{Args, ValueEnum};
 use memcordon_readiness_verifier::{Artifact, JobOutcome, JobResult};
 use std::{
@@ -61,7 +58,10 @@ fn positive(name: &str) -> Result<u64> {
         .filter(|value| *value > 0)
         .ok_or_else(|| CiError::Message(format!("native {name} must be positive decimal")))
 }
-fn failure(index: &mut memcordon_readiness_verifier::EvidenceIndex, error: impl ToString) {
+fn failure(
+    index: &mut memcordon_readiness_verifier::current::EvidenceIndexV2,
+    error: impl ToString,
+) {
     if index.assessment_failures.len() < 64 {
         index
             .assessment_failures
@@ -95,10 +95,10 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
         ("Accept".into(), "application/vnd.github+json".into()),
         ("X-GitHub-Api-Version".into(), "2022-11-28".into()),
     ];
-    let manifest = root.join("ci/consumer-readiness-v1.toml");
-    let mut index = consumer_readiness_ledger::initialize(&manifest, identity.clone())
+    let manifest = root.join("ci/consumer-readiness-v2.toml");
+    let mut index = consumer_readiness_current::initialize(&manifest, identity.clone())
         .map_err(CiError::Message)?;
-    let mut packed = consumer_readiness_ledger::PackedLedger::default();
+    let mut packed = consumer_readiness_current::PackedLedger::default();
     index.repository = Some(repository.clone());
     if matches!(args.scope, Scope::CandidateBeforePublication) {
         for row in &mut index.records {
@@ -248,7 +248,7 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
                         fs::File::open(path.parent().expect("origin parent"))?.sync_all()?;
                         producer.origin.bundle_artifact = relative.clone();
                         index.artifacts.push(retained_archive);
-                        consumer_readiness_ledger::record_origin(&mut index, producer.origin)
+                        consumer_readiness_current::record_origin(&mut index, producer.origin)
                             .map_err(CiError::Message)?;
                         packed
                             .ingest(
@@ -267,7 +267,7 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
             }
         }
     }
-    consumer_readiness_ledger::record_job_outcomes(&mut index, outcomes)
+    consumer_readiness_current::record_job_outcomes(&mut index, outcomes)
         .map_err(CiError::Message)?;
     let evidence = args.destination.join("evidence.json");
     packed

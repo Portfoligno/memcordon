@@ -15,6 +15,36 @@ pub(crate) struct Custody {
 }
 
 impl Custody {
+    /// Read-only values already resolved through the current index's held
+    /// artifact/digest boundary. This cannot construct native or file owners.
+    pub(crate) fn from_verified_values(
+        values: BTreeMap<String, Vec<u8>>,
+    ) -> VerificationResult<Self> {
+        if values.len() > crate::MAX_PRODUCER_ARTIFACTS {
+            return Err("resolved evidence count exceeds bound".into());
+        }
+        let mut bytes = BTreeMap::new();
+        let mut hashes = BTreeMap::new();
+        let mut total = 0_u64;
+        for (path, value) in values {
+            validate_path(&path)?;
+            let length = u64::try_from(value.len()).map_err(|error| error.to_string())?;
+            total = total
+                .checked_add(length)
+                .ok_or("resolved evidence total overflow")?;
+            if length > MAX_ARTIFACT_BYTES || total > MAX_PRODUCER_BYTES {
+                return Err("resolved evidence bytes exceed bound".into());
+            }
+            hashes.insert(path.clone(), crate::sha256(&value));
+            bytes.insert(path, std::sync::Arc::from(value));
+        }
+        Ok(Self {
+            bytes,
+            hashes,
+            archives: BTreeMap::new(),
+            root: PathBuf::new(),
+        })
+    }
     pub(crate) fn for_storage(
         root: &Path,
         artifacts: &[Artifact],

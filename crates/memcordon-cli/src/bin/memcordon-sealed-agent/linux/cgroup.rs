@@ -193,16 +193,44 @@ impl AttemptCgroup {
     }
 
     pub fn memory_oom_killed(&self) -> Result<bool, String> {
+        Ok(self.applied_memory_max()?.is_some()
+            && self
+                .memory_oom_event_count()?
+                .is_some_and(|count| count > 0)
+            && self.memory_oom_kill_count()?.is_some_and(|count| count > 0))
+    }
+    pub fn applied_memory_max(&self) -> Result<Option<u64>, String> {
+        let path = self.path.join("memory.max");
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        if text.trim() == "max" {
+            return Ok(None);
+        }
+        Ok(Some(text.trim().parse::<u64>().map_err(|e| e.to_string())?))
+    }
+    pub fn memory_oom_event_count(&self) -> Result<Option<u64>, String> {
+        self.memory_event_count("oom ")
+    }
+    pub fn memory_oom_kill_count(&self) -> Result<Option<u64>, String> {
+        self.memory_event_count("oom_kill ")
+    }
+    fn memory_event_count(&self, key: &str) -> Result<Option<u64>, String> {
         let path = self.path.join("memory.events");
-        if !path.exists() {
-            return Ok(false);
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(None);
         }
         let events = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        Ok(events
+        let values = events
             .lines()
-            .find_map(|line| line.strip_prefix("oom_kill "))
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|count| count > 0))
+            .filter_map(|line| line.strip_prefix(key))
+            .collect::<Vec<_>>();
+        if values.len() != 1 {
+            return Err("native memory.events omits or duplicates oom_kill".into());
+        }
+        Ok(Some(values[0].parse::<u64>().map_err(|e| e.to_string())?))
     }
 
     pub fn wait_until_empty(

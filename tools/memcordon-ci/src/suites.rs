@@ -1591,7 +1591,7 @@ pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
     };
     let spec = memcordon_ci::external_consumer::ExternalConsumerSpec {
         format: "memcordon.external-consumer".into(),
-        revision: 1,
+        revision: 2,
         target: memcordon_ci::release::distribution::native_target()?.into(),
         version: env!("CARGO_PKG_VERSION").into(),
         runtime_features: Vec::new(),
@@ -1604,10 +1604,9 @@ pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
             .into_iter()
             .map(|argument| memcordon_core::NativeArgument::from_os(std::ffi::OsStr::new(argument)))
             .collect(),
-        requested_contract: memcordon_ci::external_consumer::RequestedContract::Standard,
-        report_format: "result-v1".into(),
-        report_revision: 1,
-        expected_outcome: memcordon_core::result_v1::OutcomeKindV1::Completed,
+        report_format: "standard".into(),
+        report_revision: 10,
+        expected_outcome: memcordon_core::execution_facts::OutcomeKindV1::Completed,
         expected_native_termination: Some(memcordon_core::ChildTermination::ExitCode { code: 0 }),
         expected_wrapper_status: 0,
         coverage: memcordon_ci::external_consumer::ExpectedCoverage::Bytes {
@@ -2006,18 +2005,18 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         )
         .map(|_| ()),
         Suite::BackendLinuxCgroup => launch_delegated_linux_backend(root),
-        Suite::BackendLinuxPrivate => memcordon_ci::release::linux_installed_consumer::run_working(
+        Suite::BackendLinuxPrivate => memcordon_ci::release::linux_current_consumer::run_working(
             root,
             &root.join("target/ci/private-installed"),
         ),
         Suite::BackendLinuxPrivatePrepare => {
-            memcordon_ci::release::linux_installed_consumer::prepare_working(
+            memcordon_ci::release::linux_current_consumer::prepare_working(
                 root,
                 &root.join("target/ci/private-prepared"),
             )
         }
         Suite::BackendLinuxPrivateRuntime => {
-            memcordon_ci::release::linux_installed_consumer::run_prepared(
+            memcordon_ci::release::linux_current_consumer::run_prepared(
                 root,
                 &root.join("target/ci/private-prepared"),
                 &root.join("target/ci/private-installed"),

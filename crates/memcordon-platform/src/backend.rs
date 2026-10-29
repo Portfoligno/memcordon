@@ -59,8 +59,6 @@ pub struct UnavailableBackend {
 
 #[derive(Clone, Debug)]
 pub struct Execution {
-    pub private_execution: Option<memcordon_core::private_runtime::PrivateRuntimeExecution>,
-    pub policy_enforcement: memcordon_core::workload_evidence::RuntimePolicyEnforcement,
     pub outcome: RunOutcome,
     pub backend: BackendInfo,
     pub child_pid: Option<std::num::NonZeroU32>,
@@ -80,6 +78,37 @@ pub struct BackendCleanupFacts {
     pub containment_removed: bool,
     pub containment_incapable_of_live_members: bool,
     pub errors: Vec<String>,
+}
+
+pub(crate) fn validate_current_workload_policy(policy: &Policy) -> Result<(), Error> {
+    if let Some(request) = policy.workload_request() {
+        request.validate().map_err(|error| {
+            Error::new(ErrorCategory::Usage, "malformed-request", error.to_string())
+        })?;
+        if policy.boundary() != memcordon_core::BoundaryRequirement::Sealed {
+            return Err(Error::new(
+                ErrorCategory::Usage,
+                "MCUSAGE-WORKLOAD-BOUNDARY",
+                "workload requests require sealed native execution",
+            ));
+        }
+        let supported = match request.runtime {
+            memcordon_core::workload_request::RuntimeRequestV1::LinuxPrivate { .. } => {
+                cfg!(target_os = "linux")
+            }
+            memcordon_core::workload_request::RuntimeRequestV1::WindowsSealed { .. } => {
+                cfg!(windows)
+            }
+        };
+        if !supported {
+            return Err(Error::new(
+                ErrorCategory::Unsupported,
+                "unsupported-requirement",
+                "requested native workload profile is unavailable on this platform",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl BackendInfo {
@@ -269,6 +298,14 @@ pub fn run(
     command: &CommandSpec,
     memcordon_executable: &std::path::Path,
 ) -> Result<Execution, Error> {
+    validate_current_workload_policy(&policy)?;
+    if policy.workload_request().is_some() {
+        return Err(Error::new(
+            ErrorCategory::Usage,
+            "MCUSAGE-WORKLOAD-INPUT",
+            "caller-held workload input must be supplied through SupervisorRequest",
+        ));
+    }
     if policy.poll_interval < Duration::from_millis(10) {
         return Err(Error::new(
             ErrorCategory::Usage,
@@ -302,6 +339,7 @@ pub fn run(
     command: &CommandSpec,
     memcordon_executable: &std::path::Path,
 ) -> Result<Execution, Error> {
+    validate_current_workload_policy(&policy)?;
     if policy.poll_interval < Duration::from_millis(10) {
         return Err(Error::new(
             ErrorCategory::Usage,
@@ -325,15 +363,7 @@ pub fn run(
     reason = "the backend boundary preserves the public categorized Error contract"
 )]
 pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
-    if policy.workload_contract().is_some()
-        && policy.boundary() != memcordon_core::BoundaryRequirement::Sealed
-    {
-        return Err(Error::new(
-            memcordon_core::ErrorCategory::Unsupported,
-            "MCUNSUPPORTED-WORKLOAD-CONTRACT",
-            "strict workload admission requires a sealed provider",
-        ));
-    }
+    validate_current_workload_policy(&policy)?;
     if policy.poll_interval < Duration::from_millis(10) {
         return Err(Error::new(
             ErrorCategory::Usage,

@@ -52,16 +52,17 @@ fn exact_test_success_requires_one_executed_test() {
 }
 
 #[test]
-fn certification_consumes_typed_doctor_schema() {
+fn certification_consumes_current_typed_capabilities() {
     let mut probe = json!({
-        "schema_version": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
+        "format": "memcordon.capabilities",
+        "revision": 3,
         "tool": { "name": "memcordon", "version": "0.3.0" },
         "host": { "os": "linux", "architecture": "x86_64" },
         "selected": backend_capability("linux-cgroup-v2", true, "hard"),
         "available": [backend_capability("linux-cgroup-v2", true, "hard")],
         "unavailable": [],
         "requirement": { "kind": null, "met": true, "reason": null },
-        "workload_discovery": { "state": "unsupported" }
+        "profiles": []
     });
     assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_ok());
 
@@ -79,7 +80,7 @@ fn certification_consumes_typed_doctor_schema() {
     assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
 
     probe["selected"] = backend_capability("linux-cgroup-v2", true, "hard");
-    probe["schema_version"] = json!(1);
+    probe["revision"] = json!(99);
     assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
 }
 

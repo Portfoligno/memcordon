@@ -27,20 +27,12 @@ fn production_allocated_and_transitioned_records_pass_strict_recovery_parser() {
     let record = AttemptRecord::create_for_test(temporary.path(), IDENTITY.to_owned(), 1).unwrap();
     let path = temporary.path().join(IDENTITY);
     let allocated = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        crate::linux::attempt::parse_durable_policy(&allocated)
-            .unwrap()
-            .is_none()
-    );
+    assert!(crate::linux::attempt::parse_native_record(&allocated).is_ok());
     record.transition("boundary-created").unwrap();
     let transitioned = std::fs::read_to_string(&path).unwrap();
+    assert!(crate::linux::attempt::parse_native_record(&transitioned).is_ok());
     assert!(
-        crate::linux::attempt::parse_durable_policy(&transitioned)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        crate::linux::attempt::parse_durable_policy(
+        crate::linux::attempt::parse_native_record(
             &allocated.replace("frontend-pid=1", "frontend-pid=0")
         )
         .is_err()

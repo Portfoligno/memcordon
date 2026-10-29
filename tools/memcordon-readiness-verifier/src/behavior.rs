@@ -2,6 +2,140 @@
 use crate::*;
 use serde_json::Value;
 
+fn validate_gate_diagnostic(value: &Value, name: &str, challenge: &[u8]) -> VerificationResult<()> {
+    fn shape(value: &Value, required: &[&str], optional: &[&str]) -> VerificationResult<()> {
+        let fields = value
+            .as_object()
+            .ok_or("gate diagnostic is not an object")?;
+        if required.iter().any(|field| !fields.contains_key(*field))
+            || fields.keys().any(|field| {
+                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
+            })
+        {
+            return Err("gate diagnostic missing/unknown fields".into());
+        }
+        Ok(())
+    }
+    shape(
+        value,
+        &[
+            "revision",
+            "descriptor",
+            "descriptor_sha256",
+            "name_utf16_sha256",
+            "challenge_sha256",
+            "work_cutoff_qpc",
+            "qpc_frequency",
+        ],
+        &["namespace"],
+    )?;
+    let descriptor: Vec<u8> =
+        serde_json::from_value(value["descriptor"].clone()).map_err(|error| error.to_string())?;
+    let units = name.encode_utf16().collect::<Vec<_>>();
+    let name_bytes = units
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    if value["revision"] != 1
+        || descriptor.len() < std::mem::size_of::<[u32; 5]>()
+        || descriptor.len() > 64 * 1024
+        || descriptor[0] != 1
+        || u16::from_le_bytes(
+            descriptor[2..4]
+                .try_into()
+                .map_err(|_| "gate security descriptor control width")?,
+        ) & 0x8004
+            != 0x8004
+        || units.is_empty()
+        || units.contains(&0)
+        || value["descriptor_sha256"] != sha256(&descriptor)
+        || value["name_utf16_sha256"] != sha256(&name_bytes)
+        || value["challenge_sha256"] != sha256(challenge)
+        || value["work_cutoff_qpc"]
+            .as_u64()
+            .is_none_or(|cutoff| cutoff == 0)
+        || value["qpc_frequency"]
+            .as_u64()
+            .is_none_or(|frequency| frequency == 0)
+    {
+        return Err(
+            "gate diagnostic bytes, name/challenge or original native cutoff differ".into(),
+        );
+    }
+    if let Some(proof) = value.get("namespace").filter(|proof| !proof.is_null()) {
+        shape(
+            proof,
+            &[
+                "revision",
+                "components",
+                "path_sha256",
+                "challenge_sha256",
+                "name_utf16_sha256",
+                "descriptor_sha256",
+                "work_cutoff_qpc",
+                "qpc_frequency",
+                "controller_same_original",
+                "controller_absolute_same_original",
+                "complete",
+            ],
+            &[],
+        )?;
+        let components: Vec<Vec<u16>> = serde_json::from_value(proof["components"].clone())
+            .map_err(|error| error.to_string())?;
+        if components.is_empty() || components.len() > 17 {
+            return Err("gate namespace diagnostic component bound differs".into());
+        }
+        let mut path = Vec::<u16>::new();
+        for component in &components {
+            if component.is_empty()
+                || component
+                    .iter()
+                    .any(|unit| [0, u16::from(b'/'), u16::from(b'\\')].contains(unit))
+                || component.iter().copied().eq(".".encode_utf16())
+                || component.iter().copied().eq("..".encode_utf16())
+            {
+                return Err("gate namespace diagnostic has an escaping native component".into());
+            }
+            path.push(u16::from(b'\\'));
+            path.extend_from_slice(component);
+            if path
+                .len()
+                .checked_add(1)
+                .and_then(|length| length.checked_mul(std::mem::size_of::<u16>()))
+                .is_none_or(|bytes| bytes > 32 * 1024)
+            {
+                return Err("gate namespace diagnostic path exceeds native bound".into());
+            }
+        }
+        let path_bytes = path
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>();
+        let local = "Local\\".encode_utf16().collect::<Vec<_>>();
+        if proof["revision"] != 1
+            || proof["path_sha256"] != sha256(&path_bytes)
+            || proof["controller_same_original"] != true
+            || proof["controller_absolute_same_original"] != true
+            || proof["complete"] != true
+            || units.strip_prefix(local.as_slice()) != components.last().map(Vec::as_slice)
+        {
+            return Err("gate namespace diagnostic does not bind the same original event".into());
+        }
+        for field in [
+            "challenge_sha256",
+            "name_utf16_sha256",
+            "descriptor_sha256",
+            "work_cutoff_qpc",
+            "qpc_frequency",
+        ] {
+            if proof[field] != value[field] {
+                return Err("gate namespace diagnostic crosses original snapshot binding".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct Facts {
     pub operations: BTreeSet<String>,
     pub counters: BTreeMap<String, u64>,
@@ -88,17 +222,7 @@ fn validate_in_scope(
         }
     }
     if !semantic.key.target.ends_with("windows-msvc") {
-        if let Some(facts) =
-            crate::linux_limits::validate_behavior(behavior, semantic, native, input, custody)?
-        {
-            return Ok(facts);
-        }
-        if let Some(facts) =
-            crate::linux_isolation::validate_behavior(behavior, semantic, native, input, custody)?
-        {
-            return Ok(facts);
-        }
-        return linux(behavior, semantic, native, custody);
+        return Err("Windows factual behavior decoder received another target".into());
     }
     let descriptor: Value = wire::decode(custody.bytes(&behavior.descriptor)?)?;
     let allowed = [
@@ -126,8 +250,10 @@ fn validate_in_scope(
     let object = descriptor
         .as_object()
         .ok_or("Windows descriptor is not object")?;
-    if object.len() != allowed.len()
-        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+    if object.len() != allowed.len() + usize::from(object.contains_key("gate_access_diagnostic"))
+        || object
+            .keys()
+            .any(|key| !allowed.contains(&key.as_str()) && key != "gate_access_diagnostic")
         || descriptor["format"] != "memcordon.fixture-workload"
         || descriptor["revision"] != 1
     {
@@ -140,6 +266,18 @@ fn validate_in_scope(
         || challenge != custody.bytes(&semantic.challenge)?
     {
         return Err("raw descriptor challenge differs from independent input".into());
+    }
+    if let Some(diagnostic) = object
+        .get("gate_access_diagnostic")
+        .filter(|value| !value.is_null())
+    {
+        validate_gate_diagnostic(
+            diagnostic,
+            descriptor["start_gate"]
+                .as_str()
+                .ok_or("diagnostic original gate name absent")?,
+            &challenge,
+        )?;
     }
     let events = events(custody.bytes(&behavior.transcript)?)?;
     let first = events.first().ok_or("fixture transcript empty")?;
@@ -324,7 +462,7 @@ fn validate_in_scope(
                 "overlap retirement excludes another attempt or its own native authority".into(),
             );
         }
-        validate_windows_capacity_exclusions(
+        crate::current::windows_facts::validate_windows_capacity_exclusions(
             &retired["excluded_held_processes"],
             &retired["excluded_live_association"],
             &scope.live,
@@ -970,1479 +1108,4 @@ fn check_peer(
         ));
     }
     Ok(())
-}
-
-fn linux(
-    behavior: &FixtureBehavior,
-    semantic: &SemanticObservation,
-    native: &NativeObservation,
-    custody: &custody::Custody,
-) -> VerificationResult<Facts> {
-    let mut facts = Facts {
-        operations: BTreeSet::new(),
-        counters: BTreeMap::new(),
-    };
-    let bytes = custody.bytes(&behavior.transcript)?;
-    let binding: Value = wire::decode(
-        custody.bytes(
-            behavior
-                .native_binding
-                .as_deref()
-                .ok_or("Linux behavior lacks independently held native PID mapping")?,
-        )?,
-    )?;
-    let local = binding["target"]["namespace_pids"]
-        .as_array()
-        .and_then(|pids| pids.last())
-        .and_then(Value::as_u64)
-        .ok_or("native target namespace PID mapping absent")?;
-    if binding["target"]["process_id"].as_u64() != native.root_pid.map(u64::from)
-        || binding["target"]["birth"].as_u64() != native.root_birth
-        || binding["run_id"] != native.run_id
-    {
-        return Err("behavioral namespace PID mapping differs from held host root".into());
-    }
-    if bytes.is_empty() || !bytes.ends_with(b"\n") {
-        return Err("Linux behavioral transcript missing/truncated".into());
-    }
-    let mut root_first_child = None;
-    let mut host_denial = None;
-    let mut private_unix_positive = None;
-    let mut descriptor_isolation = None;
-    let mut argv_observation = None;
-    let mut authority_denial = None;
-    let mut neighboring_sockets = None;
-    let mut cooperation_held = None;
-    let mut cooperation_complete = None;
-    let mut abstract_held = None;
-    let build = (semantic.key.family == "L-MIX-01"
-        && semantic.key.scenario == "joint-build-tcp-unix-http")
-        || (semantic.key.family == "L-IMG-03"
-            && ["dynamic-rust-build-and-exec", "image-only-entrypoint"]
-                .contains(&semantic.key.scenario.as_str()));
-    let mut build_rows = BTreeMap::new();
-    for (ordinal, line) in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        let row: Value = wire::decode(line)?;
-        if row.as_object().is_none_or(|object| {
-            object.len() != 8
-                || object.keys().any(|key| {
-                    ![
-                        "format",
-                        "revision",
-                        "sequence",
-                        "challenge",
-                        "root_pid",
-                        "root_birth",
-                        "operation",
-                        "observation",
-                    ]
-                    .contains(&key.as_str())
-                })
-        }) || row["format"] != "memcordon.linux-readiness-transcript"
-            || row["revision"] != 1
-            || row["sequence"] != ordinal as u64 + 1
-            || row["challenge"] != hex::encode(custody.bytes(&semantic.challenge)?)
-            || row["root_pid"].as_u64() != Some(local)
-            || row["root_birth"].as_u64() != native.root_birth
-        {
-            return Err("Linux raw behavioral row association differs".into());
-        }
-        if build {
-            let operation = row["operation"]
-                .as_str()
-                .ok_or("Linux build operation encoding differs")?;
-            if build_rows
-                .insert(operation.to_owned(), row["observation"].clone())
-                .is_some()
-            {
-                return Err("Linux Joint build raw operation duplicated".into());
-            }
-        }
-        if row["operation"] == "bind-zero-and-competing-bind"
-            && row["observation"]["native_errno"] == 98
-        {
-            facts
-                .operations
-                .extend(["tcp-owned-listener", "tcp-conflicting-bind"].map(String::from));
-        }
-        if row["operation"] == "application-endpoint-mismatch" {
-            if semantic.key.family != "L-MIX-02"
-                || semantic.key.scenario != "endpoint-mismatch"
-                || native.origin != OutcomeOrigin::ApplicationRefusal
-                || native.target_status != Some(42)
-                || native.application_stage.as_deref() != Some("endpoint-policy")
-            {
-                return Err("endpoint application refusal substituted another native cause".into());
-            }
-            let raw: Value = wire::decode(
-                custody.bytes(
-                    behavior
-                        .peer_artifacts
-                        .iter()
-                        .find(|peer| peer.role == "native-endpoint-mismatch")
-                        .ok_or("independent native retained listeners absent")?
-                        .path
-                        .as_str(),
-                )?,
-            )?;
-            validate_linux_endpoint_mismatch(
-                &row["observation"],
-                &raw,
-                native.root_pid.ok_or("endpoint held root absent")?,
-                native.root_birth.ok_or("endpoint held root birth absent")?,
-                &binding["target"]["network"],
-                native
-                    .attempt_id
-                    .as_deref()
-                    .ok_or("endpoint native admission absent")?,
-                custody.bytes(&semantic.challenge)?,
-            )?;
-            let probe = semantic
-                .negative_probe
-                .as_ref()
-                .ok_or("endpoint application refusal receipt absent")?;
-            if probe.receipt != behavior.transcript
-                || probe.domain != "application"
-                || probe.native_code != 42
-                || probe.stage != "endpoint-mismatch"
-            {
-                return Err(
-                    "endpoint negative observation differs from actual typed application refusal"
-                        .into(),
-                );
-            }
-            facts.operations.extend(
-                [
-                    "tcp-owned-listener",
-                    "second-reserved-listener",
-                    "application-endpoint-refusal",
-                ]
-                .map(String::from),
-            );
-        }
-        if row["operation"] == "scm-rights-regular-and-listener" {
-            let observation = &row["observation"];
-            let fields = [
-                "file_bytes",
-                "endpoint",
-                "network_bytes",
-                "file_device",
-                "file_inode",
-                "received_file_device",
-                "received_file_inode",
-                "listener_device",
-                "listener_inode",
-                "received_listener_device",
-                "received_listener_inode",
-            ];
-            if observation.as_object().is_none_or(|object| {
-                object.len() != fields.len()
-                    || object.keys().any(|key| !fields.contains(&key.as_str()))
-            }) {
-                return Err("native descriptor transfer raw schema differs".into());
-            }
-            let endpoint: std::net::SocketAddr = observation["endpoint"]
-                .as_str()
-                .ok_or("transferred TCP endpoint absent")?
-                .parse()
-                .map_err(|_| "transferred TCP endpoint malformed")?;
-            if endpoint.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                || endpoint.port() == 0
-            {
-                return Err(
-                    "transferred listener is not an owned private loopback bind-zero socket".into(),
-                );
-            }
-            let file: Vec<u8> = serde_json::from_value(observation["file_bytes"].clone())
-                .map_err(|error| error.to_string())?;
-            let network: Vec<u8> = serde_json::from_value(observation["network_bytes"].clone())
-                .map_err(|error| error.to_string())?;
-            if file != b"descriptor-readiness" || network != b"rights-listener" {
-                return Err("actual transferred descriptor byte effects differ".into());
-            }
-            for role in ["file", "listener"] {
-                let device = format!("{role}_device");
-                let inode = format!("{role}_inode");
-                if observation[&device] != observation[format!("received_{device}")]
-                    || observation[&inode] != observation[format!("received_{inode}")]
-                    || observation[&inode].as_u64().is_none_or(|value| value == 0)
-                {
-                    return Err("transferred native descriptor identity differs".into());
-                }
-            }
-            let peers = behavior
-                .peer_artifacts
-                .iter()
-                .map(|artifact| (artifact.role.as_str(), artifact.path.as_str()))
-                .collect::<BTreeMap<_, _>>();
-            if custody.bytes(
-                peers
-                    .get("transferred-file")
-                    .copied()
-                    .ok_or("transferred file product absent")?,
-            )? != file
-                || custody.bytes(
-                    peers
-                        .get("tcp")
-                        .copied()
-                        .ok_or("transferred listener received bytes absent")?,
-                )? != network
-            {
-                return Err("raw transferred descriptor transcript/product mismatch".into());
-            }
-            facts
-                .operations
-                .extend(["scm-rights-listener", "scm-rights-private-file"].map(String::from));
-        }
-        if row["operation"] == "empty-message-exchanged" {
-            let payload: Vec<u8> = serde_json::from_value(row["observation"]["payload"].clone())
-                .map_err(|error| error.to_string())?;
-            let frame: Vec<u8> =
-                serde_json::from_value(row["observation"]["received_length_prefix"].clone())
-                    .map_err(|error| error.to_string())?;
-            let peer = behavior
-                .peer_artifacts
-                .iter()
-                .find(|artifact| artifact.role == "message")
-                .ok_or("actual empty message product absent")?;
-            if !payload.is_empty()
-                || frame != [0, 0, 0, 0]
-                || !custody.bytes(&peer.path)?.is_empty()
-            {
-                return Err("actual framed empty message is not zero length".into());
-            }
-            facts.operations.insert("empty-message-exchanged".into());
-        }
-        if [
-            "other-attempt-abstract-held",
-            "other-attempt-abstract-released",
-        ]
-        .iter()
-        .any(|operation| row["operation"] == *operation)
-            && semantic.key.family == "L-ISO-03"
-            && semantic.key.scenario == "own-abstract-positive"
-        {
-            let observation = &row["observation"];
-            let fields = [
-                "name",
-                "socket_inode",
-                "network_namespace_inode",
-                "baseline_client_connected",
-                "baseline_server_accepted",
-                "bytes",
-            ];
-            let expected = format!(
-                "memcordon-readiness-{}",
-                hex::encode(custody.bytes(&semantic.challenge)?)
-            );
-            if observation.as_object().is_none_or(|object| {
-                object.len() != fields.len()
-                    || object.keys().any(|key| !fields.contains(&key.as_str()))
-            }) || serde_json::from_value::<Vec<u8>>(observation["name"].clone())
-                .map_err(|error| error.to_string())?
-                != expected.as_bytes()
-                || observation["socket_inode"]
-                    .as_u64()
-                    .is_none_or(|inode| inode == 0)
-                || observation["network_namespace_inode"] != binding["target"]["network"]["inode"]
-                || observation["baseline_client_connected"] != true
-                || observation["baseline_server_accepted"] != true
-                || serde_json::from_value::<Vec<u8>>(observation["bytes"].clone())
-                    .map_err(|error| error.to_string())?
-                    != b"abstract-unix-readiness"
-                || custody.bytes(
-                    &behavior
-                        .peer_artifacts
-                        .iter()
-                        .find(|artifact| artifact.role == "unix-abstract")
-                        .ok_or("held own abstract original bytes absent")?
-                        .path,
-                )? != b"abstract-unix-readiness"
-            {
-                return Err("held own abstract original native listener differs".into());
-            }
-            if row["operation"] == "other-attempt-abstract-held" {
-                if ordinal != 0 || abstract_held.replace(observation.clone()).is_some() {
-                    return Err("held abstract original barrier duplicated".into());
-                }
-            } else {
-                if ordinal != 1
-                    || abstract_held.as_ref() != Some(observation)
-                    || bytes
-                        .split(|byte| *byte == b'\n')
-                        .filter(|line| !line.is_empty())
-                        .count()
-                        != 2
-                {
-                    return Err("held abstract original release differs".into());
-                }
-                facts.operations.insert("unix-abstract-exchange".into());
-            }
-        }
-        if row["operation"] == "unix-abstract-round-trip"
-            && semantic.key.family == "L-ISO-03"
-            && semantic.key.scenario == "own-abstract-positive"
-        {
-            let observation = &row["observation"];
-            if observation.as_object().is_none_or(|object| {
-                object.len() != 2 || !object.contains_key("name") || !object.contains_key("bytes")
-            }) {
-                return Err("own abstract raw exchange schema differs".into());
-            }
-            let name: Vec<u8> = serde_json::from_value(observation["name"].clone())
-                .map_err(|error| error.to_string())?;
-            let received: Vec<u8> = serde_json::from_value(observation["bytes"].clone())
-                .map_err(|error| error.to_string())?;
-            let peer = behavior
-                .peer_artifacts
-                .iter()
-                .find(|artifact| artifact.role == "unix-abstract")
-                .ok_or("actual own abstract product absent")?;
-            if name != hex::encode(custody.bytes(&semantic.challenge)?).as_bytes()
-                || received != b"abstract-unix-readiness"
-                || custody.bytes(&peer.path)? != received
-            {
-                return Err("actual own abstract name/received product differs".into());
-            }
-            facts.operations.insert("unix-abstract-exchange".into());
-        }
-        if row["operation"] == "same-attempt-cooperation-held"
-            && cooperation_held
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("cooperation live barrier repeated".into());
-        }
-        if row["operation"] == "same-attempt-cooperation-complete"
-            && cooperation_complete
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("cooperation completion repeated".into());
-        }
-        if row["operation"] == "root-exiting-before-held-descendant"
-            && root_first_child
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("root-first fixture repeated its held descendant identity".into());
-        }
-        if row["operation"] == "private-unix-pair-positive"
-            && private_unix_positive
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("private Unix pair positive repeated".into());
-        }
-        if row["operation"] == "native-descriptor-isolation"
-            && descriptor_isolation
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("native descriptor isolation probe repeated".into());
-        }
-        if (row["operation"] == "forbidden-tcp-denied"
-            || row["operation"] == "forbidden-abstract-denied"
-            || row["operation"] == "forbidden-unix-path-denied")
-            && host_denial
-                .replace((row["operation"].clone(), row["observation"].clone()))
-                .is_some()
-        {
-            return Err("host authority probe repeated its native denial".into());
-        }
-        if row["operation"] == "native-argv-observed"
-            && argv_observation
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("actual native argv observation repeated".into());
-        }
-        if row["operation"] == "native-authority-denied"
-            && authority_denial
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("selected native authority denial repeated".into());
-        }
-        if row["operation"] == "neighboring-permitted-sockets"
-            && neighboring_sockets
-                .replace(row["observation"].clone())
-                .is_some()
-        {
-            return Err("neighboring permitted socket baseline repeated".into());
-        }
-    }
-    if semantic.key.family == "L-MIX-04" && semantic.key.scenario == "cooperation" {
-        let held = cooperation_held.ok_or("cooperation held child barrier absent")?;
-        let complete = cooperation_complete.ok_or("cooperation child completion absent")?;
-        let fields = [
-            "pid",
-            "birth",
-            "endpoint",
-            "server_received",
-            "peer_transcript",
-            "native_status",
-        ];
-        if complete.as_object().is_none_or(|object| {
-            object.len() != fields.len() || object.keys().any(|key| !fields.contains(&key.as_str()))
-        }) || held["pid"] != complete["pid"]
-            || held["birth"] != complete["birth"]
-            || held["endpoint"] != complete["endpoint"]
-            || complete["native_status"] != 0
-        {
-            return Err("cooperation held/completed child association differs".into());
-        }
-        let endpoint: std::net::SocketAddr = complete["endpoint"]
-            .as_str()
-            .ok_or("cooperation endpoint absent")?
-            .parse()
-            .map_err(|_| "cooperation endpoint malformed")?;
-        if !endpoint.is_ipv4() || !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-            return Err("cooperation endpoint not private loopback bind0".into());
-        }
-        let expected = hex::encode(custody.bytes(&semantic.challenge)?).into_bytes();
-        let server: Vec<u8> = serde_json::from_value(complete["server_received"].clone())
-            .map_err(|error| error.to_string())?;
-        let peer_bytes: Vec<u8> = serde_json::from_value(complete["peer_transcript"].clone())
-            .map_err(|error| error.to_string())?;
-        let peer: Value = wire::decode(&peer_bytes)?;
-        if peer["format"] != "memcordon.linux-readiness-transcript"
-            || peer["revision"] != 1
-            || peer["sequence"] != 2
-            || peer["challenge"] != hex::encode(custody.bytes(&semantic.challenge)?)
-            || peer["root_pid"] != complete["pid"]
-            || peer["root_birth"] != complete["birth"]
-            || peer["operation"] != "cooperation-peer-received"
-            || peer["observation"]["endpoint"] != complete["endpoint"]
-            || serde_json::from_value::<Vec<u8>>(peer["observation"]["bytes"].clone())
-                .map_err(|error| error.to_string())?
-                != expected
-            || server != expected
-        {
-            return Err(
-                "actual two-process cooperation received bytes/child transcript differ".into(),
-            );
-        }
-        let retired: Value = wire::decode(
-            custody.bytes(
-                behavior
-                    .peer_artifacts
-                    .iter()
-                    .find(|peer| peer.role == "native-retirement")
-                    .ok_or("cooperation native family receipt absent")?
-                    .path
-                    .as_str(),
-            )?,
-        )?;
-        let member = retired["namespace_members"]
-            .as_array()
-            .ok_or("cooperation child namespace mapping absent")?
-            .iter()
-            .find(|member| {
-                member["namespace_pid"] == complete["pid"] && member["birth"] == complete["birth"]
-            })
-            .ok_or("cooperation child lacks independently held namespace mapping")?;
-        let identity = native
-            .held_processes
-            .iter()
-            .find(|identity| {
-                Some(u64::from(identity.pid)) == member["pid"].as_u64()
-                    && Some(identity.birth) == member["birth"].as_u64()
-            })
-            .ok_or("cooperation child held native owner absent")?;
-        if retired["format"] != "memcordon.linux-held-family-retirement"
-            || retired["revision"] != 1
-            || retired["run_id"] != native.run_id
-            || retired["lease_id"].as_str() != native.lease_id.as_deref()
-            || retired["attempt_id"].as_str() != native.attempt_id.as_deref()
-            || retired["aggregate_empty"] != true
-            || !identity.retirement_observed
-            || identity.parent_pid != native.root_pid
-            || identity.parent_birth != native.root_birth
-            || retired["descendants"]
-                .as_array()
-                .is_none_or(|descendants| descendants.len() != 1)
-            || retired["descendants"][0]
-                != serde_json::to_value(identity).map_err(|error| error.to_string())?
-        {
-            return Err(
-                "cooperation peer native parent/retirement differs from same attempt".into(),
-            );
-        }
-        let product = behavior
-            .peer_artifacts
-            .iter()
-            .find(|peer| peer.role == "cooperation")
-            .ok_or("actual cooperation product absent")?;
-        if custody.bytes(&product.path)? != expected {
-            return Err("cooperation product differs from actual received challenge".into());
-        }
-        facts.operations.insert("same-attempt-cooperation".into());
-    }
-    if (semantic.key.family == "L-ISO-01"
-        && ["ipv6", "udp", "raw", "packet", "netlink"].contains(&semantic.key.scenario.as_str()))
-        || (semantic.key.family == "L-ISO-05"
-            && ["pidfd-getfd", "ptrace", "namespace-entry"]
-                .contains(&semantic.key.scenario.as_str()))
-    {
-        let denial =
-            authority_denial.ok_or("actual selected native authority syscall denial absent")?;
-        let permitted = neighboring_sockets.ok_or("neighboring actual permitted sockets absent")?;
-        let expected_errno = match semantic.key.scenario.as_str() {
-            "ipv6" | "packet" | "netlink" => 97,
-            "udp" | "raw" => 93,
-            "pidfd-getfd" | "ptrace" | "namespace-entry" => 1,
-            _ => return Err("unknown authority errno scenario".into()),
-        };
-        if denial.as_object().is_none_or(|object| {
-            object.len() != 3
-                || object
-                    .keys()
-                    .any(|key| !["probe", "native_errno", "result"].contains(&key.as_str()))
-        }) || denial["probe"] != semantic.key.scenario
-            || denial["native_errno"] != expected_errno
-            || denial["result"] != -1
-            || permitted.as_object().is_none_or(|object| {
-                object.len() != 2
-                    || !object.contains_key("tcp_endpoint")
-                    || !object.contains_key("unix_bytes")
-            })
-        {
-            return Err(
-                "actual authority syscall/native errno or neighboring baseline differs".into(),
-            );
-        }
-        let endpoint: std::net::SocketAddr = permitted["tcp_endpoint"]
-            .as_str()
-            .ok_or("neighbor TCP endpoint absent")?
-            .parse()
-            .map_err(|_| "neighbor TCP endpoint malformed")?;
-        let received: Vec<u8> = serde_json::from_value(permitted["unix_bytes"].clone())
-            .map_err(|error| error.to_string())?;
-        if endpoint.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            || endpoint.port() == 0
-            || received != b"positive"
-        {
-            return Err("native denial omitted neighboring real permitted socket effects".into());
-        }
-        let probe = semantic
-            .negative_probe
-            .as_ref()
-            .ok_or("authority denial vector absent")?;
-        if probe.receipt != behavior.transcript
-            || probe.stage != semantic.key.scenario
-            || probe.domain != "linux"
-            || probe.native_code != expected_errno
-        {
-            return Err("actual authority denial differs from persisted selected errno".into());
-        }
-        facts.operations.insert("native-authority-probe".into());
-    }
-    if semantic.key.family == "C-IO" && semantic.key.scenario == "native-argv" {
-        let observed = argv_observation.ok_or("actual native argv transcript absent")?;
-        let arguments: Vec<Vec<u8>> =
-            serde_json::from_value(observed["argv"].clone()).map_err(|error| error.to_string())?;
-        let peer = behavior
-            .peer_artifacts
-            .iter()
-            .find(|artifact| artifact.role == "native-argv")
-            .ok_or("actual native argv product absent")?;
-        let actual: NativeArguments = wire::decode(custody.bytes(&peer.path)?)?;
-        if observed["native_exit_status"] != 0
-            || serde_json::to_value(actual).map_err(|error| error.to_string())?
-                != serde_json::to_value(NativeArguments::UnixBytes(arguments))
-                    .map_err(|error| error.to_string())?
-        {
-            return Err("actual native argv transcript/product differs".into());
-        }
-    }
-    if semantic.key.family == "L-ISO-02"
-        && ["host-run-socket", "host-temp-socket"].contains(&semantic.key.scenario.as_str())
-    {
-        let peer = |role: &str| {
-            behavior
-                .peer_artifacts
-                .iter()
-                .find(|artifact| artifact.role == role)
-                .ok_or("original host pathname socket peer absent")
-        };
-        let canary: Value = wire::decode(custody.bytes(&peer("host-path-socket-canary")?.path)?)?;
-        let intent: Value = wire::decode(custody.bytes(&peer("host-path-socket-intent")?.path)?)?;
-        let allocation: Value =
-            wire::decode(custody.bytes(&peer("host-path-socket-allocation")?.path)?)?;
-        let closed = |value: &Value, fields: &[&str]| {
-            value.as_object().is_some_and(|object| {
-                object.len() == fields.len()
-                    && object.keys().all(|key| fields.contains(&key.as_str()))
-            })
-        };
-        if !closed(
-            &canary,
-            &[
-                "format",
-                "revision",
-                "original",
-                "parent",
-                "named_absence_errno",
-                "listener_closed",
-                "parent_closed",
-            ],
-        ) || !closed(
-            &intent,
-            &["format", "revision", "kind", "path", "challenge", "parent"],
-        ) || !closed(
-            &allocation,
-            &[
-                "format",
-                "revision",
-                "path",
-                "device",
-                "inode",
-                "uid",
-                "gid",
-                "nlink",
-                "intent_sha256",
-            ],
-        ) || !closed(
-            &canary["original"],
-            &[
-                "path",
-                "device",
-                "inode",
-                "uid",
-                "gid",
-                "mode",
-                "nlink",
-                "listener_device",
-                "listener_inode",
-                "bytes",
-                "kind",
-                "peer",
-                "network_namespace_inode",
-            ],
-        ) || !closed(&canary["original"]["peer"], &["pid", "birth", "uid", "gid"])
-            || !closed(
-                &canary["parent"],
-                &["path", "device", "inode", "uid", "mode"],
-            )
-            || !closed(
-                &intent["parent"],
-                &["path", "device", "inode", "uid", "mode"],
-            )
-        {
-            return Err("host pathname socket original schema differs".into());
-        }
-        let original = &canary["original"];
-        let parent = &canary["parent"];
-        let challenge = hex::encode(custody.bytes(&semantic.challenge)?);
-        let parent_path = if semantic.key.scenario == "host-run-socket" {
-            "/run"
-        } else {
-            "/tmp"
-        };
-        let path = format!("{parent_path}/memcordon-readiness-{challenge}.sock");
-        let actual_bytes: Vec<u8> =
-            serde_json::from_value(original["bytes"].clone()).map_err(|error| error.to_string())?;
-        if allocation["format"] != "memcordon.linux-host-path-socket-allocation"
-            || allocation["revision"] != 1
-            || allocation["intent_sha256"]
-                != crate::sha256(custody.bytes(&peer("host-path-socket-intent")?.path)?)
-            || ["path", "device", "inode", "uid", "gid", "nlink"]
-                .iter()
-                .any(|field| allocation[*field] != original[*field])
-        {
-            return Err(
-                "host socket completed canary differs from original native allocation".into(),
-            );
-        }
-        if canary["format"] != "memcordon.linux-host-path-socket-canary"
-            || canary["revision"] != 1
-            || intent["format"] != "memcordon.linux-host-path-socket-intent"
-            || intent["revision"] != 1
-            || intent["challenge"] != challenge
-            || intent["kind"] != semantic.key.scenario
-            || original["kind"] != semantic.key.scenario
-            || original["path"] != path
-            || intent["path"] != path
-            || parent["path"] != parent_path
-            || intent["parent"] != *parent
-            || actual_bytes != challenge.as_bytes()
-            || original["uid"] != 0
-            || original["gid"] != 0
-            || original["nlink"] != 1
-            || parent["uid"] != 0
-            || original["peer"]["pid"] != binding["observer"]["pid"]
-            || original["peer"]["birth"] != binding["observer"]["birth"]
-            || original["peer"]["pid"]
-                .as_u64()
-                .is_none_or(|pid| pid == 0 || pid > i32::MAX as u64)
-            || original["peer"]["birth"]
-                .as_u64()
-                .is_none_or(|birth| birth == 0)
-            || original["peer"]["uid"] != 0
-            || original["peer"]["gid"] != 0
-            || canary["named_absence_errno"] != 2
-            || canary["listener_closed"] != true
-            || canary["parent_closed"] != true
-        {
-            return Err(
-                "host pathname socket crosses original acquisition/positive/retirement".into(),
-            );
-        }
-        let mode = original["mode"]
-            .as_u64()
-            .ok_or("host socket native mode absent")?;
-        let parent_mode = parent["mode"]
-            .as_u64()
-            .ok_or("host socket parent native mode absent")?;
-        if mode & 0o170000 != 0o140000
-            || mode & 0o777 != 0o666
-            || parent_mode & 0o170000 != 0o040000
-            || (parent_mode & 0o022 != 0 && !(parent_path == "/tmp" && parent_mode & 0o1000 != 0))
-            || [original, parent].iter().any(|value| {
-                ["device", "inode"]
-                    .iter()
-                    .any(|field| value[*field].as_u64().is_none_or(|value| value == 0))
-            })
-            || ["listener_device", "listener_inode"]
-                .iter()
-                .any(|field| original[*field].as_u64().is_none_or(|value| value == 0))
-        {
-            return Err("host pathname socket native object/parent custody malformed".into());
-        }
-        let host_namespace = original["network_namespace_inode"]
-            .as_u64()
-            .filter(|value| *value > 0)
-            .ok_or("host Unix socket namespace absent")?;
-        if binding["caller"]["network"]["inode"].as_u64() != Some(host_namespace)
-            || binding["target"]["network"]["inode"]
-                .as_u64()
-                .is_none_or(|value| value == 0 || value == host_namespace)
-        {
-            return Err("host Unix socket namespace reassociated".into());
-        }
-        let (operation, denial) = host_denial
-            .take()
-            .ok_or("host pathname socket actual native denial absent")?;
-        let code = denial["native_errno"]
-            .as_i64()
-            .ok_or("host pathname socket errno absent")?;
-        let probe = semantic
-            .negative_probe
-            .as_ref()
-            .ok_or("host pathname socket independent denial projection absent")?;
-        let positive = private_unix_positive
-            .take()
-            .ok_or("host socket probe omitted private Unix pair positive")?;
-        if operation != "forbidden-unix-path-denied"
-            || !closed(&denial, &["path", "native_errno"])
-            || denial["path"] != path
-            || ![1, 2, 13, 20, 111].contains(&code)
-            || probe.stage != semantic.key.scenario
-            || probe.domain != "linux"
-            || probe.native_code != code
-            || probe.receipt != behavior.transcript
-            || !closed(&positive, &["bytes"])
-            || positive["bytes"] != original["bytes"]
-        {
-            return Err("host pathname socket denial/private positive substituted".into());
-        }
-        facts.operations.insert("native-authority-probe".into());
-    }
-    if semantic.key.family == "L-ISO-05"
-        && ["stdio-host-socket", "extra-host-fd"].contains(&semantic.key.scenario.as_str())
-    {
-        let closed = |value: &Value, fields: &[&str]| {
-            value.as_object().is_some_and(|object| {
-                object.len() == fields.len()
-                    && object.keys().all(|key| fields.contains(&key.as_str()))
-            })
-        };
-        let peer = behavior
-            .peer_artifacts
-            .iter()
-            .find(|artifact| artifact.role == "host-socket-descriptor")
-            .ok_or("original hostile host socket descriptor peer absent")?;
-        let retired: Value = wire::decode(custody.bytes(&peer.path)?)?;
-        let original = &retired["original"];
-        if !closed(
-            &retired,
-            &[
-                "format",
-                "revision",
-                "original",
-                "source_closed",
-                "peer_closed",
-                "native_errno",
-            ],
-        ) || retired["format"] != "memcordon.linux-host-socket-descriptor-retired"
-            || retired["revision"] != 1
-            || retired["source_closed"] != true
-            || retired["peer_closed"] != true
-            || !retired["native_errno"].is_null()
-            || !closed(
-                original,
-                &[
-                    "format",
-                    "revision",
-                    "descriptor",
-                    "frontend",
-                    "source",
-                    "peer",
-                    "source_link",
-                    "fdinfo",
-                    "observer",
-                    "host_network",
-                ],
-            )
-            || original["format"] != "memcordon.linux-host-socket-descriptor"
-            || original["revision"] != 1
-            || original["descriptor"]
-                != if semantic.key.scenario == "stdio-host-socket" {
-                    0
-                } else {
-                    128
-                }
-        {
-            return Err("host socket original handoff/closure schema differs".into());
-        }
-        let binding = behavior
-            .native_binding
-            .as_ref()
-            .ok_or("host descriptor original native preparation binding absent")?;
-        let prepared: Value = wire::decode(custody.bytes(binding)?)?;
-        if original["frontend"] != prepared["caller"]
-            || original["observer"] != prepared["observer"]
-            || original["host_network"] != prepared["caller"]["network"]
-            || prepared["caller"]["network"] == prepared["target"]["network"]
-        {
-            return Err(
-                "host descriptor original caller/observer/private namespace association differs"
-                    .into(),
-            );
-        }
-        for name in ["source", "peer"] {
-            let native = &original[name];
-            if !closed(native, &["device", "inode", "mode"])
-                || native["device"].as_u64().is_none_or(|value| value == 0)
-                || native["inode"].as_u64().is_none_or(|value| value == 0)
-                || native["mode"]
-                    .as_u64()
-                    .is_none_or(|mode| mode & 0o170000 != 0o140000)
-            {
-                return Err("host descriptor actual held socket source absent".into());
-            }
-        }
-        if original["source"]["inode"] == original["peer"]["inode"] {
-            return Err("host socket source substituted its own external peer".into());
-        }
-        let link: Vec<u8> = serde_json::from_value(original["source_link"].clone())
-            .map_err(|error| error.to_string())?;
-        if link
-            != format!(
-                "socket:[{}]",
-                original["source"]["inode"]
-                    .as_u64()
-                    .ok_or("host socket inode absent")?
-            )
-            .as_bytes()
-        {
-            return Err("actual frontend socket named source differs".into());
-        }
-        let fdinfo: Vec<u8> = serde_json::from_value(original["fdinfo"].clone())
-            .map_err(|error| error.to_string())?;
-        if fdinfo.len() > 4096 {
-            return Err("host descriptor fdinfo unbounded".into());
-        }
-        let text = std::str::from_utf8(&fdinfo).map_err(|error| error.to_string())?;
-        let mut entries = std::collections::BTreeMap::new();
-        for line in text.lines() {
-            let (key, value) = line
-                .split_once(':')
-                .ok_or("host descriptor native fdinfo malformed")?;
-            if entries.insert(key, value.trim()).is_some() {
-                return Err("host descriptor fdinfo duplicate".into());
-            }
-        }
-        if entries
-            .keys()
-            .any(|name| !["pos", "flags", "mnt_id", "ino", "scm_fds"].contains(name))
-            || entries
-                .get("ino")
-                .and_then(|value| value.parse::<u64>().ok())
-                != original["source"]["inode"].as_u64()
-            || entries.get("pos") != Some(&"0")
-            || entries
-                .get("flags")
-                .and_then(|value| u64::from_str_radix(value, 8).ok())
-                != Some(2)
-            || entries
-                .get("mnt_id")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|value| value == 0)
-            || entries.get("scm_fds").is_some_and(|value| *value != "0")
-        {
-            return Err("host descriptor original inode/flags fdinfo differs".into());
-        }
-        let observed =
-            descriptor_isolation.ok_or("actual target descriptor syscall probe absent")?;
-        if !closed(&observed, &["stdio", "extra_descriptor", "native_errno"])
-            || observed["extra_descriptor"] != 128
-            || observed["native_errno"] != 9
-        {
-            return Err("actual target extra host descriptor did not close".into());
-        }
-        let stdio = observed["stdio"]
-            .as_array()
-            .filter(|rows| rows.len() == 3)
-            .ok_or("actual target three byte pipes absent")?;
-        let mut identities = std::collections::BTreeSet::new();
-        for (descriptor, native) in stdio.iter().enumerate() {
-            if !closed(native, &["descriptor", "device", "inode", "mode"])
-                || native["descriptor"] != descriptor as u64
-                || native["device"].as_u64().is_none_or(|value| value == 0)
-                || native["inode"].as_u64().is_none_or(|value| value == 0)
-                || native["mode"]
-                    .as_u64()
-                    .is_none_or(|mode| mode & 0o170000 != 0o010000)
-                || !identities.insert((native["device"].as_u64(), native["inode"].as_u64()))
-            {
-                return Err(
-                    "target stdio substituted external sockets or shared descriptor authority"
-                        .into(),
-                );
-            }
-        }
-        let positive = private_unix_positive
-            .take()
-            .ok_or("host descriptor probe omitted actual private Unix pair positive")?;
-        if !closed(&positive, &["bytes"])
-            || positive["bytes"]
-                != serde_json::to_value(hex::encode(custody.bytes(&semantic.challenge)?).as_bytes())
-                    .map_err(|error| error.to_string())?
-        {
-            return Err("host descriptor neighboring private pair bytes differ".into());
-        }
-        facts.operations.insert("native-authority-probe".into());
-    }
-    if (semantic.key.family == "L-ISO-01"
-        && ["host-tcp", "nonloopback"].contains(&semantic.key.scenario.as_str()))
-        || (semantic.key.family == "L-ISO-03" && semantic.key.scenario == "host-abstract")
-    {
-        let tcp = semantic.key.family == "L-ISO-01";
-        let role = if tcp {
-            "host-tcp-canary"
-        } else {
-            "host-abstract-canary"
-        };
-        let path = behavior
-            .peer_artifacts
-            .iter()
-            .find(|artifact| artifact.role == role)
-            .ok_or("independently held host canary absent")?;
-        let canary: Value = wire::decode(custody.bytes(&path.path)?)?;
-        let (operation, denial) =
-            host_denial.ok_or("actual host authority native denial absent")?;
-        let expected = if tcp {
-            "forbidden-tcp-denied"
-        } else {
-            "forbidden-abstract-denied"
-        };
-        let field = if tcp { "endpoint" } else { "name" };
-        let fields = [
-            "format",
-            "revision",
-            "challenge",
-            field,
-            "socket_inode",
-            "network_namespace_inode",
-            "baseline_client_connected",
-            "baseline_server_accepted",
-        ];
-        if canary.as_object().is_none_or(|object| {
-            object.len() != fields.len() || object.keys().any(|key| !fields.contains(&key.as_str()))
-        }) || denial.as_object().is_none_or(|object| {
-            object.len() != 2 || !object.contains_key(field) || !object.contains_key("native_errno")
-        }) {
-            return Err("host authority canary/denial raw schema differs".into());
-        }
-        if tcp {
-            let endpoint: std::net::SocketAddr = canary[field]
-                .as_str()
-                .ok_or("host TCP endpoint absent")?
-                .parse()
-                .map_err(|_| "host TCP endpoint malformed")?;
-            let address_ok = match endpoint.ip() {
-                std::net::IpAddr::V4(ip) => {
-                    if semantic.key.scenario == "nonloopback" {
-                        !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
-                    } else {
-                        ip == std::net::Ipv4Addr::LOCALHOST
-                    }
-                }
-                _ => false,
-            };
-            if !address_ok || endpoint.port() == 0 {
-                return Err(
-                    "host TCP canary differs from its actual selected native bind-zero allocation"
-                        .into(),
-                );
-            }
-        } else {
-            let name: Vec<u8> =
-                serde_json::from_value(canary[field].clone()).map_err(|error| error.to_string())?;
-            if name
-                != format!(
-                    "memcordon-readiness-{}",
-                    hex::encode(custody.bytes(&semantic.challenge)?)
-                )
-                .as_bytes()
-            {
-                return Err("host abstract canary name differs from fresh challenge".into());
-            }
-        }
-        if operation != expected
-            || canary["format"]
-                != if tcp {
-                    "memcordon.linux-host-tcp-canary"
-                } else {
-                    "memcordon.linux-host-abstract-canary"
-                }
-            || canary["revision"] != 1
-            || canary["challenge"] != hex::encode(custody.bytes(&semantic.challenge)?)
-            || canary["baseline_client_connected"] != true
-            || canary["baseline_server_accepted"] != true
-            || canary["socket_inode"]
-                .as_u64()
-                .is_none_or(|inode| inode == 0)
-            || canary[field] != denial[field]
-        {
-            return Err(
-                "actual denied host endpoint differs from independently held live baseline".into(),
-            );
-        }
-        let host_namespace = canary["network_namespace_inode"]
-            .as_u64()
-            .ok_or("host listener native namespace absent")?;
-        if host_namespace == 0
-            || binding["target"]["network"]["inode"]
-                .as_u64()
-                .is_none_or(|inode| inode == 0 || inode == host_namespace)
-            || binding["caller"]["network"]["inode"].as_u64() != Some(host_namespace)
-        {
-            return Err(
-                "held host listener and fresh target network namespace association differs".into(),
-            );
-        }
-        let probe = semantic
-            .negative_probe
-            .as_ref()
-            .ok_or("host denial vector absent")?;
-        let code = denial["native_errno"]
-            .as_i64()
-            .ok_or("host denial errno absent")?;
-        if probe.receipt != behavior.transcript
-            || probe.stage != semantic.key.scenario
-            || probe.domain != "linux"
-            || probe.native_code != code
-            || !(if tcp {
-                [1, 101, 111, 113].contains(&code)
-            } else {
-                [1, 13, 111].contains(&code)
-            })
-        {
-            return Err("host native errno differs from exact source-backed denial".into());
-        }
-        facts.operations.insert("native-authority-probe".into());
-    }
-    if (semantic.key.family == "L-LIFE-01"
-        && semantic.key.scenario == "root-first-resource-descendant")
-        || (semantic.key.family == "C-LIFETIME" && semantic.key.scenario == "root-first")
-    {
-        let peers = behavior
-            .peer_artifacts
-            .iter()
-            .map(|artifact| (artifact.role.as_str(), artifact.path.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        let completion: Value = wire::decode(
-            custody.bytes(
-                peers
-                    .get("orphan-completion")
-                    .copied()
-                    .ok_or("actual resource descendant completion product absent")?,
-            )?,
-        )?;
-        let held = root_first_child.ok_or("root-first held child publication absent")?;
-        let fields = [
-            "format",
-            "revision",
-            "challenge",
-            "pid",
-            "birth",
-            "original_parent_pid",
-            "original_parent_birth",
-            "reparented_pid",
-        ];
-        if completion.as_object().is_none_or(|object| {
-            object.len() != fields.len() || object.keys().any(|key| !fields.contains(&key.as_str()))
-        }) || completion["format"] != "memcordon.linux-orphan-completion"
-            || completion["revision"] != 1
-            || completion["challenge"] != hex::encode(custody.bytes(&semantic.challenge)?)
-            || completion["pid"] != held["pid"]
-            || completion["birth"] != held["birth"]
-            || completion["original_parent_pid"].as_u64() != Some(local)
-            || completion["original_parent_birth"].as_u64() != native.root_birth
-            || completion["reparented_pid"].as_u64()
-                != binding["namespace_init"]["namespace_pids"]
-                    .as_array()
-                    .and_then(|pids| pids.last())
-                    .and_then(Value::as_u64)
-            || completion["reparented_pid"] == completion["original_parent_pid"]
-        {
-            return Err(
-                "resource descendant did not observe the held original parent's exit/reparenting"
-                    .into(),
-            );
-        }
-        let retired: Value = wire::decode(
-            custody.bytes(
-                peers
-                    .get("native-retirement")
-                    .copied()
-                    .ok_or("held native descendant retirement receipt absent")?,
-            )?,
-        )?;
-        if retired["format"] != "memcordon.linux-held-family-retirement"
-            || retired["revision"] != 1
-            || retired["run_id"] != native.run_id
-            || retired["lease_id"].as_str() != native.lease_id.as_deref()
-            || retired["attempt_id"].as_str() != native.attempt_id.as_deref()
-            || retired["aggregate_empty"] != true
-        {
-            return Err("root-first independent cgroup retirement differs".into());
-        }
-        let members = retired["namespace_members"]
-            .as_array()
-            .ok_or("native child namespace map absent")?;
-        if members.len() != 1
-            || retired["descendants"]
-                .as_array()
-                .is_none_or(|descendants| descendants.len() != 1)
-        {
-            return Err("root-first native descendant cardinality differs".into());
-        }
-        let child = &members[0];
-        if child["namespace_pid"] != completion["pid"] || child["birth"] != completion["birth"] {
-            return Err(
-                "resource child is not the independently mapped PID namespace member".into(),
-            );
-        }
-        let identity = native
-            .held_processes
-            .iter()
-            .find(|process| {
-                Some(u64::from(process.pid)) == child["pid"].as_u64()
-                    && Some(process.birth) == child["birth"].as_u64()
-            })
-            .ok_or("resource child is not a retained native identity")?;
-        if identity.parent_pid != native.root_pid
-            || identity.parent_birth != native.root_birth
-            || !identity.retirement_observed
-            || retired["descendants"][0]
-                != serde_json::to_value(identity).map_err(|error| error.to_string())?
-        {
-            return Err(
-                "resource descendant ancestry/retirement differs from its held native owner".into(),
-            );
-        }
-        facts.operations.extend(
-            [
-                "held-descendant-identity",
-                "descendant-natural-completion",
-                "root-exited-before-held-descendant",
-            ]
-            .map(String::from),
-        );
-    }
-    if build {
-        let peers = behavior
-            .peer_artifacts
-            .iter()
-            .map(|artifact| (artifact.role.as_str(), artifact.path.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        if peers.len() != behavior.peer_artifacts.len() {
-            return Err("Linux build raw peer role duplicated".into());
-        }
-        let raw = |role: &str| -> VerificationResult<Value> {
-            wire::decode(
-                custody.bytes(
-                    peers
-                        .get(role)
-                        .copied()
-                        .ok_or_else(|| format!("Linux build {role} raw artifact absent"))?,
-                )?,
-            )
-        };
-        let observation = |operation: &str| -> VerificationResult<&Value> {
-            build_rows
-                .get(operation)
-                .ok_or_else(|| format!("actual Linux build {operation} observation absent"))
-        };
-        for (operation, role, field, expected) in [
-            (
-                "http-round-trip",
-                "http",
-                "request",
-                b"GET /readiness HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-                    .as_slice(),
-            ),
-            (
-                "http-round-trip",
-                "http-response",
-                "response",
-                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nreadiness"
-                    .as_slice(),
-            ),
-            (
-                "unix-path-round-trip",
-                "unix-path",
-                "bytes",
-                b"path-unix-readiness".as_slice(),
-            ),
-            (
-                "unix-abstract-round-trip",
-                "unix-abstract",
-                "bytes",
-                b"abstract-unix-readiness".as_slice(),
-            ),
-            (
-                "unix-stream-pair-round-trip",
-                "unix-pair",
-                "bytes",
-                b"R".as_slice(),
-            ),
-        ] {
-            let received: Vec<u8> = serde_json::from_value(observation(operation)?[field].clone())
-                .map_err(|error| error.to_string())?;
-            if received != expected
-                || custody.bytes(
-                    peers
-                        .get(role)
-                        .copied()
-                        .ok_or("actual Joint received byte product absent")?,
-                )? != received
-            {
-                return Err("Joint received native byte products differ from raw exchange".into());
-            }
-        }
-        if observation("unix-path-round-trip")?["path"] != "/work/readiness.sock"
-            || serde_json::from_value::<Vec<u8>>(
-                observation("unix-abstract-round-trip")?["name"].clone(),
-            )
-            .map_err(|error| error.to_string())?
-                != hex::encode(custody.bytes(&semantic.challenge)?).as_bytes()
-        {
-            return Err("Joint private Unix endpoint/challenge differs".into());
-        }
-        let http = observation("http-round-trip")?;
-        let endpoint: std::net::SocketAddr = http["endpoint"]
-            .as_str()
-            .ok_or("Joint HTTP endpoint absent")?
-            .parse()
-            .map_err(|_| "Joint HTTP endpoint malformed")?;
-        if !endpoint.is_ipv4()
-            || !endpoint.ip().is_loopback()
-            || endpoint.port() == 0
-            || observation("bind-zero-and-competing-bind")?["endpoint"] != http["endpoint"]
-            || observation("bind-zero-and-competing-bind")?["native_errno"] != 98
-            || observation("bind-zero-and-competing-bind")?["listener_retained"] != true
-        {
-            return Err(
-                "Joint native TCP listener/conflicting bind/HTTP association differs".into(),
-            );
-        }
-        let compile = observation("offline-rust-compile-and-test")?;
-        if compile["native_status"] != 0
-            || compile["tcp_listener_still_bound"] != true
-            || compile["output"] != "/work/offline-target"
-            || observation("joint-unix-rights-held-through-build")?["owned_native_descriptors"]
-                != 14
-            || observation("joint-unix-rights-held-through-build")?["path"]
-                != "/work/readiness.sock"
-            || observation("joint-unix-rights-held-through-build")?["transferred_file"]
-                != "/work/rights-input.bin"
-            || observation("joint-descendant-tree-naturally-retired")?["tcp_listener_still_bound"]
-                != true
-        {
-            return Err(
-                "Joint lost live TCP/Unix/descriptor effects through actual offline build".into(),
-            );
-        }
-        let input: FixtureInput = wire::decode(custody.bytes(&behavior.descriptor)?)?;
-        let toolchain_path = peers
-            .get("toolchain-inputs")
-            .copied()
-            .ok_or("measured Joint immutable compiler/linker/input images absent")?;
-        if input.toolchain_identity.as_deref() != Some(custody.hash(toolchain_path)?) {
-            return Err("Joint measured locked toolchain identity differs".into());
-        }
-        let manifest = raw("toolchain-inputs")?;
-        if manifest.as_object().is_none_or(|object| {
-            object.len() != 2 || !object.contains_key("runtime") || !object.contains_key("input")
-        }) {
-            return Err("Joint toolchain image schema differs".into());
-        }
-        let request = raw("build-request")?;
-        if linux_image_reference(&manifest["runtime"], &native.target)? != request["runtime_image"]
-            || linux_image_reference(&manifest["input"], &native.target)? != request["input_image"]
-        {
-            return Err(
-                "Joint compiler/source image bytes are not the admitted immutable definitions"
-                    .into(),
-            );
-        }
-        for relative in [
-            "Cargo.toml",
-            "Cargo.lock",
-            "rust-toolchain.toml",
-            "src/main.rs",
-            "tests/generated_child.rs",
-        ] {
-            let path = format!("owned-source/{relative}");
-            let entries = manifest["input"]["entries"]
-                .as_array()
-                .ok_or("locked source entries absent")?;
-            let entries = entries
-                .iter()
-                .filter(|entry| entry["path"] == path)
-                .collect::<Vec<_>>();
-            let role = format!("locked-source-{relative}");
-            let bytes = custody.bytes(
-                peers
-                    .get(role.as_str())
-                    .copied()
-                    .ok_or("actual locked source bytes absent")?,
-            )?;
-            if entries.len() != 1
-                || entries[0]["kind"] != "regular"
-                || entries[0]["sha256"] != hex::encode(sha2::Sha256::digest(bytes))
-                || entries[0]["size"] != bytes.len() as u64
-            {
-                return Err(
-                    "actual compiled source/lock bytes differ from admitted input image".into(),
-                );
-            }
-        }
-        for path in ["toolchain/bin/cargo", "toolchain/bin/rustc", "usr/bin/cc"] {
-            let entries = manifest["runtime"]["entries"]
-                .as_array()
-                .ok_or("toolchain entries absent")?;
-            if entries
-                .iter()
-                .filter(|entry| {
-                    entry["path"] == path
-                        && entry["kind"] == "regular"
-                        && entry["executable"] == true
-                })
-                .count()
-                != 1
-            {
-                return Err("Joint locked compiler/linker native image entry absent".into());
-            }
-        }
-        let created = raw("generated-created")?;
-        let retired = raw("generated-retired")?;
-        let compiler_live = raw("native-compiler-live")?;
-        let generated_live = raw("native-generated-live")?;
-        for (barrier, path) in [
-            (&compiler_live, "bin/owned-readiness"),
-            (&generated_live, "toolchain/bin/cargo"),
-        ] {
-            let members = barrier["members"]
-                .as_array()
-                .ok_or("actual native compiler image observation absent")?;
-            let compiler = members
-                .iter()
-                .filter(|member| {
-                    member["native"]["namespace_pids"]
-                        .as_array()
-                        .and_then(|pids| pids.last())
-                        == Some(&created["compiler_pid"])
-                        && member["native"]["birth"] == created["compiler_birth"]
-                })
-                .collect::<Vec<_>>();
-            let entries = manifest["runtime"]["entries"]
-                .as_array()
-                .expect("validated image entries");
-            let image = entries
-                .iter()
-                .find(|entry| entry["path"] == path && entry["kind"] == "regular")
-                .ok_or("approved native compiler image absent")?;
-            if compiler.len() != 1
-                || compiler[0]["executable"]["sha256"] != image["sha256"]
-                || compiler[0]["executable"]["length"] != image["size"]
-            {
-                return Err(
-                    "actual held compiler executable differs from approved immutable runtime bytes"
-                        .into(),
-                );
-            }
-        }
-        if observation("joint-generated-child-held")?["created"] != created {
-            return Err(
-                "generated fixture readiness differs from actual exported creation receipt".into(),
-            );
-        }
-        validate_linux_generated_lifecycle(
-            &created,
-            &retired,
-            &compiler_live,
-            &generated_live,
-            &binding["target"],
-            &native.held_processes,
-            (
-                native.root_pid.ok_or("held Joint root absent")?,
-                native.root_birth.ok_or("held Joint root birth absent")?,
-            ),
-            native
-                .attempt_id
-                .as_deref()
-                .ok_or("Joint admission absent")?,
-            custody.bytes(&semantic.challenge)?,
-            &native.target,
-            custody.bytes(
-                peers
-                    .get("generated-executable")
-                    .copied()
-                    .ok_or("actual generated native ELF absent")?,
-            )?,
-        )?;
-        let product = observation("generated-executable-binary-product")?;
-        let expected: Vec<u8> = (u8::MIN..=u8::MAX).collect();
-        if product["path"] != "/work/generated-readiness-artifact.bin"
-            || product["inode"].as_u64().is_none_or(|inode| inode == 0)
-            || serde_json::from_value::<Vec<u8>>(product["bytes"].clone())
-                .map_err(|error| error.to_string())?
-                != expected
-        {
-            return Err("generated executable actual all-byte output differs".into());
-        }
-        facts.operations.extend(
-            [
-                "http-exchange",
-                "unix-path-exchange",
-                "unix-abstract-exchange",
-                "unix-stream-pair",
-                "locked-rust-compile",
-                "compiled-tests",
-                "generated-executable",
-            ]
-            .map(String::from),
-        );
-    }
-    Ok(facts)
 }

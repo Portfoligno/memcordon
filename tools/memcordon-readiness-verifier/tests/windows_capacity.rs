@@ -82,7 +82,8 @@ fn capacity_inventory_rejects_other_generation_and_unsettled_authority() {
 }
 #[test]
 fn raw_overlap_exclusions_reject_missing_reassociated_or_unheld_native_owners() {
-    use memcordon_readiness_verifier::{HeldProcessIdentity, validate_windows_capacity_exclusions};
+    use memcordon_readiness_verifier::HeldProcessIdentity;
+    use memcordon_readiness_verifier::current::windows_facts::validate_windows_capacity_exclusions;
     use serde_json::json;
     // Structural vectors exercise the production binding decoder. They do not
     // represent executed Windows processes or an observed capacity verdict.

@@ -295,7 +295,7 @@ pub fn frontend_path(
         return Ok(false);
     }
     validate(receipt, terminal)?;
-    crate::wire::validate_windows_proof_matrix(terminal)?;
+    crate::current::windows_proof::validate_windows_proof_matrix(terminal)?;
     let cause = &receipt["cleanup_trigger"];
     let action = &observation["frontend_action"];
     let failure = &rejection["provider_failure"];

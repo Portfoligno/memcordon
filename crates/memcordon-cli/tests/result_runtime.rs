@@ -37,7 +37,7 @@ fn semantic_report(directory: &std::path::Path) -> memcordon_core::ResultReport 
         output.status.success(),
         "actual ordinary execution fixture: {output:?}"
     );
-    memcordon_core::ResultReport::Legacy(
+    memcordon_core::ResultReport::Standard(
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
     )
 }

@@ -3,14 +3,13 @@
 #[path = "../src/bin/memcordon-sealed-agent/inspection_schema.rs"]
 mod schema;
 
-use memcordon_core::runtime_manifest::{InstalledPolicyObservationV1, NativeProviderProtocols};
 use schema::*;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-fn platform(windows: bool) -> ProviderPackageMetadataV4 {
+fn platform(windows: bool) -> ProviderPackageMetadataV5 {
     if !windows {
-        return ProviderPackageMetadataV4::LinuxSystemd {
+        return ProviderPackageMetadataV5::LinuxSystemd {
             control_service_sha256: "a".repeat(64),
             control_socket_sha256: "b".repeat(64),
             launcher_service_sha256: "c".repeat(64),
@@ -18,7 +17,7 @@ fn platform(windows: bool) -> ProviderPackageMetadataV4 {
             tmpfiles_sha256: "e".repeat(64),
         };
     }
-    ProviderPackageMetadataV4::WindowsService {
+    ProviderPackageMetadataV5::WindowsService {
         control_service_name: "control".into(),
         launcher_service_name: "launcher".into(),
         session_broker_service_name: "broker".into(),
@@ -41,7 +40,7 @@ fn platform(windows: bool) -> ProviderPackageMetadataV4 {
         session_broker_install_path: "C:\\Program Files\\Memcordon\\broker.exe".into(),
         session_broker_sha256: "a".repeat(64),
         state_root: "C:\\ProgramData\\Memcordon".into(),
-        policy_root: "C:\\ProgramData\\policy".into(),
+        diagnostics_root: "C:\\ProgramData\\diagnostics".into(),
         control_service_sid_type: "unrestricted".into(),
         launcher_service_sid_type: "unrestricted".into(),
         session_broker_service_sid_type: "unrestricted".into(),
@@ -60,35 +59,40 @@ fn platform(windows: bool) -> ProviderPackageMetadataV4 {
     }
 }
 
-fn agent(windows: bool) -> AgentPackageInspection {
-    AgentPackageInspection {
-        format: AgentInspectionFormat::Ordinary,
-        revision: InspectionRevision,
-        version: env!("CARGO_PKG_VERSION").into(),
-        source_commit: "a".repeat(40),
-        executable_sha256: "b".repeat(64),
-        provider_protocol: 3,
-        native_protocols: if windows {
-            NativeProviderProtocols::Windows {
-                provider_contract: 3,
-                public_wire: 3,
-                private_wire: 3,
-            }
-        } else {
-            NativeProviderProtocols::Linux {
-                provider_contract: 3,
-                launch_wire: 3,
-            }
-        },
-        runtime_manifest_schema: 1,
-        workload_contract_schema: 1,
-        profile_catalog_sha256: "c".repeat(64),
-        mechanism: "sealed-v2".into(),
-        execution_report_schema: 4,
-        plan_report_schema: 1,
-        doctor_report_schema: 1,
-        platform: platform(windows),
-        compiled_metadata_valid: true,
+fn agent(windows: bool) -> AgentPackageInspectionV2 {
+    let mut value = current_inspection();
+    if windows {
+        for key in serde_json::to_value(platform(false))
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+        {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        value.as_object_mut().unwrap().extend(
+            serde_json::to_value(platform(true))
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        value["provider_protocol"] = json!(4);
+        value["native_protocols"] =
+            json!({"platform":"windows","provider_contract":4,"public_wire":4,"private_wire":4});
+        value["runtime_profile"] = json!("windows-sealed-current-token-v1");
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn current_inspection_strictly_preserves_both_platforms_and_rejects_unknown_revision() {
+    for windows in [false, true] {
+        let current = agent(windows);
+        check(&current, windows);
+        let mut unsupported = serde_json::to_value(current).unwrap();
+        unsupported["revision"] = json!(29);
+        assert!(serde_json::from_value::<AgentPackageInspectionV2>(unsupported).is_err());
     }
 }
 
@@ -167,81 +171,52 @@ fn check<T: Serialize + DeserializeOwned + std::fmt::Debug>(value: &T, windows: 
 }
 
 #[test]
-fn flattened_inspections_preserve_all_versions_and_platforms_strictly() {
-    for windows in [false, true] {
-        let current = agent(windows);
-        check(&current, windows);
-        let previous = AgentPackageInspectionV4 {
-            schema_version: 4,
-            version: current.version.clone(),
-            source_commit: current.source_commit.clone(),
-            executable_sha256: current.executable_sha256.clone(),
-            provider_protocol: 2,
-            mechanism: current.mechanism.clone(),
-            execution_report_schema: current.execution_report_schema,
-            plan_report_schema: current.plan_report_schema,
-            doctor_report_schema: current.doctor_report_schema,
-            platform: current.platform.clone(),
-            compiled_metadata_valid: true,
-        };
-        check(&previous, windows);
-        let mut historical_platform = serde_json::to_value(&current.platform).unwrap();
-        if windows {
-            historical_platform
-                .as_object_mut()
-                .unwrap()
-                .remove("policy_root")
-                .unwrap();
-            historical_platform
-                .as_object_mut()
-                .unwrap()
-                .remove("target_desktop_bootstrap_runtime")
-                .unwrap();
-            historical_platform["target_desktop_bootstrap_crt_static"] = json!(true);
-        }
-        let historical = AgentPackageInspectionV3 {
-            schema_version: 3,
-            version: previous.version,
-            source_commit: previous.source_commit,
-            executable_sha256: previous.executable_sha256,
-            provider_protocol: previous.provider_protocol,
-            mechanism: previous.mechanism,
-            execution_report_schema: previous.execution_report_schema,
-            plan_report_schema: previous.plan_report_schema,
-            doctor_report_schema: previous.doctor_report_schema,
-            platform: serde_json::from_value(historical_platform).unwrap(),
-            compiled_metadata_valid: true,
-        };
-        check(&historical, windows);
-        let installed = InstalledProviderInspection {
-            format: InstalledInspectionFormat::Ordinary,
-            revision: InspectionRevision,
-            agent: current,
-            installed_executable_sha256: "b".repeat(64),
-            installed_artifacts_valid: true,
-            provider_identity: Some("provider".into()),
-            provider_reachable: true,
-            policy: InstalledPolicyObservationV1::Unconfigured,
-        };
-        let wire = serde_json::to_value(&installed).unwrap();
-        let decoded: InstalledProviderInspection = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
-        let mut invalid = wire;
-        invalid["unexpected"] = json!(true);
-        assert!(serde_json::from_value::<InstalledProviderInspection>(invalid).is_err());
-    }
-}
-
-#[test]
 fn nested_protocol_duplicate_fields_are_not_lost_to_buffering() {
     let wire = serde_json::to_string(&agent(false)).unwrap();
-    let original = "\"launch_wire\":3";
+    let original = "\"launch_wire\":5";
     assert!(wire.contains(original));
-    let duplicate = wire.replace(original, "\"launch_wire\":3,\"launch_wire\":3");
+    let duplicate = wire.replace(original, "\"launch_wire\":5,\"launch_wire\":5");
     assert!(
-        serde_json::from_str::<AgentPackageInspection>(&duplicate)
+        serde_json::from_str::<AgentPackageInspectionV2>(&duplicate)
             .unwrap_err()
             .to_string()
             .contains("duplicate field")
     );
+}
+
+fn current_inspection() -> Value {
+    json!({
+        "format": "memcordon.agent-package-inspection", "revision": 2,
+        "version": "0.5.8-dev", "source_commit": "a".repeat(40),
+        "executable_sha256": "b".repeat(64), "provider_protocol": 3,
+        "native_protocols": {"platform":"linux", "provider_contract":3,"launch_wire":5},
+        "runtime_manifest_revision":2,
+        "workload_request":{"format":"memcordon.workload-request","revision":1},
+        "result":{"format":"memcordon.result","revision":3},
+        "capabilities":{"format":"memcordon.capabilities","revision":3},
+        "plan":{"format":"memcordon.plan","revision":3},
+        "runtime_profile":"linux-private-workload-v1", "profile_revision":1,
+        "profile_supported":false,
+        "mechanism":"linux-pid-namespace-cgroup-v2", "compiled_metadata_valid":true,
+        "platform":"linux-systemd",
+        "control_service_sha256":"a".repeat(64),
+        "control_socket_sha256":"b".repeat(64),
+        "launcher_service_sha256":"c".repeat(64),
+        "launcher_socket_sha256":"d".repeat(64),
+        "tmpfiles_sha256":"e".repeat(64)
+    })
+}
+
+#[test]
+fn current_installed_inspection_rejects_fabricated_policy_observation() {
+    let mut installed = json!({
+        "format":"memcordon.installed-provider-inspection", "revision":2,
+        "agent": current_inspection(),
+        "installed_executable_sha256":"b".repeat(64),
+        "installed_artifacts_valid":true,
+        "provider_identity":null,"provider_reachable":false
+    });
+    assert!(serde_json::from_value::<InstalledProviderInspectionV2>(installed.clone()).is_ok());
+    installed["policy"] = json!({"state":"active"});
+    assert!(serde_json::from_value::<InstalledProviderInspectionV2>(installed).is_err());
 }

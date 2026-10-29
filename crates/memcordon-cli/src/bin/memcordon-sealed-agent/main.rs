@@ -2,21 +2,16 @@
 
 use std::ffi::OsString;
 
-mod admission;
 mod inspection_schema;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod network_readiness;
 mod package;
-mod policy_registry;
-#[cfg(target_os = "linux")]
-mod private_policy_fixture_schema;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod protocol;
 #[cfg(target_os = "linux")]
 mod rejection;
-mod release_cli_cutover;
 #[cfg(target_os = "linux")]
 mod request;
 #[cfg(target_os = "windows")]
@@ -34,10 +29,7 @@ Usage:
   memcordon-sealed-agent launch-broker
   memcordon-sealed-agent probe
   memcordon-sealed-agent package <install|upgrade|inspect|verify|uninstall> [--json]
-  memcordon-sealed-agent package uninstall --lease-cleanup-cutoff-nanos <CLOCK_MONOTONIC-nanoseconds> (Linux, root only)
-  memcordon-sealed-agent package policy apply --file PATH
-  memcordon-sealed-agent package policy inspect --json
-  memcordon-sealed-agent package policy entrypoint install --definition PATH --source PATH
+  memcordon-sealed-agent package <upgrade|uninstall> --lease-cleanup-cutoff-nanos <CLOCK_MONOTONIC-nanoseconds> (Linux, root only)
 
 Package administration inspects and manages installed provider files.
 ";
@@ -47,13 +39,7 @@ fn main() {
     let entry_thread_token_transition =
         windows::token::revert_entry_thread_token().unwrap_or_else(|_| std::process::abort());
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let retired = release_cli_cutover::retired_release_command(
-        release_cli_cutover::ReleasePlatform::current(),
-        &arguments,
-    );
-    let result = if retired {
-        Err("retired release command is unavailable".into())
-    } else {
+    let result = {
         match arguments.as_slice() {
             [command] if command == "--version" || command == "-V" => {
                 println!("memcordon-sealed-agent {}", env!("CARGO_PKG_VERSION"));
@@ -179,148 +165,19 @@ fn main() {
                     session,
                 )
             }
-            #[cfg(target_os = "linux")]
-            [package, policy, operation, json]
-                if package == "package"
-                    && policy == "policy"
-                    && operation == "recover"
-                    && json == "--json" =>
-            {
-                linux::recovery::recover_administrative()
-            }
-            #[cfg(target_os = "linux")]
-            [package, policy, operation, json]
-                if package == "package"
-                    && policy == "policy"
-                    && operation == "inspect"
-                    && json == "--json" =>
-            {
-                policy_registry::inspect()
-            }
-            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
-            [
-                package,
-                policy,
-                image,
-                operation,
-                definition,
-                path,
-                cutoff,
-                millis,
-                json,
-            ] if package == "package"
-                && policy == "policy"
-                && image == "image"
-                && operation == "inspect"
-                && definition == "--definition"
-                && cutoff == "--cutoff-unix-millis"
-                && json == "--json" =>
-            {
-                millis
-                    .to_str()
-                    .ok_or_else(|| "image census cutoff is not UTF8".to_owned())
-                    .and_then(|value| {
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| "image census cutoff is invalid".to_owned())
-                    })
-                    .and_then(|value| {
-                        linux::runtime_image::inspect(std::path::Path::new(path), value)
-                    })
-            }
-            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
-            [package, policy, image, operation, definition, path, json]
-                if package == "package"
-                    && policy == "policy"
-                    && image == "image"
-                    && operation == "retire"
-                    && definition == "--definition"
-                    && json == "--json" =>
-            {
-                linux::runtime_image::retire(std::path::Path::new(path))
-            }
-            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
-            [
-                package,
-                policy,
-                image,
-                operation,
-                definition,
-                path,
-                source_root,
-                source,
-                json,
-            ] if package == "package"
-                && policy == "policy"
-                && image == "image"
-                && operation == "install"
-                && definition == "--definition"
-                && source_root == "--source-root"
-                && json == "--json" =>
-            {
-                linux::runtime_image::install(
-                    std::path::Path::new(path),
-                    std::path::Path::new(source),
-                )
-            }
-            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
-            [
-                package,
-                policy,
-                entrypoint,
-                operation,
-                definition,
-                path,
-                source,
-                image,
-            ] if package == "package"
-                && policy == "policy"
-                && entrypoint == "entrypoint"
-                && operation == "install"
-                && definition == "--definition"
-                && source == "--source" =>
-            {
-                linux::entrypoint_install::install(
-                    std::path::Path::new(path),
-                    std::path::Path::new(image),
-                )
-            }
-            #[cfg(target_os = "linux")]
-            [package, policy, operation, file, path]
-                if package == "package"
-                    && policy == "policy"
-                    && operation == "apply"
-                    && file == "--file" =>
-            {
-                policy_registry::apply(std::path::Path::new(path))
-            }
-            #[cfg(target_os = "windows")]
-            [package, policy, operation, json]
-                if package == "package"
-                    && policy == "policy"
-                    && operation == "inspect"
-                    && json == "--json" =>
-            {
-                windows::policy_registry::inspect()
-            }
-            #[cfg(target_os = "windows")]
-            [package, policy, operation, file, path]
-                if package == "package"
-                    && policy == "policy"
-                    && operation == "apply"
-                    && file == "--file" =>
-            {
-                windows::policy_registry::apply(std::path::Path::new(path))
-            }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             [package, operation] if package == "package" => package::run(operation, false),
             #[cfg(target_os = "linux")]
             [package, operation, flag, cutoff]
                 if package == "package"
-                    && operation == "uninstall"
+                    && (operation == "uninstall" || operation == "upgrade")
                     && flag == "--lease-cleanup-cutoff-nanos" =>
             {
-                package::uninstall_until(cutoff)
+                if operation == "upgrade" {
+                    package::upgrade_until(cutoff)
+                } else {
+                    package::uninstall_until(cutoff)
+                }
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             [package, operation, json] if package == "package" && json == "--json" => {

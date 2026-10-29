@@ -78,7 +78,7 @@ pub(super) fn reviewed_legacy_minutes(command: &str) -> Option<u64> {
                 Some(20)
             }
             // Installed channels retain the former full210min outer work ceiling:
-            // actual Cargo builds/installation, optional predecessor and lifecycle.
+            // actual Cargo builds/installation and current lifecycle.
             "installed-consumers" => Some(210),
             // The working Windows channel uses the accepted backend installed
             // production planning envelope as a newly enforced Actions step

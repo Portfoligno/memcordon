@@ -1,12 +1,9 @@
+use memcordon_readiness_verifier::current::{
+    ProducerManifestV2,
+    storage::{PackedProducerManifestV2, decode_producer},
+};
 use memcordon_readiness_verifier::{storage::*, *};
-use std::collections::{BTreeMap, BTreeSet};
-
-#[path = "support/linux_installed_case.rs"]
-mod linux_installed_case;
-#[path = "support/linux_legacy_case.rs"]
-mod linux_legacy_case;
-#[path = "support/persisted_case.rs"]
-mod persisted_case;
+use std::collections::BTreeSet;
 
 fn record(path: &str, bytes: &[u8]) -> Artifact {
     Artifact {
@@ -22,10 +19,10 @@ fn directory() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
 }
-fn producer(artifacts: Vec<Artifact>) -> ProducerManifest {
-    ProducerManifest {
+fn producer(artifacts: Vec<Artifact>) -> ProducerManifestV2 {
+    ProducerManifestV2 {
         format: "memcordon.consumer-readiness.producer".into(),
-        revision: 1,
+        revision: 2,
         job: "candidate-linux-x64-native".into(),
         run_id: "12".into(),
         run_attempt: 1,
@@ -191,9 +188,9 @@ fn physical_budget_counts_original_archive_objects_and_metadata_at_boundary() {
 fn explicit_envelopes_reject_unknown_revision_fields_and_duplicate_keys() {
     let logical = record("case/raw", b"same");
     let object = record(&object_path(&logical.sha256).unwrap(), b"same");
-    let packed = PackedProducerManifestV1 {
+    let packed = PackedProducerManifestV2 {
         format: "memcordon.consumer-readiness.packed-producer".into(),
-        revision: 1,
+        revision: 2,
         producer: producer(vec![logical.clone()]),
         objects: vec![object.clone()],
         bindings: vec![ArtifactBinding {
@@ -206,7 +203,7 @@ fn explicit_envelopes_reject_unknown_revision_fields_and_duplicate_keys() {
     for mutate in ["revision", "unknown", "format"] {
         let mut value = serde_json::to_value(&packed).unwrap();
         value[mutate] = match mutate {
-            "revision" => serde_json::json!(2),
+            "revision" => serde_json::json!(99),
             "unknown" => serde_json::json!(true),
             _ => serde_json::json!("future"),
         };
@@ -215,110 +212,6 @@ fn explicit_envelopes_reject_unknown_revision_fields_and_duplicate_keys() {
     let text = std::str::from_utf8(&bytes).unwrap();
     let duplicate = format!("{{\"revision\":1,{}", text.strip_prefix('{').unwrap());
     assert!(decode_producer(duplicate.as_bytes()).is_err());
-}
-
-fn pack(case: &persisted_case::PersistedCase) -> (tempfile::TempDir, PackedEvidenceIndexV1) {
-    let root = directory();
-    let mut objects = BTreeMap::new();
-    let mut bindings = Vec::new();
-    let archives: BTreeSet<_> = case
-        .index
-        .producer_origins
-        .iter()
-        .map(|origin| origin.bundle_artifact.as_str())
-        .collect();
-    for logical in &case.index.artifacts {
-        let bytes = read_artifact_bytes(case.root.path(), logical).unwrap();
-        if archives.contains(logical.path.as_str()) {
-            retain_artifact_bytes(root.path(), logical, &bytes, false).unwrap();
-            continue;
-        }
-        let object = record(&object_path(&logical.sha256).unwrap(), &bytes);
-        retain_artifact_bytes(
-            root.path(),
-            &object,
-            &bytes,
-            objects.contains_key(&object.path),
-        )
-        .unwrap();
-        bindings.push(ArtifactBinding {
-            logical_path: logical.path.clone(),
-            object_path: object.path.clone(),
-        });
-        objects.insert(object.path.clone(), object);
-    }
-    let mut evidence = case.index.clone();
-    evidence.records = vec![case.record.clone()];
-    (
-        root,
-        PackedEvidenceIndexV1 {
-            format: "memcordon.consumer-readiness.packed-evidence".into(),
-            revision: 1,
-            evidence,
-            objects: objects.into_values().collect(),
-            bindings,
-        },
-    )
-}
-
-#[test]
-fn packed_and_direct_records_preserve_semantics_and_rehashed_source_associations() {
-    let compatible = linux_legacy_case::baseline_v2();
-    compatible.validate().unwrap();
-    let (root, packed) = pack(&compatible);
-    validate_case_document(
-        &serde_json::to_vec(&packed).unwrap(),
-        &compatible.record.key,
-        root.path(),
-    )
-    .unwrap();
-    let mut case = linux_legacy_case::baseline();
-    case.validate().unwrap();
-    let (root, packed) = pack(&case);
-    let bytes = serde_json::to_vec(&packed).unwrap();
-    validate_case_document(&bytes, &case.record.key, root.path()).unwrap();
-    assert_eq!(
-        decode_evidence(&bytes).unwrap().0.producer_origins.len(),
-        case.index.producer_origins.len()
-    );
-    let mut direct = case.index.clone();
-    direct.records = vec![case.record.clone()];
-    validate_case_document(
-        &serde_json::to_vec(&direct).unwrap(),
-        &case.record.key,
-        case.root.path(),
-    )
-    .unwrap();
-    let origins = std::mem::take(&mut case.index.producer_origins);
-    let (local_root, local) = pack(&case);
-    let local_bytes = serde_json::to_vec(&local).unwrap();
-    assert!(
-        decode_evidence(&local_bytes)
-            .unwrap()
-            .0
-            .producer_origins
-            .is_empty(),
-        "standalone packing cannot invent hosted provenance"
-    );
-    assert!(
-        validate_case_document(&local_bytes, &case.record.key, local_root.path()).is_err(),
-        "an installed producer association cannot be proven by object storage alone"
-    );
-    case.index.producer_origins = origins;
-    case.mutate(
-        "installed/installed/frozen-legacy/v1/request.json",
-        |value| value["expected_epoch"]["revision"] = serde_json::json!(10),
-    );
-    assert!(case.validate().is_err());
-    let (root, packed) = pack(&case);
-    assert!(
-        validate_case_document(
-            &serde_json::to_vec(&packed).unwrap(),
-            &case.record.key,
-            root.path()
-        )
-        .is_err()
-    );
 }
 
 #[test]

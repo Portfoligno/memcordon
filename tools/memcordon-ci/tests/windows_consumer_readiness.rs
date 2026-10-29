@@ -5,30 +5,26 @@ use memcordon_ci::windows_consumer_readiness::{
     CaseAssessment, SuiteInput, accepted, check_positive_barrier_result, positive_keys,
     validate_suite, validate_toolchain_inventory,
 };
+#[path = "private/windows_current_result_fixture.rs"]
+mod current_fixture;
 
 #[test]
 fn completed_released_native_failure_cannot_wait_for_a_positive_fixture() {
-    let bytes = include_bytes!("fixtures/windows_restricted_completed_failure.json");
-    let result = memcordon_core::ResultV1::parse(bytes).unwrap();
-    let provider = result
-        .provider_association
-        .as_ref()
-        .unwrap()
-        .provider
-        .clone();
-    assert!(result.attempts.last().unwrap().error.is_none());
-    let failure = check_positive_barrier_result(bytes, &provider)
+    let result = current_fixture::completed_loader_failure();
+    let provider = result.provider.clone().unwrap();
+    let bytes = serde_json::to_vec(&result).unwrap();
+    let failure = check_positive_barrier_result(&bytes, &provider)
         .unwrap_err()
         .to_string();
     assert!(failure.contains("wrapper-status=125"));
     assert!(failure.contains("outcome=Completed"));
     assert!(failure.contains("windows-status=3221225794 (0xC0000142)"));
-    assert!(failure.contains("launch=ReleaseIssued"));
-    assert!(failure.contains("no original attempt error"));
+    assert!(failure.contains("release=Released"));
+    assert!(failure.contains("no original provider failure observed"));
     let mut foreign = provider;
     foreign.generation = memcordon_core::BoundedText::new("foreign-generation").unwrap();
     assert!(
-        check_positive_barrier_result(bytes, &foreign)
+        check_positive_barrier_result(&bytes, &foreign)
             .unwrap_err()
             .to_string()
             .contains("provider binding")
@@ -37,10 +33,10 @@ fn completed_released_native_failure_cannot_wait_for_a_positive_fixture() {
 
 #[test]
 fn completed_restricted_launch_failure_cannot_wait_for_a_positive_fixture() {
-    let bytes = include_bytes!("fixtures/windows_restricted_launch_failure.json");
-    let result = memcordon_core::ResultV1::parse(bytes).unwrap();
-    let provider = &result.provider_association.as_ref().unwrap().provider;
-    let failure = check_positive_barrier_result(bytes, provider)
+    let result = current_fixture::launch_failure();
+    let bytes = serde_json::to_vec(&result).unwrap();
+    let provider = result.provider.as_ref().unwrap();
+    let failure = check_positive_barrier_result(&bytes, provider)
         .unwrap_err()
         .to_string();
     assert!(failure.contains("positive fixture launch already failed"));
@@ -50,40 +46,31 @@ fn completed_restricted_launch_failure_cannot_wait_for_a_positive_fixture() {
     let mut foreign = provider.clone();
     foreign.generation = memcordon_core::BoundedText::new("foreign-generation").unwrap();
     assert!(
-        check_positive_barrier_result(bytes, &foreign)
+        check_positive_barrier_result(&bytes, &foreign)
             .unwrap_err()
             .to_string()
             .contains("provider binding")
     );
     assert!(check_positive_barrier_result(&bytes[..bytes.len() / 2], provider).is_err());
-    let unbound = include_bytes!("fixtures/private_worker_loss_result.json");
-    assert!(check_positive_barrier_result(unbound, provider).is_err());
 }
 
 #[test]
 fn released_loader_event_context_requires_exact_failure_and_retirement() {
     use memcordon_ci::windows_consumer_readiness::released_target_loader_event_candidate;
-    let bytes = include_bytes!("fixtures/windows_restricted_completed_failure.json");
-    let result = memcordon_core::ResultV1::parse(bytes).unwrap();
+    let result = current_fixture::completed_loader_failure();
     assert!(released_target_loader_event_candidate(&result));
-    let refusal = memcordon_core::ResultV1::parse(include_bytes!(
-        "fixtures/windows_restricted_launch_failure.json"
-    ))
-    .unwrap();
+    let refusal = current_fixture::launch_failure();
     assert!(!released_target_loader_event_candidate(&refusal));
     let mut missing_retirement = result.clone();
-    missing_retirement
-        .attempts
-        .last_mut()
-        .unwrap()
-        .restart_safety
-        .helpers_reaped = false;
+    let memcordon_core::result_v3::RuntimeExecutionV3::WindowsSealed { native, .. } =
+        &mut missing_retirement.runtime
+    else {
+        panic!("current native fixture absent");
+    };
+    native.guardian_reaped = false;
     assert!(!released_target_loader_event_candidate(&missing_retirement));
     let mut cleanup_error = result.clone();
-    cleanup_error
-        .cleanup
-        .failed_operations
-        .push("fixture retirement uncertain".into());
+    cleanup_error.cleanup.state = memcordon_core::execution_facts::CleanupStateV1::Incomplete;
     assert!(!released_target_loader_event_candidate(&cleanup_error));
     let mut different_status = result;
     different_status.outcome.wrapper_status = 0;
@@ -92,6 +79,17 @@ fn released_loader_event_context_requires_exact_failure_and_retirement() {
     different_status.outcome.native_termination =
         Some(memcordon_core::ChildTermination::WindowsStatus { status: 1 });
     assert!(!released_target_loader_event_candidate(&different_status));
+}
+
+#[test]
+fn unsupported_format_header_cannot_satisfy_current_barrier() {
+    let provider = current_fixture::completed_loader_failure()
+        .provider
+        .unwrap();
+    assert!(
+        check_positive_barrier_result(br#"{"format":"unsupported","revision":99}"#, &provider)
+            .is_err()
+    );
 }
 
 fn descriptor() -> Descriptor {
@@ -241,7 +239,7 @@ fn separate_loader_command_selects_only_the_restricted_envelope_route() {
         },
         descriptor,
         descriptor_path: root.join("input.json"),
-        workload_contract: root.join("contract.json"),
+        workload_request: root.join("request.json"),
         expected_token: TokenObservation {
             user_sid: vec![1],
             restricted: true,
@@ -360,8 +358,7 @@ fn fixture_descriptor_rejects_duplicate_and_unknown_fields() {
 fn required_windows_rows_and_terminal_custody_cannot_be_omitted() {
     let suite = SuiteInput {
         format: "memcordon.windows-readiness-input".into(),
-        revision: 1,
-        local_policy: std::env::temp_dir().join("policy.json"),
+        revision: 2,
         cases: Vec::new(),
     };
     assert!(validate_suite(&suite).is_err());
@@ -378,8 +375,7 @@ fn required_windows_rows_and_terminal_custody_cannot_be_omitted() {
             stdout_sha256: Some(measured.clone()),
             stderr_sha256: Some(measured.clone()),
             transcript_sha256: Some(measured.clone()),
-            contract_sha256: Some(measured.clone()),
-            policy_activation_sha256: Some(measured.clone()),
+            request_sha256: Some(measured.clone()),
             terminal_observation_sha256: Some(measured.clone()),
         })
         .collect();

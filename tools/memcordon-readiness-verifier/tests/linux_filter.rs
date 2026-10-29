@@ -11,8 +11,8 @@ fn digest(program: &[Instruction]) -> String {
     }
     hex::encode(Sha256::digest(bytes))
 }
-fn vector(profile: &str, abi: &str, arch: u32, socket: u32, pair: u32) -> FilterVector {
-    let program = frozen_linux_filter_program_for_profile(abi, profile).unwrap();
+fn vector(abi: &str, arch: u32, socket: u32, pair: u32) -> FilterVector {
+    let program = frozen_linux_filter_program(abi).unwrap();
     let cases: [(&str, u32, [u32; 3], u32); 8] = [
         ("tcp-positive", socket, [2, 1, 0], 0x7fff0000),
         ("unix-positive", socket, [1, 1, 0], 0x7fff0000),
@@ -45,11 +45,7 @@ fn vector(profile: &str, abi: &str, arch: u32, socket: u32, pair: u32) -> Filter
             "seqpacket-pair-positive-or-denied",
             pair,
             [1, 5 | 0x80000, 0],
-            if profile.ends_with("v2") {
-                0x7fff0000
-            } else {
-                0x5005d
-            },
+            0x7fff0000,
         ),
         ("named-seqpacket-denied", socket, [1, 5, 0], 0x5005d),
         ("seqpacket-protocol-denied", pair, [1, 5, 1], 0x5005d),
@@ -63,36 +59,11 @@ fn vector(profile: &str, abi: &str, arch: u32, socket: u32, pair: u32) -> Filter
         });
     }
     FilterVector {
-        profile: profile.into(),
+        profile: "linux-private-workload-v1".into(),
         abi: abi.into(),
         program_sha256: digest(&program),
         program,
         observations,
-    }
-}
-#[test]
-fn independently_reconstructed_gnu_program_matches_audited_comparison_words() {
-    // These comparison pins came from a host-only pure operational compiler
-    // extraction with selected GNU aliases; they claim no kernel attachment.
-    for (abi, length, sha) in [
-        (
-            "x86_64",
-            748,
-            "685124754773052438afe6c87debf548ce56bcb90976fa7ede8b72dc7e5e1a73",
-        ),
-        (
-            "aarch64",
-            668,
-            "f5fa0fca0556b9c4063d3b11cf5e97cc8f99963404d7d45fc6be36e99d12dff6",
-        ),
-    ] {
-        let program = frozen_linux_filter_program(abi).unwrap();
-        assert_eq!(program.len(), length, "{abi} complete instruction count");
-        assert_eq!(
-            digest(&program),
-            sha,
-            "{abi} complete independent instruction catalogue"
-        );
     }
 }
 #[test]
@@ -109,43 +80,30 @@ fn structural_filter_decoder_rejects_rehashed_decision_and_inventory_mutations()
         revision: 1,
         run_id: "1".into(),
         recipe_id: "native-linux-x64".into(),
-        test_name: "native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts".into(),
+        test_name: "native_current_filter::current_filter_vectors_emit_actual_component_receipts"
+            .into(),
         native_target: key.target.clone(),
         executable_sha256: "11".repeat(32),
         challenge_sha256: "22".repeat(32),
-        operation: "mixed-filter-compiler-bpf-vectors".into(),
+        operation: "current-filter-compiler-bpf-vectors".into(),
         vectors: vec![
-            vector("linux-tcp4-unix-private-v1", "x86_64", 0xc000003e, 41, 53),
-            vector(
-                "linux-tcp4-unix-private-v1",
-                "aarch64",
-                0xc00000b7,
-                198,
-                199,
-            ),
-            vector("linux-tcp4-unix-private-v2", "x86_64", 0xc000003e, 41, 53),
-            vector(
-                "linux-tcp4-unix-private-v2",
-                "aarch64",
-                0xc00000b7,
-                198,
-                199,
-            ),
+            vector("x86_64", 0xc000003e, 41, 53),
+            vector("aarch64", 0xc00000b7, 198, 199),
         ],
     };
     validate_linux_filter_receipt(&receipt, &key).unwrap();
     let mut changed = receipt.clone();
-    changed.vectors[2].profile = "linux-tcp4-unix-private-v1".into();
+    changed.vectors[0].profile = "unsupported-profile".into();
     assert!(
         validate_linux_filter_receipt(&changed, &key).is_err(),
-        "v2 program cannot masquerade as old authority"
+        "another profile cannot substitute for the sole current program"
     );
     let mut changed = receipt.clone();
-    changed.vectors[2].program = receipt.vectors[0].program.clone();
-    changed.vectors[2].program_sha256 = digest(&changed.vectors[2].program);
+    changed.vectors[1].program = receipt.vectors[0].program.clone();
+    changed.vectors[1].program_sha256 = digest(&changed.vectors[1].program);
     assert!(
         validate_linux_filter_receipt(&changed, &key).is_err(),
-        "old program cannot substitute for declared v2"
+        "another ABI program cannot substitute for the selected architecture"
     );
     let mut changed = receipt.clone();
     changed.vectors[0].program[11].k = 0x7fff0001;

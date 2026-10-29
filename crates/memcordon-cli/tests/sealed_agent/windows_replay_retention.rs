@@ -1,13 +1,12 @@
 use memcordon_core::{
     BoundarySetupPhase, PROVIDER_REJECTION_MAX_DETAIL_BYTES, ProviderRejectionEvidence,
-    RestartSafetyProof, WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS,
-    WINDOWS_PRIVATE_PROTOCOL_VERSION, WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1,
-    WindowsDurableAttemptRecordV1, WindowsDurableCleanupStateV1, WindowsLauncherResponseV3,
-    WindowsProcessIdentityV1, WindowsProviderResponseV3, WindowsRelayPhaseV1,
-    WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsTerminalizationCheckpointV1,
+    RestartSafetyProof, WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+    WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS, WindowsAttemptStateV1,
+    WindowsAttemptTerminalDispositionV1, WindowsDurableCleanupStateV1, WindowsLauncherResponseV4,
+    WindowsProcessIdentityV1, WindowsProviderResponseV4, WindowsRelayPhaseV1,
+    WindowsReplayMetadata, WindowsReplayOutboxStageV1, WindowsTerminalizationCheckpointV1,
     WindowsTerminalizationErrorStageV1, WindowsTerminalizationErrorV1,
     WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
-    parse_and_authenticate_windows_attempt_record,
 };
 
 fn binding() -> (String, String, String) {
@@ -96,7 +95,7 @@ fn preauthorization_outbox_authenticates_without_posttarget_proof() {
     assert!(record.terminal_seed.is_none());
     assert!(record.retirement_proof.is_none());
     assert!(
-        memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+        memcordon_core::parse_and_authenticate_windows_attempt_record_v5(
             &serde_json::to_vec(&record).unwrap(),
             &record.attempt_id,
             &record.provider_generation,
@@ -115,10 +114,10 @@ fn preauthorization_outbox_authenticates_without_posttarget_proof() {
 
 fn bound_preauthorization_rejection(
     record: &crate::windows::record::WindowsAttemptRecordV1,
-) -> WindowsLauncherResponseV3 {
+) -> WindowsLauncherResponseV4 {
     let (_, nonce, _) = binding();
-    WindowsLauncherResponseV3::Reject {
-        schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    WindowsLauncherResponseV4::Reject {
+        schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce,
         request_sha256: record.request_sha256.clone(),
@@ -172,7 +171,7 @@ fn launcher_record_inspection_failure_returns_bound_retained_evidence() {
             "record authentication failed".to_owned(),
         );
 
-    let WindowsLauncherResponseV3::AttemptRetainedV2(retained) = response else {
+    let WindowsLauncherResponseV4::AttemptRetainedV2(retained) = response else {
         panic!("launcher replay failure did not return AttemptRetainedV2");
     };
     assert!(retained.is_consistent_for(
@@ -200,7 +199,7 @@ fn control_private_replay_failure_returns_public_retained_evidence() {
         "private launcher pipe peer disconnected".to_owned(),
     );
 
-    let WindowsProviderResponseV3::AttemptRetainedV2(retained) = response else {
+    let WindowsProviderResponseV4::AttemptRetainedV2(retained) = response else {
         panic!("control replay failure did not return AttemptRetainedV2");
     };
     assert!(retained.is_consistent_for(
@@ -355,7 +354,7 @@ fn final_outbox_store_failure_preserves_primary_and_bounds_secondary_diagnostics
         WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS
     );
 
-    let authenticated = memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+    let authenticated = memcordon_core::parse_and_authenticate_windows_attempt_record_v5(
         &serde_json::to_vec(&record).unwrap(),
         &record.attempt_id,
         &record.provider_generation,
@@ -432,75 +431,17 @@ fn cleanup_complete_retained_failure_classifies_terminal_attempt_retained() {
 }
 
 #[test]
-fn authenticated_record_roundtrip_preserves_terminalization_and_cleanup_facts() {
-    let (attempt_id, _, request_sha256) = binding();
-    let provider_generation = "cycle-7-terminalization-generation".to_owned();
-    let identity = WindowsProcessIdentityV1 {
-        process_id: 717,
-        creation_time_100ns: 7_171,
-    };
-    let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 3,
-        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
-        diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(0).unwrap(),
-        record_revision: 1,
-        workload_admission: None,
-        workload_checkpoint: None,
-        provider_incarnation: crate::windows::record::digest(b"incarnation"),
-        attempt_id: attempt_id.clone(),
-        provider_generation: provider_generation.clone(),
-        boot_identity: "cycle-7-boot".to_owned(),
-        request_sha256,
-        caller_process_identity: identity.clone(),
-        caller_token_sha256: "de".repeat(32),
-        job_identity_sha256: "ef".repeat(32),
-        guardian_identity: Some(identity.clone()),
-        target_identity: Some(identity),
-        state: WindowsAttemptStateV1::Empty,
-        authorization_unix_millis: Some(1_725_000_000_000),
-        resume_attempted: true,
-        target_released: true,
-        cleanup_state: completed_cleanup(),
-        terminal_response_json: None,
-        terminal_disposition: Some(WindowsAttemptTerminalDispositionV1::Posttarget),
-        terminalization: retained_terminalization(),
-        integrity_sha256: String::new(),
-    };
-    record.integrity_sha256 = crate::windows::record::digest(
-        &serde_json::to_vec(&record).expect("record must serialize canonically"),
-    );
-
-    let authenticated = parse_and_authenticate_windows_attempt_record(
-        &serde_json::to_vec(&record).unwrap(),
-        &attempt_id,
-        &provider_generation,
-    )
-    .unwrap();
-    assert_eq!(authenticated.terminalization, retained_terminalization());
-    assert_eq!(authenticated.cleanup_state, completed_cleanup());
-    assert_eq!(
-        authenticated.terminal_disposition,
-        Some(WindowsAttemptTerminalDispositionV1::Posttarget)
-    );
-
-    let mut tampered = authenticated;
-    tampered.terminalization.sequence += 1;
-    assert_eq!(
-        parse_and_authenticate_windows_attempt_record(
-            &serde_json::to_vec(&tampered).unwrap(),
-            &attempt_id,
-            &provider_generation,
-        )
-        .unwrap_err(),
-        "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=integrity-digest"
-    );
-}
-
-#[test]
 fn replay_pending_roundtrip_preserves_terminalization_disposition_and_binding() {
     let (attempt_id, nonce, request_sha256) = binding();
-    let pending = WindowsReplayPendingV1 {
-        schema_version: 3,
+    let pending = memcordon_core::WindowsReplayPendingV2 {
+        schema_version: 4,
+        provider_generation: "current-provider".into(),
+        launch_incarnation: "current-launch".into(),
+        boot_identity: "current-boot".into(),
+        job_identity: "ab".repeat(32),
+        owner_manifest_sha256: Some("cd".repeat(32)),
+        checkpoint: memcordon_core::WindowsTerminalLifecycleV1::ProofReady,
+        missing_proofs: Vec::new(),
         causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
         provider_failure: None,
         diagnostic_availability:
@@ -520,7 +461,7 @@ fn replay_pending_roundtrip_preserves_terminalization_disposition_and_binding() 
         terminalization: retained_terminalization(),
         detail: "durable terminal staging failed and awaits recovery".to_owned(),
     };
-    let roundtrip: WindowsReplayPendingV1 =
+    let roundtrip: memcordon_core::WindowsReplayPendingV2 =
         serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
 
     assert_eq!(roundtrip, pending);

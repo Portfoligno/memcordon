@@ -6,10 +6,7 @@ use memcordon::invocation::{
     CLEAN_USAGE, DOCTOR_USAGE, HELP_TOPIC_USAGE, HELP_USAGE, PLAN_USAGE, PUBLIC_POLICY_OPTIONS,
     PolicyArgs, REFERENCE_URL, ROOT_USAGE,
 };
-use memcordon_core::{
-    CLEAN_REPORT_SCHEMA_VERSION, DOCTOR_REPORT_SCHEMA_VERSION, EXECUTION_REPORT_SCHEMA_VERSION,
-    HalfLifeLogisticBackoffPolicy, Lifetime, PLAN_REPORT_SCHEMA_VERSION,
-};
+use memcordon_core::{CLEAN_REPORT_SCHEMA_VERSION, HalfLifeLogisticBackoffPolicy, Lifetime};
 
 fn workspace_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -157,29 +154,25 @@ fn generated_public_help_is_exact_complete_and_keeps_private_routes_hidden() {
         }
     }
 
-    for (help, option, version) in [
-        (all, "--report", EXECUTION_REPORT_SCHEMA_VERSION),
-        (DOCTOR_USAGE, "--json", DOCTOR_REPORT_SCHEMA_VERSION),
-        (PLAN_USAGE, "--json", PLAN_REPORT_SCHEMA_VERSION),
-        (CLEAN_USAGE, "--json", CLEAN_REPORT_SCHEMA_VERSION),
-    ] {
-        assert!(
-            option_line(help, option).contains(&format!("schema-{version}")),
-            "{option} should advertise schema-{version}"
-        );
-    }
+    assert!(option_line(all, "--report").contains("result-v3"));
+    assert!(DOCTOR_USAGE.contains("memcordon.capabilities revision 3"));
+    assert!(PLAN_USAGE.contains("memcordon.plan revision 3"));
+    assert!(
+        option_line(CLEAN_USAGE, "--json")
+            .contains(&format!("schema-{CLEAN_REPORT_SCHEMA_VERSION}"))
+    );
     let output = HELP_TOPIC_USAGE
         .iter()
         .find_map(|(topic, usage)| (*topic == "output").then_some(*usage))
         .expect("output topic should exist");
-    for version in [
-        CLEAN_REPORT_SCHEMA_VERSION,
-        DOCTOR_REPORT_SCHEMA_VERSION,
-        PLAN_REPORT_SCHEMA_VERSION,
-        EXECUTION_REPORT_SCHEMA_VERSION,
+    for format in [
+        "result-v3",
+        "memcordon.capabilities revision 3",
+        "memcordon.plan revision 3",
     ] {
-        assert!(output.contains(&format!("schema-{version}")));
+        assert!(output.contains(format));
     }
+    assert!(output.contains(&format!("schema-{CLEAN_REPORT_SCHEMA_VERSION}")));
 }
 
 #[test]

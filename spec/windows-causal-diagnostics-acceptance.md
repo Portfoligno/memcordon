@@ -1,9 +1,9 @@
 # Windows causal diagnostics acceptance after 0.5.5-rc.1
 
 This acceptance map supplements [the V1 contract](windows-causal-diagnostics-v1.md).
-Live Windows execution uses `memcordon.result` revision 1, public/private
-protocol 3/3, terminal receipt V2, and durable attempt record V4. Numeric execution
-report schema 11 remains a compatibility format. Diagnostic projections remain
+Live Windows execution uses `memcordon.result` revision 3, public/private
+protocol 4/4, terminal receipt 3, and durable attempt record 5. Only current
+formats are accepted. Diagnostic projections remain
 V1. A diagnostic never supplies a
 missing terminal receipt, acknowledgment, retirement proof or restart authority.
 
@@ -27,7 +27,7 @@ executable assertions, not an assertion that this document ran them.
 | Bound retained response survives record reread failure | `windows_replay_retention::bound_launch_retention_survives_record_reread_failure` | Native retained-failure response |
 | Accounting conversion retains its native code and monitor classification | `windows::launcher_service::job_conversion_tests::job_accounting_conversion_preserves_monitor_classification` | Native wrapper through launch conversion and journal |
 | Every emitted Job/target/guardian operation has one typed mapping | `windows::launcher_service::job_conversion_tests::job_observation_mapping_covers_emitted_operations` | Native conversion inventory and semantic errors |
-| String-returning wrappers cannot replace the typed original | `windows::launcher_service::job_conversion_tests::job_string_conversion_preserves_semantics` | Native legacy conversion |
+| String-returning wrappers cannot replace the typed original | `windows::launcher_service::job_conversion_tests::job_string_conversion_preserves_semantics` | Current native conversion |
 | Later observation reconstruction retains the original operation | `windows::launcher_service::job_conversion_tests::job_diagnostic_reconstruction_preserves_operation` | Native cleanup conversion |
 
 These source-file names are navigation labels. Fully qualified test names follow
@@ -75,8 +75,7 @@ installer compilation, direct executable installer invocation and the project's
 remaining required gates. Preserve the reviewed workload and its budgets; a
 source build or a tool-version check alone cannot replace the functional gate.
 
-The Linux baseline continues to reject genuine TCP requirements before release.
-Required TCP tests remain blocked in that context, never counted as passing
-negative application tests. The optional private TCP provider uses its own local
-grants and native checks as described in the
-[V2 workload contract](../docs/spec-workload-contract-v2.md).
+The ordinary Linux credential-preserving mechanism does not supply the private
+workload profile. Current private TCP/UNIX scenarios require the matching current
+provider and genuine native observations, as described in the
+[workload request contract](../docs/spec-workload-request-v1.md).

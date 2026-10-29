@@ -8,10 +8,10 @@ is for applications that embed backend probing or execution.
 Boundary capability is reported separately from memory enforcement. Sealed
 requests never fall back to standard backends. Linux and Windows report sealed
 capability only when matching components and live native readiness are verified;
-missing or mismatched providers reject before target authorization. Local grants
-are checked independently on every launch. Named ResultV1 retains current admission
-and private native facts; supported numeric execution formats retain their frozen
-historical meanings.
+missing or mismatched providers reject before target release. Caller-owned
+workload requests select behavior without administrator grants. Named result
+revision 3 retains actual native release, execution, cleanup and delivery facts.
+Ordinary nonsealed execution uses numeric schema 10.
 
 ## Install
 

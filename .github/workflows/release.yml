@@ -2475,7 +2475,7 @@ jobs:
         timeout-minutes: 20
       - &shared_step_102
         if: '!cancelled() && matrix.producer-job != '''''
-        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
+        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
         timeout-minutes: 10
       - &shared_step_103
         id: readiness-upload
@@ -2716,7 +2716,7 @@ jobs:
         timeout-minutes: 20
       - &shared_step_112
         if: '!cancelled() && matrix.producer-job != '''''
-        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
+        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
         timeout-minutes: 10
       - &shared_step_113
         id: readiness-upload
@@ -3220,7 +3220,7 @@ jobs:
         timeout-minutes: 30
   public-linux-x64-native:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3230,7 +3230,7 @@ jobs:
       matrix:
         include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "channel": "public-native", "producer-job": "public-linux-x64-native"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3260,51 +3260,31 @@ jobs:
           digest-mismatch: error
         timeout-minutes: 6
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_48
+      - *shared_step_49
+      - *shared_step_50
       - &shared_step_126
-        id: driver-cold-build
-        if: runner.os != 'Windows'
-        timeout-minutes: 30
-        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
-      - &shared_step_127
-        id: driver-cold-adopt
-        if: steps.driver-cold-build.outcome == 'success'
-        timeout-minutes: 15
-        run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
-      - *shared_step_3
-      - *shared_step_4
-      - *shared_step_5
-      - *shared_step_6
-      - *shared_step_7
-      - *shared_step_8
-      - *shared_step_9
-      - &shared_step_128
-        id: driver-workflows-check
-        if: runner.os != 'Windows'
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci workflows --check
-      - &shared_step_129
         run: ./target/ci-runtime/current/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json
         if: runner.os != 'Windows'
         timeout-minutes: 60
-      - &shared_step_130
+      - &shared_step_127
         run: ./target/ci-driver-cold/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
         if: runner.os != 'Windows'
         timeout-minutes: 10
-      - &shared_step_131
+      - &shared_step_128
         run: ./target/ci-driver-cold/release/consumer-readiness acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
         if: runner.os != 'Windows'
         timeout-minutes: 160
-      - &shared_step_132
+      - &shared_step_129
         id: readiness-cleanup
         if: (always()) && runner.os != 'Windows'
         run: ./target/ci-driver-cold/release/consumer-readiness cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
         timeout-minutes: 20
-      - &shared_step_133
+      - &shared_step_130
         if: (!cancelled()) && runner.os != 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
+        run: ./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
         timeout-minutes: 10
-      - &shared_step_134
+      - &shared_step_131
         id: readiness-upload
         if: '!cancelled()'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -3315,11 +3295,9 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-linux-x64-cargo:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3329,7 +3307,7 @@ jobs:
       matrix:
         include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "channel": "public-cargo", "producer-job": "public-linux-x64-cargo"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3340,28 +3318,18 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_48
+      - *shared_step_49
+      - *shared_step_50
       - *shared_step_126
       - *shared_step_127
-      - *shared_step_3
-      - *shared_step_4
-      - *shared_step_5
-      - *shared_step_6
-      - *shared_step_7
-      - *shared_step_8
-      - *shared_step_9
       - *shared_step_128
       - *shared_step_129
       - *shared_step_130
       - *shared_step_131
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_134
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-linux-arm64-native:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-arm64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3371,7 +3339,7 @@ jobs:
       matrix:
         include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "channel": "public-native", "producer-job": "public-linux-arm64-native"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3382,28 +3350,18 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_77
+      - *shared_step_49
+      - *shared_step_50
       - *shared_step_126
       - *shared_step_127
-      - *shared_step_3
-      - *shared_step_4
-      - *shared_step_5
-      - *shared_step_6
-      - *shared_step_7
-      - *shared_step_8
-      - *shared_step_9
       - *shared_step_128
       - *shared_step_129
       - *shared_step_130
       - *shared_step_131
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_134
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-linux-arm64-cargo:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-arm64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3413,7 +3371,7 @@ jobs:
       matrix:
         include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "channel": "public-cargo", "producer-job": "public-linux-arm64-cargo"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3424,28 +3382,18 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_77
+      - *shared_step_49
+      - *shared_step_50
       - *shared_step_126
       - *shared_step_127
-      - *shared_step_3
-      - *shared_step_4
-      - *shared_step_5
-      - *shared_step_6
-      - *shared_step_7
-      - *shared_step_8
-      - *shared_step_9
       - *shared_step_128
       - *shared_step_129
       - *shared_step_130
       - *shared_step_131
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_134
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-windows-x64-native:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3455,7 +3403,7 @@ jobs:
       matrix:
         include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "channel": "public-native", "producer-job": "public-windows-x64-native"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3466,105 +3414,31 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
-      - &shared_step_135
-        id: driver-cold-build-windows
-        if: runner.os == 'Windows'
-        timeout-minutes: 30
-        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
-      - &shared_step_136
-        id: driver-cold-adopt-windows
-        if: steps.driver-cold-build-windows.outcome == 'success'
-        timeout-minutes: 15
-        run: ./target/ci-driver-cold/release/memcordon-ci.exe ci driver-adopt-cold
-      - &shared_step_137
-        id: driver-cold-adopt-windows-bootstrap-probe
-        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == ''true'''
-        continue-on-error: true
-        timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
-          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
-          lookup-only: true
-      - &shared_step_138
-        id: driver-cold-adopt-windows-bootstrap-save
-        if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
-          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
-      - &shared_step_139
-        id: driver-cold-adopt-windows-source-complete-probe
-        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.source-complete-save == ''true'''
-        continue-on-error: true
-        timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
-          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
-          lookup-only: true
-      - &shared_step_140
-        id: driver-cold-adopt-windows-source-complete-save
-        if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
-          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
-      - &shared_step_141
-        id: driver-cold-adopt-windows-archives-partial-save
-        if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
-          path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
-      - &shared_step_142
-        id: driver-cold-adopt-windows-index-partial-save
-        if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
-          path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
-      - &shared_step_143
-        id: driver-cold-cleanup-windows
-        if: always() && steps.driver-cold-adopt-windows.outcome == 'success'
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci.exe ci driver-cleanup
-      - &shared_step_144
-        id: driver-workflows-check-windows
-        if: runner.os == 'Windows'
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
-      - &shared_step_145
+      - *shared_step_81
+      - *shared_step_49
+      - *shared_step_82
+      - &shared_step_132
         run: ./target/ci-runtime/current/memcordon-ci.exe release prepare-readiness-tools --build-source .release/build-source.json
         if: runner.os == 'Windows'
         timeout-minutes: 60
-      - &shared_step_146
+      - &shared_step_133
         run: ./target/ci-driver-cold/release/consumer-readiness.exe identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
         if: runner.os == 'Windows'
         timeout-minutes: 10
-      - &shared_step_147
+      - &shared_step_134
         run: ./target/ci-driver-cold/release/consumer-readiness.exe acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell
         if: runner.os == 'Windows'
         timeout-minutes: 160
-      - &shared_step_148
+      - &shared_step_135
         id: readiness-cleanup
         if: (always()) && runner.os == 'Windows'
         run: ./target/ci-driver-cold/release/consumer-readiness.exe cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell
         timeout-minutes: 20
-      - &shared_step_149
+      - &shared_step_136
         if: (!cancelled()) && runner.os == 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness.exe seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
+        run: ./target/ci-driver-cold/release/consumer-readiness.exe seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
         timeout-minutes: 10
-      - &shared_step_150
+      - &shared_step_137
         id: readiness-upload
         if: '!cancelled()'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -3575,11 +3449,9 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-windows-x64-cargo:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3589,7 +3461,7 @@ jobs:
       matrix:
         include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "channel": "public-cargo", "producer-job": "public-windows-x64-cargo"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3600,28 +3472,18 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_81
+      - *shared_step_49
+      - *shared_step_82
+      - *shared_step_132
+      - *shared_step_133
+      - *shared_step_134
       - *shared_step_135
       - *shared_step_136
       - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
-      - *shared_step_145
-      - *shared_step_146
-      - *shared_step_147
-      - *shared_step_148
-      - *shared_step_149
-      - *shared_step_150
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-windows-arm64-native:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-arm64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3631,7 +3493,7 @@ jobs:
       matrix:
         include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "channel": "public-native", "producer-job": "public-windows-arm64-native"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3642,28 +3504,18 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_95
+      - *shared_step_49
+      - *shared_step_82
+      - *shared_step_132
+      - *shared_step_133
+      - *shared_step_134
       - *shared_step_135
       - *shared_step_136
       - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
-      - *shared_step_145
-      - *shared_step_146
-      - *shared_step_147
-      - *shared_step_148
-      - *shared_step_149
-      - *shared_step_150
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   public-windows-arm64-cargo:
     name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-arm64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3673,7 +3525,7 @@ jobs:
       matrix:
         include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "channel": "public-cargo", "producer-job": "public-windows-arm64-cargo"}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 317
     outputs:
       artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
@@ -3684,25 +3536,15 @@ jobs:
       - *shared_step_124
       - *shared_step_125
       - *shared_step_13
-      - *shared_step_2
+      - *shared_step_95
+      - *shared_step_49
+      - *shared_step_82
+      - *shared_step_132
+      - *shared_step_133
+      - *shared_step_134
       - *shared_step_135
       - *shared_step_136
       - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
-      - *shared_step_145
-      - *shared_step_146
-      - *shared_step_147
-      - *shared_step_148
-      - *shared_step_149
-      - *shared_step_150
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   readiness-candidate-report:
     needs: ["select", "native-linux-x64", "native-linux-arm64", "native-windows-x64", "native-windows-arm64", "candidate-linux-x64-native", "candidate-linux-x64-cargo", "candidate-linux-arm64-native", "candidate-linux-arm64-cargo", "candidate-windows-x64-native", "candidate-windows-x64-cargo", "candidate-windows-arm64-native", "candidate-windows-arm64-cargo"]
     if: '!cancelled() && needs.select.result == ''success'' && needs.select.outputs.recovery-mode == ''reprepare'''
@@ -3717,8 +3559,16 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_126
-      - *shared_step_127
+      - &shared_step_138
+        id: driver-cold-build
+        if: runner.os != 'Windows'
+        timeout-minutes: 30
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
+      - &shared_step_139
+        id: driver-cold-adopt
+        if: steps.driver-cold-build.outcome == 'success'
+        timeout-minutes: 15
+        run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - *shared_step_3
       - *shared_step_4
       - *shared_step_5
@@ -3726,11 +3576,15 @@ jobs:
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_128
-      - &shared_step_151
+      - &shared_step_140
+        id: driver-workflows-check
+        if: runner.os != 'Windows'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci ci workflows --check
+      - &shared_step_141
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-readiness-verifier
         timeout-minutes: 60
-      - *shared_step_130
+      - *shared_step_127
       - name: Read candidate consumer readiness observations
         run: ./target/ci-runtime/current/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope candidate-before-publication --destination .release/readiness-report
         env:
@@ -3764,8 +3618,8 @@ jobs:
       - *shared_step_125
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_126
-      - *shared_step_127
+      - *shared_step_138
+      - *shared_step_139
       - *shared_step_3
       - *shared_step_4
       - *shared_step_5
@@ -3773,9 +3627,9 @@ jobs:
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_128
-      - *shared_step_151
-      - *shared_step_130
+      - *shared_step_140
+      - *shared_step_141
+      - *shared_step_127
       - name: Read complete consumer readiness observations
         run: ./target/ci-runtime/current/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope complete-profile --destination .release/readiness-report
         env:
@@ -4020,7 +3874,7 @@ jobs:
       - id: supply-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests supply-audit
-      - &shared_step_152
+      - &shared_step_142
         id: supply-request-source-restore
         if: steps.supply-request.outputs.source-restore == 'true'
         continue-on-error: true
@@ -4030,7 +3884,7 @@ jobs:
           key: ${{ steps.supply-request.outputs.source-key }}
           path: ${{ steps.supply-request.outputs.source-path }}
           restore-keys: ${{ steps.supply-request.outputs.source-prefix }}
-      - &shared_step_153
+      - &shared_step_143
         id: supply-request-archives-partial-restore
         if: steps.supply-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
@@ -4040,7 +3894,7 @@ jobs:
           key: ${{ steps.supply-request.outputs.archives-partial-key }}
           path: ${{ steps.supply-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.supply-request.outputs.archives-partial-prefix }}
-      - &shared_step_154
+      - &shared_step_144
         id: supply-request-index-partial-restore
         if: steps.supply-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
@@ -4089,7 +3943,7 @@ jobs:
       - id: supply
         timeout-minutes: 130
         run: ./.release/tool/memcordon-ci ci segment supply-audit
-      - &shared_step_155
+      - &shared_step_145
         id: supply-source-complete-probe
         if: '!cancelled() && steps.supply.outputs.source-complete-save == ''true'''
         continue-on-error: true
@@ -4099,7 +3953,7 @@ jobs:
           key: ${{ steps.supply.outputs.source-complete-key }}
           path: ${{ steps.supply.outputs.source-complete-path }}
           lookup-only: true
-      - &shared_step_156
+      - &shared_step_146
         id: supply-source-complete-save
         if: always() && steps.supply.outputs.source-complete-save == 'true' && steps.supply-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -4108,7 +3962,7 @@ jobs:
         with:
           key: ${{ steps.supply.outputs.source-complete-key }}
           path: ${{ steps.supply.outputs.source-complete-path }}
-      - &shared_step_157
+      - &shared_step_147
         id: supply-archives-partial-save
         if: always() && steps.supply.outputs.archives-partial-save == 'true'
         continue-on-error: true
@@ -4117,7 +3971,7 @@ jobs:
         with:
           key: ${{ steps.supply.outputs.archives-partial-key }}
           path: ${{ steps.supply.outputs.archives-partial-path }}
-      - &shared_step_158
+      - &shared_step_148
         id: supply-index-partial-save
         if: always() && steps.supply.outputs.index-partial-save == 'true'
         continue-on-error: true
@@ -4216,9 +4070,9 @@ jobs:
       - id: supply-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests supply-deny
-      - *shared_step_152
-      - *shared_step_153
-      - *shared_step_154
+      - *shared_step_142
+      - *shared_step_143
+      - *shared_step_144
       - id: supply-request-cargo-deny-image-restore
         if: steps.supply-request.outputs.cargo-deny-image-restore == 'true'
         continue-on-error: true
@@ -4258,10 +4112,10 @@ jobs:
       - id: supply
         timeout-minutes: 130
         run: ./.release/tool/memcordon-ci ci segment supply-deny
-      - *shared_step_155
-      - *shared_step_156
-      - *shared_step_157
-      - *shared_step_158
+      - *shared_step_145
+      - *shared_step_146
+      - *shared_step_147
+      - *shared_step_148
       - id: supply-cargo-deny-image-probe
         if: '!cancelled() && steps.supply.outputs.cargo-deny-image-save == ''true'''
         continue-on-error: true
@@ -4548,8 +4402,8 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_126
-      - *shared_step_127
+      - *shared_step_138
+      - *shared_step_139
       - *shared_step_3
       - *shared_step_4
       - *shared_step_5
@@ -4557,12 +4411,12 @@ jobs:
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_128
-      - &shared_step_159
+      - *shared_step_140
+      - &shared_step_149
         id: readiness-tools-bind
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind readiness
-      - &shared_step_160
+      - &shared_step_150
         id: readiness-tools-package
         timeout-minutes: 5
         run: tar -czf target/readiness-tools.tar.gz target/ci-runtime/current target/ci-driver-cold/release/consumer-readiness target/ci/release/consumer-readiness target/ci-preparation/readiness.json
@@ -4594,8 +4448,8 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_126
-      - *shared_step_127
+      - *shared_step_138
+      - *shared_step_139
       - *shared_step_3
       - *shared_step_4
       - *shared_step_5
@@ -4603,9 +4457,9 @@ jobs:
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_128
-      - *shared_step_159
-      - *shared_step_160
+      - *shared_step_140
+      - *shared_step_149
+      - *shared_step_150
       - id: readiness-tools-upload
         uses: *action_0
         timeout-minutes: 6
@@ -4633,8 +4487,8 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_126
-      - *shared_step_127
+      - *shared_step_138
+      - *shared_step_139
       - *shared_step_3
       - *shared_step_4
       - *shared_step_5
@@ -4642,9 +4496,9 @@ jobs:
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_128
-      - *shared_step_159
-      - *shared_step_160
+      - *shared_step_140
+      - *shared_step_149
+      - *shared_step_150
       - id: readiness-tools-upload
         uses: *action_0
         timeout-minutes: 6
@@ -4673,8 +4527,8 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_126
-      - *shared_step_127
+      - *shared_step_138
+      - *shared_step_139
       - *shared_step_3
       - *shared_step_4
       - *shared_step_5
@@ -4682,9 +4536,9 @@ jobs:
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_128
-      - *shared_step_159
-      - *shared_step_160
+      - *shared_step_140
+      - *shared_step_149
+      - *shared_step_150
       - id: readiness-tools-upload
         uses: *action_0
         timeout-minutes: 6
@@ -4714,16 +4568,82 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_135
-      - *shared_step_136
-      - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
+      - &shared_step_151
+        id: driver-cold-build-windows
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
+      - &shared_step_152
+        id: driver-cold-adopt-windows
+        if: steps.driver-cold-build-windows.outcome == 'success'
+        timeout-minutes: 15
+        run: ./target/ci-driver-cold/release/memcordon-ci.exe ci driver-adopt-cold
+      - &shared_step_153
+        id: driver-cold-adopt-windows-bootstrap-probe
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
+          lookup-only: true
+      - &shared_step_154
+        id: driver-cold-adopt-windows-bootstrap-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
+      - &shared_step_155
+        id: driver-cold-adopt-windows-source-complete-probe
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
+          lookup-only: true
+      - &shared_step_156
+        id: driver-cold-adopt-windows-source-complete-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
+      - &shared_step_157
+        id: driver-cold-adopt-windows-archives-partial-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
+      - &shared_step_158
+        id: driver-cold-adopt-windows-index-partial-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
+      - &shared_step_159
+        id: driver-cold-cleanup-windows
+        if: always() && steps.driver-cold-adopt-windows.outcome == 'success'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci driver-cleanup
+      - &shared_step_160
+        id: driver-workflows-check-windows
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
       - &shared_step_161
         id: readiness-tools-bind
         timeout-minutes: 5
@@ -4760,16 +4680,16 @@ jobs:
       - *shared_step_12
       - *shared_step_13
       - *shared_step_2
-      - *shared_step_135
-      - *shared_step_136
-      - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
+      - *shared_step_151
+      - *shared_step_152
+      - *shared_step_153
+      - *shared_step_154
+      - *shared_step_155
+      - *shared_step_156
+      - *shared_step_157
+      - *shared_step_158
+      - *shared_step_159
+      - *shared_step_160
       - *shared_step_161
       - *shared_step_162
       - id: readiness-tools-upload

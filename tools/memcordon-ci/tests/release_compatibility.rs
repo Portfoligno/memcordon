@@ -1,11 +1,10 @@
 use memcordon_ci::release::{
-    compatibility::{Compatibility, NativePackage},
+    compatibility::{CompatibilityV2, NativePackage},
     distribution::{Distribution, TargetDistribution},
     source::{BuildSourceIdentity, SelectedSource},
 };
-use memcordon_core::runtime_manifest::{
-    RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-};
+use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+use memcordon_core::runtime_manifest_v2::RuntimeManifestV2;
 use std::collections::BTreeMap;
 
 fn source() -> BuildSourceIdentity {
@@ -72,7 +71,7 @@ fn compatibility_uses_selected_inventory_and_exact_runtime_protocol_profiles() {
             .collect(),
         targets: vec![selected.clone()],
     };
-    let manifest = RuntimeManifest::cli_only(
+    let manifest = RuntimeManifestV2::cli_only(
         "1.2.3".into(),
         source.commit().into(),
         selected.target.clone(),
@@ -87,13 +86,13 @@ fn compatibility_uses_selected_inventory_and_exact_runtime_protocol_profiles() {
     )
     .unwrap();
     let mut manifests = BTreeMap::from([(selected.target.clone(), manifest)]);
-    let compatibility = Compatibility::selected(&source, &distribution, &manifests).unwrap();
+    let compatibility = CompatibilityV2::selected(&source, &distribution, &manifests).unwrap();
     assert_eq!(compatibility.targets[0].selected_binaries, ["memcordon"]);
     assert!(compatibility.targets[0].native_protocols.is_none());
-    assert_eq!(compatibility.named_formats["memcordon.result"], 1);
-    assert_eq!(compatibility.historical_execution_schemas, [10, 11]);
-    assert_eq!(compatibility.historical_plan_schemas, [9]);
+    assert_eq!(compatibility.named_formats["memcordon.result"], 3);
+    assert_eq!(compatibility.execution_schema, 10);
+    assert_eq!(compatibility.clean_schema, 2);
     manifests.get_mut(&selected.target).unwrap().source_commit =
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
-    assert!(Compatibility::selected(&source, &distribution, &manifests).is_err());
+    assert!(CompatibilityV2::selected(&source, &distribution, &manifests).is_err());
 }

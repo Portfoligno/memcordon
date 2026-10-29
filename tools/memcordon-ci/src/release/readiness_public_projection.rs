@@ -1,5 +1,5 @@
 //! A readable copy of selected evidence, never the private execution tree.
-use crate::consumer_readiness_ledger::CellEvidence;
+use crate::consumer_readiness_current::CellEvidenceV2 as CellEvidence;
 use crate::{CiError, Result};
 use memcordon_readiness_verifier::Artifact;
 use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, openat, renameat, unlinkat};

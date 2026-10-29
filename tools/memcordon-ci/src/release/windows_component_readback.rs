@@ -10,7 +10,8 @@ pub fn observe(
     binaries: &[String],
     target: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    use memcordon_core::runtime_manifest::{RuntimeComponentRole as Role, RuntimeManifest};
+    use memcordon_core::runtime_components::RuntimeComponentRole as Role;
+    use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
     let measure = |path: &Path, operation: &str| {
         super::artifacts::read_file(path).map_err(|error| {
             CiError::Message(format!(

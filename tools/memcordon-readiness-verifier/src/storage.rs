@@ -1,121 +1,16 @@
 //! One-level physical storage for unchanged logical evidence records.
 use crate::{
-    Artifact, EvidenceIndex, MAX_ARTIFACT_BYTES, MAX_INDEX_BYTES, MAX_PRODUCER_ARTIFACTS,
-    MAX_PRODUCER_BYTES, ProducerManifest, VerificationResult,
+    Artifact, MAX_ARTIFACT_BYTES, MAX_INDEX_BYTES, MAX_PRODUCER_ARTIFACTS, MAX_PRODUCER_BYTES,
+    VerificationResult,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CellSource {
-    run_id: String,
-    source_commit: String,
-    source_tree_sha256: String,
-    version: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CellDocument {
-    format: String,
-    revision: u32,
-    identity: CellSource,
-    key: crate::ProductKey,
-    product: Option<crate::ProductObservation>,
-    component_build: Option<crate::ComponentBuild>,
-    records: Vec<crate::CaseRecord>,
-    artifacts: Vec<Artifact>,
-    cleanup_failures: Vec<String>,
-    cache_quiescent: bool,
-}
-
-/// Reassess the original cell carried by this producer, not a report-side substitute.
-pub fn validate_cell(producer: &ProducerManifest, bytes: &[u8]) -> VerificationResult<()> {
-    if bytes.len() > MAX_INDEX_BYTES * 2 {
-        return Err("producer cell exceeds original bound".into());
-    }
-    let cell: CellDocument = crate::wire::decode(bytes)?;
-    crate::header(
-        &cell.format,
-        cell.revision,
-        "memcordon.consumer-readiness.cell",
-    )?;
-    let equal = |left: serde_json::Value, right: serde_json::Value| -> VerificationResult<()> {
-        if left == right {
-            Ok(())
-        } else {
-            Err("producer cell differs from immutable logical manifest".into())
-        }
-    };
-    if cell.identity.run_id != producer.run_id
-        || cell.identity.source_commit != producer.source_commit
-        || cell.identity.source_tree_sha256 != producer.source_tree_sha256
-        || cell.identity.version != producer.version
-        || cell
-            .product
-            .as_ref()
-            .is_some_and(|product| product.key != cell.key)
-        || cell
-            .component_build
-            .as_ref()
-            .is_some_and(|build| build.target != cell.key.target)
-        || cell.records.iter().any(|record| {
-            record.key.target != cell.key.target || record.run_id != cell.identity.run_id
-        })
-        || ((!cell.cache_quiescent || !cell.cleanup_failures.is_empty())
-            && cell
-                .records
-                .iter()
-                .any(|record| record.state != crate::CaseState::Failed))
-    {
-        return Err("producer cell source, association or cleanup state differs".into());
-    }
-    equal(
-        serde_json::to_value(&cell.artifacts).map_err(|e| e.to_string())?,
-        serde_json::to_value(&producer.artifacts).map_err(|e| e.to_string())?,
-    )?;
-    equal(
-        serde_json::to_value(&cell.records).map_err(|e| e.to_string())?,
-        serde_json::to_value(&producer.records).map_err(|e| e.to_string())?,
-    )?;
-    equal(
-        serde_json::to_value(cell.product.into_iter().collect::<Vec<_>>())
-            .map_err(|e| e.to_string())?,
-        serde_json::to_value(&producer.products).map_err(|e| e.to_string())?,
-    )?;
-    equal(
-        serde_json::to_value(cell.component_build.into_iter().collect::<Vec<_>>())
-            .map_err(|e| e.to_string())?,
-        serde_json::to_value(&producer.component_builds).map_err(|e| e.to_string())?,
-    )
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactBinding {
     pub logical_path: String,
     pub object_path: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PackedProducerManifestV1 {
-    pub format: String,
-    pub revision: u32,
-    pub producer: ProducerManifest,
-    pub objects: Vec<Artifact>,
-    pub bindings: Vec<ArtifactBinding>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PackedEvidenceIndexV1 {
-    pub format: String,
-    pub revision: u32,
-    pub evidence: EvidenceIndex,
-    pub objects: Vec<Artifact>,
-    pub bindings: Vec<ArtifactBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -354,9 +249,9 @@ impl StoragePlan {
         }
         Ok(())
     }
-    pub fn legacy(records: &[Artifact]) -> VerificationResult<Self> {
+    pub fn direct(records: &[Artifact]) -> VerificationResult<Self> {
         if records.len() > MAX_PRODUCER_ARTIFACTS {
-            return Err("legacy storage reference count exceeds bound".into());
+            return Err("direct storage reference count exceeds bound".into());
         }
         let mut physical = BTreeMap::new();
         let mut resolution = BTreeMap::new();
@@ -542,100 +437,5 @@ impl StoragePlan {
             .ok_or_else(|| {
                 "physical evidence including archives and metadata exceeds total budget".into()
             })
-    }
-}
-
-pub fn decode_producer(bytes: &[u8]) -> VerificationResult<(ProducerManifest, StoragePlan)> {
-    if bytes.len() > MAX_INDEX_BYTES {
-        return Err("producer envelope exceeds metadata bound".into());
-    }
-    let value: serde_json::Value = crate::wire::decode(bytes)?;
-    match value["format"].as_str() {
-        Some("memcordon.consumer-readiness.producer") => {
-            let producer: ProducerManifest = crate::wire::decode(bytes)?;
-            crate::header(
-                &producer.format,
-                producer.revision,
-                "memcordon.consumer-readiness.producer",
-            )?;
-            let plan = StoragePlan::legacy(&producer.artifacts)?;
-            Ok((producer, plan))
-        }
-        Some("memcordon.consumer-readiness.packed-producer") => {
-            let packed: PackedProducerManifestV1 = crate::wire::decode(bytes)?;
-            crate::header(
-                &packed.format,
-                packed.revision,
-                "memcordon.consumer-readiness.packed-producer",
-            )?;
-            crate::header(
-                &packed.producer.format,
-                packed.producer.revision,
-                "memcordon.consumer-readiness.producer",
-            )?;
-            let logical_total = packed.producer.artifacts.iter().try_fold(0u64, |n, a| {
-                n.checked_add(a.length)
-                    .ok_or("logical producer total overflow")
-            })?;
-            if logical_total > MAX_PRODUCER_BYTES {
-                return Err("logical producer source plan exceeds bound".into());
-            }
-            let plan = StoragePlan::packed(
-                &packed.producer.artifacts,
-                &packed.objects,
-                &packed.bindings,
-                &BTreeSet::new(),
-            )?;
-            plan.check_budget(bytes.len() as u64)?;
-            Ok((packed.producer, plan))
-        }
-        _ => Err("unknown producer storage format".into()),
-    }
-}
-
-pub fn decode_evidence(bytes: &[u8]) -> VerificationResult<(EvidenceIndex, StoragePlan)> {
-    if bytes.len() > MAX_INDEX_BYTES {
-        return Err("evidence envelope exceeds metadata bound".into());
-    }
-    let value: serde_json::Value = crate::wire::decode(bytes)?;
-    match value["format"].as_str() {
-        Some("memcordon.consumer-readiness.evidence") => {
-            let evidence: EvidenceIndex = crate::wire::decode(bytes)?;
-            crate::header(
-                &evidence.format,
-                evidence.revision,
-                "memcordon.consumer-readiness.evidence",
-            )?;
-            let plan = StoragePlan::legacy(&evidence.artifacts)?;
-            Ok((evidence, plan))
-        }
-        Some("memcordon.consumer-readiness.packed-evidence") => {
-            let packed: PackedEvidenceIndexV1 = crate::wire::decode(bytes)?;
-            crate::header(
-                &packed.format,
-                packed.revision,
-                "memcordon.consumer-readiness.packed-evidence",
-            )?;
-            crate::header(
-                &packed.evidence.format,
-                packed.evidence.revision,
-                "memcordon.consumer-readiness.evidence",
-            )?;
-            let archives = packed
-                .evidence
-                .producer_origins
-                .iter()
-                .map(|origin| origin.bundle_artifact.clone())
-                .collect();
-            let plan = StoragePlan::packed(
-                &packed.evidence.artifacts,
-                &packed.objects,
-                &packed.bindings,
-                &archives,
-            )?;
-            plan.check_budget(bytes.len() as u64)?;
-            Ok((packed.evidence, plan))
-        }
-        _ => Err("unknown evidence storage format".into()),
     }
 }

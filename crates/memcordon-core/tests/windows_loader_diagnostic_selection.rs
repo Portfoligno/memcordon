@@ -1,18 +1,18 @@
 use memcordon_core::{
-    WindowsLaunchRequestV1, WindowsLoaderDiagnosticKindV1, WindowsLoaderDiagnosticSelectionV1,
+    WindowsLaunchRequestV2, WindowsLoaderDiagnosticKindV1, WindowsLoaderDiagnosticSelectionV1,
 };
 use sha2::{Digest, Sha256};
 
-fn ordinary_request() -> WindowsLaunchRequestV1 {
+fn ordinary_request() -> WindowsLaunchRequestV2 {
     serde_json::from_value(serde_json::json!({
         "restart_attempt": 0,
-        "schema_version": 3,
+        "schema_version": 4,
         "expected_provider_binding": {
             "generation": "measured-support",
             "source_commit": "ab".repeat(20),
             "runtime_manifest_sha256": "cd".repeat(32)
         },
-        "workload_contract": null,
+        "workload_request": null,
         "nonce": "own-diagnostic-request",
         "command": { "program": [120], "arguments": [] },
         "environment": [],
@@ -54,7 +54,7 @@ fn ordinary_wire_omits_diagnostic_and_selection_is_inside_canonical_digest() {
     let selected_bytes = serde_json::to_vec(&selected).unwrap();
     assert_ne!(Sha256::digest(&bytes), Sha256::digest(&selected_bytes));
     assert_eq!(
-        serde_json::from_slice::<WindowsLaunchRequestV1>(&selected_bytes).unwrap(),
+        serde_json::from_slice::<WindowsLaunchRequestV2>(&selected_bytes).unwrap(),
         selected
     );
     for changed_field in [
@@ -71,7 +71,7 @@ fn ordinary_wire_omits_diagnostic_and_selection_is_inside_canonical_digest() {
         } else {
             serde_json::json!(300)
         };
-        let changed: WindowsLaunchRequestV1 = serde_json::from_value(changed).unwrap();
+        let changed: WindowsLaunchRequestV2 = serde_json::from_value(changed).unwrap();
         assert_ne!(changed, selected);
         assert_ne!(
             Sha256::digest(&selected_bytes),

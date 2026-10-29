@@ -7,7 +7,8 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 
-use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+use memcordon_core::runtime_components::RuntimeComponentRole;
+use memcordon_core::runtime_manifest_v2::RuntimeManifestV2 as RuntimeManifest;
 use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{

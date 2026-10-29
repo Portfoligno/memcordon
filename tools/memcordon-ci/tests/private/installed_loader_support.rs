@@ -53,7 +53,7 @@ pub(crate) fn fixture() -> (
     tempfile::TempDir,
     BuildSourceIdentity,
     InstalledWindowsPayload,
-    RuntimeManifest,
+    RuntimeManifestV2,
 ) {
     let directory = tempfile::tempdir().unwrap();
     let source = BuildSourceIdentity::Working {
@@ -83,7 +83,7 @@ pub(crate) fn fixture() -> (
         std::fs::write(directory.path().join(&path), &bytes).unwrap();
         components.push(super::super::target::runtime_component(role, path, &bytes));
     }
-    let manifest = RuntimeManifest::windows(
+    let manifest = RuntimeManifestV2::windows(
         source.version().to_string(),
         source.commit().into(),
         distribution.target.clone(),

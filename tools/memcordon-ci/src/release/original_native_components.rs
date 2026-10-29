@@ -8,11 +8,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use memcordon_readiness_verifier::{Artifact, ComponentBuild, ProducerManifest, ProductKey};
+use memcordon_readiness_verifier::current::ProducerManifestV2 as ProducerManifest;
+use memcordon_readiness_verifier::{Artifact, ComponentBuild, ProductKey};
 use serde::Deserialize;
 
 use super::{artifacts, native_component_harness, source};
-use crate::consumer_readiness_ledger::{CellEvidence, SourceIdentity};
+use crate::consumer_readiness_current::CellEvidenceV2 as CellEvidence;
+use crate::readiness_identity::SourceIdentity;
 use crate::{CiError, Result};
 #[path = "original_loader_diagnostic.rs"]
 pub mod loader_diagnostic;
@@ -99,7 +101,7 @@ struct AcquiredActor {
     source: source::BuildSourceIdentity,
     native_target: String,
     features: Vec<String>,
-    runtime_manifest: memcordon_core::runtime_manifest::RuntimeManifest,
+    runtime_manifest: memcordon_core::runtime_manifest_v2::RuntimeManifestV2,
 }
 
 #[cfg(windows)]
@@ -677,6 +679,61 @@ fn persist_unix(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn retain_current_owner_probe(
+    root: &Path,
+    identity: &SourceIdentity,
+    target: &str,
+    destination: &Path,
+) -> Result<Vec<crate::windows_installed_cases::SelectedArtifact>> {
+    let executable = std::env::current_exe()?;
+    let bytes = artifacts::read_file(&executable)?;
+    super::target::validate_executable(&bytes, target)?;
+    let preparation = artifacts::read_file(&root.join("target/ci-preparation/readiness.json"))?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&preparation)
+        .map_err(CiError::Message)?;
+    let record: serde_json::Value = serde_json::from_slice(&preparation)?;
+    if record["format"] != 1
+        || record["inputs"]["kind"] != "readiness"
+        || record["inputs"]["source"]["commit"] != identity.source_commit
+        || record["inputs"]["source"]["version"] != identity.version
+        || record["inputs"]["host"] != target
+        || !record["files"].as_array().is_some_and(|files| {
+            files.iter().any(|file| {
+                file["sha256"] == artifacts::checksum(&bytes)
+                    && file["size"] == bytes.len() as u64
+                    && file["executable"] == true
+            })
+        })
+    {
+        return Err(CiError::Message(
+            "current owner probe is not the original source-prepared controller image".into(),
+        ));
+    }
+    std::fs::create_dir(destination)?;
+    let artifact = retain_file(
+        &executable,
+        destination,
+        Path::new("current-linux-owner"),
+        None,
+        512 * 1024 * 1024,
+    )?;
+    persist(
+        &destination.join("current-linux-owner.preparation.json"),
+        &preparation,
+    )?;
+    Ok(vec![
+        crate::windows_installed_cases::SelectedArtifact {
+            path: destination.join(artifact.path),
+            sha256: artifact.sha256,
+        },
+        crate::windows_installed_cases::SelectedArtifact {
+            path: destination.join("current-linux-owner.preparation.json"),
+            sha256: artifacts::checksum(&preparation),
+        },
+    ])
+}
+
 fn retain_file(
     source: &Path,
     bundle: &Path,
@@ -853,7 +910,7 @@ fn seal(root: &Path, args: &Args, selection: &Selection, cell: &CellEvidence) ->
     )?;
     let manifest = ProducerManifest {
         format: "memcordon.consumer-readiness.producer".into(),
-        revision: 1,
+        revision: 2,
         job: selection.job.clone(),
         run_id: selection.identity.run_id.clone(),
         run_attempt: selection.run_attempt,
@@ -861,7 +918,7 @@ fn seal(root: &Path, args: &Args, selection: &Selection, cell: &CellEvidence) ->
         source_tree_sha256: selection.identity.source_tree_sha256.clone(),
         version: selection.identity.version.clone(),
         manifest_sha256: artifacts::checksum(&artifacts::read_file(
-            &root.join("ci/consumer-readiness-v1.toml"),
+            &root.join("ci/consumer-readiness-v2.toml"),
         )?),
         artifacts: cell.artifacts.clone(),
         products: Vec::new(),
@@ -1011,279 +1068,134 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
         let (build, source, artifacts) = prepare_build(&root, &destination, &prefix, &selection)?;
         cell.component_build = Some(build.clone());
         cell.artifacts = artifacts;
-        let operational = acquire_linux_role(&selection, "operational")?;
         let parser = acquire_linux_role(&selection, "parser")?;
-        let operational = scope.prepare("operational", &operational)?;
         let parser = scope.prepare("parser", &parser)?;
-        let preparation = scope.prepare_operational_fixture(
+        let operational = acquire_linux_role(&selection, "operational")?;
+        let operational = scope.prepare("operational", &operational)?;
+        if let Err(error) = scope.execute_current_recipes(
+            &parser,
             &operational,
-            &selection.scope_recipe(),
-            &root,
-            &selection.identity,
+            &selection.identity.run_id,
+            recipe_id,
+            &scope_recipe,
             &selection.target,
-            &destination,
+            prefix_text,
             selection.work,
             selection.cleanup,
             selection.deadline.work_deadline_unix_millis,
             selection.deadline.cleanup_deadline_unix_millis,
-        );
-        if let Err(error) = &preparation {
+        ) {
             cell.cleanup_failures
-                .push(format!("original native fixture preparation: {error}"));
+                .push(format!("current native execution: {error}"));
         }
-        if preparation.is_ok()
-            && let Err(error) = scope.execute(
-                &parser,
-                &operational,
-                &selection.identity.run_id,
-                recipe_id,
-                &scope_recipe,
-                &selection.target,
-                prefix_text,
-                selection.work,
-                selection.cleanup,
-                selection.deadline.work_deadline_unix_millis,
-                selection.deadline.cleanup_deadline_unix_millis,
-            )
-        {
-            cell.cleanup_failures
-                .push(format!("original native execution: {error}"));
-        }
-        // Settlement precedes evidence decoding, but deletion never precedes copying.
         if let Err(error) = scope.settle(selection.cleanup) {
             cell.cleanup_failures.push(error.to_string());
         }
         cell.cleanup_failures
             .extend(scope.failures().iter().cloned());
-        // Borrow the actual protected acquisition records before deleting the
-        // administrative scope. The loan retains their native file/ancestor
-        // custody throughout unchanged publication into the producer bundle.
-        let fixture_acquisition = match scope.component_fixture_acquisition(selection.cleanup) {
-            Ok(loan) => {
-                let transfer =
-                    (|| -> Result<memcordon_readiness_verifier::ComponentFixtureAcquisition> {
-                        let relative = prefix.join("native-fixture");
-                        let parents = DirectoryCustody::create_confined(&destination, &relative)?;
-                        let mut paths = std::collections::BTreeMap::new();
-                        for (name, bytes) in loan.entries() {
-                            if Instant::now() >= selection.cleanup {
-                                return Err(CiError::Message(
-                                    "original fixture transfer cutoff exhausted".into(),
-                                ));
-                            }
-                            let path = relative.join(name);
-                            persist(&destination.join(&path), bytes)?;
-                            parents.verify()?;
-                            let path = path
-                                .to_str()
-                                .ok_or_else(|| {
-                                    CiError::Message("fixture transport path not UTF8".into())
-                                })?
-                                .to_owned();
-                            cell.artifacts.push(Artifact {
-                                path: path.clone(),
-                                length: bytes.len() as u64,
-                                sha256: artifacts::checksum(bytes),
-                            });
-                            paths.insert(name.as_str(), path);
-                        }
-                        let mut take = |name| {
-                            paths.remove(name).ok_or_else(|| {
-                                CiError::Message(format!("actual fixture acquisition omits {name}"))
-                            })
-                        };
-                        Ok(memcordon_readiness_verifier::ComponentFixtureAcquisition {
-                            checkpoint: take("owned-resources-acquired.json")?,
-                            account_intent: take("exclusive-account-intent.json")?,
-                            account_readback: take("exclusive-account-getent.bin")?,
-                            group_readback: take("exclusive-group-getent.bin")?,
-                        })
-                    })();
-                let leaves = loan.verify(selection.cleanup);
-                if let Err(error) = &leaves {
-                    cell.cleanup_failures
-                        .push(format!("native fixture acquired leaf custody: {error}"));
-                }
-                let named = scope.verify_named();
-                if let Err(error) = &named {
-                    cell.cleanup_failures
-                        .push(format!("native fixture source named custody: {error}"));
-                }
-                let transfer = transfer.and_then(|acquired| leaves.and(named).map(|()| acquired));
-                // The acquisition loan remains held through the final named
-                // source check. A transfer failure cannot bypass settlement.
-                match transfer {
-                    Ok(acquired) => Some(acquired),
-                    Err(error) => {
-                        cell.cleanup_failures
-                            .push(format!("native fixture acquisition transfer: {error}"));
-                        if let Err(cleanup) = scope.settle(selection.cleanup) {
-                            cell.cleanup_failures
-                                .push(format!("native fixture transfer settlement: {cleanup}"));
-                        }
-                        None
-                    }
-                }
-            }
-            Err(error) => {
-                cell.cleanup_failures
-                    .push(format!("native fixture acquisition transfer: {error}"));
-                None
-            }
-        };
-        // The fast-exit recovery process is associated with this unchanged
-        // originally selected package owner, not a reconstructed metadata view.
-        match scope.component_package_owner(selection.cleanup) {
-            Ok(loan) => {
-                let transfer = (|| -> Result<()> {
-                    let relative = prefix.join("native-fixture");
-                    let parents = DirectoryCustody::create_confined(&destination, &relative)?;
-                    if loan.entries().len() != 1
-                        || loan.entries()[0].0 != "native-package-owner.json"
-                    {
-                        return Err(CiError::Message(
-                            "native package owner loan has a different record set".into(),
-                        ));
-                    }
-                    for (name, bytes) in loan.entries() {
-                        if Instant::now() >= selection.cleanup {
-                            return Err(CiError::Message(
-                                "original package owner transfer cutoff exhausted".into(),
-                            ));
-                        }
-                        let path = relative.join(name);
-                        persist(&destination.join(&path), bytes)?;
-                        parents.verify()?;
-                        cell.artifacts.push(Artifact {
-                            path: path
-                                .to_str()
-                                .ok_or_else(|| {
-                                    CiError::Message("package owner transport path not UTF8".into())
-                                })?
-                                .to_owned(),
-                            length: bytes.len() as u64,
-                            sha256: artifacts::checksum(bytes),
-                        });
-                    }
-                    Ok(())
-                })();
-                let leaves = loan.verify(selection.cleanup);
-                let named = scope.verify_named();
-                for (label, result) in [("leaf", &leaves), ("scope", &named)] {
-                    if let Err(error) = result {
-                        cell.cleanup_failures
-                            .push(format!("native package owner {label} custody: {error}"));
-                    }
-                }
-                if let Err(error) = transfer.and(leaves).and(named) {
-                    cell.cleanup_failures
-                        .push(format!("native package owner transfer: {error}"));
-                    if let Err(cleanup) = scope.settle(selection.cleanup) {
-                        cell.cleanup_failures.push(format!(
-                            "native package owner transfer settlement: {cleanup}"
-                        ));
-                    }
-                }
-            }
+        let nested = format!("{prefix_text}/current-parser");
+        match super::linux_current_components::collect_parser(
+            &selection.identity,
+            &build,
+            &source,
+            &scope.outputs().join("recipes/current-parser"),
+            &nested,
+            &destination,
+            &selection.identity.version,
+        ) {
+            Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
             Err(error) => cell
                 .cleanup_failures
-                .push(format!("native package owner acquisition: {error}")),
+                .push(format!("current parser capture: {error}")),
         }
-        for name in [
-            "index-parser",
-            "operational-parser",
-            "filter",
-            "versions",
-            "journal",
-            "release",
-        ] {
-            let output = scope.outputs().join("recipes").join(name);
-            let nested = prefix.join(name);
-            match crate::linux_consumer_readiness::normalize_native_harness_with_fixture(
-                &selection.identity,
-                &build,
-                &source,
-                &output,
-                nested.to_str().ok_or_else(|| {
-                    CiError::Message("native recipe prefix encoding differs".into())
-                })?,
-                &destination,
-                if name == "release" {
-                    fixture_acquisition.clone()
-                } else {
-                    None
-                },
-            ) {
-                Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
-                Err(error) => cell.cleanup_failures.push(format!(
-                    "{name}: retained native products unavailable: {error}"
-                )),
-            }
+        scope.verify_named()?;
+        match super::linux_current_components::collect_filter(
+            &selection.identity,
+            &build,
+            &source,
+            &scope.outputs().join("recipes/current-filter"),
+            &format!("{prefix_text}/current-filter"),
+            &destination,
+            &selection.identity.version,
+        ) {
+            Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
+            Err(error) => cell
+                .cleanup_failures
+                .push(format!("current filter capture: {error}")),
         }
-        for name in ["account-retirement", "lost-terminal"] {
-            let projection = (|| -> Result<()> {
-                let acquired = fixture_acquisition.clone().ok_or_else(|| {
-                    CiError::Message(
-                        "native recovery original fixture acquisition unavailable".into(),
-                    )
-                })?;
-                let relative = prefix.join(name);
-                let (records, products) =
-                    crate::linux_consumer_readiness::normalize_native_recovery_harness(
-                        &selection.identity,
-                        &build,
-                        &source,
-                        &scope.outputs().join("recipes").join(name),
-                        relative.to_str().ok_or_else(|| {
-                            CiError::Message("native recovery prefix is not UTF8".into())
-                        })?,
-                        &destination,
-                        acquired,
-                    )
-                    .map_err(CiError::Message)?;
-                let mut retained = Vec::new();
-                for (artifact, bytes) in products {
-                    if Instant::now() >= selection.cleanup {
-                        return Err(CiError::Message(
-                            "original recovery transport cutoff exhausted".into(),
-                        ));
-                    }
-                    let path = Path::new(&artifact.path);
-                    let parent =
-                        crate::linux_consumer_readiness::recovery_artifact_tree::projected_parent(
-                            path, &relative,
-                        )
-                        .map_err(CiError::Message)?;
-                    if artifact.length != bytes.len() as u64
-                        || artifact.sha256 != artifacts::checksum(&bytes)
-                    {
-                        return Err(CiError::Message(
-                            "native recovery projection substitutes its confined bytes/path".into(),
-                        ));
-                    }
-                    let parents = DirectoryCustody::create_confined(&destination, parent)?;
-                    persist(&destination.join(path), &bytes)?;
-                    parents.verify()?;
-                    retained.push(artifact);
+        match super::linux_current_components::collect_versions(
+            &selection.identity,
+            &build,
+            &source,
+            &scope.outputs().join("recipes/current-versions"),
+            &format!("{prefix_text}/current-versions"),
+            &destination,
+            &selection.identity.version,
+        ) {
+            Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
+            Err(error) => cell
+                .cleanup_failures
+                .push(format!("current version capture: {error}")),
+        }
+        match super::linux_current_components::collect_wire_version(
+            &selection.identity,
+            &build,
+            &source,
+            &scope.outputs().join("recipes/current-wire"),
+            &format!("{prefix_text}/current-wire"),
+            &destination,
+            &selection.identity.version,
+        ) {
+            Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
+            Err(error) => cell
+                .cleanup_failures
+                .push(format!("current wire capture: {error}")),
+        }
+        let native_key = memcordon_readiness_verifier::ProductKey {
+            target: selection.target.clone(),
+            channel: "candidate-native".into(),
+        };
+        let payload = super::installed_consumer::materialize_native(
+            &root.join(".release/target"),
+            scope.outputs(),
+        )?;
+        match super::linux_current_component_lifetime::run(
+            &root,
+            &payload,
+            &selection.identity,
+            &native_key,
+            scope.outputs(),
+            prefix_text,
+            &destination,
+            &build,
+            &source,
+            selection.work,
+            selection.cleanup,
+            selection.deadline.cleanup_deadline_unix_millis,
+        ) {
+            Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
+            Err(primary) => {
+                match super::linux_current_component_lifetime::retained_observations(
+                    scope.outputs(),
+                    &selection.identity,
+                    &native_key,
+                ) {
+                    Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
+                    Err(secondary) => cell.cleanup_failures.push(format!(
+                        "current native lifecycle retained frame: {secondary}"
+                    )),
                 }
-                scope.verify_named()?;
-                merge_rows(&mut cell, records, retained)
-            })();
-            let named = scope.verify_named();
-            if let Err(error) = &named {
                 cell.cleanup_failures
-                    .push(format!("{name}: native recovery source custody: {error}"));
+                    .push(format!("current native lifecycle: {primary}"));
             }
-            if let Err(error) = projection.and(named) {
-                cell.cleanup_failures.push(format!(
-                    "{name}: retained native recovery unavailable: {error}"
-                ));
-                if let Err(cleanup) = scope.settle(selection.cleanup) {
-                    cell.cleanup_failures.push(format!(
-                        "{name}: independent recovery transfer settlement: {cleanup}"
-                    ));
-                }
-            }
+        }
+        drop(payload);
+        if cell
+            .records
+            .iter()
+            .any(|record| record.state == memcordon_readiness_verifier::CaseState::Failed)
+        {
+            return Err(CiError::Message("independent current native component operation failed; original rows and captures retained".into()));
         }
         // Persist partial evidence before any cleanup. Missing capture products are
         // an operation failure, never permission to publish fabricated test rows.
@@ -1410,7 +1322,7 @@ fn prepare_windows_support_until(
         None,
         16 * 1024 * 1024,
     )?;
-    let parsed = memcordon_core::runtime_manifest::RuntimeManifest::parse(&manifest.bytes)
+    let parsed = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&manifest.bytes)
         .map_err(CiError::Message)?;
     if serde_json::to_vec(&parsed)? != serde_json::to_vec(&actor.runtime_manifest)? {
         return Err(CiError::Message(
@@ -1776,7 +1688,7 @@ fn cleanup_windows(root: &Path, destination: &Path, selection: &Selection) -> Re
         ));
     }
     let manifest = OwnedRecord::read(&selected_directory.join("runtime-manifest.json"))?;
-    let parsed = memcordon_core::runtime_manifest::RuntimeManifest::parse(&manifest.bytes)
+    let parsed = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&manifest.bytes)
         .map_err(CiError::Message)?;
     if serde_json::to_vec(&parsed)? != serde_json::to_vec(&actor.runtime_manifest)?
         || artifacts::checksum(&manifest.bytes) != owner.config.installed_manifest.sha256
@@ -2195,7 +2107,7 @@ fn validate_windows_settlement(
     let mut expected_paths = vec![
         owner.removal.binary_root.clone(),
         owner.removal.state_root.clone(),
-        owner.removal.policy_root.clone(),
+        owner.removal.diagnostics_root.clone(),
         owner.config.installed_agent.path.clone(),
         owner.config.installed_manifest.path.clone(),
     ];
@@ -2333,7 +2245,7 @@ fn settle_windows_support(
         windows_launcher_diagnostic::retain(
             &launcher_diagnostic_binding(owner)?,
             &lifetime.join("launcher-diagnostic-epoch.json"),
-            &owner.removal.policy_root,
+            &owner.removal.diagnostics_root,
             directory,
             cleanup,
         )
@@ -2618,14 +2530,14 @@ impl DirectoryCustody {
 }
 
 fn empty_cell(root: &Path, selection: &Selection) -> Result<CellEvidence> {
-    let index = crate::consumer_readiness_ledger::initialize(
-        &root.join("ci/consumer-readiness-v1.toml"),
+    let index = crate::consumer_readiness_current::initialize(
+        &root.join("ci/consumer-readiness-v2.toml"),
         selection.identity.clone(),
     )
     .map_err(CiError::Message)?;
     Ok(CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
+        revision: 2,
         identity: selection.identity.clone(),
         key: ProductKey {
             target: selection.target.clone(),
@@ -2788,6 +2700,52 @@ fn prepare_build(
         length: recipe.len() as u64,
         sha256: recipe_hash.clone(),
     });
+    #[cfg(target_os = "linux")]
+    let actor = {
+        let executable = std::env::current_exe()?;
+        let bytes = artifacts::read_file(&executable)?;
+        super::target::validate_executable(&bytes, &selection.target)?;
+        let preparation = artifacts::read_file(&root.join("target/ci-preparation/readiness.json"))?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&preparation)
+            .map_err(CiError::Message)?;
+        let record: serde_json::Value = serde_json::from_slice(&preparation)?;
+        if record["format"] != 1
+            || record["inputs"]["kind"] != "readiness"
+            || record["inputs"]["source"]["commit"] != selection.identity.source_commit
+            || record["inputs"]["host"] != selection.target
+            || !record["files"].as_array().is_some_and(|files| {
+                files.iter().any(|file| {
+                    file["sha256"] == artifacts::checksum(&bytes)
+                        && file["size"] == bytes.len() as u64
+                        && file["executable"] == true
+                })
+            })
+        {
+            return Err(CiError::Message(
+                "actual current lifecycle controller differs from original source preparation"
+                    .into(),
+            ));
+        }
+        let artifact = retain_file(
+            &executable,
+            destination,
+            &prefix.join("roles/lifecycle-controller/harness"),
+            None,
+            512 * 1024 * 1024,
+        )?;
+        let path = artifact.path.clone();
+        retained.push(artifact);
+        let proof = prefix.join("roles/lifecycle-controller/preparation.json");
+        persist(&destination.join(&proof), &preparation)?;
+        retained.push(Artifact {
+            path: proof.to_string_lossy().into_owned(),
+            length: preparation.len() as u64,
+            sha256: artifacts::checksum(&preparation),
+        });
+        Some(path)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let actor = None;
     Ok((
         ComponentBuild {
             target: selection.target.clone(),
@@ -2799,7 +2757,7 @@ fn prepare_build(
             executable: operational
                 .ok_or_else(|| CiError::Message("operational native role absent".into()))?,
             instrumented: true,
-            actor_executable: None,
+            actor_executable: actor,
             frontend_wrapper_executable: None,
             parser_executable: parser,
         },
@@ -3045,6 +3003,24 @@ fn cleanup_linux(root: &Path, destination: &Path, selection: &Selection) -> Resu
         selection.cleanup,
     )?;
     let mut errors = Vec::new();
+    if scope.outputs().join("current-owner.json").try_exists()? {
+        let key = memcordon_readiness_verifier::ProductKey {
+            target: selection.target.clone(),
+            channel: "candidate-native".into(),
+        };
+        if let Err(error) = super::linux_current_lease::recover_current_cell(
+            root,
+            scope.outputs(),
+            scope.outputs(),
+            &selection.identity,
+            &key,
+            selection.cleanup,
+        ) {
+            errors.push(format!(
+                "original current native component lifetime recovery: {error}"
+            ));
+        }
+    }
     let settled = match scope.settle(selection.cleanup) {
         Ok(()) => true,
         Err(error) => {

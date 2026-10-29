@@ -3,13 +3,24 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 
-pub(crate) fn copy_exact(source: &File, destination: &mut File, size: u64) -> io::Result<()> {
+pub(crate) fn copy_exact(
+    source: &File,
+    destination: &mut File,
+    size: u64,
+    cutoff: std::time::Instant,
+) -> io::Result<()> {
     let bound = size
         .checked_add(1)
         .ok_or_else(|| io::Error::other("image copy bound overflow"))?;
     let mut offset = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if std::time::Instant::now() >= cutoff {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original snapshot copy cutoff exhausted",
+            ));
+        }
         let remaining = bound - offset;
         let length = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("image copy buffer length fits usize");

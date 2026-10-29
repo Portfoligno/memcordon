@@ -15,6 +15,9 @@ impl PrivateNamespaceTargetIdentity {
     pub fn host_pid(self) -> i32 {
         self.host_pid
     }
+    pub fn namespace_pid(self) -> i32 {
+        self.namespace_pid
+    }
 
     pub fn require_exec_pid(
         self,

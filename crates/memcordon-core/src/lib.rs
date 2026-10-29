@@ -9,38 +9,26 @@
 
 pub mod canonical_json;
 pub mod diagnostics;
-pub mod historical_public_reports;
-pub mod historical_workload_evidence;
-pub use historical_public_reports::{HistoricalDoctorReport, HistoricalPlanReport};
-pub mod product_fixture;
+pub mod discovery;
+pub mod execution_facts;
+pub mod identifiers;
+pub mod native_readiness;
 pub mod provider_rejection_wire;
+pub mod runtime_components;
 pub mod runtime_evidence;
-pub mod runtime_manifest;
-pub mod runtime_readiness;
+pub mod runtime_manifest_v2;
 pub use runtime_evidence::*;
-pub mod report_v11;
-pub mod result_v1;
-pub mod result_v2;
-pub use result_v1::{ReportFormat, ResultReport, ResultV1};
+pub mod result_v3;
+pub use execution_facts::{ReportFormat, ResultReport};
+pub use result_v3::ResultV3;
+pub use windows_sealed::*;
 pub mod elf_closure;
-pub mod mixed_advisory;
-pub mod mixed_observation;
-pub mod mixed_runtime;
-pub mod private_runtime;
-pub mod runtime_image_census;
-pub mod workload_admission_v2;
-pub mod workload_admission_v3;
-pub mod workload_codec;
-pub mod workload_contract;
-pub mod workload_contract_v3;
-pub mod workload_discovery;
-pub mod workload_discovery_v2;
-pub mod workload_evidence;
-pub mod workload_evidence_v2;
+pub mod workload_bundle;
+pub mod workload_chunks;
+pub mod workload_files;
 pub mod workload_limits;
-pub mod workload_registry;
-pub mod workload_registry_v2;
-pub mod workload_registry_v3;
+pub mod workload_request;
+pub mod workload_requirements;
 pub use diagnostics::*;
 mod error;
 mod outcome;
@@ -51,7 +39,7 @@ mod state_machine;
 mod supervision;
 #[cfg(feature = "test-support")]
 pub mod test_support;
-mod windows_capability_owner;
+mod windows_capability_owner_v2;
 mod windows_guardian_receipt;
 mod windows_pe;
 mod windows_process_observation;
@@ -77,16 +65,14 @@ pub use policy::{
 pub use policy::{DeadlinePolicy, DeadlineScope};
 pub use report::{
     AttemptHistoryReport, BackoffPolicyReport, BudgetKindReport, BudgetTokenReport,
-    CLEAN_REPORT_SCHEMA_VERSION, CircuitBreakerPolicyReport, CleanReport,
-    DOCTOR_REPORT_SCHEMA_VERSION, DeadlinePolicyReport, DoctorReport,
-    EXECUTION_REPORT_SCHEMA_VERSION, EffectiveMemoryPolicyReport, EffectivePolicyReport,
-    EffectiveRestartPolicyReport, ExecutionErrorReport, HistoricalMemcordonReport, HostReport,
+    CLEAN_REPORT_SCHEMA_VERSION, CircuitBreakerPolicyReport, CleanReport, DeadlinePolicyReport,
+    DoctorReport, EXECUTION_REPORT_SCHEMA_VERSION, EffectiveMemoryPolicyReport,
+    EffectivePolicyReport, EffectiveRestartPolicyReport, ExecutionErrorReport, HostReport,
     InvocationReport, MemcordonReport, NativeArgument, NativeArgumentRaw, OptionEffectReport,
-    PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanResolutionReport, PolicyEnvelopeReport,
-    ReportModelError, ReportWritePhase, RequestedMemoryPolicyReport, RequestedPolicyReport,
-    RequestedRestartPolicyReport, RequirementReport, SupervisionReport, SwapReport, ToolReport,
-    UnavailableCapabilityReport, WINDOWS_EXECUTION_REPORT_SCHEMA_V11,
-    WindowsTerminalDeliveryEvidenceV1, write_report_atomic, write_report_bytes_atomic,
+    PlanReport, PlanResolutionReport, PolicyEnvelopeReport, ReportModelError, ReportWritePhase,
+    RequestedMemoryPolicyReport, RequestedPolicyReport, RequestedRestartPolicyReport,
+    RequirementReport, SupervisionReport, SwapReport, ToolReport, UnavailableCapabilityReport,
+    write_report_atomic, write_report_bytes_atomic,
 };
 #[cfg(feature = "test-support")]
 pub use report::{
@@ -115,13 +101,14 @@ pub use supervision::{
     WindowsLoaderDebugObservationV1, WindowsLoaderMitigationObservationV1,
     WindowsLoaderMitigationPolicyObservationV1, WindowsLoaderNativeStatusV1,
     WindowsLoaderQualificationFailureV2, WindowsLoaderQualificationOutcomeV2,
-    WindowsLoaderQualificationStageV2, WindowsLoaderReadyEvidenceV1, WindowsSealedEvidenceV2,
+    WindowsLoaderQualificationStageV2, WindowsLoaderReadyEvidenceV1, WorkloadFrontendEvidenceV1,
     boundary_evidence_is_consistent,
 };
-pub use windows_capability_owner::{
-    WINDOWS_CAPABILITY_OWNER_MANIFEST_SCHEMA_VERSION, WINDOWS_CAPABILITY_OWNER_ROLE_COUNT,
-    WindowsCapabilityExtinctionProofV1, WindowsCapabilityOwnerEntryV1,
-    WindowsCapabilityOwnerManifestV1, WindowsCapabilityOwnerRoleV1, WindowsJobClosureContractV1,
+pub use windows_capability_owner_v2::{
+    WINDOWS_CURRENT_CAPABILITY_OWNER_MANIFEST_SCHEMA_VERSION,
+    WINDOWS_CURRENT_CAPABILITY_OWNER_ROLE_COUNT, WindowsCapabilityExtinctionProofV2,
+    WindowsCapabilityOwnerEntryV2, WindowsCapabilityOwnerManifestV2, WindowsCapabilityOwnerRoleV2,
+    WindowsJobClosureContractV2,
 };
 pub use windows_guardian_receipt::{
     WindowsGuardianCleanupTriggerV1, WindowsGuardianReceiptBinding, WindowsGuardianReceiptV2,
@@ -147,59 +134,6 @@ pub use windows_process_observation::{
 pub use windows_recovery_authorization::{
     WindowsRecoveryAccessFloorV1, WindowsRecoveryAuthorizationV1, WindowsRecoveryCallerEvidenceV1,
     WindowsRecoveryPolicyV1,
-};
-pub use windows_sealed::{
-    NativeWindowsCommandV1, WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT, WINDOWS_CONTROL_PIPE,
-    WINDOWS_CONTROL_REQUIRED_PRIVILEGES, WINDOWS_CONTROL_SERVICE_NAME,
-    WINDOWS_GUARDIAN_PIPE_PREFIX, WINDOWS_GUARDIAN_SERVICE_PREFIX, WINDOWS_GUARDIAN_SLOT_COUNT,
-    WINDOWS_LAUNCHER_PIPE, WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES, WINDOWS_LAUNCHER_SERVICE_NAME,
-    WINDOWS_MAX_FRAME_BYTES, WINDOWS_MAX_JOB_PROCESS_IDENTITIES,
-    WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS, WINDOWS_PREAUTHORIZATION_FAULTS,
-    WINDOWS_PRIVATE_PROTOCOL_VERSION, WINDOWS_PUBLIC_PROTOCOL_VERSION,
-    WINDOWS_RELEASE_MUTANT_VARIANTS, WINDOWS_RELEASE_MUTANTS, WINDOWS_RETIREMENT_FAULTS,
-    WINDOWS_SESSION_BROKER_PIPE, WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES,
-    WINDOWS_SESSION_BROKER_SERVICE_NAME, WindowsAttemptRetainedV1, WindowsAttemptRetainedV2,
-    WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1, WindowsAuthorityLossEvidenceV1,
-    WindowsCallerTokenEnvelopeV1, WindowsCertificationObservationsV1,
-    WindowsCertificationObservationsV2, WindowsCertificationPhaseV1,
-    WindowsCleanupProcessCreationEvidenceV1, WindowsControlRequestStatusV1,
-    WindowsControlWorkerSiteV1, WindowsDurableAttemptRecordV1, WindowsDurableAttemptRecordV4,
-    WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1, WindowsFaultRejectionObservationV1,
-    WindowsFaultRejectionObservationV2, WindowsGuardianAttemptObservation,
-    WindowsLaunchBrokerRequestV1, WindowsLaunchPolicyV1, WindowsLaunchRequestV1,
-    WindowsLauncherRequestV1, WindowsLauncherRequestV3, WindowsLauncherResponseV1,
-    WindowsLauncherResponseV3, WindowsLifetimeV1, WindowsLoaderDiagnosticKindV1,
-    WindowsLoaderDiagnosticSelectionV1, WindowsMissingRetirementProofV1,
-    WindowsMutantHookObservationV1, WindowsMutantKillEvidenceV1, WindowsMutantNativeObservationV1,
-    WindowsMutantNativeReceiptV1, WindowsMutantObservationV1, WindowsPackageCleanupOutcomeV1,
-    WindowsPreauthorizationFaultMatrixEvidenceV1, WindowsPreauthorizationFaultMatrixEvidenceV2,
-    WindowsPreauthorizationRetirementProofV1, WindowsPrematureReleaseWitnessV1,
-    WindowsProcessIdentityV1, WindowsProviderProbeV1, WindowsProviderRejectionDispositionV2,
-    WindowsProviderRejectionV2, WindowsProviderReplacementQuiescenceV1, WindowsProviderRequestV1,
-    WindowsProviderRequestV3, WindowsProviderResponseV1, WindowsProviderResponseV3,
-    WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
-    WindowsReadOnlyQueryFailure, WindowsReadOnlyQueryOperation, WindowsReadOnlyQueryPhase,
-    WindowsRecoveryInventoryV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1,
-    WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsReplayPendingV2,
-    WindowsRetainedRecordBindingV1, WindowsRetainedRecordUnavailableReasonV1,
-    WindowsRetirementFaultMatrixEvidenceV1, WindowsRetirementFaultMatrixEvidenceV2,
-    WindowsRetirementLedgerCompletionV1, WindowsRetirementProofSourceV2, WindowsRetirementProofV2,
-    WindowsSealedFault, WindowsSealedMutant, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
-    WindowsTerminalLifecycleV1, WindowsTerminalPayloadV2, WindowsTerminalReceiptV1,
-    WindowsTerminalReceiptV2, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
-    WindowsTerminalRetiredV2, WindowsTerminalSeedV2, WindowsTerminalizationCheckpointV1,
-    WindowsTerminalizationErrorStageV1, WindowsTerminalizationErrorV1,
-    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1, WindowsTokenMatrixEvidenceV1,
-    WindowsTokenScenarioEvidenceV1, WindowsWorkerThreadIdentityV1,
-    authenticate_decoded_windows_attempt_record, authenticate_decoded_windows_attempt_record_v4,
-    decode_windows_command_line, encode_windows_command_line, encode_windows_environment_block,
-    parse_and_authenticate_windows_attempt_record,
-    parse_and_authenticate_windows_attempt_record_v4,
-    parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,
-    validate_windows_stream_manifest, windows_attempt_transition_allowed,
-    windows_certification_argument_prelude_len, windows_certification_transition_allowed,
-    windows_provider_replacement_quiescence, windows_service_attestation_challenge_is_valid,
-    windows_terminal_outbox_is_bound, windows_terminal_outbox_is_bound_v3,
 };
 pub use windows_startup_diagnostic::{
     WINDOWS_LAUNCHER_STARTUP_DIAGNOSTIC_BYTES, WINDOWS_LAUNCHER_STARTUP_DIAGNOSTIC_MAX_AGE_MILLIS,

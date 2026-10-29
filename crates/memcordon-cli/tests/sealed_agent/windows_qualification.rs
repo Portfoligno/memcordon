@@ -1,9 +1,9 @@
 use memcordon_core::{
-    WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1,
-    WindowsDurableCleanupStateV1, WindowsProcessIdentityV1, WindowsRelayPhaseV1,
-    WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsTerminalizationCheckpointV1,
-    WindowsTerminalizationErrorStageV1, WindowsTerminalizationErrorV1,
-    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
+    WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION, WindowsAttemptStateV1,
+    WindowsAttemptTerminalDispositionV1, WindowsDurableCleanupStateV1, WindowsProcessIdentityV1,
+    WindowsRelayPhaseV1, WindowsReplayMetadata, WindowsReplayOutboxStageV1,
+    WindowsTerminalizationCheckpointV1, WindowsTerminalizationErrorStageV1,
+    WindowsTerminalizationErrorV1, WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
 };
 use std::cell::Cell;
 
@@ -106,15 +106,15 @@ fn fallback_rejection_finalizes_before_staging_bound_terminal_outbox() {
         memcordon_core::BoundarySetupPhase::Retirement,
         true,
     );
-    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
-        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = memcordon_core::WindowsLauncherResponseV4::Reject {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
         request_sha256: record.request_sha256.clone(),
         rejection,
     };
     record.stage_terminal_response_for_test(&response).unwrap();
-    let replayed: memcordon_core::WindowsLauncherResponseV3 =
+    let replayed: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(replayed).unwrap(),
@@ -177,15 +177,15 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
         "MCSEALED-WINDOWS-LAUNCH",
         memcordon_core::BoundarySetupPhase::Retirement,
     );
-    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
-        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+    let response = memcordon_core::WindowsLauncherResponseV4::Reject {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
         request_sha256: record.request_sha256.clone(),
         rejection,
     };
     record.stage_terminal_response_for_test(&response).unwrap();
-    let replayed: memcordon_core::WindowsLauncherResponseV3 =
+    let replayed: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(replayed).unwrap(),
@@ -225,7 +225,7 @@ fn qualification_accepts_only_locally_derived_pre_stream_reject_attempts() {
 
     for returned_attempt in [&process_attempt, &pretarget_attempt] {
         crate::windows::qualification::validate_native_reject(
-            WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             returned_attempt,
             nonce,
             &request_sha256,
@@ -241,7 +241,7 @@ fn qualification_accepts_only_locally_derived_pre_stream_reject_attempts() {
     }
 
     let error = crate::windows::qualification::validate_native_reject(
-        WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         &"cd".repeat(32),
         nonce,
         &request_sha256,
@@ -259,28 +259,28 @@ fn qualification_accepts_only_locally_derived_pre_stream_reject_attempts() {
 
     for (schema, returned_nonce, returned_digest, observed_rejection, predicate) in [
         (
-            WINDOWS_PUBLIC_PROTOCOL_VERSION + 1,
+            WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION + 1,
             nonce,
             request_sha256.as_str(),
             rejection.clone(),
             "schema",
         ),
         (
-            WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             "wrong-nonce",
             request_sha256.as_str(),
             rejection.clone(),
             "nonce",
         ),
         (
-            WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             nonce,
             "wrong-digest",
             rejection.clone(),
             "request-digest",
         ),
         (
-            WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             nonce,
             request_sha256.as_str(),
             {
@@ -319,7 +319,7 @@ fn qualification_post_stream_reject_is_pinned_to_the_active_attempt() {
         "bound post-stream rejection".to_owned(),
     );
     crate::windows::qualification::validate_native_reject(
-        WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         &active_attempt,
         nonce,
         &request_sha256,
@@ -334,7 +334,7 @@ fn qualification_post_stream_reject_is_pinned_to_the_active_attempt() {
     .unwrap();
 
     let error = crate::windows::qualification::validate_native_reject(
-        WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         &"78".repeat(32),
         nonce,
         &request_sha256,
@@ -431,8 +431,7 @@ fn failed_terminal_ack_preserves_primary_and_secondary_evidence() {
 #[test]
 fn terminal_ack_requires_exact_completed_v2_retirement_receipt() {
     use memcordon_core::{
-        WindowsProviderResponseV3, WindowsRetirementLedgerCompletionV1, WindowsTerminalRetiredV1,
-        WindowsTerminalRetiredV2,
+        WindowsProviderResponseV4, WindowsRetirementLedgerCompletionV1, WindowsTerminalRetiredV2,
     };
 
     let attempt_id = "a".repeat(64);
@@ -465,7 +464,7 @@ fn terminal_ack_requires_exact_completed_v2_retirement_receipt() {
             &terminal_response_sha256,
         )
     };
-    confirm(WindowsProviderResponseV3::TerminalRetiredV2(
+    confirm(WindowsProviderResponseV4::TerminalRetiredV2(
         retired.clone(),
     ))
     .unwrap();
@@ -473,28 +472,20 @@ fn terminal_ack_requires_exact_completed_v2_retirement_receipt() {
     let mut wrong_digest = retired.clone();
     wrong_digest.terminal_response_sha256 = "1".repeat(64);
     assert_eq!(
-        confirm(WindowsProviderResponseV3::TerminalRetiredV2(wrong_digest)).unwrap_err(),
+        confirm(WindowsProviderResponseV4::TerminalRetiredV2(wrong_digest)).unwrap_err(),
         "provider did not confirm exact terminal retirement"
     );
     let mut missing_proof = retired.clone();
     missing_proof.retirement_proof_sha256.clear();
     assert_eq!(
-        confirm(WindowsProviderResponseV3::TerminalRetiredV2(missing_proof)).unwrap_err(),
+        confirm(WindowsProviderResponseV4::TerminalRetiredV2(missing_proof)).unwrap_err(),
         "provider did not confirm exact terminal retirement"
     );
-    assert_eq!(
-        confirm(WindowsProviderResponseV3::TerminalRetired(
-            WindowsTerminalRetiredV1 {
-                schema_version: 1,
-                attempt_id: attempt_id.clone(),
-                nonce: nonce.to_owned(),
-                request_sha256: request_sha256.clone(),
-                terminal_response_sha256: terminal_response_sha256.clone(),
-                disposition: WindowsAttemptTerminalDispositionV1::Posttarget,
-            }
-        ))
-        .unwrap_err(),
-        "provider did not confirm exact terminal retirement"
+    assert!(
+        serde_json::from_slice::<WindowsProviderResponseV4>(
+            br#"{"kind":"unsupported","schema_version":99}"#
+        )
+        .is_err()
     );
 }
 
@@ -502,8 +493,7 @@ fn terminal_ack_requires_exact_completed_v2_retirement_receipt() {
 fn qualification_pending_diagnostic_preserves_authenticated_terminalization_snapshot() {
     let attempt_id = "a7".repeat(32);
     let request_sha256 = "b7".repeat(32);
-    let pending = WindowsReplayPendingV1 {
-        schema_version: 3,
+    let pending = WindowsReplayMetadata {
         causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
         provider_failure: None,
         diagnostic_availability:

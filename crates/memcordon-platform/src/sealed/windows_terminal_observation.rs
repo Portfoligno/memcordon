@@ -1,7 +1,7 @@
 //! Explicit frontend-local custody of an already authenticated terminal receipt.
 //! This adds no provider authority and does not change existing result formats.
 use memcordon_core::{
-    PublicProviderBindingV1, WindowsTerminalDeliveryEvidenceV1, WindowsTerminalReceiptV2,
+    PublicProviderBindingV1, WindowsFrontendDeliveryV3, WindowsTerminalReceiptV3,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 pub const MAX_TERMINAL_OBSERVATION_BYTES: usize =
-    memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES * 2;
+    memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES * 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,10 +17,12 @@ pub struct AuthenticatedWindowsTerminalObservation {
     pub format: String,
     pub revision: u32,
     pub provider: PublicProviderBindingV1,
-    pub terminal: WindowsTerminalReceiptV2,
-    pub frontend_delivery: WindowsTerminalDeliveryEvidenceV1,
+    pub terminal: WindowsTerminalReceiptV3,
+    pub frontend_delivery: WindowsFrontendDeliveryV3,
     /// Exact frontend-local serialization hashed by the authenticated protocol.
     pub provider_request: Vec<u8>,
+    /// Exact immutable authority serialization acknowledged by this frontend.
+    pub terminal_authority_json: String,
 }
 
 struct Active {
@@ -210,7 +212,7 @@ pub(super) fn retain_request(bytes: &[u8]) -> Result<(), String> {
             if let Some((path, file)) = active.request_publication.as_mut() {
                 file.write_all(bytes).map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
-                let mut named = std::fs::OpenOptions::new()
+                let named = std::fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                     .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -260,12 +262,20 @@ impl Drop for WindowsTerminalObservationScope {
 
 pub(super) fn retain(
     provider: &PublicProviderBindingV1,
-    terminal: &WindowsTerminalReceiptV2,
-    delivery: &WindowsTerminalDeliveryEvidenceV1,
+    terminal: &WindowsTerminalReceiptV3,
+    delivery: &WindowsFrontendDeliveryV3,
+    authority_json: Result<String, String>,
 ) {
     ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
         if let Some(active) = active.as_mut() {
+            let authority_json = match authority_json {
+                Ok(value) => value,
+                Err(error) => {
+                    active.first_probe_failure.get_or_insert(error);
+                    return;
+                }
+            };
             if active.observation.is_some() {
                 active.multiple_terminals = true;
                 return;
@@ -276,11 +286,12 @@ pub(super) fn retain(
             };
             active.observation = Some(AuthenticatedWindowsTerminalObservation {
                 format: "memcordon.windows-terminal-observation".into(),
-                revision: 1,
+                revision: 2,
                 provider: provider.clone(),
                 terminal: terminal.clone(),
                 frontend_delivery: delivery.clone(),
                 provider_request,
+                terminal_authority_json: authority_json,
             });
         }
     });

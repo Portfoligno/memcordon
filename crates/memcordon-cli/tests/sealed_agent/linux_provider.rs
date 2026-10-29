@@ -24,7 +24,7 @@ fn readiness_observation_requires_complete_retirement() {
         ] {
             let mut value = serde_json::to_value(&observation).unwrap();
             value[field] = false.into();
-            let mut incomplete: memcordon_core::runtime_readiness::ReadinessObservation =
+            let mut incomplete: memcordon_core::native_readiness::ReadinessObservation =
                 serde_json::from_value(value).unwrap();
             incomplete.observation_digest = incomplete.digest_facts().unwrap();
             assert!(
@@ -32,7 +32,7 @@ fn readiness_observation_requires_complete_retirement() {
                 "{field} must remain a real observation"
             );
             assert!(
-                memcordon_core::runtime_readiness::ReadinessObservation::parse(
+                memcordon_core::native_readiness::ReadinessObservation::parse(
                     incomplete.render().as_bytes()
                 )
                 .is_err()

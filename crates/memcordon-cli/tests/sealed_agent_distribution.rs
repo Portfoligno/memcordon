@@ -94,13 +94,13 @@ fn package_inspection_is_credential_free_and_machine_readable() {
     let inspection: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("inspection should be JSON");
     assert_eq!(inspection["format"], "memcordon.agent-package-inspection");
-    assert_eq!(inspection["revision"], 1);
+    assert_eq!(inspection["revision"], 2);
     assert_eq!(inspection["version"], env!("CARGO_PKG_VERSION"));
     #[cfg(target_os = "windows")]
     {
         assert_eq!(
             inspection["provider_protocol"],
-            memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+            memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
         );
         assert_eq!(inspection["mechanism"], "windows-job-object-v2");
         assert_eq!(inspection["platform"], "windows-service");
@@ -111,18 +111,19 @@ fn package_inspection_is_credential_free_and_machine_readable() {
         assert_eq!(inspection["mechanism"], "linux-pid-namespace-cgroup-v2");
         assert_eq!(inspection["platform"], "linux-systemd");
     }
+    for (field, format) in [
+        ("result", "memcordon.result"),
+        ("plan", "memcordon.plan"),
+        ("capabilities", "memcordon.capabilities"),
+    ] {
+        assert_eq!(inspection[field]["format"], format);
+        assert_eq!(inspection[field]["revision"], 3);
+    }
     assert_eq!(
-        inspection["execution_report_schema"],
-        memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
+        inspection["workload_request"]["format"],
+        "memcordon.workload-request"
     );
-    assert_eq!(
-        inspection["plan_report_schema"],
-        memcordon_core::PLAN_REPORT_SCHEMA_VERSION
-    );
-    assert_eq!(
-        inspection["doctor_report_schema"],
-        memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION
-    );
+    assert_eq!(inspection["workload_request"]["revision"], 1);
     assert_eq!(inspection["compiled_metadata_valid"], true);
     #[cfg(target_os = "windows")]
     let digest_fields = [

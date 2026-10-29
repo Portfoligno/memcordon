@@ -2,87 +2,80 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::{
-    BoundaryMechanismEvidence, BoundaryRequirement, CleanupSummary, RestartSafetyProof,
-    WindowsTerminalReceiptV1,
-};
+use crate::{BoundaryRequirement, CleanupSummary, RestartSafetyProof};
 
 pub const PROVIDER_REJECTION_MAX_DETAIL_BYTES: usize = 8 * 1024;
 
-/// Descriptive observations copied from an actual failed operational attempt.
-/// Parsing this value cannot authorize launch, retry or native retirement.
+/// Current factual failed-attempt observations; parsing never reacquires native ownership.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationalAttemptFailure {
-    pub format: String,
-    pub revision: u32,
-    pub private_rejection: Option<crate::private_runtime::PrivateRuntimeRejection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_preallocation_cancellation: Option<Box<crate::WindowsPreallocationCancellationV1>>,
+    pub windows_frontend_delivery: Option<crate::WindowsFrontendDeliveryV3>,
+    pub workload_attempt: Option<crate::workload_request::WorkloadAttemptAssociationV1>,
+    pub workload_binding: Option<crate::result_v3::WorkloadRequestAssociationV1>,
+    pub workload_rejection: Option<crate::workload_request::WorkloadRejectionV1>,
+    pub workload_input_complete: bool,
+    pub windows_current_rejection: Option<crate::WindowsProviderRejectionV3>,
     pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
-    pub provider_association: Option<crate::result_v1::ProviderAttemptAssociationV1>,
-    pub windows_rejection: Option<crate::WindowsProviderRejectionV2>,
-    pub windows_terminal_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
+    pub provider_association: Option<crate::execution_facts::ProviderAttemptAssociationV1>,
 }
-
 impl OperationalAttemptFailure {
     pub fn from_error(error: &Error) -> Option<Self> {
-        if error.private_rejection.is_none()
+        if error.windows_preallocation_cancellation.is_none()
             && error.provider_failure.is_none()
             && error.provider_association.is_none()
-            && error.windows_provider_rejection_v2.is_none()
-            && error.windows_terminal_delivery.is_none()
+            && error.windows_provider_rejection_v3.is_none()
+            && error.workload_attempt.is_none()
+            && error.workload_rejection.is_none()
+            && error.windows_frontend_delivery.is_none()
         {
             return None;
         }
         Some(Self {
-            format: "memcordon.operational-attempt-failure".into(),
-            revision: 1,
-            private_rejection: error.private_rejection.as_deref().cloned(),
+            windows_preallocation_cancellation: error.windows_preallocation_cancellation.clone(),
+            windows_frontend_delivery: error.windows_frontend_delivery.clone(),
+            workload_attempt: error.workload_attempt.clone(),
+            workload_binding: error.workload_binding.clone(),
+            workload_rejection: error.workload_rejection.clone(),
+            workload_input_complete: error.workload_input_complete,
+            windows_current_rejection: error.windows_provider_rejection_v3.as_deref().cloned(),
             provider_failure: error.provider_failure.clone(),
             provider_association: error.provider_association.as_deref().cloned(),
-            windows_rejection: error.windows_provider_rejection_v2.as_deref().cloned(),
-            windows_terminal_delivery: error.windows_terminal_delivery.clone(),
         })
     }
-
     pub fn validate(&self) -> Result<(), String> {
-        if self.format != "memcordon.operational-attempt-failure" || self.revision != 1 {
-            return Err("operational failure namespace differs".into());
-        }
-        if self.private_rejection.is_none()
-            && self.provider_failure.is_none()
-            && self.provider_association.is_none()
-            && self.windows_rejection.is_none()
-            && self.windows_terminal_delivery.is_none()
-        {
-            return Err("operational failure has no actual observations".into());
-        }
-        if let Some(rejection) = &self.private_rejection {
-            rejection.validate()?;
-            if self.provider_failure.is_some()
-                || self.provider_association.is_some()
-                || self.windows_rejection.is_some()
-                || self.windows_terminal_delivery.is_some()
+        if let Some(cancellation) = &self.windows_preallocation_cancellation {
+            cancellation.validate().map_err(str::to_owned)?;
+            if self.windows_current_rejection.is_some()
+                || self.provider_failure.is_some()
+                || self.workload_attempt.is_some()
+                || self.workload_rejection.is_some()
+                || self.windows_frontend_delivery.is_some()
             {
-                return Err("private rejection contains foreign Windows observations".into());
+                return Err(
+                    "preallocation cancellation imports another native execution/failure".into(),
+                );
             }
         }
         if self
-            .windows_rejection
+            .windows_current_rejection
             .as_ref()
-            .is_some_and(|rejection| !rejection.is_consistent())
+            .is_some_and(|x| !x.is_consistent())
             || self
-                .windows_terminal_delivery
+                .provider_failure
                 .as_ref()
-                .is_some_and(|delivery| !delivery.is_consistent())
-            || self.provider_failure.as_ref().is_some_and(|failure| {
-                !failure.is_consistent() || failure.projection_sha256 != failure.canonical_digest()
-            })
+                .is_some_and(|x| !x.is_consistent() || x.projection_sha256 != x.canonical_digest())
             || self
                 .provider_association
                 .as_ref()
-                .is_some_and(|association| !association.provider.is_consistent())
+                .is_some_and(|x| !x.provider.is_consistent())
         {
-            return Err("operational failure observations are inconsistent".into());
+            return Err("failed native observations are inconsistent".into());
+        }
+        if let Some(locator) = &self.workload_attempt {
+            locator.validate().map_err(|e| e.to_string())?;
         }
         if let (Some(failure), Some(association)) =
             (&self.provider_failure, &self.provider_association)
@@ -91,56 +84,12 @@ impl OperationalAttemptFailure {
                 || failure.attempt_id != association.attempt_id
                 || failure.request_sha256 != association.request_sha256
             {
-                return Err(
-                    "failure diagnostic differs from independently retained association".into(),
-                );
+                return Err("failure differs from authenticated association".into());
             }
         }
-        if let Some(rejection) = &self.windows_rejection {
-            if rejection.provider_failure != self.provider_failure {
-                return Err("Windows rejection diagnostic differs from retained failure".into());
-            }
-            if let (Some(receipt), Some(association)) =
-                (rejection.terminal_receipt(), &self.provider_association)
-            {
-                if receipt.attempt_id != String::from(association.attempt_id.clone())
-                    || receipt.request_sha256 != String::from(association.request_sha256.clone())
-                    || receipt.retirement_proof.provider_generation
-                        != association.provider.generation.as_str()
-                {
-                    return Err(
-                        "Windows receipt differs from independently retained association".into(),
-                    );
-                }
-            }
-        }
-        if let (Some(delivery), Some(association)) =
-            (&self.windows_terminal_delivery, &self.provider_association)
-        {
-            if delivery.attempt_id != String::from(association.attempt_id.clone())
-                || delivery.request_sha256 != String::from(association.request_sha256.clone())
-            {
-                return Err(
-                    "Windows delivery differs from independently retained association".into(),
-                );
-            }
-        }
-        if let (Some(delivery), Some(receipt)) = (
-            &self.windows_terminal_delivery,
-            self.windows_rejection
-                .as_ref()
-                .and_then(|rejection| rejection.terminal_receipt()),
-        ) {
-            if delivery.attempt_id != receipt.attempt_id
-                || delivery.request_sha256 != receipt.request_sha256
-                || delivery.nonce != receipt.nonce
-            {
-                return Err("Windows delivery differs from retained receipt".into());
-            }
-        }
-        crate::bounded_json_bytes(self, crate::result_v1::RESULT_MAX_BYTES, false)
+        crate::bounded_json_bytes(self, crate::execution_facts::RESULT_MAX_BYTES, false)
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -424,9 +373,8 @@ pub struct BoundarySetupFailure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderRejectionEvidence {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workload_admission: Option<crate::workload_evidence::WorkloadAdmissionRejectionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
     pub schema_version: u32,
@@ -442,13 +390,6 @@ pub struct ProviderRejectionEvidence {
     pub target_released: bool,
     pub cleanup_attempted: bool,
     pub restart_safety: RestartSafetyProof,
-    /// The provider durably retained this exact rejection until the caller
-    /// acknowledges it. This is independent of `terminal_receipt`: a launch
-    /// can fail after its streams became visible but before a target exists.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub terminal_ack_required: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_receipt: Option<Box<WindowsTerminalReceiptV1>>,
 }
 
 impl ProviderRejectionEvidence {
@@ -457,11 +398,6 @@ impl ProviderRejectionEvidence {
         const MAX_CLEANUP_ERRORS: usize = 16;
         const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
         self.schema_version == 1
-            && self.workload_admission.as_ref().is_none_or(|admission| {
-                !self.target_released
-                    && admission.request.authorization.approved_plan_digest
-                        == admission.request.workload_plan_digest
-            })
             && self.provider_failure.as_ref().is_none_or(|projection| {
                 projection.is_consistent()
                     && projection.canonical_digest() == projection.projection_sha256
@@ -489,23 +425,6 @@ impl ProviderRejectionEvidence {
             && (self.cleanup_attempted || self.restart_safety == RestartSafetyProof::default())
             && (!self.restart_safety.sealed_boundary_retired
                 || self.restart_safety.is_safe_for(BoundaryRequirement::Sealed))
-            && (!self.terminal_ack_required
-                || (self.cleanup_attempted
-                    && self.restart_safety.is_safe_for(BoundaryRequirement::Sealed)))
-            && self.terminal_receipt.as_ref().is_none_or(|terminal| {
-                let target_release_matches = matches!(
-                    &terminal.boundary_detail,
-                    BoundaryMechanismEvidence::WindowsJobObjectV2(native)
-                        if native.target_released == self.target_released
-                );
-                self.terminal_ack_required
-                    && self.target_created
-                    && target_release_matches
-                    && self.cleanup_attempted
-                    && terminal.schema_version == 1
-                    && terminal.restart_safety == self.restart_safety
-                    && terminal.process_identity_inventory_shape_is_bounded()
-            })
     }
 }
 
@@ -542,11 +461,15 @@ pub enum ErrorCategory {
 #[derive(Clone, Debug, Error)]
 #[error("{message} ({code})")]
 pub struct Error {
-    pub private_rejection: Option<Box<crate::private_runtime::PrivateRuntimeRejection>>,
-    pub provider_association: Option<Box<crate::result_v1::ProviderAttemptAssociationV1>>,
+    pub windows_preallocation_cancellation: Option<Box<crate::WindowsPreallocationCancellationV1>>,
+    pub windows_frontend_delivery: Option<crate::WindowsFrontendDeliveryV3>,
+    pub workload_attempt: Option<crate::workload_request::WorkloadAttemptAssociationV1>,
+    pub workload_binding: Option<crate::result_v3::WorkloadRequestAssociationV1>,
+    pub workload_rejection: Option<crate::workload_request::WorkloadRejectionV1>,
+    pub workload_input_complete: bool,
+    pub provider_association: Option<Box<crate::execution_facts::ProviderAttemptAssociationV1>>,
     pub runtime: Option<crate::RuntimeEvidenceV1>,
     pub native_startup: Option<NativeStartupDiagnosticV1>,
-    pub policy_enforcement: Option<crate::workload_evidence::RuntimePolicyEnforcement>,
     pub category: ErrorCategory,
     pub code: &'static str,
     pub message: String,
@@ -566,15 +489,19 @@ pub struct Error {
     /// Indirect because this error is propagated through nested native supervisor frames.
     pub provider_rejection: Option<Box<ProviderRejectionEvidence>>,
     /// Indirect for the same bounded-stack reason; report projection remains by value.
-    pub windows_provider_rejection_v2: Option<Box<crate::WindowsProviderRejectionV2>>,
-    pub windows_terminal_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
+    pub windows_provider_rejection_v3: Option<Box<crate::WindowsProviderRejectionV3>>,
     pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
 }
 
 impl Error {
     pub fn new(category: ErrorCategory, code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            private_rejection: None,
+            windows_preallocation_cancellation: None,
+            windows_frontend_delivery: None,
+            workload_attempt: None,
+            workload_binding: None,
+            workload_rejection: None,
+            workload_input_complete: false,
             provider_association: None,
             category,
             code,
@@ -593,10 +520,8 @@ impl Error {
             initial_spawn_failure: None,
             boundary_setup_failure: None,
             provider_rejection: None,
-            windows_provider_rejection_v2: None,
-            windows_terminal_delivery: None,
+            windows_provider_rejection_v3: None,
             provider_failure: None,
-            policy_enforcement: None,
             native_startup: None,
             runtime: None,
         }
@@ -604,10 +529,6 @@ impl Error {
 
     pub fn provider_rejection(&self) -> Option<&ProviderRejectionEvidence> {
         self.provider_rejection.as_deref()
-    }
-
-    pub fn windows_provider_rejection_v2(&self) -> Option<&crate::WindowsProviderRejectionV2> {
-        self.windows_provider_rejection_v2.as_deref()
     }
 
     pub fn with_os_error(mut self, error: &std::io::Error) -> Self {
@@ -646,18 +567,6 @@ impl Error {
     }
 
     pub fn with_provider_rejection(mut self, rejection: ProviderRejectionEvidence) -> Self {
-        if let Some(admission) = rejection
-            .workload_admission
-            .as_ref()
-            .filter(|_| rejection.is_consistent())
-        {
-            self.policy_enforcement = Some(
-                crate::workload_evidence::RuntimePolicyEnforcement::NotAuthorized {
-                    request: admission.request.clone(),
-                    rejection: admission.rejection.clone(),
-                },
-            );
-        }
         self.os_code = rejection.os_code;
         self.target_released = rejection.target_released;
         self.restart_safety = Some(rejection.restart_safety.clone());
@@ -665,26 +574,14 @@ impl Error {
         self
     }
 
-    pub fn with_windows_provider_rejection_v2(
+    pub fn with_windows_provider_rejection_v3(
         mut self,
-        rejection: crate::WindowsProviderRejectionV2,
+        rejection: crate::WindowsProviderRejectionV3,
     ) -> Self {
-        if let Some(admission) = rejection
-            .workload_admission
-            .as_ref()
-            .filter(|_| rejection.is_consistent())
-        {
-            self.policy_enforcement = Some(
-                crate::workload_evidence::RuntimePolicyEnforcement::NotAuthorized {
-                    request: admission.request.clone(),
-                    rejection: admission.rejection.clone(),
-                },
-            );
-        }
         self.os_code = rejection.os_code;
         self.target_released = rejection.target_released;
         self.restart_safety = Some(rejection.restart_safety.clone());
-        self.windows_provider_rejection_v2 = Some(Box::new(rejection));
+        self.windows_provider_rejection_v3 = Some(Box::new(rejection));
         self
     }
 }

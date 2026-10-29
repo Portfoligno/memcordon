@@ -1,4 +1,4 @@
-#[path = "../../../memcordon-core/tests/support/windows_postauthorization.rs"]
+#[path = "../../../memcordon-core/tests/support/windows_current_postauthorization.rs"]
 mod fixture;
 
 #[test]
@@ -8,7 +8,7 @@ fn authenticated_failed_receipt_preserves_actual_release_and_retirement_facts() 
     let binding = projection.provider_binding.clone();
     let attempt = String::from(projection.attempt_id.clone());
     let request = String::from(projection.request_sha256.clone());
-    let error = super::bound_rejection_error(rejection.clone(), None, &binding, &attempt, &request);
+    let error = super::bound_rejection_error(rejection.clone(), &binding, &attempt, &request);
     assert!(error.target_released);
     assert_eq!(
         error.authorization_offset,
@@ -30,7 +30,7 @@ fn authenticated_failed_receipt_preserves_actual_release_and_retirement_facts() 
         "receipt does not contain a runtime clock origin"
     );
     assert_eq!(
-        error.windows_provider_rejection_v2.as_deref(),
+        error.windows_provider_rejection_v3.as_deref(),
         Some(&rejection)
     );
     let retained = error.provider_failure.as_ref().unwrap();
@@ -50,8 +50,7 @@ fn authenticated_failed_receipt_preserves_actual_release_and_retirement_facts() 
         ),
         attempt
     );
-    let substituted =
-        super::bound_rejection_error(rejection, None, &binding, &"01".repeat(32), &request);
+    let substituted = super::bound_rejection_error(rejection, &binding, &"01".repeat(32), &request);
     assert!(!substituted.target_released);
     assert!(substituted.authorization_offset.is_none());
     assert!(substituted.provider_failure.is_none());

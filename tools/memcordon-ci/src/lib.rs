@@ -1,4 +1,5 @@
-// Unsafe Windows calls are confined to file identity and owned-guardian adapters.
+// Unsafe native calls are confined to file identity, owned guardians, and the
+// current Linux kernel permission/syscall observation adapter.
 // All other CI orchestration remains safe Rust.
 #![deny(unsafe_code)]
 
@@ -17,7 +18,7 @@ pub mod command_progress_line;
 #[cfg(unix)]
 pub mod compiler_pool;
 pub mod config;
-pub mod consumer_readiness_ledger;
+pub mod consumer_readiness_current;
 pub mod download_cache;
 pub mod driver_cache;
 pub mod failure_mode;
@@ -34,9 +35,9 @@ pub mod native_test_plan;
 pub mod policy;
 pub mod preparation;
 pub mod preparation_tools;
-pub mod producer_failure_forwarding;
 pub mod public_install_capture;
 pub mod public_reads;
+pub mod readiness_identity;
 pub mod rehearsal_support;
 pub mod release;
 pub mod reparse_diagnostic;
@@ -67,7 +68,6 @@ pub mod windows_installed_cases;
 pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
-pub mod windows_policy_activation;
 #[cfg(windows)]
 mod windows_readiness_acl;
 pub mod windows_readiness_adapter;
@@ -145,7 +145,8 @@ pub type Result<T> = std::result::Result<T, CiError>;
 pub mod arm32_abi_helper;
 pub mod exact_harness;
 pub mod external_consumer;
+#[cfg(target_os = "linux")]
+pub mod linux_snapshot_probe;
 pub mod macos_performance;
-pub mod mixed_collection_diagnostics;
 pub mod native_acceptance_catalogue;
 pub mod performance_plan;

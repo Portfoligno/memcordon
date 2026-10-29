@@ -604,7 +604,7 @@ fn collect_context(
         inputs.insert(
             "consumer-readiness-inventory".into(),
             artifacts::checksum(&artifacts::read_file(
-                &root.join("ci/consumer-readiness-v1.toml"),
+                &root.join("ci/consumer-readiness-v2.toml"),
             )?),
         );
         inputs.insert("consumer-profile".into(), "selected-product:release;owned-fixture:release;driver:release;generated-consumer:dev+release".into());

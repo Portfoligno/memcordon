@@ -9,7 +9,7 @@ output. For installation and a first run, see the [README](../README.md).
 ```text
 memcordon [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...
 memcordon help [TOPIC]
-memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-contract PATH] [--probe-execution]
+memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-request PATH] [--probe-execution]
 memcordon plan [OPTION|BUDGET]...
 memcordon clean [--dry-run] [--json]
 ```
@@ -52,7 +52,10 @@ appear between them.
 | Option | Values | Default |
 |---|---|---|
 | `--enforcement` | `auto`, `hard`, `watchdog` | `auto` |
-| `--workload-contract` | bounded V1 contract file path; requires sealed containment | unset |
+| `--workload-request` | bounded current workload request; requires sealed containment | unset |
+| `--workload-input` | caller-readable Linux input bundle | unset |
+| `--workload-output` | caller-owned destination directory for declared outputs | unset |
+| `--workload-observation` | persist the original Linux attempt locator | unset |
 | `--wait-for` | `command`, `workload` | `command` |
 | `--command-exit-grace` | duration | `0s` |
 | `--metric` | `native`, `physical-footprint`, `rss`, `virtual` | `native` |
@@ -183,22 +186,19 @@ MemCordon-generated status.
 
 | Utility | Result | JSON contract |
 |---|---|---|
-| `doctor` | Prints the version and selected backend; `--require hard|watchdog|sealed` returns `125` when unmet | Schema-6 host, backend, capability, limitation, requirement, and workload discovery data |
-| `doctor --probe-execution` | Explicit macOS helper/target/cleanup execution check; unsupported or unsuccessful probes return `125` | Separate `doctor-execution-probe` schema-1 envelope containing the schema-6 `doctor` and an `execution` result |
-| `plan` | Resolves policy without launching; text includes `launch proof: false` | Schema-9 budgets, requested/effective policy, dormant conditions, effects, limitations, backoff sample, and workload resolution |
+| `doctor` | Prints the version and selected backend; `--require hard|watchdog|sealed` returns `125` when unmet | `memcordon.capabilities` revision 3: host, backend, capabilities, limitations, requirement, and current profiles |
+| `doctor --probe-execution` | Explicit macOS helper/target/cleanup execution check; unsupported or unsuccessful probes return `125` | Separate `capabilities-probe` revision-2 envelope containing current capabilities and actual execution observations |
+| `plan` | Resolves resource settings without launching; text includes `launch proof: false` | `memcordon.plan` revision 3: budgets, requested/effective resources, effects, limitations, and backoff sample |
 | `clean` | Removes stale MemCordon-owned artifacts; `--dry-run` only lists them; incomplete cleanup returns `125` | Schema-2 cleanup result |
 
-In plan JSON, backoff configuration is under `request.restart.backoff`.
+In plan JSON, backoff configuration is under `resources.restart.backoff`.
 `resolution.backoff_sample_ms` contains the first calculated wait when restart
 is enabled and is otherwise empty.
 
-New machine-readable consumers can select `--report-format result-v1`,
-`plan --plan-format plan-v1`, and `doctor --capability-format capabilities-v1`.
-These envelopes use explicit `format` and `revision` fields. Plan and capability
-outputs always declare `authorizes_launch: false`. Supported numeric execution,
-plan and doctor formats retain their historical meanings; they cannot contain
-new local admission or private execution facts. An incompatible format request
-rejects before native allocation.
+Current machine-readable selectors are `--report-format result-v3`,
+`plan --plan-format plan-v3`, and `doctor --capability-format capabilities-v3`.
+These envelopes use explicit `format` and `revision` fields. Plans do not
+authorize launch. Incompatible format requests fail before native allocation.
 
 Ordinary `doctor` does not launch a target. `--probe-execution` explicitly runs
 a five-second-deadline native probe on macOS and checks helper readiness,
@@ -208,13 +208,12 @@ Its `execution` fields are `supported`, `helper_ready`, `target_exec_confirmed`,
 memory enforcement, sealed containment, or workload-policy compatibility. See
 the [macOS native launch contract](../spec/macos-native-launch-v1.md).
 
-For strict workload admission, pass `--workload-contract PATH` before the
-target command with `--sealed`. The contract describes requirements
-and binds an independently authorized profile, grant and expected policy epoch;
-it cannot create permission. Discovery is advisory, and a planned resolution
-does not prove launch authorization. The
-[workload contract V1 specification](spec-workload-contract-v1.md) defines the
-two supported baseline profiles, exact bounds, and admission/retirement proof.
+Pass `--workload-request PATH` before the target command with `--sealed` to
+describe workload needs. Linux private workloads additionally stream a caller
+input bundle; Windows uses the authenticated caller's effective token. Discovery
+and plans are advisory. The [current request specification](spec-workload-request-v1.md)
+describes the exact platform boundaries and separate outcome, cleanup and delivery
+observations. Only the current request interface is available.
 
 Human-readable output follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` and
 is plain when redirected by default. JSON, report files, and child streams are
@@ -378,7 +377,8 @@ Circuit policy reports expose `threshold`, `half_life_ms`, and `cooldown_ms`.
 
 ## Execution reports
 
-`--report PATH` writes a mandatory schema-10 JSON document. The document is
+`--report PATH` writes a mandatory current result-v3 document for sealed runs;
+ordinary nonsealed runs retain their schema-10 resource report. The document is
 pretty-printed, ends in one newline, and is atomically persisted through a
 same-directory temporary file. The parent directory must exist. A write failure
 returns `125`.
@@ -389,7 +389,11 @@ replacement leaves persistence uncertain. File presence alone cannot prove
 successful delivery. The report records the primary execution cause before
 delivery, and cannot certify its own writer's later acknowledgment or reap.
 
-The envelope contains tool and native invocation identity, requested/effective
+The sealed result separates native release/outcome, exact attempt association,
+native cleanup, output delivery and frontend/report delivery. See the
+[current request and result contract](spec-workload-request-v1.md).
+
+The ordinary nonsealed envelope contains tool and native invocation identity, requested/effective
 policy, nullable backend capability, a supervision summary, bounded attempt
 records, and either terminal supervision or pre-supervision error provenance.
 Requested and effective policy include `command_exit_grace_ms`, distinct from
@@ -421,9 +425,9 @@ Execution schema 10 adds explicit authorization uncertainty and runtime clock,
 deadline, retirement and delivery evidence. A target PID can be absent before
 native creation. Confirmed authorization and unknown attempts are separate
 counters; neither attempt count nor retry count implies an issued grant.
-Historical schema 9 observations must not be promoted by inventing these facts.
-Ordinary doctor schema 6 is unchanged; absent startup diagnostics add no field.
-Plan schema 9 names the macOS continuous clock and origin before helper setup.
+Doctor and plan use named capabilities and plan revision 3 formats. Plan retains
+the macOS continuous clock and origin before helper setup. Absent native startup
+diagnostics add no execution field.
 
 Attempt history has capacity 256. Attempt 1 is retained permanently and the
 latest 255 attempts form a contiguous ascending tail. Declared retained,

@@ -148,7 +148,7 @@ pub fn transport_injection_authority(
 /// Consume original authenticated transport authority before terminal ACK can
 /// retire its receipt. A later tombstone never substitutes for this observation.
 pub fn authenticated_transport_injection_authority(
-    response: &memcordon_core::WindowsProviderResponseV3,
+    response: &memcordon_core::WindowsProviderResponseV4,
     selected: memcordon_core::WindowsSealedFault,
     provider: &memcordon_core::PublicProviderBindingV1,
     attempt: &str,
@@ -156,7 +156,7 @@ pub fn authenticated_transport_injection_authority(
     request: &str,
 ) -> bool {
     use memcordon_core::*;
-    let WindowsProviderResponseV3::Reject {
+    let WindowsProviderResponseV4::Reject {
         schema_version,
         attempt_id,
         nonce: actual_nonce,
@@ -166,7 +166,7 @@ pub fn authenticated_transport_injection_authority(
     else {
         return false;
     };
-    if *schema_version != WINDOWS_PUBLIC_PROTOCOL_VERSION
+    if *schema_version != WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
         || attempt_id != attempt
         || actual_nonce != nonce
         || request_sha256 != request
@@ -177,7 +177,7 @@ pub fn authenticated_transport_injection_authority(
     {
         return false;
     }
-    let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+    let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
         &rejection.disposition
     else {
         return false;
@@ -250,7 +250,7 @@ pub fn frontend_disconnect_observation(
 }
 
 pub fn frontend_guardian_injection_authority(
-    rejection: &memcordon_core::WindowsProviderRejectionV2,
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
     selected: memcordon_core::WindowsSealedFault,
     provider: &memcordon_core::PublicProviderBindingV1,
     attempt: &str,
@@ -343,7 +343,7 @@ pub fn control_service_loss_observation(
 }
 
 pub fn control_service_guardian_injection_authority(
-    rejection: &memcordon_core::WindowsProviderRejectionV2,
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
     selected: memcordon_core::WindowsSealedFault,
     provider: &memcordon_core::PublicProviderBindingV1,
     attempt: &str,
@@ -371,13 +371,13 @@ pub fn control_service_guardian_injection_authority(
 }
 
 pub fn control_service_recovery_authority(
-    response: &memcordon_core::WindowsProviderResponseV3,
-    delivery: &memcordon_core::WindowsTerminalDeliveryEvidenceV1,
+    response: &memcordon_core::WindowsProviderResponseV4,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedControlServiceLoss,
 ) -> bool {
     use memcordon_core::*;
-    let WindowsProviderResponseV3::Reject {
+    let WindowsProviderResponseV4::Reject {
         schema_version,
         attempt_id,
         nonce,
@@ -390,12 +390,12 @@ pub fn control_service_recovery_authority(
     let Ok(authority) = response.terminal_authority_json() else {
         return false;
     };
-    *schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+    *schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
         && delivery.is_consistent()
         && delivery.attempt_id == *attempt_id
         && delivery.nonce == *nonce
         && delivery.request_sha256 == *request_sha256
-        && delivery.authority_sha256
+        && delivery.terminal_sha256
             == crate::windows_causal_acceptance::sha256(authority.as_bytes())
         && live.live_nonce.as_ref() == Some(nonce)
         && control_service_guardian_injection_authority(
@@ -410,7 +410,7 @@ pub fn control_service_recovery_authority(
 }
 
 fn guardian_frontend_chain_authority(
-    rejection: &memcordon_core::WindowsProviderRejectionV2,
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
     selected: memcordon_core::WindowsSealedFault,
     provider: &memcordon_core::PublicProviderBindingV1,
     attempt: &str,
@@ -979,97 +979,6 @@ mod native {
             .ok_or_else(|| {
                 CiError::Message("component runner finite joint fixture absent".into())
             })?;
-        let policy_budget = deadlines.work_budget(Duration::from_secs(90))?;
-        let mut apply = crate::command::CommandSpec::new(
-            &config.installed_agent.path,
-            &config.output_directory,
-            policy_budget,
-        )
-        .args([
-            OsString::from("package"),
-            "policy".into(),
-            "apply".into(),
-            "--file".into(),
-            suite.local_policy.clone().into_os_string(),
-        ])
-        .materialize()?;
-        apply.env_clear();
-        let activated = memcordon_testkit::run_with_deadline_output_limit(
-            &mut apply,
-            policy_budget,
-            256 * 1024,
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?;
-        let _activation_stdout = crate::windows_readiness_adapter::publish_receipt(
-            &config.output_directory.join("policy-activation.stdout.bin"),
-            &activated.stdout,
-        )?;
-        let _activation_stderr = crate::windows_readiness_adapter::publish_receipt(
-            &config.output_directory.join("policy-activation.stderr.bin"),
-            &activated.stderr,
-        )?;
-        crate::command::require_successful_output("component policy activation", &activated)?;
-        let activation: serde_json::Value =
-            serde_json::from_slice(&activated.stdout).map_err(|error| {
-                CiError::Message(format!("successful component activation decode: {error}"))
-            })?;
-        let configured = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(&read(
-            &suite.local_policy,
-            256 * 1024,
-        )?)
-        .map_err(CiError::Message)?;
-        let registry: memcordon_core::workload_registry::RuntimePolicyRegistry =
-            serde_json::from_value(activation.get("registry").cloned().ok_or_else(|| {
-                CiError::Message("component activation omitted registry".into())
-            })?)?;
-        if configured != registry
-            || activation.get("format").and_then(serde_json::Value::as_str)
-                != Some("memcordon.local-activation")
-            || activation
-                .get("revision")
-                .and_then(serde_json::Value::as_u64)
-                != Some(1)
-            || activation
-                .get("registry_digest")
-                .and_then(serde_json::Value::as_str)
-                != Some(
-                    String::from(registry.canonical_digest().map_err(CiError::Message)?).as_str(),
-                )
-        {
-            return Err(CiError::Message(
-                "native component policy activation differs from exact configured registry".into(),
-            ));
-        }
-        let epoch = serde_json::from_value(
-            activation
-                .get("epoch")
-                .cloned()
-                .ok_or_else(|| CiError::Message("component activation epoch absent".into()))?,
-        )?;
-        let mut contract = memcordon_core::workload_contract::WorkloadContractV1::parse(&read(
-            &base.workload_contract,
-            256 * 1024,
-        )?)
-        .map_err(CiError::Message)?;
-        contract.expected_epoch = epoch;
-        let contract_directory = config.output_directory.join("W-JOINT").join("ordinary");
-        fs::create_dir_all(&contract_directory)?;
-        let bytes = serde_json::to_vec(&contract)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(contract_directory.join("requested-contract.json"))?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        if read(
-            &contract_directory.join("requested-contract.json"),
-            256 * 1024,
-        )? != bytes
-        {
-            return Err(CiError::Message(
-                "component activated request readback differs".into(),
-            ));
-        }
         let mut first_error = None;
         for (ordinal, fault) in fault_selectors().into_iter().enumerate() {
             let selector = serde_json::json!({"kind":"fault", "fault":fault});
@@ -1090,7 +999,6 @@ mod native {
                 config,
                 input,
                 base,
-                &suite.local_policy,
                 Some(fault),
                 None,
                 &selector,
@@ -1134,7 +1042,6 @@ mod native {
                 config,
                 input,
                 base,
-                &suite.local_policy,
                 None,
                 Some(mutant),
                 &selector,
@@ -1216,7 +1123,7 @@ mod native {
     fn recover_held_attempt_retaining(
         capture: RecoveryCapture<'_>,
         diagnostics: &mut super::component_barriers::SettlementErrors<CiError>,
-    ) -> Result<Option<memcordon_core::WindowsProviderResponseV3>> {
+    ) -> Result<Option<memcordon_core::WindowsProviderResponseV4>> {
         let RecoveryCapture {
             config,
             input,
@@ -1350,12 +1257,12 @@ mod native {
         memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
             .map_err(CiError::Message)?;
         let recovered: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        if recovered.get("schema_version") != Some(&serde_json::json!(1)) {
+        if recovered.get("schema_version") != Some(&serde_json::json!(2)) {
             return Err(CiError::Message(
                 "failed collection recovery wrapper schema differs".into(),
             ));
         }
-        let response: memcordon_core::WindowsProviderResponseV3 =
+        let response: memcordon_core::WindowsProviderResponseV4 =
             serde_json::from_value(recovered.get("provider_response").cloned().ok_or_else(
                 || CiError::Message("failed collection recovery omitted provider response".into()),
             )?)?;
@@ -1366,7 +1273,7 @@ mod native {
     }
 
     fn worker_recovery_receipt_authority(
-        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        receipt: &memcordon_core::WindowsTerminalReceiptV3,
         provider_generation: &str,
         attempt: &str,
         nonce: &str,
@@ -1381,7 +1288,7 @@ mod native {
             && receipt.retirement_proof.provider_generation == provider_generation
             && matches!(
                 &receipt.payload,
-                memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+                memcordon_core::WindowsTerminalPayloadV3::RecoveredClosure {
                     primary_failure: memcordon_core::OriginalFailureV1::Unavailable {
                         reason:
                             memcordon_core::OriginalUnavailableReasonV1::WorkerLostBeforeObservation
@@ -1395,7 +1302,6 @@ mod native {
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &ComponentInput,
         base: &crate::windows_consumer_readiness::CaseInput,
-        local_policy: &std::path::Path,
         fault: Option<memcordon_core::WindowsSealedFault>,
         mutant: Option<memcordon_core::WindowsSealedMutant>,
         selector: &serde_json::Value,
@@ -1446,59 +1352,14 @@ mod native {
         case.descriptor.transcript = case.descriptor.output_root.join("fixture-events.bin");
         case.descriptor_path = directory.join("input.json");
         fs::create_dir_all(&case.descriptor.output_root)?;
-        let prepared_contract = config
-            .output_directory
-            .join("W-JOINT")
-            .join("ordinary")
-            .join("requested-contract.json");
-        let requested = memcordon_core::workload_contract::WorkloadContractV1::parse(&read(
-            &prepared_contract,
-            256 * 1024,
-        )?)
-        .map_err(CiError::Message)?;
-        let configured = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(&read(
-            local_policy,
-            256 * 1024,
-        )?)
-        .map_err(CiError::Message)?;
-        let policy_budget = deadlines.work_budget(Duration::from_secs(90))?;
-        let mut apply = crate::command::CommandSpec::new(
-            &config.installed_agent.path,
-            directory,
-            policy_budget,
-        )
-        .args(["package", "policy", "apply", "--file"])
-        .arg(local_policy)
-        .materialize()?;
-        apply.env_clear();
-        let activated = memcordon_testkit::run_with_deadline_output_limit(
-            &mut apply,
-            policy_budget,
-            256 * 1024,
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?;
-        retain(
-            &directory.join("policy-activation.stdout.bin"),
-            &activated.stdout,
-            record,
+        let request_bytes = read(
+            &base.workload_request,
+            memcordon_core::workload_limits::REQUEST_BYTES,
         )?;
-        retain(
-            &directory.join("policy-activation.stderr.bin"),
-            &activated.stderr,
-            record,
-        )?;
-        crate::command::require_successful_output("component case policy activation", &activated)?;
-        let contract = crate::windows_policy_activation::refresh_contract(
-            &requested,
-            &configured,
-            &activated.stdout,
-        )?;
-        case.workload_contract = directory.join("requested-contract.json");
-        retain(
-            &case.workload_contract,
-            &serde_json::to_vec(&contract)?,
-            record,
-        )?;
+        memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
+            .map_err(|error| CiError::Message(error.to_string()))?;
+        case.workload_request = directory.join("workload-request.json");
+        retain(&case.workload_request, &request_bytes, record)?;
         retain(
             &case.descriptor_path,
             &serde_json::to_vec(&case.descriptor)?,
@@ -2170,7 +2031,7 @@ mod native {
                     "native component selection/custody differs".into(),
                 ));
             }
-            let actual_request: memcordon_core::WindowsLaunchRequestV1 =
+            let actual_request: memcordon_core::WindowsLaunchRequestV2 =
                 serde_json::from_value(observed["launch"].clone())?;
             retain(
                 &directory.join("provider-request.bin"),
@@ -2302,7 +2163,7 @@ mod native {
             let mut recovery_failure = None;
             for raw in frames {
                 let bytes: Vec<u8> = serde_json::from_value(raw.clone())?;
-                let response: memcordon_core::WindowsProviderResponseV3 =
+                let response: memcordon_core::WindowsProviderResponseV4 =
                     serde_json::from_slice(&bytes)?;
                 if fault
                     == Some(memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization)
@@ -2351,7 +2212,7 @@ mod native {
                 }) {
                     rejected = true;
                 }
-                if let memcordon_core::WindowsProviderResponseV3::CertificationMutantObserved(
+                if let memcordon_core::WindowsProviderResponseV4::CertificationMutantObserved(
                     ref receipt,
                 ) = response
                 {
@@ -2367,7 +2228,7 @@ mod native {
                 }
                 if let (
                     Some(expected),
-                    memcordon_core::WindowsProviderResponseV3::Reject {
+                    memcordon_core::WindowsProviderResponseV4::Reject {
                         schema_version,
                         attempt_id,
                         nonce: actual_nonce,
@@ -2377,11 +2238,11 @@ mod native {
                     },
                 ) = (mutant, &response)
                 {
-                    if let memcordon_core::WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt }
+                    if let memcordon_core::WindowsProviderRejectionDispositionV3::PrematureReleaseFailure { receipt }
                         = &rejection.disposition
                     {
                         let held = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
-                        rejected |= *schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+                        rejected |= *schema_version == memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
                             && attempt_id == attempt && actual_nonce == nonce && request_sha256 == request
                             && rejection.is_consistent()
                             && receipt.validate_for_attempt().is_ok()
@@ -2395,11 +2256,11 @@ mod native {
                                 && held.live_nonce.as_deref() == Some(nonce)
                                 && receipt.process_observation.root_identity == held.live_target_identity)
                             && matches!(&receipt.payload,
-                                memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure { witness, .. }
+                                memcordon_core::WindowsTerminalPayloadV3::PrematureReleaseFailure { witness, .. }
                                     if witness.mutant == expected && witness.is_consistent());
                     }
                 }
-                if let memcordon_core::WindowsProviderResponseV3::Reject {
+                if let memcordon_core::WindowsProviderResponseV4::Reject {
                     attempt_id,
                     nonce: actual_nonce,
                     request_sha256,
@@ -2446,12 +2307,12 @@ mod native {
                 memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
                     .map_err(CiError::Message)?;
                 let recovered: serde_json::Value = serde_json::from_slice(&bytes)?;
-                if recovered.get("schema_version") != Some(&serde_json::json!(1)) {
+                if recovered.get("schema_version") != Some(&serde_json::json!(2)) {
                     return Err(CiError::Message(
                         "worker recovery wrapper schema differs".into(),
                     ));
                 }
-                let response: memcordon_core::WindowsProviderResponseV3 = serde_json::from_value(
+                let response: memcordon_core::WindowsProviderResponseV4 = serde_json::from_value(
                     recovered.get("provider_response").cloned().ok_or_else(|| {
                         CiError::Message("worker recovery omitted provider response".into())
                     })?,
@@ -2652,13 +2513,13 @@ mod native {
                 if output.status.success() || (fault==Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
                     &&output.status.code()==Some(1)) {
                     let recovered: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-                    let response: memcordon_core::WindowsProviderResponseV3 = serde_json::from_value(recovered.get("provider_response").cloned()
+                    let response: memcordon_core::WindowsProviderResponseV4 = serde_json::from_value(recovered.get("provider_response").cloned()
                         .ok_or_else(|| CiError::Message("component recovery omitted actual provider response".into()))?)?;
                     if fault==Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
-                        &&recovered.get("schema_version")==Some(&serde_json::json!(1))
+                        &&recovered.get("schema_version")==Some(&serde_json::json!(2))
                         &&recovered.get("frontend_delivery").is_some_and(serde_json::Value::is_null)
-                        &&matches!(&response,memcordon_core::WindowsProviderResponseV3::RecoveryAttemptUnavailable {
-                            schema_version,attempt_id,challenge,detail } if *schema_version==memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+                        &&matches!(&response,memcordon_core::WindowsProviderResponseV4::RecoveryAttemptUnavailable {
+                            schema_version,attempt_id,challenge,detail } if *schema_version==memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
                                 &&attempt_id==attempt&&!challenge.is_empty()
                                 &&detail=="exact recovery authority remains retained pending checked closure") {
                         // Exact authenticated uncertainty is the expected
@@ -2674,24 +2535,24 @@ mod native {
                             &config.provider).map_err(CiError::Message)?
                     } else { false };
                     let receipt = match &response {
-                        memcordon_core::WindowsProviderResponseV3::Terminal(receipt) => Some(receipt),
-                        memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => rejection.terminal_receipt(),
+                        memcordon_core::WindowsProviderResponseV4::Terminal(receipt) => Some(receipt),
+                        memcordon_core::WindowsProviderResponseV4::Reject { rejection, .. } => rejection.terminal_receipt(),
                         _ => None,
                     };
                     let selected_transport_original = fault.is_some_and(|selected|
-                        matches!(&response, memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. }
+                        matches!(&response, memcordon_core::WindowsProviderResponseV4::Reject { rejection, .. }
                             if rejection.provider_failure.as_ref().is_some_and(|failure|
                                 transport_injection_authority(failure, selected, &config.provider, attempt, request))));
                     let selected_frontend_guardian_original = if let (Some(selected),Some(observed)) = (fault,observed_frontend_loss.as_ref()) {
                         let association = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
                         association.as_ref().is_some_and(|association|
-                            matches!(&response,memcordon_core::WindowsProviderResponseV3::Reject {rejection,..}
+                            matches!(&response,memcordon_core::WindowsProviderResponseV4::Reject {rejection,..}
                                 if frontend_guardian_injection_authority(rejection,selected,&config.provider,attempt,request,association,observed)))
                     } else { false };
                     let selected_control_guardian_original = if let (Some(selected), Some(observed)) = (fault, observed_control_service_loss.as_ref()) {
                         let association = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
                         let delivery = recovered.get("frontend_delivery").cloned().and_then(|value|
-                            serde_json::from_value::<memcordon_core::WindowsTerminalDeliveryEvidenceV1>(value).ok());
+                            serde_json::from_value::<memcordon_core::WindowsFrontendDeliveryV3>(value).ok());
                         selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
                             && association.as_ref().zip(delivery.as_ref()).is_some_and(|(association, delivery)|
                                 control_service_recovery_authority(&response, delivery, association, observed))
@@ -2701,7 +2562,7 @@ mod native {
                         if receipt.attempt_id == attempt && receipt.nonce == nonce && receipt.request_sha256 == request
                             && receipt.retirement_proof.provider_generation == config.provider.generation.as_str()
                             && ((fault == Some(memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization)
-                            && matches!(&receipt.payload, memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+                            && matches!(&receipt.payload, memcordon_core::WindowsTerminalPayloadV3::RecoveredClosure {
                                 primary_failure: memcordon_core::OriginalFailureV1::Observed { event }, .. }
                                 if event.sequence != 0 && event.operation == memcordon_core::FailureOperationV1::CheckGuardian
                                     && event.code == memcordon_core::FailureCodeV1::GuardianLoss
@@ -2716,7 +2577,7 @@ mod native {
                                 || fault.is_some_and(|selected| {
                                     use memcordon_core::WindowsSealedFault::*;
                                     matches!(selected, Resume | TerminateJob | ActiveProcessQuery | RelayRetire | GuardianReap | FinalHandleClose)
-                                        && matches!(&receipt.payload, memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+                                        && matches!(&receipt.payload, memcordon_core::WindowsTerminalPayloadV3::RecoveredClosure {
                                             primary_failure: memcordon_core::OriginalFailureV1::Observed { event }, .. }
                                             if event.sequence > 0
                                                 && event.operation == memcordon_core::FailureOperationV1::UnclassifiedProviderOperation

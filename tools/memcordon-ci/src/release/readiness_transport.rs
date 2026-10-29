@@ -5,8 +5,8 @@ use super::{
     http::{self, ReadBudget, StreamingTransport, Transport},
 };
 use crate::{
-    CiError, Result,
-    consumer_readiness_ledger::{CellEvidence, SourceIdentity},
+    CiError, Result, consumer_readiness_current::CellEvidenceV2 as CellEvidence,
+    readiness_identity::SourceIdentity,
 };
 use memcordon_readiness_verifier::{
     Artifact, JobOutcome, JobResult, MAX_PRODUCER_ARCHIVE_BYTES, ProducerOrigin,
@@ -98,7 +98,7 @@ pub fn check_evidence_budget(existing: &[Artifact], producer: &DownloadedProduce
         .storage
         .check_budget(overhead)
         .map_err(CiError::Message)?;
-    memcordon_readiness_verifier::storage::StoragePlan::legacy(existing)
+    memcordon_readiness_verifier::storage::StoragePlan::direct(existing)
         .and_then(|plan| plan.check_budget(producer_bytes))
         .map(|_| ())
         .map_err(CiError::Message)
@@ -453,10 +453,10 @@ pub fn download_producer(
     memcordon_core::canonical_json::reject_duplicate_json_keys(&manifest_bytes)
         .map_err(CiError::Message)?;
     let (manifest, storage) =
-        memcordon_readiness_verifier::storage::decode_producer(&manifest_bytes)
+        memcordon_readiness_verifier::current::storage::decode_producer(&manifest_bytes)
             .map_err(CiError::Message)?;
     if manifest.format != "memcordon.consumer-readiness.producer"
-        || manifest.revision != 1
+        || manifest.revision != 2
         || manifest.job != job
         || manifest.run_id != run.to_string()
         || manifest.run_attempt != attempt
@@ -564,11 +564,11 @@ pub fn download_producer(
         .map_err(CiError::Message)?;
     let cell: CellEvidence = serde_json::from_slice(&cell_bytes)?;
     if storage.is_packed() {
-        memcordon_readiness_verifier::storage::validate_cell(&manifest, &cell_bytes)
+        memcordon_readiness_verifier::current::storage::validate_cell(&manifest, &cell_bytes)
             .map_err(CiError::Message)?;
     }
     if cell.format != "memcordon.consumer-readiness.cell"
-        || cell.revision != 1
+        || cell.revision != 2
         || cell.identity.run_id != manifest.run_id
         || cell.identity.source_commit != manifest.source_commit
         || cell.identity.source_tree_sha256 != manifest.source_tree_sha256

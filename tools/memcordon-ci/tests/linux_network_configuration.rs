@@ -1,4 +1,4 @@
-use memcordon_ci::release::linux_installed_consumer::host_network_configuration_unchanged;
+use memcordon_ci::release::linux_current_network::host_network_configuration_unchanged;
 use serde_json::{Value, json};
 
 #[test]
@@ -10,7 +10,7 @@ fn captured_same_mac_slave_addition_stays_strict_without_native_provenance() {
     let original_before = before.clone();
     let original_after = after.clone();
     let comparison =
-        memcordon_ci::release::linux_installed_consumer::host_network_comparison(&before, &after)
+        memcordon_ci::release::linux_current_network::host_network_comparison(&before, &after)
             .unwrap();
     assert_eq!(comparison["unchanged"], false);
     assert!(
@@ -33,7 +33,7 @@ fn malformed_link_population_has_an_explicit_structural_delta() {
     let mut after = before.clone();
     after["links"] = json!("not a native link map");
     let comparison =
-        memcordon_ci::release::linux_installed_consumer::host_network_comparison(&before, &after)
+        memcordon_ci::release::linux_current_network::host_network_comparison(&before, &after)
             .unwrap();
     assert_eq!(comparison["unchanged"], false);
     assert_eq!(comparison["changes"][0]["path"], json!(["links"]));

@@ -1,29 +1,29 @@
 #![cfg(feature = "test-support")]
 
-#[path = "../../memcordon-core/tests/support/windows_postauthorization.rs"]
+#[path = "../../memcordon-core/tests/support/windows_current_postauthorization.rs"]
 mod terminal_fixture;
 
 use memcordon_core::*;
 use memcordon_platform::{SupervisorRequest, test_support::supervise_failed_attempt};
-use std::{ffi::OsStr, time::Duration};
+use std::time::Duration;
 
-fn rejection() -> WindowsProviderRejectionV2 {
+fn rejection() -> WindowsProviderRejectionV3 {
     let mut rejection = terminal_fixture::rejection();
-    let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+    let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
         &mut rejection.disposition
     else {
         panic!("full execution fixture")
     };
-    let WindowsTerminalPayloadV2::Execution {
+    let WindowsTerminalPayloadV3::Execution {
         boundary_detail, ..
     } = &mut receipt.payload
     else {
         panic!("execution fixture")
     };
-    let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = boundary_detail.as_mut() else {
+    let BoundaryMechanismEvidence::WindowsJobObjectV3(native) = boundary_detail.as_mut() else {
         panic!("Windows native fixture")
     };
-    native.schema_version = 2;
+    native.schema_version = 3;
     native.service_identity = "MemCordonSealedControl+MemCordonSealedLauncher:v1".into();
     native.caller_token_authenticated = true;
     native.initial_target_token_matches_caller = true;
@@ -46,7 +46,7 @@ fn rejection() -> WindowsProviderRejectionV2 {
     rejection
 }
 
-fn failure(rejection: WindowsProviderRejectionV2) -> Error {
+fn failure(rejection: WindowsProviderRejectionV3) -> Error {
     let projection = rejection.provider_failure.clone().unwrap();
     let mut error = Error::new(
         ErrorCategory::Setup,
@@ -62,17 +62,17 @@ fn failure(rejection: WindowsProviderRejectionV2) -> Error {
         cleanup_attempted: rejection.cleanup_attempted,
         restart_safety: rejection.restart_safety.clone(),
     })
-    .with_windows_provider_rejection_v2(rejection.clone());
-    error.provider_association = Some(Box::new(result_v1::ProviderAttemptAssociationV1 {
+    .with_windows_provider_rejection_v3(rejection.clone());
+    error.provider_association = Some(Box::new(execution_facts::ProviderAttemptAssociationV1 {
         provider: projection.provider_binding.clone(),
         attempt_id: projection.attempt_id.clone(),
         request_sha256: projection.request_sha256.clone(),
     }));
     error.provider_failure = Some(projection);
     error.launch_phase = Some("monitoring");
-    if let Some(WindowsTerminalReceiptV2 {
+    if let Some(WindowsTerminalReceiptV3 {
         payload:
-            WindowsTerminalPayloadV2::Execution {
+            WindowsTerminalPayloadV3::Execution {
                 child_pid,
                 authorization_offset_millis,
                 outcome,
@@ -94,6 +94,8 @@ fn request() -> SupervisorRequest {
         restart: RestartPolicy::Never,
         command: CommandSpec::new("receipt-fixture-target"),
         memcordon_executable: None,
+        #[cfg(target_os = "linux")]
+        workload_frontend: None,
         resolved_backend: Some(BackendCapabilityReport {
             name: "windows-job-object".into(),
             boundary: BoundaryCapability {
@@ -111,73 +113,8 @@ fn request() -> SupervisorRequest {
     }
 }
 
-fn report(execution: SupervisionExecution) -> MemcordonReport {
-    let policy = PolicyEnvelopeReport {
-        requested: RequestedPolicyReport {
-            workload: Default::default(),
-            boundary: BoundaryRequirement::Sealed,
-            memory: None,
-            deadline: None,
-            wait_for: "command".into(),
-            signal_grace_ms: 2_000,
-            command_exit_grace_ms: 0,
-            limit_grace_ms: 0,
-            restart: RequestedRestartPolicyReport {
-                enabled: false,
-                enablement_source: None,
-                configured_conditions: RestartConditions::NONE,
-                limit: RestartLimit::Unlimited,
-                backoff: None,
-                circuit_breaker: None,
-            },
-        },
-        effective: EffectivePolicyReport {
-            workload: workload_evidence::RuntimeWorkloadResolution::unresolved(
-                None,
-                workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend,
-            ),
-            boundary: BoundaryClass::Sealed,
-            memory: None,
-            deadline: None,
-            wait_for: "command".into(),
-            signal_grace_ms: 2_000,
-            command_exit_grace_ms: 0,
-            limit_grace_ms: 0,
-            restart: EffectiveRestartPolicyReport {
-                enabled: false,
-                conditions: RestartConditions::NONE,
-                dormant_conditions: Vec::new(),
-                cleanup_proof_required: false,
-            },
-        },
-        effects: Vec::new(),
-    };
-    let backend = execution.backend().clone();
-    MemcordonReport::schema10(
-        ToolReport {
-            name: "memcordon".into(),
-            version: "fixture".into(),
-        },
-        InvocationReport {
-            syntax: "plus-budgets-v1".into(),
-            budget_tokens: Vec::new(),
-            memory_token: None,
-            deadline_token: None,
-            argv: vec![NativeArgument::from_os(OsStr::new(
-                "receipt-fixture-target",
-            ))],
-        },
-        policy,
-        Some(backend),
-        Some(execution),
-        None,
-    )
-    .unwrap()
-}
-
 #[test]
 fn actual_supervisor_failure_retains_windows_execution_proofs_and_public_association() {
-    use result_v1::{AuthorizationV1, CleanupStateV1, OutcomeKindV1, ResultV1};
     let rejection = rejection();
     let diagnostic = rejection.provider_failure.clone().unwrap();
     let error = failure(rejection);
@@ -197,28 +134,25 @@ fn actual_supervisor_failure_retains_windows_execution_proofs_and_public_associa
     assert!(attempt.runtime.is_none());
     assert!(matches!(
         attempt.boundary_detail,
-        BoundaryMechanismEvidence::WindowsJobObjectV2(_)
+        BoundaryMechanismEvidence::WindowsJobObjectV3(_)
     ));
     assert!(boundary_evidence_is_consistent(
         &attempt.launch,
         &attempt.restart_safety,
         &attempt.boundary_detail
     ));
-    let source = report(execution);
-    assert!(source.error.is_none());
-    let result = ResultV1::from_legacy(&source, vec!["windows-sealed-runtime".into()]).unwrap();
-    assert_eq!(result.outcome.kind, OutcomeKindV1::ProviderFailure);
-    assert_eq!(result.outcome.wrapper_status, 125);
+    let failure = attempt.operational_failure.as_ref().unwrap();
+    assert_eq!(failure.provider_failure.as_ref(), Some(&diagnostic));
     assert_eq!(
-        result.outcome.native_termination,
-        Some(ChildTermination::ExitCode { code: 0 })
-    );
-    assert_eq!(result.authorization, AuthorizationV1::Granted);
-    assert_eq!(result.cleanup.state, CleanupStateV1::Complete);
-    assert_eq!(result.diagnostics, Some(diagnostic.clone()));
-    assert_eq!(
-        result.provider_association.unwrap().attempt_id,
+        failure.provider_association.as_ref().unwrap().attempt_id,
         diagnostic.attempt_id
+    );
+    assert!(
+        failure
+            .windows_current_rejection
+            .as_ref()
+            .unwrap()
+            .is_consistent()
     );
 }
 
@@ -226,18 +160,18 @@ fn actual_supervisor_failure_retains_windows_execution_proofs_and_public_associa
 fn failed_supervisor_does_not_invent_missing_windows_native_proofs() {
     for missing in ["guardian", "handles", "breakaway", "caller-token"] {
         let mut rejection = rejection();
-        let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+        let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
             &mut rejection.disposition
         else {
             panic!("fixture receipt")
         };
-        let WindowsTerminalPayloadV2::Execution {
+        let WindowsTerminalPayloadV3::Execution {
             boundary_detail, ..
         } = &mut receipt.payload
         else {
             panic!("fixture execution")
         };
-        let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = boundary_detail.as_mut() else {
+        let BoundaryMechanismEvidence::WindowsJobObjectV3(native) = boundary_detail.as_mut() else {
             panic!("fixture Windows boundary")
         };
         match missing {
@@ -247,8 +181,8 @@ fn failed_supervisor_does_not_invent_missing_windows_native_proofs() {
             _ => native.initial_target_token_matches_caller = false,
         }
         assert!(
-            rejection.is_consistent(),
-            "bounded receipt still requires native boundary validation"
+            !rejection.is_consistent(),
+            "current receipt rejects the missing native release proof"
         );
         assert_eq!(
             supervise_failed_attempt(request(), failure(rejection))
@@ -263,7 +197,7 @@ fn failed_supervisor_does_not_invent_missing_windows_native_proofs() {
 #[test]
 fn failed_supervisor_does_not_promote_missing_recovered_or_mismatched_receipts() {
     let mut missing = failure(rejection());
-    missing.windows_provider_rejection_v2 = None;
+    missing.windows_provider_rejection_v3 = None;
     assert_eq!(
         supervise_failed_attempt(request(), missing)
             .unwrap_err()
@@ -285,12 +219,12 @@ fn failed_supervisor_does_not_promote_missing_recovered_or_mismatched_receipts()
         .unwrap()
         .original
         .clone();
-    let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+    let WindowsProviderRejectionDispositionV3::PostauthorizationFailure { receipt } =
         &mut recovered.disposition
     else {
         panic!("fixture receipt")
     };
-    receipt.payload = WindowsTerminalPayloadV2::RecoveredClosure {
+    receipt.payload = WindowsTerminalPayloadV3::RecoveredClosure {
         primary_failure: original,
         target_creation_observed: true,
         resume_attempted: true,

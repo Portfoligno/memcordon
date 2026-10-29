@@ -192,7 +192,7 @@ pub fn build_original_roles(
             root,
             target,
             "memcordon-readiness-verifier",
-            "contract",
+            "current_parser_receipts",
             None,
             &destination.join("parser"),
             deadline,
@@ -213,7 +213,7 @@ pub fn build_original_roles(
                 {"role":"operational","package":"memcordon","test":"sealed_agent","features":features,
                     "executable":operational.executable,"sha256":operational.sha256,
                     "compiler_output":operational.compiler_output,"compiler_errors":operational.compiler_errors},
-                {"role":"parser","package":"memcordon-readiness-verifier","test":"contract","features":null,
+                {"role":"parser","package":"memcordon-readiness-verifier","test":"current_parser_receipts","features":null,
                     "executable":parser.executable,"sha256":parser.sha256,
                     "compiler_output":parser.compiler_output,"compiler_errors":parser.compiler_errors}
             ]}))?,
@@ -369,7 +369,9 @@ pub(super) fn build_windows_actor(
     destination: &Path,
     deadline: Instant,
 ) -> Result<()> {
-    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+    use memcordon_core::{
+        runtime_components::RuntimeComponentRole, runtime_manifest_v2::RuntimeManifestV2,
+    };
     if !matches!(target, "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc")
         || target != distribution::native_target()?
     {
@@ -486,7 +488,7 @@ pub(super) fn build_windows_actor(
         assembly.observe(crate::work_outcome::WorkOutcome::from_result(
             selected.recheck(root),
         ))?;
-        let runtime = RuntimeManifest::windows(
+        let runtime = RuntimeManifestV2::windows(
             selected.version().to_string(),
             selected.commit().to_owned(),
             target.to_owned(),
@@ -531,7 +533,7 @@ pub fn build(
             if target.ends_with("-unknown-linux-gnu") => {}
         ("memcordon", "sealed_agent", Some("windows-sealed-runtime,test-support"))
             if target.ends_with("-pc-windows-msvc") => {}
-        ("memcordon-readiness-verifier", "contract", None) => (),
+        ("memcordon-readiness-verifier", "current_parser_receipts", None) => (),
         _ => {
             return Err(CiError::Message(
                 "component harness recipe is not a frozen native role".into(),

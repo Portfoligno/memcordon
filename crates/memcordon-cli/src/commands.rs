@@ -52,7 +52,7 @@ pub(crate) fn windows_recovery(args: memcordon::invocation::WindowsRecoveryArgs)
                 let _=&request;
                 if matches!(
                     response,
-                    memcordon_core::WindowsProviderResponseV3::RecoveryAttemptUnavailable { .. }
+                    memcordon_core::WindowsProviderResponseV4::RecoveryAttemptUnavailable { .. }
                 ) {
                     #[cfg(feature = "test-support")]
                     {
@@ -60,15 +60,17 @@ pub(crate) fn windows_recovery(args: memcordon::invocation::WindowsRecoveryArgs)
                         // the real authenticated refusal as observation. It
                         // still returns the original denial status and cannot
                         // acknowledge or create terminal authority.
-                        println!("{}",serde_json::json!({"schema_version":1,
-                            "provider_response":response,"frontend_delivery":delivery,"provider_request":request}));
+                        println!("{}",serde_json::json!({"schema_version":2,
+                            "provider_response":response,"frontend_delivery":delivery,"provider_request":request,"terminal_authority_json":null}));
                     }
                     return Err("authenticated provider denied recovery authority".to_owned());
                 }
+                let authority=response.terminal_authority_json().map_err(|error|error.to_string())?;
                 let value=serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "provider_response": response,
                     "frontend_delivery": delivery,
+                    "terminal_authority_json": authority,
                 });
                 #[cfg(feature="test-support")]
                 let value={let mut observed=value;observed["provider_request"]=serde_json::to_value(request).map_err(|error|error.to_string())?;observed};

@@ -29,6 +29,8 @@ pub mod exit_mapping;
 pub mod invocation;
 #[cfg(feature = "test-fixtures")]
 pub mod toolchain_creation_ack;
+pub mod workload_pack;
+pub mod workload_recovery;
 
 pub use memcordon_core::{
     BoundaryRequirement, ByteSize, ChildTermination, CircuitBreakerPolicy, CleanupSummary,
@@ -230,6 +232,8 @@ impl Supervisor {
             .selected_for(boundary)
             .map(|backend| memcordon_platform::capabilities_for(backend, boundary));
         memcordon_platform::supervise(memcordon_platform::SupervisorRequest {
+            #[cfg(target_os = "linux")]
+            workload_frontend: None,
             policy: self.policy,
             restart,
             command,

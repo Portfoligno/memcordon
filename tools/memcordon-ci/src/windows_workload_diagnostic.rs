@@ -4,9 +4,9 @@ mod sddl_text;
 use crate::windows_consumer_readiness::CaseInput;
 use crate::windows_installed_cases::InstalledWindowsPayload;
 use crate::{CiError, Result};
-use memcordon_windows_loader_lab::workload::{
+use memcordon_windows_loader_lab::current_workload::{
     DefaultDaclProbeEligibilityV1, DefaultDaclProbeKindV1, DefaultDaclProbeTargetV1,
-    MAX_REQUEST_BYTES, WorkloadDiagnosticRequestV1,
+    MAX_REQUEST_BYTES, WorkloadDiagnosticRequestV2,
 };
 use std::{
     fs,
@@ -39,13 +39,9 @@ pub(super) fn observe(
     let original =
         crate::windows_readiness_adapter::hold_artifact(public_report, None, 4 * 1024 * 1024)?;
     let parsed =
-        memcordon_core::result_v1::ResultV1::parse(&original.bytes).map_err(CiError::Message)?;
+        memcordon_core::result_v3::ResultV3::parse(&original.bytes).map_err(CiError::Message)?;
     if !super::released_target_loader_event_candidate(&parsed)
-        || parsed
-            .provider_association
-            .as_ref()
-            .map(|value| &value.provider)
-            != Some(&config.provider)
+        || parsed.provider.as_ref() != Some(&config.provider)
         || case.key.family != "W-ENVELOPE"
         || case.key.scenario != "restricted"
     {
@@ -61,7 +57,7 @@ pub(super) fn observe(
     )?;
     let terminal: memcordon_platform::AuthenticatedWindowsTerminalObservation =
         serde_json::from_slice(&terminal_file.bytes)?;
-    let request: memcordon_core::WindowsLaunchRequestV1 =
+    let request: memcordon_core::WindowsLaunchRequestV2 =
         serde_json::from_slice(&terminal.provider_request)?;
     let fixture_path = std::path::absolute(&config.fixture.path)?;
     let image = crate::windows_readiness_adapter::hold_artifact(
@@ -127,8 +123,8 @@ pub(super) fn observe(
             "original cutoff lacks diagnostic work/retirement room".into(),
         ));
     }
-    let mut input = WorkloadDiagnosticRequestV1 {
-        schema_version: 1,
+    let mut input = WorkloadDiagnosticRequestV2 {
+        schema_version: 2,
         default_dacl_probe: None,
         original_result_sha256: original.sha256.clone(),
         original_terminal_sha256: terminal_file.sha256.clone(),

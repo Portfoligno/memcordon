@@ -1,7 +1,7 @@
 //! Fixed public projection publication within the trusted CI runner's sudo role.
 //! This grants no acquisition, cleanup, or arbitrary filesystem write authority.
-use crate::consumer_readiness_ledger::SourceIdentity;
 use crate::preparation_tools::ReadinessHelperContext;
+use crate::readiness_identity::SourceIdentity;
 use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -290,12 +290,12 @@ impl Scope {
 
     pub fn publish_packed(
         &self,
-        producer: &memcordon_readiness_verifier::ProducerManifest,
+        producer: &memcordon_readiness_verifier::current::ProducerManifestV2,
     ) -> Result<(), String> {
         use super::readiness_artifact_catalog::PackedCatalog;
         use crate::release::consumer_readiness_cell::public_projection as projection;
         self.verify_named()?;
-        memcordon_readiness_verifier::storage::validate_cell(producer, &self.cell_bytes)?;
+        memcordon_readiness_verifier::current::storage::validate_cell(producer, &self.cell_bytes)?;
         // Only this fresh derivative is writable; original captures remain untouched.
         native(rustix::fs::mkdirat(
             &self.acquisition,
@@ -331,15 +331,15 @@ impl Scope {
         .map_err(|e| e.to_string())?;
         projection::write_new(&packed, std::ffi::OsStr::new("cell.json"), &self.cell_bytes)
             .map_err(|e| e.to_string())?;
-        let envelope = memcordon_readiness_verifier::storage::PackedProducerManifestV1 {
+        let envelope = memcordon_readiness_verifier::current::storage::PackedProducerManifestV2 {
             format: "memcordon.consumer-readiness.packed-producer".into(),
-            revision: 1,
+            revision: 2,
             producer: producer.clone(),
             objects: catalog.objects,
             bindings: catalog.bindings,
         };
         let bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| e.to_string())?;
-        let (_, storage) = memcordon_readiness_verifier::storage::decode_producer(&bytes)?;
+        let (_, storage) = memcordon_readiness_verifier::current::storage::decode_producer(&bytes)?;
         storage.check_budget(self.cell_bytes.len() as u64 + bytes.len() as u64 + 1)?;
         // Check every selected source again before sealing; never substitute an earlier object.
         for record in &producer.artifacts {

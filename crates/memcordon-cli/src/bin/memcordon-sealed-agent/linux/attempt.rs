@@ -8,9 +8,6 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct AttemptRecord {
-    policy_binding: Option<String>,
-    private_invocation: Option<(u32, memcordon_core::DiagnosticSha256)>,
-    policy_checkpoint: Option<String>,
     identity: String,
     path: PathBuf,
     state_root: PathBuf,
@@ -129,15 +126,12 @@ impl AttemptRecord {
             return Err("allocated attempt record exceeds bound".into());
         }
         let body = format!(
-            "version=2\ncgroup={identity}\nfrontend-pid={frontend_pid}\ncaller-envelope-digest={caller_envelope_digest}\nstate=allocated\n"
+            "format=memcordon.sealed-native-journal\nrevision=1\ncgroup={identity}\nfrontend-pid={frontend_pid}\ncaller-envelope-digest={caller_envelope_digest}\nstate=allocated\n"
         );
         if observed != record_text(&body) {
             return Err("attempt record does not match authenticated broker identity".to_owned());
         }
         Ok(Self {
-            policy_binding: None,
-            private_invocation: None,
-            policy_checkpoint: None,
             identity,
             path,
             state_root: state_root.to_owned(),
@@ -166,17 +160,12 @@ impl AttemptRecord {
     ) -> Result<Self, String> {
         validate_identity(&identity, caller_envelope_digest.as_deref())?;
         let path = state_root.join(&identity);
-        let version = if caller_envelope_digest.is_some() {
-            2
-        } else {
-            1
-        };
         let envelope = caller_envelope_digest
             .as_deref()
             .map(|digest| format!("caller-envelope-digest={digest}\n"))
             .unwrap_or_default();
         let bytes = record_text(&format!(
-            "version={version}\ncgroup={identity}\nfrontend-pid={frontend_pid}\n{envelope}state=allocated\n"
+            "format=memcordon.sealed-native-journal\nrevision=1\ncgroup={identity}\nfrontend-pid={frontend_pid}\n{envelope}state=allocated\n"
         ));
         let directory = OpenOptions::new()
             .read(true)
@@ -192,9 +181,6 @@ impl AttemptRecord {
         )
         .map_err(|error| error.to_string())?;
         Ok(Self {
-            policy_binding: None,
-            private_invocation: None,
-            policy_checkpoint: None,
             identity,
             path,
             state_root: state_root.to_owned(),
@@ -204,68 +190,6 @@ impl AttemptRecord {
 
     pub fn transition(&self, state: &str) -> Result<(), String> {
         self.transition_inner(state, None)
-    }
-
-    pub fn bind_policy_checkpoint(
-        &mut self,
-        binding: &memcordon_core::workload_evidence::RuntimeAttemptBinding,
-        checkpoint: &memcordon_core::workload_evidence::VerifiedCheckpointV1,
-    ) -> Result<(), String> {
-        let snapshot: crate::admission::FrozenAdmission = serde_json::from_str(
-            self.policy_binding
-                .as_deref()
-                .ok_or("policy checkpoint lacks frozen admission")?,
-        )
-        .map_err(|error| error.to_string())?;
-        if !binding.matches_snapshot(&snapshot)
-            || binding.attempt_id.as_str() != self.identity
-            || !checkpoint.matches_binding(binding)
-        {
-            return Err("policy checkpoint differs from exact durable admission".into());
-        }
-        let bytes =
-            serde_json::to_string(&(binding, checkpoint)).map_err(|error| error.to_string())?;
-        if bytes.len() > memcordon_core::workload_limits::CONTRACT_BYTES {
-            return Err("policy checkpoint exceeds durable limit".into());
-        }
-        if self
-            .policy_checkpoint
-            .as_ref()
-            .is_some_and(|previous| previous != &bytes)
-        {
-            return Err("policy checkpoint cannot change".into());
-        }
-        self.policy_checkpoint = Some(bytes);
-        self.transition("policy-verified-before-authorization")
-    }
-
-    pub fn bind_policy(
-        mut self,
-        admission: &crate::admission::FrozenAdmission,
-        authenticated_uid: u32,
-        native_invocation_digest: memcordon_core::DiagnosticSha256,
-    ) -> Result<Self, String> {
-        admission.validate()?;
-        if admission.caller
-            != (memcordon_core::workload_registry::CallerSelector::Linux {
-                uid: authenticated_uid,
-            })
-            || admission.private_invocation_digest != native_invocation_digest
-            || self.policy_binding.is_some()
-        {
-            return Err(
-                "frozen admission differs from authenticated caller or exact native invocation"
-                    .into(),
-            );
-        }
-        let bytes = serde_json::to_string(admission).map_err(|error| error.to_string())?;
-        if bytes.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
-            return Err("policy binding exceeds durable limit".into());
-        }
-        self.policy_binding = Some(bytes);
-        self.private_invocation = Some((authenticated_uid, native_invocation_digest));
-        self.transition("policy-planned")?;
-        Ok(self)
     }
 
     #[cfg(feature = "test-support")]
@@ -279,38 +203,14 @@ impl AttemptRecord {
         #[cfg(feature = "test-support")] fault: Option<TransitionFault>,
         #[cfg(not(feature = "test-support"))] _fault: Option<()>,
     ) -> Result<(), String> {
-        let header = if self.policy_binding.is_some() {
-            "format=memcordon.linux-workload-journal\nrevision=1\n"
-        } else if self.caller_envelope_digest.is_some() {
-            "version=2\n"
-        } else {
-            "version=1\n"
-        };
+        let header = "format=memcordon.sealed-native-journal\nrevision=1\n";
         let envelope = self
             .caller_envelope_digest
             .as_deref()
             .map(|digest| format!("caller-envelope-digest={digest}\n"))
             .unwrap_or_default();
-        let policy = self
-            .policy_binding
-            .as_deref()
-            .map(|binding| format!("policy-binding={binding}\n"))
-            .unwrap_or_default();
-        let checkpoint = self
-            .policy_checkpoint
-            .as_deref()
-            .map(|value| format!("policy-checkpoint={value}\n"))
-            .unwrap_or_default();
-        let private_invocation = self
-            .private_invocation
-            .as_ref()
-            .map(|(uid, digest)| {
-                let digest: String = digest.clone().into();
-                format!("authenticated-uid={uid}\nprivate-invocation-digest={digest}\n")
-            })
-            .unwrap_or_default();
         let body = format!(
-            "{header}cgroup={}\n{envelope}{private_invocation}{policy}{checkpoint}state={state}\n",
+            "{header}cgroup={}\n{envelope}state={state}\n",
             self.identity
         );
         let mut temporary =
@@ -364,16 +264,14 @@ fn write_record(file: &mut File, body: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn parse_durable_policy(
-    record: &str,
-) -> Result<Option<crate::admission::FrozenAdmission>, String> {
+pub(crate) fn parse_native_record(record: &str) -> Result<(), String> {
     if !record.ends_with('\n') {
         return Err("durable record lacks newline".into());
     }
     let (body, digest) = record
         .rsplit_once("digest=")
         .ok_or("durable record digest absent")?;
-    let expected: String = memcordon_core::workload_codec::hash_bytes(body.as_bytes()).into();
+    let expected: String = memcordon_core::hash_bytes(body.as_bytes()).into();
     if digest.strip_suffix('\n') != Some(expected.as_str()) {
         return Err("durable record digest differs".into());
     }
@@ -386,13 +284,11 @@ pub(crate) fn parse_durable_policy(
             return Err("duplicate durable record field".into());
         }
     }
-    let version = match fields.remove("format") {
-        Some("memcordon.linux-workload-journal") if fields.remove("revision") == Some("1") => {
-            "local-policy"
-        }
-        Some(_) => return Err("unsupported durable record format or revision".into()),
-        None => fields.remove("version").ok_or("durable version absent")?,
-    };
+    if fields.remove("format") != Some("memcordon.sealed-native-journal")
+        || fields.remove("revision") != Some("1")
+    {
+        return Err("unsupported native journal format".into());
+    }
     let identity = fields
         .remove("cgroup")
         .ok_or("durable attempt identity absent")?;
@@ -407,72 +303,16 @@ pub(crate) fn parse_durable_policy(
         None if state != "allocated" => {}
         _ => return Err("durable frontend identity differs from allocated state".into()),
     }
-    if matches!(version, "2" | "local-policy") {
-        let digest = fields
-            .remove("caller-envelope-digest")
-            .ok_or("durable caller envelope absent")?;
+    if let Some(digest) = fields.remove("caller-envelope-digest") {
         let _: memcordon_core::DiagnosticSha256 = memcordon_core::DiagnosticSha256::try_from(
             memcordon_core::BoundedText::new(digest).map_err(str::to_owned)?,
         )
         .map_err(str::to_owned)?;
     }
-    let admission = match version {
-        "1" | "2" => None,
-        "local-policy" => {
-            let bytes = fields
-                .remove("policy-binding")
-                .ok_or("durable policy admission absent")?
-                .as_bytes();
-            if bytes.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
-                return Err("durable policy admission exceeds bound".into());
-            }
-            memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
-            let snapshot: crate::admission::FrozenAdmission =
-                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-            snapshot.validate()?;
-            let uid = fields
-                .remove("authenticated-uid")
-                .ok_or("durable authenticated UID absent")?
-                .parse::<u32>()
-                .map_err(|_| "invalid durable authenticated UID")?;
-            let invocation = fields
-                .remove("private-invocation-digest")
-                .ok_or("durable native invocation absent")?;
-            let invocation = memcordon_core::DiagnosticSha256::try_from(
-                memcordon_core::BoundedText::new(invocation).map_err(str::to_owned)?,
-            )
-            .map_err(str::to_owned)?;
-            if snapshot.caller != (memcordon_core::workload_registry::CallerSelector::Linux { uid })
-                || snapshot.private_invocation_digest != invocation
-            {
-                return Err("durable caller or native invocation binding differs".into());
-            }
-            if let Some(bytes) = fields.remove("policy-checkpoint") {
-                if bytes.len() > memcordon_core::workload_limits::CONTRACT_BYTES {
-                    return Err("durable checkpoint exceeds bound".into());
-                }
-                memcordon_core::workload_contract::reject_duplicate_json_keys(bytes.as_bytes())?;
-                let (binding, checkpoint): (
-                    memcordon_core::workload_evidence::RuntimeAttemptBinding,
-                    memcordon_core::workload_evidence::VerifiedCheckpointV1,
-                ) = serde_json::from_str(bytes).map_err(|error| error.to_string())?;
-                if binding.attempt_id.as_str() != identity
-                    || !binding.matches_snapshot(&snapshot)
-                    || !checkpoint.matches_binding(&binding)
-                {
-                    return Err("durable policy checkpoint binding differs".into());
-                }
-            } else if matches!(state, "authorized" | "policy-verified-before-authorization") {
-                return Err("durable authorization checkpoint absent".into());
-            }
-            Some(snapshot)
-        }
-        _ => return Err("unsupported durable record version".into()),
-    };
     if !fields.is_empty() {
         return Err("unknown durable record fields".into());
     }
-    Ok(admission)
+    Ok(())
 }
 
 fn record_text(body: &str) -> String {

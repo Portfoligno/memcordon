@@ -40,10 +40,12 @@ pub const BINDING_RECEIPTLESS: &str = "windows_postauthorization_retirement::rec
 pub const BINDING_GENERATION: &str = "windows::record::record_fault_tests::native_durable_record_rejects_provider_generation_substitution";
 pub const BINDING_PROJECTION: &str = "windows::record::record_fault_tests::native_provider_projection_preserves_original_and_reports_bounded_loss";
 pub const OWNED_OUTBOX_REPLAY: &str = "windows_postauthorization_retirement::suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox";
+pub const OUTBOX_CRASH: &str = "windows::record::record_fault_tests::native_terminal_outbox_crash_preserves_exact_replay_boundary";
 pub const NATIVE_CAUSAL_CAPTURE: &str = "windows::diagnostics::causal_capture_tests::native_invalid_handle_capture_preserves_first_cause_across_phase_change";
 pub const INDEX_PARSER: &str = "native_index_mutations_emit_actual_parser_receipts";
 pub const OPERATIONAL_PARSER: &str =
     "operational_parser_receipts::native_operational_parser_mutations_emit_actual_receipts";
+pub const CURRENT_PARSER: &str = "emit_current_parser_mutations";
 
 #[cfg(windows)]
 pub fn run_parser(input: &NativeTestInput, records: &mut Vec<NativeTestAssessment>) -> Result<()> {
@@ -65,25 +67,21 @@ mod native {
         run_named(
             input,
             records,
-            "index-parser",
-            INDEX_PARSER,
-            "C-PARSER",
-            &["omitted-case", "duplicate-case", "wrong-product"],
-        )?;
-        run_named(
-            input,
-            records,
-            "operational-parser",
-            OPERATIONAL_PARSER,
+            "current-parser",
+            CURRENT_PARSER,
             "C-PARSER",
             &[
                 "duplicate-key",
                 "wrong-format",
                 "wrong-revision",
-                "unknown-authority-variant",
+                "unknown-variant",
                 "oversized-record",
                 "stale-attempt",
                 "forged-cleanup",
+                "omitted-case",
+                "duplicate-case",
+                "wrong-product",
+                "unsupported-result-format",
             ],
         )
     }
@@ -253,6 +251,14 @@ mod native {
         run_named(
             input,
             records,
+            "terminal-outbox-crash",
+            OUTBOX_CRASH,
+            "W-REPLAY",
+            &["crash-before-durable", "crash-after-durable"],
+        )?;
+        run_named(
+            input,
+            records,
             "native-causal-capture",
             NATIVE_CAUSAL_CAPTURE,
             "W-CAUSAL",
@@ -304,7 +310,7 @@ mod native {
         fs::create_dir(&directory)?;
         let artifact_root = directory.join("authority");
         let challenge = fresh_challenge()?;
-        let parser = [INDEX_PARSER, OPERATIONAL_PARSER].contains(&test_name);
+        let parser = test_name == CURRENT_PARSER;
         let request = if parser {
             fs::create_dir(&artifact_root)?;
             let prefix = input.artifact_prefix.join(directory_name).join("authority");
@@ -371,7 +377,7 @@ mod native {
         let mut specification = crate::command::CommandSpec::new(&image, &directory, budget)
             .bounded_until(work_deadline)
             .args(["--exact", test_name, "--nocapture", "--test-threads", "1"]);
-        if parser || [WRITER_RESERVATION, BINDING_PROJECTION].contains(&test_name) {
+        if parser || [WRITER_RESERVATION, BINDING_PROJECTION, OUTBOX_CRASH].contains(&test_name) {
             specification = specification.args(["--ignored"]);
         }
         let mut command = specification.materialize()?;

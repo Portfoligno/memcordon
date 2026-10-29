@@ -1,6 +1,6 @@
 #[path = "../src/sealed/windows_rejection_retirement.rs"]
 mod retirement;
-#[path = "../../memcordon-core/tests/support/windows_postauthorization.rs"]
+#[path = "../../memcordon-core/tests/support/windows_current_postauthorization.rs"]
 mod support;
 
 use memcordon_core::*;
@@ -11,15 +11,32 @@ fn digest(bytes: &[u8]) -> String {
     String::from(DiagnosticSha256::from_bytes(Sha256::digest(bytes).into()))
 }
 
-fn fixture(required: bool) -> (PublicProviderBindingV1, WindowsProviderResponseV3) {
-    let mut rejection = support::rejection();
+fn fixture(required: bool) -> (PublicProviderBindingV1, WindowsProviderResponseV4) {
+    let historical = support::rejection();
+    let mut rejection = WindowsProviderRejectionV3 {
+        schema_version: 3,
+        provider_failure: historical.provider_failure.clone(),
+        guardian_causal_receipt: historical.guardian_causal_receipt.clone(),
+        code: historical.code.clone(),
+        phase: historical.phase,
+        detail: historical.detail.clone(),
+        os_code: historical.os_code,
+        loader_qualification: historical.loader_qualification.clone(),
+        target_created: false,
+        target_released: false,
+        cleanup_attempted: historical.cleanup_attempted,
+        restart_safety: historical.restart_safety.clone(),
+        disposition: WindowsProviderRejectionDispositionV3::Preauthorization {
+            terminal_ack_required: required,
+        },
+    };
     let provider = rejection
         .provider_failure
         .as_ref()
         .unwrap()
         .provider_binding
         .clone();
-    let receipt = rejection.terminal_receipt().unwrap();
+    let receipt = historical.terminal_receipt().unwrap();
     let (attempt_id, nonce, request_sha256) = (
         receipt.attempt_id.clone(),
         receipt.nonce.clone(),
@@ -30,14 +47,14 @@ fn fixture(required: bool) -> (PublicProviderBindingV1, WindowsProviderResponseV
     rejection.phase = BoundarySetupPhase::ResourceVerification;
     rejection.target_created = false;
     rejection.target_released = false;
-    rejection.disposition = WindowsProviderRejectionDispositionV2::Preauthorization {
+    rejection.disposition = WindowsProviderRejectionDispositionV3::Preauthorization {
         terminal_ack_required: required,
     };
     assert!(rejection.is_consistent());
     (
         provider,
-        WindowsProviderResponseV3::Reject {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        WindowsProviderResponseV4::Reject {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id,
             nonce,
             request_sha256,
@@ -48,9 +65,9 @@ fn fixture(required: bool) -> (PublicProviderBindingV1, WindowsProviderResponseV
 
 fn context<'a>(
     provider: &'a PublicProviderBindingV1,
-    response: &'a WindowsProviderResponseV3,
+    response: &'a WindowsProviderResponseV4,
 ) -> RejectionContext<'a> {
-    let WindowsProviderResponseV3::Reject {
+    let WindowsProviderResponseV4::Reject {
         attempt_id,
         nonce,
         request_sha256,
@@ -73,7 +90,7 @@ fn primary(context: &RejectionContext<'_>) -> Error {
         "ORIGINAL-REJECTION",
         "original stream-create rejection",
     );
-    error.provider_association = Some(Box::new(result_v1::ProviderAttemptAssociationV1 {
+    error.provider_association = Some(Box::new(execution_facts::ProviderAttemptAssociationV1 {
         provider: context.provider.clone(),
         attempt_id: DiagnosticSha256::try_from(BoundedText::new(context.attempt_id).unwrap())
             .unwrap(),
@@ -136,7 +153,7 @@ fn retired(context: &RejectionContext<'_>, authority: &str) -> Vec<u8> {
         context.request_sha256,
         authority
     ));
-    serde_json::to_vec(&WindowsProviderResponseV3::TerminalRetiredV2(confirmation)).unwrap()
+    serde_json::to_vec(&WindowsProviderResponseV4::TerminalRetiredV2(confirmation)).unwrap()
 }
 
 #[test]
@@ -156,9 +173,9 @@ fn early_preauthorization_rejection_acknowledges_exact_authority_and_retains_del
     assert_eq!(result.code, "ORIGINAL-REJECTION");
     assert_eq!(result.message, "original stream-create rejection");
     assert!(!result.target_released);
-    let delivery = result.windows_terminal_delivery.unwrap();
-    assert!(delivery.retired_confirmed);
-    assert_eq!(delivery.authority_sha256, digest(&raw));
+    let delivery = result.windows_frontend_delivery.unwrap();
+    assert!(delivery.acknowledgement_observed);
+    assert_eq!(delivery.terminal_sha256, digest(&raw));
     assert_eq!(
         delivery.retired_sha256,
         digest(&retired(&context, &expected))
@@ -176,15 +193,15 @@ fn rejection_without_terminal_obligation_does_not_emit_ack_or_invent_delivery() 
         &context,
         |_| panic!("ACK not required"),
     );
-    assert!(result.windows_terminal_delivery.is_none());
+    assert!(result.windows_frontend_delivery.is_none());
     assert_eq!(result.message, "original stream-create rejection");
 }
 
 #[test]
-fn acknowledgment_hash_excludes_expirable_diagnostics_but_delivery_hashes_actual_bytes() {
+fn acknowledgment_and_current_delivery_bind_the_same_immutable_native_authority() {
     let (provider, mut response) = fixture(true);
     let immutable = response.terminal_authority_json().unwrap();
-    let WindowsProviderResponseV3::Reject { rejection, .. } = &mut response else {
+    let WindowsProviderResponseV4::Reject { rejection, .. } = &mut response else {
         unreachable!()
     };
     rejection.provider_failure = support::rejection().provider_failure;
@@ -197,9 +214,9 @@ fn acknowledgment_hash_excludes_expirable_diagnostics_but_delivery_hashes_actual
             assert_eq!(authority, digest(immutable.as_bytes()));
             Ok(retired(&context, authority))
         });
-    let delivery = result.windows_terminal_delivery.unwrap();
-    assert_eq!(delivery.authority_sha256, digest(&raw));
-    assert_ne!(delivery.authority_sha256, digest(immutable.as_bytes()));
+    let delivery = result.windows_frontend_delivery.unwrap();
+    assert_ne!(delivery.terminal_sha256, digest(&raw));
+    assert_eq!(delivery.terminal_sha256, digest(immutable.as_bytes()));
 }
 
 #[test]
@@ -219,10 +236,10 @@ fn acknowledgment_failure_preserves_original_rejection_and_rejects_foreign_retir
         "original stream-create rejection; secondary terminal acknowledgment failure:"
     ));
     assert!(failure.message.contains("pipe closed"));
-    assert!(failure.windows_terminal_delivery.is_none());
+    assert!(failure.windows_frontend_delivery.is_none());
     for field in ["attempt_id", "nonce", "request_sha256", "schema_version"] {
         let mut foreign = response.clone();
-        let WindowsProviderResponseV3::Reject {
+        let WindowsProviderResponseV4::Reject {
             schema_version,
             attempt_id,
             nonce,
@@ -246,7 +263,7 @@ fn acknowledgment_failure_preserves_original_rejection_and_rejects_foreign_retir
             &context,
             |_| panic!("foreign response must not emit ACK"),
         );
-        assert!(result.windows_terminal_delivery.is_none(), "{field}");
+        assert!(result.windows_frontend_delivery.is_none(), "{field}");
         assert_eq!(result.code, "ORIGINAL-REJECTION");
         assert!(
             result
@@ -269,7 +286,7 @@ fn acknowledgment_failure_preserves_original_rejection_and_rejects_foreign_retir
                 foreign[field] = serde_json::json!("9".repeat(64));
                 Ok(serde_json::to_vec(&foreign).unwrap())
             });
-        assert!(result.windows_terminal_delivery.is_none(), "{field}");
+        assert!(result.windows_frontend_delivery.is_none(), "{field}");
         assert!(
             result
                 .message

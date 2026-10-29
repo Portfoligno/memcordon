@@ -1,5 +1,15 @@
 //! Native containment used only by black-box process tests.
 
+#[cfg(target_os = "linux")]
+pub fn workload_start_bytes(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    request: &memcordon_core::workload_request::WorkloadRequestV1,
+    frontend: &crate::WorkloadFrontendRequest,
+) -> Result<Vec<u8>, String> {
+    crate::sealed::client::encode_start_for_test(policy, command, request, frontend)
+}
+
 mod ci_interrupt;
 pub use ci_interrupt::{CiInterrupt, CiInterruptRegistration, CiInterruptToken};
 
@@ -507,17 +517,6 @@ pub fn linux_launcher_status(bytes: &[u8]) -> io::Result<Option<i32>> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn linux_private_incoming_reader()
--> impl FnMut(&mut std::os::unix::net::UnixStream) -> Result<Option<(u16, Vec<u8>)>, String> {
-    crate::sealed::client::incoming_reader_for_test()
-}
-
-#[cfg(target_os = "linux")]
-pub fn linux_private_frame(kind: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
-    crate::sealed::client::encoded_frame_for_test(kind, payload)
-}
-
-#[cfg(target_os = "linux")]
 pub fn sealed_terminal_spawn_error(
     payload: &[u8],
 ) -> Result<Option<memcordon_core::Error>, String> {
@@ -543,23 +542,6 @@ pub fn sealed_terminal_spawn_error(
 }
 
 #[cfg(target_os = "linux")]
-pub fn sealed_terminal_revocation_error(payload: &[u8]) -> Result<memcordon_core::Error, String> {
-    let terminal = crate::sealed::client::parse_terminal(payload)?;
-    if !terminal.policy_revoked {
-        return Err("terminal is not a policy revocation".to_owned());
-    }
-    let cleanup = memcordon_core::CleanupSummary {
-        direct_child_reaped: terminal.init_reaped,
-        workload_empty: Some(terminal.cgroup_empty),
-        ..Default::default()
-    };
-    let safety = crate::sealed::client::terminal_restart_safety(&terminal);
-    Ok(crate::sealed::client::terminal_revocation_error(
-        &terminal, cleanup, safety,
-    ))
-}
-
-#[cfg(target_os = "linux")]
 pub fn sealed_terminal_v2_is_valid(payload: &[u8]) -> Result<(), String> {
     crate::sealed::client::parse_terminal(payload).map(|_| ())
 }
@@ -567,6 +549,15 @@ pub fn sealed_terminal_v2_is_valid(payload: &[u8]) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 pub fn sealed_readiness_is_valid(payload: &[u8]) -> Result<(), String> {
     crate::sealed::client::parse_readiness(payload).map(|_| ())
+}
+
+#[cfg(windows)]
+pub fn read_windows_current_response_until(
+    file: &std::fs::File,
+    budget: std::time::Duration,
+    progress: &mut dyn FnMut() -> std::io::Result<()>,
+) -> Result<memcordon_core::WindowsProviderResponseV4, String> {
+    crate::sealed::windows::read_current_response_for_test(file, budget, progress)
 }
 
 #[cfg(target_os = "linux")]
@@ -640,8 +631,6 @@ pub fn backend_selection_matches(
     crate::supervisor::test_backend_selection_matches(selected, observed, metric)
 }
 
-pub use crate::mixed_indeterminate::test_project as project_mixed_indeterminate;
-pub use crate::supervisor::test_authorization_evidence_failure as authorization_evidence_failure;
 pub use crate::supervisor::test_supervise_backend_execution as supervise_backend_execution;
 pub use crate::supervisor::test_supervise_counted_failed_attempt as supervise_counted_failed_attempt;
 pub use crate::supervisor::test_supervise_failed_attempt as supervise_failed_attempt;

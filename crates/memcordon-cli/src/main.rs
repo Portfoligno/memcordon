@@ -10,6 +10,45 @@ use presentation::Presentation;
 
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let [workload, acknowledge, arguments @ ..] = argv.as_slice()
+        && workload == "workload"
+        && acknowledge == "acknowledge"
+    {
+        let code = match memcordon::workload_recovery::acknowledge(arguments) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("MCWORKLOAD-ACKNOWLEDGMENT: {error}");
+                125
+            }
+        };
+        std::process::exit(code);
+    }
+    if let [workload, recover, arguments @ ..] = argv.as_slice()
+        && workload == "workload"
+        && recover == "recover"
+    {
+        let code = match memcordon::workload_recovery::run(arguments) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("MCWORKLOAD-RECOVERY: {error}");
+                125
+            }
+        };
+        std::process::exit(code);
+    }
+    if let [workload, pack, arguments @ ..] = argv.as_slice()
+        && workload == "workload"
+        && pack == "pack"
+    {
+        let code = match memcordon::workload_pack::run(arguments) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("MCWORKLOAD-PACK: {error}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
     #[cfg(all(target_os = "windows", feature = "test-support"))]
     if argv
         .first()
@@ -125,7 +164,7 @@ fn execute_windows_certification(argv: &[std::ffi::OsString]) -> i32 {
         if selection.len() > 4096 {
             return Err("certification selection exceeds bound".into());
         }
-        memcordon_core::workload_contract::reject_duplicate_json_keys(&selection)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&selection)?;
         let scope = memcordon_platform::WindowsCertificationScope::begin_persisted(
             serde_json::from_slice(&selection).map_err(|error| error.to_string())?,
             std::path::Path::new(observation_path),
@@ -205,17 +244,6 @@ fn execute_with_terminal_observation(
     args: memcordon::invocation::ExecutionArgs,
     presentation: &Presentation,
 ) -> i32 {
-    #[cfg(target_os = "linux")]
-    let _mixed_observation_scope = match args.output.mixed_observation_directory.as_deref() {
-        Some(directory) => match memcordon_platform::MixedObservationScope::install(directory) {
-            Ok(scope) => Some(scope),
-            Err(error) => {
-                eprintln!("error[MCCLI-MIXED-OBSERVATION]: {error}");
-                return 126;
-            }
-        },
-        None => None,
-    };
     #[cfg(windows)]
     if let Some(path) = &args.output.windows_request_observation {
         let path = match std::path::absolute(path) {

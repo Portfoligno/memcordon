@@ -234,8 +234,7 @@ pub fn load_receipt(descriptor: &Descriptor, binary: &str) -> Result<Receipt> {
         return Err(refuse("invalid capture binary name"));
     }
     let bytes = private_bytes(&directory.join(format!("{binary}.json")), 1024 * 1024)?;
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)
-        .map_err(CiError::Message)?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes).map_err(CiError::Message)?;
     let receipt: Receipt = serde_json::from_slice(&bytes)?;
     if receipt.format != "memcordon.public-install-compiler-output"
         || receipt.revision != 1
@@ -435,7 +434,7 @@ pub fn run_if_wrapper() -> Result<Option<std::process::ExitStatus>> {
     let descriptor_pin = pin(&descriptor_path)?;
     let wrapper_pin = pin(&executable)?;
     let descriptor_bytes = private_bytes(&parent.join(DESCRIPTOR_NAME), 64 * 1024)?;
-    memcordon_core::workload_contract::reject_duplicate_json_keys(&descriptor_bytes)
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&descriptor_bytes)
         .map_err(CiError::Message)?;
     let descriptor: Descriptor = serde_json::from_slice(&descriptor_bytes)?;
     if serde_json::to_vec(&descriptor)? != descriptor_bytes {

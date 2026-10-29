@@ -6,12 +6,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{Frame, MessageKind, PROTOCOL_VERSION, write_frame};
+use crate::protocol::{Frame, MessageKind, PROTOCOL_VERSION};
 use crate::rejection::RejectionV1;
 
 pub fn serve() -> Result<(), String> {
     super::startup::clear()?;
-    crate::policy_registry::start_service_instance()?;
     configure_subreaper()?;
     let qualification = super::launcher::probe().map_err(|error| {
         // Transport and decoding failures may carry free-form I/O text. Give
@@ -123,35 +122,53 @@ fn handle(
     stream: &mut UnixStream,
     qualification: &super::qualification::ReadinessObservation,
 ) -> Result<(), String> {
+    let setup_cutoff = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let setup_cutoff_nanos = super::clock::monotonic_nanos()?
+        .checked_add(30_000_000_000)
+        .ok_or("native setup cutoff overflow")?;
     let credentials = peer_credentials(stream)?;
     if credentials.uid == u32::MAX {
         return Err("MCSEALED-PIPE-AUTH: invalid peer credentials".to_owned());
     }
     let groups = peer_groups(credentials.pid)?;
     authorize_peer(credentials, &groups)?;
-    let (request, descriptors, version) = super::transport::receive_public(stream)?;
-    super::retired_state::require_provider_registrations_absent()?;
+    let (request, descriptors, version) =
+        super::transport::receive_public_until(stream, setup_cutoff)?;
     let response = match (version, request.kind) {
+        (crate::protocol::WORKLOAD_PROTOCOL_VERSION, MessageKind::WorkloadStart) => {
+            return super::workload_runtime::forward_public(
+                stream,
+                &request,
+                descriptors,
+                credentials.pid,
+                credentials.uid,
+                credentials.gid,
+                &groups,
+                setup_cutoff_nanos,
+            );
+        }
+        (crate::protocol::WORKLOAD_PROTOCOL_VERSION, MessageKind::WorkloadRecover) => {
+            super::workload_recovery::recover_public(
+                stream,
+                &request,
+                descriptors,
+                credentials.pid,
+                credentials.uid,
+                credentials.gid,
+            )?
+        }
+        (crate::protocol::WORKLOAD_PROTOCOL_VERSION, MessageKind::WorkloadAcknowledge) => {
+            super::workload_recovery::acknowledge_public(
+                stream,
+                &request,
+                descriptors,
+                credentials.pid,
+                credentials.uid,
+                credentials.gid,
+            )?
+        }
         (PROTOCOL_VERSION, MessageKind::Probe) => {
             probe_response(&request, descriptors.len(), qualification)?
-        }
-        (PROTOCOL_VERSION, MessageKind::WorkloadDiscovery) => {
-            workload_discovery_response(&request, descriptors.len(), credentials.uid)?
-        }
-        (PROTOCOL_VERSION, MessageKind::WorkloadPlan) => {
-            workload_plan_response(&request, descriptors.len(), credentials.uid)?
-        }
-        (PROTOCOL_VERSION, MessageKind::PrivatePlan) => {
-            super::private_runtime::plan(&request, descriptors.len(), credentials.uid)?
-        }
-        (PROTOCOL_VERSION, MessageKind::PrivateDiscovery) => {
-            super::private_runtime::discovery(&request, descriptors.len(), credentials.uid)?
-        }
-        (crate::protocol::MIXED_PROTOCOL_VERSION, MessageKind::MixedPlan) => {
-            super::mixed_advisory::plan(&request, descriptors.len(), credentials.uid)?
-        }
-        (crate::protocol::MIXED_PROTOCOL_VERSION, MessageKind::MixedDiscovery) => {
-            super::mixed_advisory::discovery(&request, descriptors.len(), credentials.uid)?
         }
         (PROTOCOL_VERSION, MessageKind::Launch) => {
             match launch_response(request.clone(), descriptors, credentials, groups) {
@@ -162,213 +179,19 @@ fn handle(
                 }
             }
         }
-        (PROTOCOL_VERSION, MessageKind::PrivateLaunch) => {
-            if peer_inside_active_attempt(credentials.pid)? {
-                rejected_text(
-                    &request,
-                    "MCSEALED-RECURSIVE-PROVIDER-REQUEST",
-                    "caller is already inside an owned attempt",
-                )?
-            } else {
-                match super::private_runtime::forward_public(
-                    stream,
-                    &request,
-                    descriptors,
-                    credentials.pid,
-                    credentials.uid,
-                    credentials.gid,
-                    &groups,
-                ) {
-                    Ok(response) => response,
-                    Err(error) => rejected_text(&request, "MCSEALED-PRIVATE-INGRESS", &error)?,
-                }
-            }
-        }
-        (crate::protocol::MIXED_PROTOCOL_VERSION, MessageKind::MixedLaunch) => {
-            if peer_inside_active_attempt(credentials.pid)? {
-                super::mixed_runtime::rejected_ingress(
-                    &request,
-                    memcordon_core::result_v2::MixedAdmissionRejectionV2::RecursiveProviderRequest,
-                    "caller already belongs to an owned attempt",
-                )?
-            } else {
-                match super::mixed_runtime::forward_public(
-                    stream,
-                    &request,
-                    descriptors,
-                    credentials.pid,
-                    credentials.uid,
-                    credentials.gid,
-                    &groups,
-                ) {
-                    Ok(response) => response,
-                    Err(error) => super::mixed_runtime::rejected_ingress(
-                        &request,
-                        memcordon_core::result_v2::MixedAdmissionRejectionV2::MalformedIngress,
-                        &error,
-                    )?,
-                }
-            }
-        }
-        (crate::protocol::MIXED_PROTOCOL_VERSION, _) => super::mixed_runtime::rejected_ingress(
-            &request,
-            memcordon_core::result_v2::MixedAdmissionRejectionV2::UnsupportedRequest,
-            "unsupported public mixed request kind",
-        )?,
         _ => rejected_text(
             &request,
             "MCSEALED-AUTHORIZATION",
             "MCSEALED-AUTHORIZATION: launch protocol requires the native descriptor transaction",
         )?,
     };
-    write_frame(stream, &response).map_err(|error| error.to_string())
+    super::workload_runtime::write_frame_until(
+        stream,
+        &response,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
 }
 
-fn workload_discovery_response(
-    request: &Frame,
-    descriptor_count: usize,
-    uid: u32,
-) -> Result<Frame, String> {
-    if descriptor_count != 0 || request.attempt_id != [0; 16] || !request.payload.is_empty() {
-        return Err("workload discovery must not carry resources or an attempt".into());
-    }
-    let lease = discovery_phase(request, "registry-acquire", || {
-        crate::policy_registry::native::Lease::acquire()
-    })?;
-    let activation = discovery_phase(request, "registry-read", || lease.read())?;
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map_err(|error| error.to_string())?;
-    let provider = discovery_phase(request, "installed-binding", || {
-        super::runtime_manifest::installed_binding()
-    })?;
-    let discovery = memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
-        activation
-            .as_ref()
-            .map(|activation| (&activation.registry, &activation.epoch)),
-        &memcordon_core::workload_registry::CallerSelector::Linux { uid },
-        memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
-        provider,
-        memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
-    )?;
-    Ok(Frame {
-        kind: MessageKind::WorkloadDiscoveryReceipt,
-        nonce: request.nonce,
-        attempt_id: request.attempt_id,
-        payload: serde_json::to_vec(&discovery).map_err(|error| error.to_string())?,
-    })
-}
-
-/// Bounded fields only: no registry contents, grants, credentials or payload.
-/// Diagnostics preserve phase deadlines and never authorize a receipt.
-fn discovery_phase<T>(
-    request: &Frame,
-    phase: &str,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    let started = std::time::Instant::now();
-    let nonce = format!("{:02x?}", request.nonce);
-    eprintln!(
-        "sealed discovery phase nonce={nonce} pid={} phase={phase} state=begin",
-        std::process::id()
-    );
-    let result = operation();
-    eprintln!(
-        "sealed discovery phase nonce={nonce} pid={} phase={phase} state={} elapsed_ms={}",
-        std::process::id(),
-        if result.is_ok() { "complete" } else { "failed" },
-        started.elapsed().as_millis()
-    );
-    result
-}
-
-fn workload_plan_response(
-    request: &Frame,
-    descriptor_count: usize,
-    uid: u32,
-) -> Result<Frame, String> {
-    use memcordon_core::workload_evidence::*;
-    use memcordon_core::workload_registry::*;
-    if descriptor_count != 0 || request.attempt_id != [0; 16] {
-        return Err("workload plan must not allocate an attempt or carry descriptors".into());
-    }
-    let contract =
-        match memcordon_core::workload_contract::WorkloadContract::parse(&request.payload)? {
-            memcordon_core::workload_contract::WorkloadContract::V1(contract) => contract,
-            memcordon_core::workload_contract::WorkloadContract::V2(_) => {
-                return rejected_text(
-                    request,
-                    "MCSEALED-WORKLOAD-V2-UNAVAILABLE",
-                    "qualified private V2 plan ingress has been retired",
-                );
-            }
-            memcordon_core::workload_contract::WorkloadContract::V3(_) => {
-                return rejected_text(
-                    request,
-                    "MCSEALED-WORKLOAD-V3-UNAVAILABLE",
-                    "combined V3 plan requires the revision-two private ingress",
-                );
-            }
-        };
-    let binding = RequestBindingV1::from_contract(&contract)?;
-    let result = (|| -> Result<RuntimeWorkloadResolution, String> {
-        let lease = crate::policy_registry::native::Lease::acquire()?;
-        let activation = lease.read()?.ok_or("policy activation absent")?;
-        if let Err(rejection) = resolve(
-            &activation.registry,
-            &activation.epoch,
-            &contract,
-            &CallerSelector::Linux { uid },
-            BaselineProfile::LinuxUnixCreate,
-        ) {
-            return Ok(RuntimeWorkloadResolution::Rejected {
-                binding: binding.clone(),
-                rejection,
-                target_authorized: False::default(),
-            });
-        }
-        let provider = super::runtime_manifest::installed_binding()?;
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .map_err(|error| error.to_string())?;
-        let plan = RuntimePlanBinding::from_local_grant(
-            &contract,
-            activation.registry_digest,
-            provider,
-            memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
-        )?;
-        let mut pending = memcordon_core::BoundedVec::default();
-        for check in [
-            PrelaunchCheck::CallerIdentity,
-            PrelaunchCheck::InvocationIdentity,
-            PrelaunchCheck::DescriptorCustody,
-            PrelaunchCheck::NativeControls,
-            PrelaunchCheck::Guardian,
-            PrelaunchCheck::CurrentEpoch,
-            PrelaunchCheck::DurableCheckpoint,
-        ] {
-            pending
-                .try_push(check)
-                .expect("fixed prelaunch check inventory fits");
-        }
-        Ok(RuntimeWorkloadResolution::Planned { binding: plan, effective: EffectiveWorkloadPolicyV1 {
-            profile: BaselineProfile::LinuxUnixCreate, ceiling: BaselineProfile::LinuxUnixCreate.ceiling(),
-            restriction: BaselineRestrictionObservationV1::LinuxUnixOnlySocketSyscallFilterAlternatePathsUnknown,
-        }, pending })
-    })();
-    let response = result.unwrap_or(RuntimeWorkloadResolution::Unavailable {
-        request: Some(binding),
-        reason: AdmissionAvailabilityFailure::BindingUnavailable,
-        authorization: AuthorizationKnowledge::NotAuthorized,
-    });
-    Ok(Frame {
-        kind: MessageKind::WorkloadPlanReceipt,
-        nonce: request.nonce,
-        attempt_id: request.attempt_id,
-        payload: serde_json::to_vec(&response).map_err(|error| error.to_string())?,
-    })
-}
-
-/// Return launcher readiness observations for a descriptor-free probe request.
-/// This response neither allocates nor authorizes a workload.
 fn probe_response(
     request: &Frame,
     descriptor_count: usize,
@@ -488,7 +311,7 @@ pub(crate) fn terminal_payload(facts: &super::launch::TerminalFacts) -> Vec<u8> 
             (class.receipt_name(), os_code.to_string())
         }
     };
-    let mut payload = format!(
+    let payload = format!(
         "schema-version=2\nmechanism=linux-pid-namespace-cgroup-v2\nstatus={}\nexec-status={}\nexec-os-code={}\nspawn-error-reported={}\ntarget-pid={}\nauthorization-offset-millis={}\nmemory-limit-exceeded={}\ndeadline-exceeded={}\nassignment-verified={}\nnamespaces-verified={}\ntarget-initial-credentials-verified={}\ninitial-provider-capabilities-absent={}\ncaller-envelope-digest={}\ncaller-no-new-privs={}\ntarget-no-new-privs-matched={}\ncaller-capability-bounding-set-digest={}\ntarget-capability-bounding-set-matched={}\ncaller-mount-namespace-digest={}\ntarget-mount-context-derived-from-caller={}\ncredential-transition-disposition=preserve-caller-envelope\nboundary-independent-of-credentials={}\ndescriptors-verified={}\nwritable-ancestor-cgroup-denied={}\nparent-namespace-handles-denied={}\nrecursive-provider-request-denied={}\nguardian-ready-before-authorization={}\nfrontend-loss-authority-verified={}\ncgroup-kill-invoked={}\ncgroup-empty={}\ninit-reaped={}\nguardian-reaped={}\nboundary-retired={}\n",
         facts.child_status.map_or_else(|| "none".to_owned(), |status| status.to_string()),
         exec_status,
@@ -523,15 +346,6 @@ pub(crate) fn terminal_payload(facts: &super::launch::TerminalFacts) -> Vec<u8> 
         facts.boundary_retired
     )
     .into_bytes();
-    if facts.policy_revoked {
-        payload.extend_from_slice(b"policy-revoked=true\n");
-    }
-    payload.extend_from_slice(b"policy-enforcement=");
-    payload.extend_from_slice(
-        &serde_json::to_vec(&facts.policy_enforcement)
-            .expect("typed policy enforcement serializes"),
-    );
-    payload.push(b'\n');
     payload
 }
 
@@ -575,7 +389,6 @@ fn journal_rejection(attempt_id: [u8; 16], rejection: &RejectionV1) {
 }
 
 pub(crate) const PACKAGE_LEASE: &str = "/run/memcordon-sealed-package.lock";
-const LEGACY_PACKAGE_LEASE: &str = "/run/memcordon/sealed-package.lock";
 
 #[derive(Clone, Copy)]
 enum LeaseAccess {
@@ -637,18 +450,6 @@ pub(crate) fn acquire_package_lease_until_observed(
     );
     observation.finished_monotonic_nanos = super::clock::monotonic_nanos().ok();
     result
-}
-
-pub fn acquire_legacy_package_lease_until(deadline: u64) -> Result<std::fs::File, String> {
-    acquire_lease_inner(
-        LEGACY_PACKAGE_LEASE,
-        LeaseAccess::ExclusiveCreate,
-        Some(deadline),
-    )
-}
-
-pub fn acquire_legacy_package_lease() -> Result<std::fs::File, String> {
-    acquire_lease(LEGACY_PACKAGE_LEASE, LeaseAccess::ExclusiveCreate)
 }
 
 fn acquire_lease(path: &str, access: LeaseAccess) -> Result<std::fs::File, String> {
@@ -856,7 +657,7 @@ fn namespace_identity(metadata: &std::fs::Metadata) -> crate::request::Namespace
     }
 }
 
-fn peer_inside_active_attempt(pid: libc::pid_t) -> Result<bool, String> {
+pub(super) fn peer_inside_active_attempt(pid: libc::pid_t) -> Result<bool, String> {
     peer_inside_active_attempt_at(
         pid,
         std::path::Path::new("/proc"),

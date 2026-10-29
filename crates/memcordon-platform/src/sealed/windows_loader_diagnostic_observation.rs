@@ -1,7 +1,7 @@
 //! Separate support-only observation; never a certification acceptance row.
 use memcordon_core::{
-    WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsLaunchRequestV1, WindowsLoaderDiagnosticSelectionV1,
-    WindowsProcessIdentityV1, WindowsProviderRequestV3,
+    WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION, WindowsLaunchRequestV2,
+    WindowsLoaderDiagnosticSelectionV1, WindowsProcessIdentityV1, WindowsProviderRequestV4,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 #[serde(deny_unknown_fields)]
 pub struct WindowsLoaderDiagnosticObservation {
     pub selection: WindowsLoaderDiagnosticSelectionV1,
-    pub launch: Option<WindowsLaunchRequestV1>,
+    pub launch: Option<WindowsLaunchRequestV2>,
     pub caller: Option<WindowsProcessIdentityV1>,
     pub attempt_id: Option<String>,
     pub request_sha256: Option<String>,
@@ -64,7 +64,7 @@ impl Drop for WindowsLoaderDiagnosticScope {
     }
 }
 
-pub(super) fn decorate(launch: &mut WindowsLaunchRequestV1) -> Result<(), String> {
+pub(super) fn decorate(launch: &mut WindowsLaunchRequestV2) -> Result<(), String> {
     ACTIVE.with(|active| {
         if let Some(observation) = active.borrow().as_ref() {
             if observation.launch.is_some() || super::certification_observation::active() {
@@ -76,7 +76,7 @@ pub(super) fn decorate(launch: &mut WindowsLaunchRequestV1) -> Result<(), String
     })
 }
 
-pub(super) fn route(launch: WindowsLaunchRequestV1) -> Result<WindowsProviderRequestV3, String> {
+pub(super) fn route(launch: WindowsLaunchRequestV2) -> Result<WindowsProviderRequestV4, String> {
     ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
         let Some(observation) = active.as_mut() else {
@@ -101,8 +101,8 @@ pub(super) fn route(launch: WindowsLaunchRequestV1) -> Result<WindowsProviderReq
         observation.caller = Some(caller.clone());
         observation.attempt_id = Some(attempt.clone());
         observation.request_sha256 = Some(digest.clone());
-        Ok(WindowsProviderRequestV3::LoaderDiagnosticLaunch {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        Ok(WindowsProviderRequestV4::LoaderDiagnosticLaunch {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt,
             request_sha256: digest,
             caller_process_identity: caller,

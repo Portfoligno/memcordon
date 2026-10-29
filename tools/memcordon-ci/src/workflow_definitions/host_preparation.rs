@@ -148,14 +148,11 @@ pub(super) fn apply(workflow: &mut Value) -> Result<()> {
         ]));
         early.push(object(&[("id",text("readiness-tools-upload")),("uses",text(UPLOAD)),("timeout-minutes",Value::from(6)),("with",object(&[("name",text(&format!("readiness-tools-{host}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}"))),("path",text("target/readiness-tools.tar.gz")),("if-no-files-found",text("error")),("overwrite",Value::Bool(false))]))]));
         put(&mut producer, "steps", Value::Sequence(early));
-        put(
-            &mut producer,
-            "outputs",
-            object(&[(
-                "artifact-id",
-                text("${{ steps.readiness-tools-upload.outputs.artifact-id }}"),
-            )]),
-        );
+        let outputs = object(&[(
+            "artifact-id",
+            text("${{ steps.readiness-tools-upload.outputs.artifact-id }}"),
+        )]);
+        put(&mut producer, "outputs", outputs);
         jobs.insert(text(&preparation), producer);
         let consumers = jobs
             .keys()
@@ -164,6 +161,7 @@ pub(super) fn apply(workflow: &mut Value) -> Result<()> {
                 *name == native
                     || name.starts_with(&format!("candidate-{host}-"))
                     || name.starts_with(&format!("installed-{host}-"))
+                    || (!host.starts_with("macos-") && name.starts_with(&format!("public-{host}-")))
             })
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -200,8 +198,8 @@ pub(super) fn apply(workflow: &mut Value) -> Result<()> {
     Ok(())
 }
 
-/// Whole real jobs must equal the reviewed generated graph before legacy
-/// policy vocabulary is restored; no dependency or artifact mutation is hidden.
+/// Whole real jobs must equal the reviewed generated graph before projection;
+/// no dependency or artifact mutation is hidden.
 pub(super) fn project(actual: &mut Mapping, expected: &Value, original: &Value) -> Result<()> {
     let jobs = actual
         .get_mut(text("jobs"))
@@ -220,6 +218,7 @@ pub(super) fn project(actual: &mut Mapping, expected: &Value, original: &Value) 
                     || *name == native
                     || name.starts_with(&format!("candidate-{host}-"))
                     || name.starts_with(&format!("installed-{host}-"))
+                    || (!host.starts_with("macos-") && name.starts_with(&format!("public-{host}-")))
             })
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -253,6 +252,7 @@ pub(super) fn projected_job(name: &str) -> bool {
         name == format!("native-{host}")
             || name.starts_with(&format!("candidate-{host}-"))
             || name.starts_with(&format!("installed-{host}-"))
+            || (!host.starts_with("macos-") && name.starts_with(&format!("public-{host}-")))
     })
 }
 

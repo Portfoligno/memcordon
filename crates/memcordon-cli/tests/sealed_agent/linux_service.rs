@@ -2,7 +2,7 @@
 
 use crate::protocol::{Frame, MessageKind};
 use crate::rejection::{RejectionPhaseV1, RejectionV1};
-use memcordon_core::runtime_readiness::ReadinessObservation;
+use memcordon_core::native_readiness::ReadinessObservation;
 use std::path::Path;
 
 #[test]
@@ -76,10 +76,9 @@ fn recursive_inventory(proc_root: &Path, cgroup_root: &Path) -> Result<bool, Str
 
 pub(super) fn readiness() -> ReadinessObservation {
     let mut observation = ReadinessObservation {
-        format: "memcordon.runtime-readiness".into(),
+        format: "memcordon.native-readiness".into(),
         revision: 1,
-        workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
-            .reference(),
+        probe_role: "credential-preserving".into(),
         workload_profile_probe_verified: true,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),

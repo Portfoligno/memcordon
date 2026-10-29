@@ -4,7 +4,9 @@ use crate::windows_installed_cases::{
     InstalledWindowsAssessment, InstalledWindowsPayload, WindowsLeaseDeadlines,
 };
 use crate::{CiError, Result};
-use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+use memcordon_core::{
+    runtime_components::RuntimeComponentRole, runtime_manifest_v2::RuntimeManifestV2,
+};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,8 +100,11 @@ fn admit(
     Ok(())
 }
 
-fn mixed_manifest(actor: &RuntimeManifest, original_bootstrap: &[u8]) -> Result<RuntimeManifest> {
-    let actor = RuntimeManifest::parse(&serde_json::to_vec(actor)?).map_err(CiError::Message)?;
+fn mixed_manifest(
+    actor: &RuntimeManifestV2,
+    original_bootstrap: &[u8],
+) -> Result<RuntimeManifestV2> {
+    let actor = RuntimeManifestV2::parse(&serde_json::to_vec(actor)?).map_err(CiError::Message)?;
     super::target::validate_executable(original_bootstrap, &actor.target)?;
     let mut mixed = actor.clone();
     let bootstrap = mixed
@@ -112,7 +117,7 @@ fn mixed_manifest(actor: &RuntimeManifest, original_bootstrap: &[u8]) -> Result<
         bootstrap.path.clone(),
         original_bootstrap,
     );
-    RuntimeManifest::parse(&serde_json::to_vec(&mixed)?).map_err(CiError::Message)
+    RuntimeManifestV2::parse(&serde_json::to_vec(&mixed)?).map_err(CiError::Message)
 }
 
 #[cfg(windows)]
@@ -171,7 +176,7 @@ pub(super) fn run(
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| CiError::Message("support attempt absent".into()))?;
     let original_result = read(&pending.join("original-result.json"))?;
-    let parsed = memcordon_core::ResultV1::parse(&original_result).map_err(CiError::Message)?;
+    let parsed = memcordon_core::ResultV3::parse(&original_result).map_err(CiError::Message)?;
     if !crate::support_loader_producer::installed_trigger(&parsed, &original.provider)? {
         return Err(CiError::Message(
             "pending diagnostic original refusal changed".into(),
@@ -217,7 +222,7 @@ pub(super) fn run(
         "association":association,
         "original_result_sha256":artifacts::checksum(&original_result),
         "original_input_sha256":artifacts::checksum(&read(&pending.join("original-input.json"))?),
-        "original_contract_sha256":artifacts::checksum(&read(&pending.join("original-contract.json"))?),
+        "original_request_sha256":artifacts::checksum(&read(&pending.join("original-contract.json"))?),
         "original_bootstrap_sha256":original_bootstrap.sha256,
         "original_assessment_sha256":artifacts::checksum(&serde_json::to_vec(assessment)?),
         "original_removal":removed.receipt,
@@ -233,7 +238,7 @@ pub(super) fn run(
         &actor,
         deadlines.work,
     )?;
-    let actor_manifest = RuntimeManifest::parse(&read(&actor.join("runtime-manifest.json"))?)
+    let actor_manifest = RuntimeManifestV2::parse(&read(&actor.join("runtime-manifest.json"))?)
         .map_err(CiError::Message)?;
     let mixed = mixed_manifest(&actor_manifest, &bootstrap_bytes)?;
     let selected = directory.join("selected-support");
@@ -531,65 +536,14 @@ fn capture(
         .into_iter()
         .find(|case| case.key.family == "W-ENVELOPE" && case.key.scenario == "restricted")
         .ok_or_else(|| CiError::Message("support restricted case absent".into()))?;
-    let activation = crate::command::CommandSpec::new(
-        &config.installed_agent.path,
-        &config.output_directory,
-        Duration::from_secs(90),
-    )
-    .args([
-        std::ffi::OsString::from("package"),
-        "policy".into(),
-        "apply".into(),
-        "--file".into(),
-        input.local_policy.clone().into_os_string(),
-    ])
-    .bounded_until(deadlines.work)
-    .output_limit(256 * 1024)
-    .output_quiet()?;
-    crate::command::require_successful_output(
-        "installed diagnostic policy activation",
-        &activation,
-    )?;
-    let registry = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(
-        &super::artifacts::read_file(&input.local_policy)?,
-    )
-    .map_err(CiError::Message)?;
-    let contract = memcordon_core::workload_contract::WorkloadContractV1::parse(
-        &super::artifacts::read_file(&case.workload_contract)?,
-    )
-    .map_err(CiError::Message)?;
-    let activated = crate::windows_policy_activation::refresh_contract(
-        &contract,
-        &registry,
-        &activation.stdout,
-    )?;
-    let original_contract =
-        memcordon_core::workload_contract::WorkloadContractV1::parse(&super::artifacts::read_file(
-            &original
-                .output_directory
-                .join("pending-loader-diagnostic/original-contract.json"),
-        )?)
-        .map_err(CiError::Message)?;
-    if activated.expected_epoch == original_contract.expected_epoch {
-        return Err(CiError::Message(
-            "support diagnostic must bind a distinct actual policy epoch".into(),
-        ));
-    }
-    case.workload_contract = crate::windows_consumer_readiness::write_activated_contract(
-        &config.output_directory,
-        &case.key,
-        &serde_json::to_vec(&activated)?,
-    )?;
+    memcordon_core::workload_request::WorkloadRequestV1::parse(&super::artifacts::read_file(
+        &case.workload_request,
+    )?)
+    .map_err(|error| CiError::Message(error.to_string()))?;
     std::fs::create_dir_all(&case.descriptor.output_root)?;
     let _descriptor = crate::windows_readiness_adapter::publish_receipt(
         &case.descriptor_path,
         &serde_json::to_vec(&case.descriptor)?,
-    )?;
-    let _activation = crate::windows_readiness_adapter::publish_receipt(
-        &config
-            .output_directory
-            .join("diagnostic-policy-activation.json"),
-        &activation.stdout,
     )?;
     crate::windows_consumer_readiness::installed_loader_diagnostic::collect(
         config,

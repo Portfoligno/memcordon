@@ -361,7 +361,6 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
         errors: Vec::new(),
     };
     let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
         provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-AUTHORIZATION".to_owned(),
@@ -373,8 +372,6 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
         target_released: false,
         cleanup_attempted: true,
         restart_safety: restart_safety.clone(),
-        terminal_ack_required: false,
-        terminal_receipt: None,
     };
     let mut error = Error::new(
         ErrorCategory::Setup,

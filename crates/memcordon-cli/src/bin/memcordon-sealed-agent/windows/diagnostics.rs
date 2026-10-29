@@ -86,8 +86,8 @@ pub(crate) fn capture_native_with_injected_fault(
         sequence: 0,
         origin: memcordon_core::DiagnosticOriginV1::Launcher,
         category: match operation {
-            memcordon_core::FailureOperationV1::InstallPolicy
-            | memcordon_core::FailureOperationV1::VerifyPolicy => {
+            memcordon_core::FailureOperationV1::ConfigureJob
+            | memcordon_core::FailureOperationV1::VerifyJob => {
                 memcordon_core::FailureCategoryV1::Admission
             }
             memcordon_core::FailureOperationV1::ReadControlFrame

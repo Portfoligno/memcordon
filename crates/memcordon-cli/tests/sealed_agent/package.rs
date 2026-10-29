@@ -8,6 +8,8 @@ fn package_cleanup_cutoff_rejects_invalid_values_before_mutation() {
     for value in ["", "0", "-1", "1.5", "18446744073709551616"] {
         let error = crate::package::uninstall_until(std::ffi::OsStr::new(value)).unwrap_err();
         assert_eq!(error, "invalid original package cleanup monotonic cutoff");
+        let error = crate::package::upgrade_until(std::ffi::OsStr::new(value)).unwrap_err();
+        assert_eq!(error, "invalid original package cleanup monotonic cutoff");
     }
 }
 
@@ -69,9 +71,10 @@ fn compiled_package_metadata_uses_split_control_and_launcher_identities() {
     assert!(semantic_lines(control_service).contains(
         &"After=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket"
     ));
-    assert!(semantic_lines(control_service).contains(
-        &"ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy"
-    ));
+    assert!(
+        semantic_lines(control_service)
+            .contains(&"ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed")
+    );
     assert!(!control_service.contains("ReadWritePaths=/run/memcordon-sealed-package.lock"));
     assert!(!control_service.contains("RuntimeDirectory="));
     assert!(!control_service.contains("RuntimeDirectoryMode="));
@@ -160,9 +163,8 @@ fn optional_network_launcher_is_package_owned_but_not_an_active_profile() {
     assert!(semantic_lines(network_socket).contains(&"SocketUser=root"));
     assert!(semantic_lines(network_socket).contains(&"SocketGroup=root"));
 
-    use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest, SealedRuntime,
-    };
+    use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+    use memcordon_core::runtime_manifest_v2::{RuntimeManifestV2, SealedRuntimeV2};
     let component = |id: &str, role| RuntimeComponentRecord {
         id: id.into(),
         path: if role == RuntimeComponentRole::PublicCli {
@@ -174,9 +176,9 @@ fn optional_network_launcher_is_package_owned_but_not_an_active_profile() {
         role,
         size: 4,
         mode: 0o755,
-        sha256: memcordon_core::workload_codec::hash_bytes(b"test").into(),
+        sha256: memcordon_core::hash_bytes(b"test").into(),
     };
-    let manifest = RuntimeManifest::linux(
+    let manifest = RuntimeManifestV2::linux(
         env!("CARGO_PKG_VERSION").into(),
         "ab".repeat(20),
         "x86_64-unknown-linux-gnu".into(),
@@ -184,12 +186,19 @@ fn optional_network_launcher_is_package_owned_but_not_an_active_profile() {
             component("public-cli", RuntimeComponentRole::PublicCli),
             component("sealed-agent", RuntimeComponentRole::SealedAgent),
         ],
+        cfg!(feature = "private-tcp"),
     )
     .unwrap();
-    let SealedRuntime::Included { profiles, .. } = manifest.sealed else {
-        panic!("Linux baseline runtime is no longer included");
-    };
-    assert_eq!(profiles, ["linux-unix-create-v1"]);
+    match manifest.sealed {
+        SealedRuntimeV2::Included { profile, .. } => {
+            assert!(cfg!(feature = "private-tcp"));
+            assert_eq!(profile, "linux-private-workload-v1");
+        }
+        SealedRuntimeV2::CredentialPreservingLinux { .. } => {
+            assert!(!cfg!(feature = "private-tcp"))
+        }
+        SealedRuntimeV2::NotIncluded => panic!("Linux runtime omitted"),
+    }
 }
 
 #[test]
@@ -224,4 +233,10 @@ fn package_metadata_semantics_are_identical_with_crlf_checkout() {
             "f /run/memcordon-sealed-package.lock 0600 root root -",
         ]
     );
+}
+#[test]
+fn unsupported_operation_rejects_before_native_administration() {
+    let error =
+        crate::package::run(std::ffi::OsStr::new("unsupported-operation"), false).unwrap_err();
+    assert_eq!(error, "unknown package operation");
 }

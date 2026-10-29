@@ -6988,8 +6988,8 @@ fn support_control_release_reads_only_complete_bounded_frames_before_original_cu
         read_control_release(read.raw(), peer, Instant::now() + Duration::from_secs(1)).is_err()
     );
     let (read, write) = pair();
-    let message = memcordon_core::WindowsProviderRequestV3::Probe {
-        schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let message = memcordon_core::WindowsProviderRequestV4::Probe {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
     };
     crate::windows::pipe::write_frame(write.raw(), &message).unwrap();
     assert_eq!(

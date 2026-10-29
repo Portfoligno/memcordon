@@ -182,8 +182,8 @@ fn handle(
         )?
     } else {
         match request.kind {
-            MessageKind::MixedBrokerLaunch if network && cfg!(feature = "private-tcp") => {
-                super::mixed_runtime::execute_brokered(
+            MessageKind::WorkloadBrokerStart if network && cfg!(feature = "private-tcp") => {
+                super::workload_runtime::execute_brokered(
                     stream,
                     &request,
                     descriptors,
@@ -191,8 +191,17 @@ fn handle(
                     peer.process_start_time,
                 )?
             }
-            MessageKind::PrivateBrokerLaunch if network && cfg!(feature = "private-tcp") => {
-                super::private_runtime::execute_brokered(
+            MessageKind::WorkloadBrokerRecover if network && cfg!(feature = "private-tcp") => {
+                super::workload_recovery::recover_brokered(
+                    stream,
+                    &request,
+                    descriptors,
+                    peer.pid,
+                    peer.process_start_time,
+                )?
+            }
+            MessageKind::WorkloadBrokerAcknowledge if network && cfg!(feature = "private-tcp") => {
+                super::workload_recovery::acknowledge_brokered(
                     stream,
                     &request,
                     descriptors,
@@ -220,7 +229,11 @@ fn handle(
             )?,
         }
     };
-    write_frame(stream, &response).map_err(|error| error.to_string())
+    super::workload_runtime::write_frame_until(
+        stream,
+        &response,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
 }
 
 fn launch_response(
@@ -340,6 +353,163 @@ fn connect_authenticated(nonce: [u8; 16], attempt_id: [u8; 16]) -> Result<UnixSt
     connect_selected(SOCKET_PATH, LAUNCHER_UNIT, nonce, attempt_id)
 }
 
+pub(super) fn connect_workload(
+    attempt: [u8; 16],
+    challenge: [u8; 16],
+) -> Result<UnixStream, String> {
+    connect_workload_until(
+        attempt,
+        challenge,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+pub(super) fn connect_workload_until(
+    attempt: [u8; 16],
+    challenge: [u8; 16],
+    cutoff: std::time::Instant,
+) -> Result<UnixStream, String> {
+    use std::time::{Duration, Instant};
+    let mut stream = loop {
+        if Instant::now() >= cutoff {
+            return Err("original native broker connection cutoff expired".into());
+        }
+        // SAFETY: scalar socket arguments request a newly owned nonblocking Unix stream.
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        // SAFETY: the successful socket result transfers unique ownership.
+        let stream = unsafe { UnixStream::from_raw_fd(raw) };
+        // SAFETY: zero is a valid initial representation of sockaddr_un before fields are set.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path = std::ffi::CString::new(NETWORK_SOCKET_PATH).expect("fixed native socket path");
+        if path.as_bytes_with_nul().len() > address.sun_path.len() {
+            return Err("fixed native socket path exceeds ABI bound".into());
+        }
+        for (target, byte) in address.sun_path.iter_mut().zip(path.as_bytes_with_nul()) {
+            *target = *byte as libc::c_char;
+        }
+        // SAFETY: initialized sockaddr_un and its exact ABI length remain live through connect.
+        let connected = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if connected == 0 {
+            break stream;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EAGAIN) {
+            std::thread::sleep(
+                cutoff
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            );
+            continue;
+        }
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error.to_string());
+        }
+        loop {
+            let remaining = cutoff.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("original native broker connect cutoff expired".into());
+            }
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one initialized poll record borrows the original live socket for a bounded wait.
+            let result = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    i32::try_from(remaining.as_millis())
+                        .unwrap_or(i32::MAX)
+                        .min(100),
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.to_string());
+            }
+            if result == 0 {
+                continue;
+            }
+            let mut native_error = 0_i32;
+            let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+            // SAFETY: exact initialized SO_ERROR output word and length are writable for the call.
+            if unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut native_error as *mut i32).cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            if native_error != 0 {
+                return Err(io::Error::from_raw_os_error(native_error).to_string());
+            }
+            break;
+        }
+        break stream;
+    };
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    let remaining = cutoff.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("original broker authentication cutoff expired".into());
+    }
+    stream
+        .set_read_timeout(Some(remaining))
+        .and_then(|_| stream.set_write_timeout(Some(remaining)))
+        .map_err(|e| e.to_string())?;
+    set_receive_credentials(&stream, true)?;
+    let authentication = Frame {
+        kind: MessageKind::BrokerAuthenticate,
+        nonce: challenge,
+        attempt_id: attempt,
+        payload: Vec::new(),
+    };
+    super::workload_runtime::write_frame_until(&mut stream, &authentication, cutoff)?;
+    let (response, descriptors, credentials) =
+        super::transport::receive_authentication_until(&stream, cutoff)?;
+    if response.kind != MessageKind::BrokerAuthenticated
+        || response.nonce != challenge
+        || response.attempt_id != attempt
+        || !response.payload.is_empty()
+        || !descriptors.is_empty()
+    {
+        return Err("invalid bounded native broker authentication response".into());
+    }
+    let credentials = credentials.ok_or("native broker authentication credentials missing")?;
+    let _ = authenticate_credentials(credentials, NETWORK_LAUNCHER_UNIT)?;
+    if Instant::now() >= cutoff {
+        return Err(
+            "original broker authentication cutoff expired after native identity verification"
+                .into(),
+        );
+    }
+    set_receive_credentials(&stream, false)?;
+    Ok(stream)
+}
+
 fn connect_selected(
     path: &str,
     unit: &str,
@@ -362,219 +532,6 @@ fn connect_selected(
     let _ = authenticate_credentials(credentials, unit)?;
     set_receive_credentials(&stream, false)?;
     Ok(stream)
-}
-
-pub(super) fn forward_private(
-    frontend_stream: &UnixStream,
-    request: &Frame,
-    payload: Vec<u8>,
-    descriptors: &[RawFd],
-) -> Result<Frame, String> {
-    if !cfg!(feature = "private-tcp") || descriptors.len() != 7 {
-        return Err("MCSEALED-PRIVATE-DESCRIPTORS: selected runtime and exact descriptor inventory required".into());
-    }
-    let mut stream = connect_selected(
-        NETWORK_SOCKET_PATH,
-        NETWORK_LAUNCHER_UNIT,
-        request.nonce,
-        request.attempt_id,
-    )?;
-    let frame = Frame {
-        kind: if request.kind == MessageKind::MixedLaunch {
-            MessageKind::MixedBrokerLaunch
-        } else {
-            MessageKind::PrivateBrokerLaunch
-        },
-        nonce: request.nonce,
-        attempt_id: request.attempt_id,
-        payload,
-    };
-    let mut bytes = Vec::new();
-    write_frame(&mut bytes, &frame).map_err(|error| error.to_string())?;
-    super::transport::send(&stream, &bytes, descriptors)?;
-    let mut cancelled = false;
-    let mut retirement: Option<super::mixed_retirement::RetirementRelay> = None;
-    loop {
-        if retirement
-            .as_ref()
-            .is_some_and(|exchange| std::time::Instant::now() >= exchange.deadline)
-        {
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            return Err("original retirement relay cleanup cutoff expired".into());
-        }
-        let mut sockets = [
-            libc::pollfd {
-                fd: stream.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if cancelled {
-                    -1
-                } else {
-                    frontend_stream.as_raw_fd()
-                },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let poll_millis = retirement.as_ref().map_or(100, |exchange| {
-            i32::try_from(
-                exchange
-                    .deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_millis(),
-            )
-            .unwrap_or(100)
-            .min(100)
-        });
-        let ready = unsafe {
-            libc::poll(
-                sockets.as_mut_ptr(),
-                sockets.len() as libc::nfds_t,
-                poll_millis,
-            )
-        };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error.to_string());
-        }
-        if !cancelled && sockets[1].revents != 0 {
-            // Invalid follow-up input also fails closed by cancelling owned
-            // target resources before forwarding their terminal observation.
-            if super::private_runtime::cancellation_requested(frontend_stream).unwrap_or(true) {
-                let byte = [1_u8];
-                let sent = unsafe {
-                    libc::send(
-                        stream.as_raw_fd(),
-                        byte.as_ptr().cast(),
-                        byte.len(),
-                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                    )
-                };
-                if sent != byte.len() as isize {
-                    stream
-                        .shutdown(std::net::Shutdown::Write)
-                        .map_err(|error| error.to_string())?;
-                }
-                cancelled = true;
-            }
-        }
-        if sockets[0].revents != 0 {
-            let version = if request.kind == MessageKind::MixedLaunch {
-                crate::protocol::MIXED_PROTOCOL_VERSION
-            } else {
-                crate::protocol::PROTOCOL_VERSION
-            };
-            let response = if let Some(retirement) = retirement.as_ref() {
-                super::mixed_retirement::receive_until(&stream, retirement.deadline)?
-            } else {
-                crate::protocol::read_frame_version(&mut stream, version)
-                    .map_err(|error| error.to_string())?
-            };
-            if response.nonce != request.nonce || response.attempt_id != request.attempt_id {
-                return Err("network worker response association differs".into());
-            }
-            if let Some(retirement) = retirement.as_mut() {
-                if retirement.forward(frontend_stream, &stream, &response)? {
-                    continue;
-                }
-                if response.kind == MessageKind::MixedReleaseObservation
-                    && !retirement.release_allowed()
-                {
-                    return Err(
-                        "mixed release preceded original retirement enrollment acceptance".into(),
-                    );
-                }
-            }
-            if request.kind == MessageKind::MixedLaunch
-                && matches!(
-                    response.kind,
-                    MessageKind::MixedPreparedObservation | MessageKind::MixedReleaseObservation
-                )
-            {
-                if cancelled {
-                    return Err("mixed observation arrived after cancellation".into());
-                }
-                let (ack, ack_fds, ack_version) = if let Some(exchange) = retirement.as_ref() {
-                    super::mixed_retirement::send_until(
-                        frontend_stream,
-                        &response,
-                        exchange.deadline,
-                    )?;
-                    (
-                        super::mixed_retirement::receive_until(frontend_stream, exchange.deadline)?,
-                        Vec::new(),
-                        crate::protocol::MIXED_PROTOCOL_VERSION,
-                    )
-                } else {
-                    write_frame(&mut &*frontend_stream, &response)
-                        .map_err(|error| error.to_string())?;
-                    frontend_stream
-                        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                        .map_err(|error| error.to_string())?;
-                    let ack = super::transport::receive_public(frontend_stream);
-                    let restore = frontend_stream
-                        .set_read_timeout(None)
-                        .map_err(|error| error.to_string());
-                    let received = ack?;
-                    restore?;
-                    received
-                };
-                let expected = if response.kind == MessageKind::MixedPreparedObservation {
-                    MessageKind::MixedPreparedAck
-                } else {
-                    MessageKind::MixedReleaseAck
-                };
-                if ack_version != version
-                    || (ack.kind != expected
-                        && !(response.kind == MessageKind::MixedPreparedObservation
-                            && ack.kind == MessageKind::MixedPreparedRetirementAck))
-                    || ack.nonce != request.nonce
-                    || ack.attempt_id != request.attempt_id
-                    || (ack.kind != MessageKind::MixedPreparedRetirementAck
-                        && !ack.payload.is_empty())
-                    || !ack_fds.is_empty()
-                {
-                    return Err("public mixed observation acknowledgement differs".into());
-                }
-                if ack.kind == MessageKind::MixedPreparedRetirementAck {
-                    if retirement.is_some() {
-                        return Err("mixed retirement enrollment repeated".into());
-                    }
-                    retirement = Some(super::mixed_retirement::RetirementRelay::enroll(
-                        &response, &ack,
-                    )?);
-                }
-                if let Some(exchange) = retirement.as_ref() {
-                    super::mixed_retirement::send_until(&stream, &ack, exchange.deadline)?;
-                } else {
-                    write_frame(&mut stream, &ack).map_err(|error| error.to_string())?;
-                }
-                continue;
-            }
-            let accepted = if request.kind == MessageKind::MixedLaunch {
-                matches!(
-                    response.kind,
-                    MessageKind::MixedTerminal | MessageKind::MixedRejected
-                )
-            } else {
-                matches!(
-                    response.kind,
-                    MessageKind::PrivateTerminal
-                        | MessageKind::PrivateRejected
-                        | MessageKind::Rejected
-                )
-            };
-            if !accepted {
-                return Err("network worker returned wrong selected carrier".into());
-            }
-            return Ok(response);
-        }
-    }
 }
 
 pub(super) fn check_network_endpoint() -> Result<(), String> {

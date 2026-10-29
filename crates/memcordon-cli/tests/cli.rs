@@ -10,9 +10,7 @@ use memcordon::invocation::{
 };
 use memcordon::parse_duration;
 use memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION;
-use memcordon_core::{
-    BoundaryRequirement, DOCTOR_REPORT_SCHEMA_VERSION, Lifetime, PLAN_REPORT_SCHEMA_VERSION,
-};
+use memcordon_core::{BoundaryRequirement, Lifetime};
 
 fn native(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
@@ -200,8 +198,9 @@ fn sealed_execution_plan_and_doctor_fail_closed() {
         .expect("sealed plan");
     assert!(plan.status.success());
     let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
-    assert_eq!(plan["schema_version"], PLAN_REPORT_SCHEMA_VERSION);
-    assert_eq!(plan["request"]["boundary"], "sealed");
+    assert_eq!(plan["format"], "memcordon.plan");
+    assert_eq!(plan["revision"], 3);
+    assert_eq!(plan["resources"]["boundary"], "sealed");
     assert_eq!(plan["resolution"]["effective"]["boundary"], "unavailable");
     assert!(plan["resolution"]["backend"]["sealed_unavailable"].is_object());
 
@@ -211,7 +210,8 @@ fn sealed_execution_plan_and_doctor_fail_closed() {
         .expect("sealed doctor");
     assert_eq!(doctor.status.code(), Some(125));
     let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
-    assert_eq!(doctor["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
+    assert_eq!(doctor["format"], "memcordon.capabilities");
+    assert_eq!(doctor["revision"], 3);
     assert_eq!(doctor["requirement"]["kind"], "sealed");
     assert_eq!(doctor["requirement"]["met"], false);
     if doctor["selected"].is_object() {
@@ -1173,7 +1173,8 @@ fn doctor_text_and_json_have_distinct_complete_shapes() {
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("doctor must emit JSON");
     assert!(!output.stdout.contains(&0x1b));
-    assert_eq!(value["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
+    assert_eq!(value["format"], "memcordon.capabilities");
+    assert_eq!(value["revision"], 3);
     assert_eq!(value["tool"]["name"], "memcordon");
     assert!(value.get("selected").is_some());
     assert!(value["available"].is_array());
@@ -1235,9 +1236,9 @@ fn inferred_restart_conditions_are_silent_but_remain_machine_readable() {
         assert!(plan.status.success());
         let plan: serde_json::Value =
             serde_json::from_slice(&plan.stdout).expect("plan must emit JSON");
-        assert_eq!(plan["request"]["restart"]["enablement_source"], "restart");
+        assert_eq!(plan["resources"]["restart"]["enablement_source"], "restart");
         assert_eq!(
-            plan["request"]["restart"]["configured_conditions"],
+            plan["resources"]["restart"]["configured_conditions"],
             serde_json::json!(["memory-limit", "deadline"])
         );
         assert!(
@@ -1325,8 +1326,8 @@ fn inferred_swap_is_silent_but_remains_machine_readable() {
         serde_json::from_slice(&explicit_plan.stdout).expect("plan must emit JSON");
 
     assert_eq!(
-        implicit_plan["request"]["memory"]["swap"],
-        explicit_plan["request"]["memory"]["swap"]
+        implicit_plan["resources"]["memory"]["swap"],
+        explicit_plan["resources"]["memory"]["swap"]
     );
     assert_eq!(
         implicit_plan["resolution"]["effective"]["memory"]["swap"],
@@ -1395,14 +1396,15 @@ fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available(
     let value: serde_json::Value =
         serde_json::from_slice(&json.stdout).expect("plan must emit JSON");
     assert!(!json.stdout.contains(&0x1b));
-    assert_eq!(value["schema_version"], PLAN_REPORT_SCHEMA_VERSION);
-    assert!(value["request"].is_object());
+    assert_eq!(value["format"], "memcordon.plan");
+    assert_eq!(value["revision"], 3);
+    assert!(value["resources"].is_object());
     assert!(value["resolution"]["backend"].is_object());
     assert!(value["resolution"]["effective"].is_object());
     assert!(value["resolution"]["effects"].is_array());
     assert!(value["resolution"]["limitations"].is_array());
     assert_eq!(value["resolution"]["launch_proof"], false);
-    assert_eq!(value["request"]["command_exit_grace_ms"], 250);
+    assert_eq!(value["resources"]["command_exit_grace_ms"], 250);
     assert_eq!(
         value["resolution"]["effective"]["command_exit_grace_ms"],
         250
@@ -1433,8 +1435,8 @@ fn plan_json_preserves_explicit_zero_budgets() {
     assert_eq!(value["budget_tokens"][0]["token"], "+0B");
     assert_eq!(value["budget_tokens"][1]["kind"], "time");
     assert_eq!(value["budget_tokens"][1]["token"], "+0ms");
-    assert_eq!(value["request"]["memory"]["limit_bytes"], 0);
-    assert_eq!(value["request"]["deadline"]["duration_ms"], 0);
+    assert_eq!(value["resources"]["memory"]["limit_bytes"], 0);
+    assert_eq!(value["resources"]["deadline"]["duration_ms"], 0);
     assert_eq!(value["resolution"]["effective"]["memory"]["limit_bytes"], 0);
     assert_eq!(
         value["resolution"]["effective"]["deadline"]["duration_ms"],
@@ -1468,50 +1470,50 @@ fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     assert_eq!(value["budget_tokens"][0]["token"], "+1s");
     assert_eq!(value["budget_tokens"][1]["kind"], "memory");
     assert_eq!(value["budget_tokens"][1]["token"], "+1GiB");
-    assert_eq!(value["request"]["restart"]["enabled"], true);
+    assert_eq!(value["resources"]["restart"]["enabled"], true);
     assert_eq!(
-        value["request"]["restart"]["backoff"]["model"],
+        value["resources"]["restart"]["backoff"]["model"],
         "half-life-logistic-v1"
     );
     assert_eq!(
-        value["request"]["restart"]["backoff"]["base_interval_ms"],
+        value["resources"]["restart"]["backoff"]["base_interval_ms"],
         250
     );
     assert_eq!(
-        value["request"]["restart"]["backoff"]["multiplier_numerator"],
+        value["resources"]["restart"]["backoff"]["multiplier_numerator"],
         1
     );
     assert_eq!(
-        value["request"]["restart"]["backoff"]["multiplier_denominator"],
+        value["resources"]["restart"]["backoff"]["multiplier_denominator"],
         1
     );
     assert_eq!(
-        value["request"]["restart"]["backoff"]["asymptote_interval_ms"],
+        value["resources"]["restart"]["backoff"]["asymptote_interval_ms"],
         900_000
     );
     assert_eq!(
-        value["request"]["restart"]["backoff"]["recovery_half_life_ms"],
+        value["resources"]["restart"]["backoff"]["recovery_half_life_ms"],
         900_000
     );
     assert_eq!(
-        value["request"]["restart"]["circuit_breaker"]["threshold"],
+        value["resources"]["restart"]["circuit_breaker"]["threshold"],
         2.5
     );
     assert_eq!(
-        value["request"]["restart"]["circuit_breaker"]["half_life_ms"],
+        value["resources"]["restart"]["circuit_breaker"]["half_life_ms"],
         900_000
     );
     assert_eq!(
-        value["request"]["restart"]["circuit_breaker"]["cooldown_ms"],
+        value["resources"]["restart"]["circuit_breaker"]["cooldown_ms"],
         300_000
     );
     assert!(
-        value["request"]["restart"]["circuit_breaker"]
+        value["resources"]["restart"]["circuit_breaker"]
             .get("burst")
             .is_none()
     );
     assert!(
-        value["request"]["restart"]["circuit_breaker"]
+        value["resources"]["restart"]["circuit_breaker"]
             .get("window_ms")
             .is_none()
     );

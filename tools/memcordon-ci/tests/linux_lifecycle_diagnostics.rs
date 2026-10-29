@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use memcordon_ci::consumer_readiness_ledger::SourceIdentity;
+use memcordon_ci::readiness_identity::SourceIdentity;
 use memcordon_ci::release::linux_lifecycle_diagnostics::{
     HeldCellPublication, publish, register_existing,
 };

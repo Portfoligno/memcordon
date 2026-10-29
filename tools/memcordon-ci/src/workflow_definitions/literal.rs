@@ -1783,10 +1783,10 @@ impl LiteralRun {
                 "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"
             }
             Self::LinuxProjectedProducerSeal => {
-                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell"
+                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell"
             }
             Self::LinuxProjectedProducerColdSeal => {
-                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell"
+                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell"
             }
             Self::R0 => "rustup toolchain install 1.97.1 --profile minimal",
             Self::R1 => {
@@ -3302,7 +3302,7 @@ impl LiteralRun {
                 "./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell"
             }
             Self::R535 => {
-                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json"
+                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json"
             }
             Self::R536 => {
                 "./target/ci/release/memcordon-ci release consumer-cache --channel cargo --profile readiness"
@@ -3390,10 +3390,10 @@ impl LiteralRun {
                 "./target/ci-driver-cold/release/consumer-readiness.exe identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json"
             }
             Self::R567 => {
-                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json"
+                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json"
             }
             Self::R568 => {
-                "./target/ci-driver-cold/release/consumer-readiness.exe seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json"
+                "./target/ci-driver-cold/release/consumer-readiness.exe seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json"
             }
             Self::R569 => "./target/ci-runtime/current/memcordon-ci ci aggregate-macos",
             Self::R570 => "./target/ci-runtime/current/memcordon-ci.exe ci aggregate-macos",

@@ -2,14 +2,13 @@ use memcordon_ci::release::{
     artifacts,
     distribution::TargetDistribution,
     installed_consumer::{
-        binary_path, cli_case_command, create_fresh_destination, measured_manifest,
+        binary_path, cli_case_command, create_fresh_destination, measured_current_manifest,
     },
     source::{BuildSourceIdentity, SelectedSource},
     target::unit_export_directory,
 };
-use memcordon_core::runtime_manifest::{
-    RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest, SealedRuntime,
-};
+use memcordon_core::runtime_components::{RuntimeComponentRecord, RuntimeComponentRole};
+use memcordon_core::runtime_manifest_v2::{RuntimeManifestV2, SealedRuntimeV2};
 
 fn directory() -> tempfile::TempDir {
     if cfg!(unix) {
@@ -224,7 +223,7 @@ fn cargo_inventory_measures_own_graph_and_does_not_copy_native_binary_hashes() {
         )
         .unwrap();
     }
-    let first = measured_manifest(&source(), &selected, root.path()).unwrap();
+    let first = measured_current_manifest(&source(), &selected, root.path()).unwrap();
     assert_eq!(first.components.len(), 4);
     for component in &first.components {
         assert_eq!(
@@ -238,7 +237,7 @@ fn cargo_inventory_measures_own_graph_and_does_not_copy_native_binary_hashes() {
         &replacement,
     )
     .unwrap();
-    let second = measured_manifest(&source(), &selected, root.path()).unwrap();
+    let second = measured_current_manifest(&source(), &selected, root.path()).unwrap();
     assert_ne!(first.components[0].sha256, second.components[0].sha256);
     assert_eq!(
         second.components[0].sha256,
@@ -257,13 +256,13 @@ fn selected_graph_rejects_wrong_native_architecture_missing_companion_and_fixtur
     }
     let mut wrong = selected.clone();
     wrong.target = "aarch64-pc-windows-msvc".into();
-    assert!(measured_manifest(&source(), &wrong, root.path()).is_err());
+    assert!(measured_current_manifest(&source(), &wrong, root.path()).is_err());
     let missing = binary_path(root.path(), "memcordon-session-broker", &selected.target);
     std::fs::remove_file(missing).unwrap();
-    assert!(measured_manifest(&source(), &selected, root.path()).is_err());
+    assert!(measured_current_manifest(&source(), &selected, root.path()).is_err());
     let mut fixture = selected;
     fixture.binaries.push("memcordon-test-fixture".into());
-    assert!(measured_manifest(&source(), &fixture, root.path()).is_err());
+    assert!(measured_current_manifest(&source(), &fixture, root.path()).is_err());
 }
 
 #[test]
@@ -289,13 +288,13 @@ fn linux_inventory_selects_private_profile_only_with_actual_private_feature_grap
     for binary in &selected.binaries {
         std::fs::write(root.path().join(binary), &elf).unwrap();
     }
-    let ordinary = measured_manifest(&source(), &selected, root.path()).unwrap();
-    let SealedRuntime::Included { profiles, .. } = ordinary.sealed else {
-        panic!("selected runtime missing");
-    };
-    assert_eq!(profiles, ["linux-unix-create-v1"]);
+    let ordinary = measured_current_manifest(&source(), &selected, root.path()).unwrap();
+    assert!(matches!(
+        ordinary.sealed,
+        SealedRuntimeV2::CredentialPreservingLinux { .. }
+    ));
     selected.features.push("private-tcp".into());
-    assert!(measured_manifest(&source(), &selected, root.path()).is_err());
+    assert!(measured_current_manifest(&source(), &selected, root.path()).is_err());
     selected.units.extend(
         [
             "memcordon-sealed-network-launcher.service",
@@ -303,19 +302,11 @@ fn linux_inventory_selects_private_profile_only_with_actual_private_feature_grap
         ]
         .map(str::to_owned),
     );
-    let private = measured_manifest(&source(), &selected, root.path()).unwrap();
-    let SealedRuntime::Included { profiles, .. } = private.sealed else {
+    let private = measured_current_manifest(&source(), &selected, root.path()).unwrap();
+    let SealedRuntimeV2::Included { profile, .. } = private.sealed else {
         panic!("selected runtime missing");
     };
-    assert_eq!(
-        profiles,
-        [
-            "linux-unix-create-v1",
-            "linux-tcp4-private-v1",
-            "linux-tcp4-unix-private-v1",
-            "linux-tcp4-unix-private-v2"
-        ]
-    );
+    assert_eq!(profile, "linux-private-workload-v1");
 }
 
 fn retained_component(
@@ -390,46 +381,28 @@ fn runtime_inventory_matches_retained_linux_source_contract_in_both_channels() {
                 native.push(runtime_component(role, path.into(), &bytes));
                 retained.push(retained_component(owner.path(), role, id, path));
             }
-            let expected = if private {
-                RuntimeManifest::linux_combined(
-                    "1.2.3".into(),
-                    source().commit().into(),
-                    target.into(),
-                    retained,
-                )
-            } else {
-                RuntimeManifest::linux_selected(
-                    "1.2.3".into(),
-                    source().commit().into(),
-                    target.into(),
-                    retained,
-                    private,
-                )
-            }
+            let expected = RuntimeManifestV2::linux(
+                "1.2.3".into(),
+                source().commit().into(),
+                target.into(),
+                retained,
+                private,
+            )
             .unwrap();
-            let produced = if private {
-                RuntimeManifest::linux_combined(
-                    "1.2.3".into(),
-                    source().commit().into(),
-                    target.into(),
-                    native,
-                )
-            } else {
-                RuntimeManifest::linux_selected(
-                    "1.2.3".into(),
-                    source().commit().into(),
-                    target.into(),
-                    native,
-                    private,
-                )
-            }
+            let produced = RuntimeManifestV2::linux(
+                "1.2.3".into(),
+                source().commit().into(),
+                target.into(),
+                native,
+                private,
+            )
             .unwrap();
             assert_eq!(
-                RuntimeManifest::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),
+                RuntimeManifestV2::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),
                 expected
             );
             assert_eq!(
-                measured_manifest(&source(), &selected, owner.path()).unwrap(),
+                measured_current_manifest(&source(), &selected, owner.path()).unwrap(),
                 expected
             );
             let mut old = expected.clone();
@@ -489,14 +462,14 @@ fn runtime_inventory_matches_retained_windows_source_contract_in_both_channels()
             native.push(runtime_component(role, path.into(), &bytes));
             retained.push(retained_component(owner.path(), role, id, path));
         }
-        let expected = RuntimeManifest::windows(
+        let expected = RuntimeManifestV2::windows(
             "1.2.3".into(),
             source().commit().into(),
             target.into(),
             retained,
         )
         .unwrap();
-        let produced = RuntimeManifest::windows(
+        let produced = RuntimeManifestV2::windows(
             "1.2.3".into(),
             source().commit().into(),
             target.into(),
@@ -504,11 +477,11 @@ fn runtime_inventory_matches_retained_windows_source_contract_in_both_channels()
         )
         .unwrap();
         assert_eq!(
-            RuntimeManifest::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),
+            RuntimeManifestV2::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),
             expected
         );
         assert_eq!(
-            measured_manifest(&source(), &selected, owner.path()).unwrap(),
+            measured_current_manifest(&source(), &selected, owner.path()).unwrap(),
             expected
         );
     }

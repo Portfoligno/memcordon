@@ -2374,7 +2374,7 @@ fn check_readiness_candidate_steps(
             "always() && matrix.producer-job != ''",
         ),
         (
-            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
             "!cancelled() && matrix.producer-job != ''",
         ),
     ];
@@ -2639,7 +2639,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                     Some("always()"),
                 ),
                 (
-                    "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+                    "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
                     Some("!cancelled()"),
                 ),
             ] {

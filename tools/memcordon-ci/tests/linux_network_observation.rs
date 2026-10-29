@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use memcordon_ci::release::linux_network_observation::observe_link;
+use memcordon_ci::release::linux_current_network::observe_link;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};

@@ -6,10 +6,8 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use memcordon_core::{
-    ChildTermination, InvocationReport, NativeArgument,
-    result_v1::{CleanupStateV1, OutcomeKindV1, ResultV1},
-    workload_contract::{WorkloadContractV1, WorkloadContractV2},
-    workload_evidence::WorkloadRequestReport,
+    ChildTermination, InvocationReport, MemcordonReport, NativeArgument, RunOutcome,
+    execution_facts::OutcomeKindV1,
 };
 use memcordon_testkit::ProcessTestError;
 use serde::{Deserialize, Serialize};
@@ -50,14 +48,6 @@ pub enum Selection {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum RequestedContract {
-    Standard,
-    Process { contract: Box<WorkloadContractV1> },
-    PrivateTcp { contract: Box<WorkloadContractV2> },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ExpectedCoverage {
     Bytes {
         stdout_sha256: String,
@@ -81,7 +71,6 @@ pub struct ExternalConsumerSpec {
     pub workload: MeasuredExecutable,
     pub working_directory: PathBuf,
     pub arguments: Vec<NativeArgument>,
-    pub requested_contract: RequestedContract,
     pub report_format: String,
     pub report_revision: u32,
     pub expected_outcome: OutcomeKindV1,
@@ -243,16 +232,16 @@ impl ExternalConsumerSpec {
         if bytes.len() as u64 > MAX_INPUT_BYTES {
             return Err(failure("external consumer input exceeds bound"));
         }
-        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes).map_err(failure)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(bytes).map_err(failure)?;
         let spec: Self = serde_json::from_slice(bytes)?;
         spec.validate()?;
         Ok(spec)
     }
     pub fn validate(&self) -> Result<()> {
         if self.format != "memcordon.external-consumer"
-            || self.revision != 1
-            || self.report_format != "result-v1"
-            || self.report_revision != 1
+            || self.revision != 2
+            || self.report_format != "standard"
+            || self.report_revision != 10
             || self.selected_inputs.len() > 32
             || self.arguments.len() > 256
             || !(1..=600_000).contains(&self.outer_deadline_millis)
@@ -340,11 +329,6 @@ impl ExternalConsumerSpec {
         }
         for argument in &self.arguments {
             decode_argument(argument)?;
-        }
-        match &self.requested_contract {
-            RequestedContract::Standard => {}
-            RequestedContract::Process { contract } => contract.validate().map_err(failure)?,
-            RequestedContract::PrivateTcp { contract } => contract.validate().map_err(failure)?,
         }
         match &self.coverage {
             ExpectedCoverage::Bytes {
@@ -509,56 +493,60 @@ pub fn require_coverage(bytes: &[u8], expected: &[String]) -> Result<()> {
 
 pub fn assess_result(
     spec: &ExternalConsumerSpec,
-    result: &ResultV1,
+    result: &MemcordonReport,
     status: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<(Assessment, Assessment)> {
-    result.validate().map_err(failure)?;
     if result.tool.name != "memcordon"
         || result.tool.version != spec.version
-        || result.tool.os != std::env::consts::OS
-        || result.tool.architecture != std::env::consts::ARCH
-        || result.tool.runtime_features.iter().collect::<BTreeSet<_>>()
-            != spec.runtime_features.iter().collect::<BTreeSet<_>>()
-        || result.invocation.association_sha256 != spec.invocation_digest()?
-        || result.invocation.requested_memory.is_some()
-        || result.invocation.requested_deadline.is_some()
+        || artifacts::checksum(&serde_json::to_vec(&result.invocation)?)
+            != spec.invocation_digest()?
+        || result.invocation.memory_token.is_some()
+        || result.invocation.deadline_token.is_some()
+        || result.schema_version != 10
     {
         return Err(failure(
             "external report selected source/invocation association differs",
         ));
     }
-    match &spec.requested_contract {
-        RequestedContract::Standard
-            if result.policy.requested.workload != WorkloadRequestReport::LegacyUnspecified
-                || result.private_execution.is_some() =>
-        {
-            return Err(failure("external standard request was substituted"));
-        }
-        RequestedContract::Process { contract }
-            if result.policy.requested.workload
-                != WorkloadRequestReport::StrictV1 {
-                    contract: contract.clone(),
-                } =>
-        {
-            return Err(failure("external process contract was substituted"));
-        }
-        RequestedContract::PrivateTcp { contract }
-            if result.private_execution.as_ref().is_none_or(|execution| {
-                execution.terminal.admission_metadata.request != **contract
-            }) =>
-        {
-            return Err(failure(
-                "external private contract was substituted or absent",
-            ));
-        }
-        _ => {}
-    }
+    let outcome = result
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.outcome.as_ref())
+        .ok_or_else(|| failure("external report has no observed target outcome"))?;
+    let (kind, native_termination) = match outcome {
+        RunOutcome::Exited { child, .. } => (OutcomeKindV1::Completed, Some(child)),
+        RunOutcome::LimitExceeded {
+            child_after_termination,
+            ..
+        } => (
+            OutcomeKindV1::ConfirmedMemoryLimit,
+            child_after_termination.as_ref(),
+        ),
+        RunOutcome::DeadlineExceeded {
+            child_after_termination,
+            ..
+        } => (OutcomeKindV1::Deadline, child_after_termination.as_ref()),
+        RunOutcome::Interrupted {
+            child_after_termination,
+            ..
+        } => (OutcomeKindV1::Interrupted, child_after_termination.as_ref()),
+        RunOutcome::MonitorFailed {
+            child_after_termination,
+            ..
+        } => (
+            OutcomeKindV1::ProviderFailure,
+            child_after_termination.as_ref(),
+        ),
+    };
     let execution = if status != Some(spec.expected_wrapper_status)
-        || result.outcome.wrapper_status != spec.expected_wrapper_status
-        || result.outcome.kind != spec.expected_outcome
-        || result.outcome.native_termination != spec.expected_native_termination
+        || result
+            .supervision
+            .as_ref()
+            .is_none_or(|summary| summary.wrapper_exit_code != spec.expected_wrapper_status)
+        || kind != spec.expected_outcome
+        || native_termination != spec.expected_native_termination.as_ref()
     {
         failed("external native outcome/wrapper status differs")
     } else {
@@ -579,11 +567,9 @@ pub fn assess_result(
         };
         coverage.map_or_else(|error| failed(error.to_string()), |_| Assessment::Passed)
     };
-    let retirement = if result.cleanup.state == CleanupStateV1::Complete
-        && result.cleanup.direct_child_reaped
-        && result.cleanup.workload_empty != Some(false)
-        && result.cleanup.outstanding.is_empty()
-        && result.cleanup.failed_operations.is_empty()
+    let retirement = if outcome.cleanup().direct_child_reaped
+        && outcome.cleanup().workload_empty != Some(false)
+        && outcome.cleanup().errors.is_empty()
     {
         Assessment::Passed
     } else {
@@ -601,7 +587,7 @@ pub fn retain_diagnostics(source: &Path, destination: &Path) -> Result<()> {
         let name = entry.file_name();
         let maximum = match name.to_str() {
             Some("stdout.bin" | "stderr.bin") => MAX_STREAM_BYTES as u64,
-            Some("result.json") => memcordon_core::result_v1::RESULT_MAX_BYTES as u64,
+            Some("result.json") => memcordon_core::execution_facts::RESULT_MAX_BYTES as u64,
             Some("requested-contract.json" | "assessment.json") => MAX_INPUT_BYTES,
             _ => {
                 return Err(failure(
@@ -702,24 +688,10 @@ pub fn run(spec: &ExternalConsumerSpec, destination: &Path) -> Result<ExternalCo
     let report_path = destination.canonicalize()?.join("result.json");
     let mut arguments = vec![
         OsString::from("--report-format"),
-        OsString::from("result-v1"),
+        OsString::from("standard"),
         OsString::from("--report"),
         report_path.as_os_str().to_owned(),
     ];
-    let contract = match &spec.requested_contract {
-        RequestedContract::Standard => None,
-        RequestedContract::Process { contract } => Some(serde_json::to_vec(contract)?),
-        RequestedContract::PrivateTcp { contract } => Some(serde_json::to_vec(contract)?),
-    };
-    if let Some(bytes) = contract {
-        let path = destination.canonicalize()?.join("requested-contract.json");
-        fs::write(&path, bytes)?;
-        arguments.extend([
-            OsString::from("--sealed"),
-            OsString::from("--workload-contract"),
-            path.into_os_string(),
-        ]);
-    }
     arguments.extend([
         OsString::from("--"),
         spec.workload.path.as_os_str().to_owned(),
@@ -776,7 +748,7 @@ pub fn run(spec: &ExternalConsumerSpec, destination: &Path) -> Result<ExternalCo
     fs::write(destination.join("stderr.bin"), &stderr)?;
     let collected = bounded_regular(
         &report_path,
-        memcordon_core::result_v1::RESULT_MAX_BYTES as u64,
+        memcordon_core::execution_facts::RESULT_MAX_BYTES as u64,
     );
     let report_sha256 = collected
         .as_ref()
@@ -799,7 +771,11 @@ pub fn run(spec: &ExternalConsumerSpec, destination: &Path) -> Result<ExternalCo
             });
     let parsed = images_unchanged
         .and(collected)
-        .and_then(|bytes| ResultV1::parse(&bytes).map_err(failure))
+        .and_then(|bytes| {
+            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes).map_err(failure)?;
+            serde_json::from_slice::<MemcordonReport>(&bytes)
+                .map_err(|error| failure(error.to_string()))
+        })
         .and_then(|result| assess_result(spec, &result, status, &stdout, &stderr));
     let (execution, collection, native_retirement) = match parsed {
         Ok((execution, retirement)) => (execution, Assessment::Passed, retirement),

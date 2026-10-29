@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use memcordon_core::{
     BoundaryMechanismEvidence, ByteSize, ChildTermination, CleanupErrorRecord, CleanupSummary,
     CredentialTransitionDisposition, DeadlineEvidence, DeadlineScope, Interruption, LimitEvidence,
-    RestartSafetyProof, RunOutcome, WINDOWS_CONTROL_SERVICE_NAME, WINDOWS_LAUNCHER_PIPE,
-    WINDOWS_LAUNCHER_SERVICE_NAME, WINDOWS_PRIVATE_PROTOCOL_VERSION,
-    WindowsCleanupProcessCreationEvidenceV1, WindowsLaunchBrokerRequestV1,
-    WindowsLauncherRequestV3, WindowsLauncherResponseV3, WindowsProviderReplacementQuiescenceV1,
-    WindowsSealedEvidenceV2, WindowsSealedFault, WindowsTerminalReceiptV1,
+    RestartSafetyProof, RunOutcome, WINDOWS_CONTROL_SERVICE_NAME,
+    WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION, WINDOWS_LAUNCHER_PIPE, WINDOWS_LAUNCHER_SERVICE_NAME,
+    WindowsCleanupProcessCreationEvidenceV1, WindowsLaunchBrokerRequestV2,
+    WindowsLauncherRequestV4, WindowsLauncherResponseV4, WindowsNativeTerminalObservationV1,
+    WindowsProviderReplacementQuiescenceV1, WindowsSealedEvidenceV3, WindowsSealedFault,
     windows_provider_replacement_quiescence,
 };
 use memcordon_core::{ProcessObservationPolicyV1, ProcessObserver};
@@ -91,7 +91,6 @@ fn require_startup_admission() -> Result<(), String> {
 }
 
 struct LaunchAttemptError {
-    workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
     code: &'static str,
     detail: String,
     os_code: Option<i32>,
@@ -104,8 +103,8 @@ struct LaunchAttemptError {
 }
 
 enum TerminalCandidate {
-    Historical(Box<WindowsTerminalReceiptV1>),
-    Authoritative(Box<memcordon_core::WindowsTerminalReceiptV2>),
+    Native(Box<WindowsNativeTerminalObservationV1>),
+    Authoritative(Box<memcordon_core::WindowsTerminalReceiptV3>),
 }
 
 struct LateControlLoss {
@@ -147,7 +146,6 @@ fn observed_late_control_loss(
         loader_qualification: None,
         terminal_candidate: None,
         job_operation: None,
-        workload_admission: None,
     }
 }
 
@@ -212,7 +210,6 @@ impl From<String> for LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -232,7 +229,6 @@ impl From<super::job::JobObservationError> for LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: Some(error.operation),
-            workload_admission: None,
         };
         failure.captured()
     }
@@ -264,13 +260,6 @@ impl LaunchAttemptError {
             FailureCodeV1 as Code, FailureOperationV1 as Operation,
         };
         let (category, operation, code, phase, native_known) = match self.code {
-            "MCSEALED-POLICY-DRIFT" => (
-                Category::Monitor,
-                Operation::VerifyPolicy,
-                Code::PolicyRevoked,
-                Phase::Monitoring,
-                false,
-            ),
             "MCSEALED-WINDOWS-TARGET-RESUME" => (
                 Category::Launch,
                 Operation::ResumeTarget,
@@ -394,7 +383,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }.captured()
     }
 
@@ -422,7 +410,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }.captured()
     }
 
@@ -442,7 +429,6 @@ impl LaunchAttemptError {
             loader_qualification: error.loader_qualification,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -458,7 +444,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -478,7 +463,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -509,7 +493,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }.captured()
     }
 
@@ -533,7 +516,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -549,7 +531,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -565,7 +546,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -586,7 +566,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured_fault(fault)
     }
@@ -605,27 +584,26 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
 
     fn mutant_candidate(
         observation: memcordon_core::WindowsMutantNativeObservationV1,
-        candidate: WindowsTerminalReceiptV1,
+        candidate: WindowsNativeTerminalObservationV1,
     ) -> Self {
         Self::mutant_observed(observation, memcordon_core::BoundarySetupPhase::Retirement)
             .with_terminal_candidate(candidate)
     }
 
-    fn with_terminal_candidate(mut self, candidate: WindowsTerminalReceiptV1) -> Self {
-        self.terminal_candidate = Some(TerminalCandidate::Historical(Box::new(candidate)));
+    fn with_terminal_candidate(mut self, candidate: WindowsNativeTerminalObservationV1) -> Self {
+        self.terminal_candidate = Some(TerminalCandidate::Native(Box::new(candidate)));
         self
     }
 
     fn with_authoritative_terminal(
         mut self,
-        receipt: memcordon_core::WindowsTerminalReceiptV2,
+        receipt: memcordon_core::WindowsTerminalReceiptV3,
     ) -> Self {
         self.terminal_candidate = Some(TerminalCandidate::Authoritative(Box::new(receipt)));
         self
@@ -642,7 +620,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -658,7 +635,6 @@ impl LaunchAttemptError {
             loader_qualification: None,
             terminal_candidate: None,
             job_operation: None,
-            workload_admission: None,
         }
         .captured()
     }
@@ -697,7 +673,7 @@ struct GuardianStartupDiagnostic {
 }
 
 fn inject_fault(
-    request: &WindowsLaunchBrokerRequestV1,
+    request: &WindowsLaunchBrokerRequestV2,
     faults: &[WindowsSealedFault],
     phase: memcordon_core::BoundarySetupPhase,
 ) -> Result<(), LaunchAttemptError> {
@@ -1093,8 +1069,8 @@ fn handle_control(
         rejection.os_code = error.os_code;
         return pipe::write_frame(
             connection,
-            &WindowsLauncherResponseV3::Reject {
-                schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+            &WindowsLauncherResponseV4::Reject {
+                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                 attempt_id: String::new(),
                 nonce: String::new(),
                 request_sha256: String::new(),
@@ -1102,12 +1078,12 @@ fn handle_control(
             },
         );
     }
-    let first: WindowsLauncherRequestV3 = pipe::read_frame(connection)?;
+    let first: WindowsLauncherRequestV4 = pipe::read_frame(connection)?;
     match first {
-        WindowsLauncherRequestV3::StartupAttestation {
+        WindowsLauncherRequestV4::StartupAttestation {
             schema_version,
             challenge,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION => {
             let attestation = super::token::current_service_self_attestation(
                 "launcher-service",
                 WINDOWS_LAUNCHER_SERVICE_NAME,
@@ -1117,16 +1093,16 @@ fn handle_control(
             .map_err(|error| error.to_string())?;
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::StartupAttestation {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::StartupAttestation {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     attestation,
                 },
             )
         }
-        WindowsLauncherRequestV3::Probe {
+        WindowsLauncherRequestV4::Probe {
             schema_version,
             challenge,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION => {
             let attestation = super::token::current_service_self_attestation(
                 "launcher-service",
                 WINDOWS_LAUNCHER_SERVICE_NAME,
@@ -1136,18 +1112,18 @@ fn handle_control(
             .map_err(|error| error.to_string())?;
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::Probe {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::Probe {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     attestation,
                     provider_binding: super::package::installed_public_provider_binding()?,
                 },
             )
         }
-        WindowsLauncherRequestV3::ObserveGuardianAttempt {
+        WindowsLauncherRequestV4::ObserveGuardianAttempt {
             schema_version,
             challenge,
             guardian_identity,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
             && !challenge.as_str().is_empty()
             && guardian_identity.process_id != 0
             && guardian_identity.creation_time_100ns != 0 =>
@@ -1180,9 +1156,9 @@ fn handle_control(
                 })();
             let response = match result {
                 Ok(observation) => {
-                    WindowsLauncherResponseV3::GuardianAttemptObservation(observation)
+                    WindowsLauncherResponseV4::GuardianAttemptObservation(observation)
                 }
-                Err(error) => WindowsLauncherResponseV3::ReadOnlyQueryFailure(
+                Err(error) => WindowsLauncherResponseV4::ReadOnlyQueryFailure(
                     memcordon_core::WindowsReadOnlyQueryFailure::new(
                         memcordon_core::WindowsReadOnlyQueryOperation::GuardianObservation,
                         challenge,
@@ -1195,28 +1171,28 @@ fn handle_control(
             pipe::write_frame(connection, &response)
         }
         #[cfg(any(test, feature = "test-support"))]
-        WindowsLauncherRequestV3::CertificationMachineRestart { schema_version }
-            if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION =>
+        WindowsLauncherRequestV4::CertificationMachineRestart { schema_version }
+            if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION =>
         {
             let _settlement =
                 SETTLEMENT.settle_until(Instant::now() + Duration::from_secs(30), || Ok(true))?;
             let recovered = super::record::certify_machine_restart_recovery()?;
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::CertificationMachineRestart {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::CertificationMachineRestart {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     recovered,
                 },
             )
         }
-        WindowsLauncherRequestV3::RecoverAttempt {
+        WindowsLauncherRequestV4::RecoverAttempt {
             schema_version,
             attempt_id,
             nonce,
             request_sha256,
             challenge,
             caller,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
             && !challenge.is_empty()
             && caller.is_consistent() =>
         {
@@ -1228,23 +1204,23 @@ fn handle_control(
                 &caller,
             ) {
                 Ok(Some(response)) => response,
-                Ok(None) => WindowsLauncherResponseV3::RecoveryAttemptUnavailable {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                Ok(None) => WindowsLauncherResponseV4::RecoveryAttemptUnavailable {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     challenge: challenge.clone(),
                     attempt_id: attempt_id.clone(),
                     detail: "exact recovery authority remains retained pending checked closure"
                         .to_owned(),
                 },
-                Err(error) => WindowsLauncherResponseV3::RecoveryAttemptUnavailable {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                Err(error) => WindowsLauncherResponseV4::RecoveryAttemptUnavailable {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     challenge: challenge.clone(),
                     attempt_id: attempt_id.clone(),
                     detail: error,
                 },
             };
             let ack_digest = match &response {
-                WindowsLauncherResponseV3::Terminal(_)
-                | WindowsLauncherResponseV3::Reject { .. } => Some(super::record::digest(
+                WindowsLauncherResponseV4::Terminal(_)
+                | WindowsLauncherResponseV4::Reject { .. } => Some(super::record::digest(
                     response
                         .terminal_authority_json()
                         .map_err(|error| error.to_string())?
@@ -1252,43 +1228,53 @@ fn handle_control(
                 )),
                 _ => None,
             };
+            let terminal_cutoff = Instant::now() + Duration::from_secs(30);
+            let mut terminal_transport = Some(pipe::SynchronousIoDeadline::start(terminal_cutoff)?);
             pipe::write_frame(connection, &response)?;
             if let Some(ack_digest) = ack_digest {
-                let ack: WindowsLauncherRequestV3 = pipe::read_frame(connection)?;
+                let ack: WindowsLauncherRequestV4 = pipe::read_frame(connection)?;
                 match ack {
-                    WindowsLauncherRequestV3::TerminalAcknowledged {
+                    WindowsLauncherRequestV4::TerminalAcknowledged {
                         schema_version,
                         attempt_id: acknowledged_attempt,
                         nonce: acknowledged_nonce,
                         request_sha256: acknowledged_request,
                         terminal_response_sha256,
-                    } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+                    } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
                         && acknowledged_attempt == attempt_id
                         && acknowledged_nonce == nonce
                         && acknowledged_request == request_sha256
                         && terminal_response_sha256 == ack_digest =>
                     {
+                        terminal_transport
+                            .take()
+                            .expect("terminal transport exists for ACK")
+                            .finish()?;
                         let retired = super::record::acknowledge_terminal_response(
                             &attempt_id,
                             &nonce,
                             &request_sha256,
                         )?;
-                        pipe::write_frame(
+                        pipe::write_frame_until(
                             connection,
-                            &WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+                            &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+                            terminal_cutoff,
                         )
                     }
                     _ => Err("recovery ACK did not bind the exact durable authority".to_owned()),
                 }
             } else {
-                Ok(())
+                terminal_transport
+                    .take()
+                    .expect("terminal transport owns current reply")
+                    .finish()
             }
         }
-        WindowsLauncherRequestV3::ConvergeRecovery {
+        WindowsLauncherRequestV4::ConvergeRecovery {
             schema_version,
             challenge,
             deadline_millis,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
             && !challenge.is_empty()
             && deadline_millis != 0 =>
         {
@@ -1311,8 +1297,8 @@ fn handle_control(
                     .map_err(|error| format!("convergence recovery inventory: {error}"))
             })();
             let response = match result {
-                Ok(inventory) => WindowsLauncherResponseV3::RecoveryInventory(inventory),
-                Err(error) => WindowsLauncherResponseV3::ReadOnlyQueryFailure(
+                Ok(inventory) => WindowsLauncherResponseV4::RecoveryInventory(inventory),
+                Err(error) => WindowsLauncherResponseV4::ReadOnlyQueryFailure(
                     memcordon_core::WindowsReadOnlyQueryFailure::new(
                         memcordon_core::WindowsReadOnlyQueryOperation::RecoveryConvergence,
                         memcordon_core::BoundedText::new(&challenge).map_err(str::to_owned)?,
@@ -1326,10 +1312,10 @@ fn handle_control(
             drop(settlement);
             written
         }
-        WindowsLauncherRequestV3::PackageCleanup {
+        WindowsLauncherRequestV4::PackageCleanup {
             schema_version,
             deadline_millis,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION && deadline_millis != 0 => {
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION && deadline_millis != 0 => {
             let deadline = Instant::now()
                 .checked_add(Duration::from_millis(deadline_millis))
                 .ok_or_else(|| "package cleanup deadline overflowed".to_owned())?;
@@ -1394,8 +1380,8 @@ fn handle_control(
             }
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::PackageCleanup {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::PackageCleanup {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     status,
                     attempts_empty,
                     terminal_outboxes,
@@ -1403,7 +1389,7 @@ fn handle_control(
                 },
             )
         }
-        WindowsLauncherRequestV3::ReplayTerminal {
+        WindowsLauncherRequestV4::ReplayTerminal {
             schema_version,
             attempt_id,
             nonce,
@@ -1412,7 +1398,7 @@ fn handle_control(
             caller_process_identity,
             caller_token_sha256,
             terminalization_error,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
             && !attempt_id.is_empty()
             && !nonce.is_empty()
             && !request_sha256.is_empty()
@@ -1431,7 +1417,7 @@ fn handle_control(
                 )?;
                 return pipe::write_frame(
                     connection,
-                    &WindowsLauncherResponseV3::AttemptRetainedV2(retained),
+                    &WindowsLauncherResponseV4::AttemptRetainedV2(retained),
                 );
             }
             match super::record::acknowledged_terminal_from_tombstone(
@@ -1442,9 +1428,10 @@ fn handle_control(
                 &caller_token_sha256,
             ) {
                 Ok(Some(retired)) => {
-                    return pipe::write_frame(
+                    return pipe::write_frame_until(
                         connection,
-                        &WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+                        &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+                        Instant::now() + Duration::from_secs(30),
                     );
                 }
                 Ok(None) => {}
@@ -1508,10 +1495,10 @@ fn handle_control(
                 if let Some(evidence) = pending {
                     let response = match evidence {
                         super::record::ReplayUnstagedEvidence::Pending(pending) => {
-                            WindowsLauncherResponseV3::ReplayPendingV2(pending)
+                            WindowsLauncherResponseV4::ReplayPendingV2(pending)
                         }
                         super::record::ReplayUnstagedEvidence::Retained(retained) => {
-                            WindowsLauncherResponseV3::AttemptRetainedV2(retained)
+                            WindowsLauncherResponseV4::AttemptRetainedV2(retained)
                         }
                     };
                     return pipe::write_frame(connection, &response);
@@ -1540,7 +1527,7 @@ fn handle_control(
                 };
                 return pipe::write_frame(
                     connection,
-                    &WindowsLauncherResponseV3::AttemptRetainedV2(retained),
+                    &WindowsLauncherResponseV4::AttemptRetainedV2(retained),
                 );
             };
             let terminal_response_sha256 = super::record::digest(
@@ -1549,6 +1536,8 @@ fn handle_control(
                     .map_err(|error| error.to_string())?
                     .as_bytes(),
             );
+            let terminal_transport =
+                pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))?;
             pipe::write_frame(connection, &response)?;
             response.release_payload();
             wait_for_terminal_acknowledgment(
@@ -1558,13 +1547,16 @@ fn handle_control(
                 &request_sha256,
                 &terminal_response_sha256,
             )?;
+            let terminal_cutoff = terminal_transport.cutoff();
+            terminal_transport.finish()?;
             let retired = response.acknowledge(&attempt_id, &nonce, &request_sha256)?;
-            pipe::write_frame(
+            pipe::write_frame_until(
                 connection,
-                &WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+                &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+                terminal_cutoff,
             )
         }
-        WindowsLauncherRequestV3::Membership {
+        WindowsLauncherRequestV4::Membership {
             schema_version,
             attempt_id,
             nonce,
@@ -1574,7 +1566,7 @@ fn handle_control(
             // This lease spans the following Launch request, including rejection
             // staging performed after launch_attempt returns an error.
             let process = OwnedHandle::new(remote_process_handle as usize as HANDLE)?;
-            if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
+            if schema_version != WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
                 || attempt_id.is_empty()
                 || nonce.is_empty()
                 || request_sha256.is_empty()
@@ -1595,23 +1587,23 @@ fn handle_control(
                 })?;
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::Membership {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::Membership {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     attempt_id: attempt_id.clone(),
                     nonce: nonce.clone(),
                     request_sha256: request_sha256.clone(),
                     inside_active_job,
                 },
             )?;
-            let launch: WindowsLauncherRequestV3 = pipe::read_frame(connection)?;
+            let launch: WindowsLauncherRequestV4 = pipe::read_frame(connection)?;
             match launch {
-                WindowsLauncherRequestV3::Launch(request) => {
+                WindowsLauncherRequestV4::Launch(request) => {
                     let transferred = LaunchTransferredHandles::adopt(&request)?;
                     if let Err(detail) = require_startup_admission() {
                         return pipe::write_frame(
                             connection,
-                            &WindowsLauncherResponseV3::Reject {
-                                schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                            &WindowsLauncherResponseV4::Reject {
+                                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                                 attempt_id,
                                 nonce,
                                 request_sha256,
@@ -1765,9 +1757,9 @@ fn handle_control(
                             {
                                 return pipe::write_frame(
                                     connection,
-                                    &WindowsLauncherResponseV3::CertificationMutantObserved(
-                                        memcordon_core::WindowsMutantNativeReceiptV1 {
-                                            schema_version: 1,
+                                    &WindowsLauncherResponseV4::CertificationMutantObserved(
+                                        memcordon_core::WindowsMutantNativeReceiptV2 {
+                                            schema_version: 2,
                                             mutant,
                                             attempt_id,
                                             nonce,
@@ -1778,7 +1770,7 @@ fn handle_control(
                                                 },
                                             remote_observation_handle: None,
                                             terminal_candidate: match failure.terminal_candidate {
-                                                Some(TerminalCandidate::Historical(candidate)) => Some(candidate),
+                                                Some(TerminalCandidate::Native(candidate)) => Some(candidate),
                                                 _ => None,
                                             },
                                         },
@@ -1786,7 +1778,6 @@ fn handle_control(
                                 );
                             }
                             let primary_detail = failure.detail.clone();
-                            let workload_admission = failure.workload_admission;
                             let mut rejection = super::record::rejection_evidence(
                                 &attempt_id,
                                 failure.code,
@@ -1801,7 +1792,6 @@ fn handle_control(
                                     _ => None,
                                 },
                             )?;
-                            rejection.workload_admission = workload_admission;
                             if rejection.provider_failure.is_none() {
                                 let mut journal =
                                     memcordon_core::WindowsCausalDiagnosticsV1::default();
@@ -1819,8 +1809,8 @@ fn handle_control(
                                         .ok();
                                 }
                             }
-                            let response = WindowsLauncherResponseV3::Reject {
-                                schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                            let response = WindowsLauncherResponseV4::Reject {
+                                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                                 attempt_id: attempt_id.clone(),
                                 nonce: nonce.clone(),
                                 request_sha256: request_sha256.clone(),
@@ -1855,6 +1845,9 @@ fn handle_control(
                                     .map_err(|error| error.to_string())?
                                     .as_bytes(),
                             );
+                            let terminal_transport = pipe::SynchronousIoDeadline::start(
+                                Instant::now() + Duration::from_secs(30),
+                            )?;
                             pipe::write_frame(connection, &response).map_err(|secondary| {
                                 format!(
                                     "{primary_detail}; secondary bound rejection delivery failure: {secondary}"
@@ -1873,6 +1866,8 @@ fn handle_control(
                                         "{primary_detail}; secondary terminal ACK failure: {secondary}"
                                     )
                                 })?;
+                                let terminal_cutoff = terminal_transport.cutoff();
+                                terminal_transport.finish()?;
                                 let retired = super::record::acknowledge_terminal_response(
                                     &attempt_id,
                                     &nonce,
@@ -1883,15 +1878,18 @@ fn handle_control(
                                         "{primary_detail}; secondary terminal retirement failure: {secondary}"
                                     )
                                 })?;
-                                pipe::write_frame(
+                                pipe::write_frame_until(
                                     connection,
-                                    &WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+                                    &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+                                    terminal_cutoff,
                                 )
                                 .map_err(|secondary| {
                                     format!(
                                         "{primary_detail}; secondary terminal retirement receipt failure: {secondary}"
                                     )
                                 })?;
+                            } else {
+                                terminal_transport.finish()?;
                             }
                             Ok(())
                         }
@@ -1910,8 +1908,8 @@ fn bound_launcher_replay_failure_response(
     request_sha256: &str,
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     error: String,
-) -> WindowsLauncherResponseV3 {
-    WindowsLauncherResponseV3::AttemptRetainedV2(
+) -> WindowsLauncherResponseV4 {
+    WindowsLauncherResponseV4::AttemptRetainedV2(
         super::record::in_memory_retained_attempt_evidence(
             attempt_id,
             nonce,
@@ -1930,7 +1928,7 @@ pub(crate) fn bound_launcher_replay_failure_response_for_test(
     request_sha256: &str,
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     error: String,
-) -> WindowsLauncherResponseV3 {
+) -> WindowsLauncherResponseV4 {
     bound_launcher_replay_failure_response(attempt_id, nonce, request_sha256, relay_phase, error)
 }
 
@@ -2330,7 +2328,7 @@ struct LaunchTransferredHandles {
 }
 
 impl LaunchTransferredHandles {
-    fn adopt(request: &WindowsLaunchBrokerRequestV1) -> Result<Self, String> {
+    fn adopt(request: &WindowsLaunchBrokerRequestV2) -> Result<Self, String> {
         let primary_token =
             OwnedHandle::new(request.remote_primary_token_handle as usize as HANDLE);
         let frontend = OwnedHandle::new(request.remote_frontend_process_handle as usize as HANDLE);
@@ -2359,7 +2357,7 @@ impl LaunchTransferredHandles {
 
 fn launch_attempt(
     connection: HANDLE,
-    request: WindowsLaunchBrokerRequestV1,
+    request: WindowsLaunchBrokerRequestV2,
     transferred: LaunchTransferredHandles,
     expected_attempt_id: &str,
     expected_nonce: &str,
@@ -2387,7 +2385,7 @@ fn launch_attempt(
         super::process::verify_not_inheritable(handle.raw())?;
     }
     let digest_length = super::record::digest(&[]).len();
-    if request.schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
+    if request.schema_version != WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
         || request.launch.expected_provider_binding
             != super::package::installed_public_provider_binding()?
         || request.attempt_id.len() != digest_length
@@ -2471,36 +2469,22 @@ fn launch_attempt(
         )
         .into());
     }
-    let workload_admission = request
+    request.launch.validate_workload()?;
+    let setup_now = unsafe { GetTickCount64() };
+    let setup_deadline_millis = request
         .launch
-        .workload_contract
-        .as_ref()
-        .map(|contract| {
-            crate::admission::plan_windows(
-                contract,
-                &duplicated_primary_envelope.user_sid,
-                memcordon_core::workload_codec::hash_bytes(&launch_bytes),
-            )
-            .map_err(|rejection| {
-                let mut failure = LaunchAttemptError::from(
-                    "exact caller workload admission was rejected before target allocation"
-                        .to_owned(),
-                );
-                failure.code = "MCSEALED-POLICY-ADMISSION";
-                failure.workload_admission = Some(
-                    memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1 {
-                        request:
-                            memcordon_core::workload_evidence::RequestBindingV1::from_contract(
-                                contract,
-                            )
-                            .expect("native launch contract was validated"),
-                        rejection,
-                    },
-                );
-                failure
-            })
-        })
-        .transpose()?;
+        .policy
+        .absolute_deadline_millis
+        .map_or(request.setup_deadline_millis, |deadline| {
+            deadline.min(request.setup_deadline_millis)
+        });
+    if setup_deadline_millis == 0 || setup_now >= setup_deadline_millis {
+        return Err(
+            "original preparation cutoff elapsed before native allocation"
+                .to_owned()
+                .into(),
+        );
+    }
     super::record::reserve_attempt(&request.attempt_id, &request.request_sha256)?;
     // Keep the durable admission until the first authenticated attempt record
     // has been stored. Package mutation therefore sees either the admission or
@@ -2508,6 +2492,11 @@ fn launch_attempt(
     super::record::validate_admission(&request.attempt_id, &request.request_sha256)?;
 
     let started = Instant::now();
+    let setup_cutoff = started
+        .checked_add(Duration::from_millis(
+            setup_deadline_millis.saturating_sub(unsafe { GetTickCount64() }),
+        ))
+        .ok_or_else(|| "preparation cutoff overflow".to_owned())?;
     let job = Job::create(
         request.launch.policy.memory_limit_bytes,
         request.certification_fault,
@@ -2647,16 +2636,6 @@ fn launch_attempt(
     // starting. Recovery must never infer readiness merely from process creation.
     record.store()?;
     let mut cleanup_guard = AttemptCleanup::new(&job, disarm.raw(), guardian.raw(), record);
-    let workload_admission = if let Some((snapshot, lease)) = workload_admission {
-        cleanup_guard
-            .record
-            .bind_workload_admission(snapshot.clone())?;
-        lease.register_reference(&request.attempt_id, &snapshot)?;
-        drop(lease);
-        Some(snapshot)
-    } else {
-        None
-    };
     if request.certification_mutant
         != Some(memcordon_core::WindowsSealedMutant::ResumeBeforeGuardian)
     {
@@ -2698,8 +2677,8 @@ fn launch_attempt(
     let remote_streams = streams.remote.clone();
     pipe::write_frame(
         connection,
-        &WindowsLauncherResponseV3::StreamsPrepared {
-            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        &WindowsLauncherResponseV4::StreamsPrepared {
+            schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
             attempt_id: request.attempt_id.clone(),
             nonce: request.launch.nonce.clone(),
             request_sha256: request.request_sha256.clone(),
@@ -2716,8 +2695,8 @@ fn launch_attempt(
             cleanup_guard.observe_failure(&failure);
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::RelaysAbort {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::RelaysAbort {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     attempt_id: request.attempt_id.clone(),
                     nonce: request.launch.nonce.clone(),
                     request_sha256: request.request_sha256.clone(),
@@ -2773,6 +2752,7 @@ fn launch_attempt(
             &request.request_sha256,
             frontend.raw(),
             request.certification_fault,
+            setup_cutoff,
         ) {
             let failure = if request.certification_fault == Some(WindowsSealedFault::RelayReady) {
                 LaunchAttemptError::certification_fault(
@@ -2824,8 +2804,8 @@ fn launch_attempt(
             cleanup_guard.observe_failure(&failure);
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::RelaysAbort {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::RelaysAbort {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     attempt_id: request.attempt_id.clone(),
                     nonce: request.launch.nonce.clone(),
                     request_sha256: request.request_sha256.clone(),
@@ -3040,9 +3020,11 @@ fn launch_attempt(
         ($failure:expr) => {
             retire_postauthorization_before_resume!($failure, None)
         };
-        ($failure:expr, $premature:expr) => {{
+        ($failure:expr, $premature:expr) => {{ retire_postauthorization_before_resume!($failure, $premature, None) }};
+        ($failure:expr, $premature:expr, $cancel_signal:expr) => {{
             let mut failure = $failure;
             let premature: Option<memcordon_core::WindowsPrematureReleaseWitnessV1> = $premature;
+            let cancel_signal: Option<i32> = $cancel_signal;
             if premature.is_some() {
                 // The immutable failure payload retains the selected observation;
                 // delivery must use the durable Reject/ACK route, not the legacy
@@ -3054,8 +3036,8 @@ fn launch_attempt(
             let job_total_processes = job.total_processes()?;
             pipe::write_frame(
                 connection,
-                &WindowsLauncherResponseV3::RelaysAbort {
-                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                &WindowsLauncherResponseV4::RelaysAbort {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                     attempt_id: request.attempt_id.clone(),
                     nonce: request.launch.nonce.clone(),
                     request_sha256: request.request_sha256.clone(),
@@ -3112,15 +3094,24 @@ fn launch_attempt(
             cleanup_guard.record.cleanup_state.guardian_reaped = true;
             cleanup_guard.record.store()?;
             let child_pid = target.process_id;
-            let outcome = RunOutcome::MonitorFailed {
-                error: failure.detail.clone(),
-                child_after_termination: Some(child_termination(target.exit_status()?)),
-                cleanup: CleanupSummary {
-                    force_attempted: true,
-                    direct_child_reaped: true,
-                    workload_empty: Some(true),
-                    ..CleanupSummary::default()
-                },
+            let cleanup = CleanupSummary {
+                force_attempted: true,
+                direct_child_reaped: true,
+                workload_empty: Some(true),
+                ..CleanupSummary::default()
+            };
+            let outcome = if let Some(signal) = cancel_signal {
+                RunOutcome::Interrupted {
+                    signal: memcordon_core::Interruption { signal },
+                    child_after_termination: Some(child_termination(target.exit_status()?)),
+                    cleanup,
+                }
+            } else {
+                RunOutcome::MonitorFailed {
+                    error: failure.detail.clone(),
+                    child_after_termination: Some(child_termination(target.exit_status()?)),
+                    cleanup,
+                }
             };
             let process_observation =
                 process_observer.freeze(cleanup_guard.record.target_identity.clone(), None);
@@ -3194,9 +3185,7 @@ fn launch_attempt(
             } else {
                 let mut historical =
                     build_terminal_receipt(&request, started, authorization_offset, completed);
-                if let Some((binding, checkpoint)) = record.workload_checkpoint.clone() {
-                    bind_terminal_policy(&mut historical, binding, checkpoint)?;
-                }
+
                 authoritative_terminal_receipt(historical, process_observation, &record)?
             };
             record.stage_terminal_proof(&receipt, Some(primary_failure))?;
@@ -3230,31 +3219,31 @@ fn launch_attempt(
                 &control_identity,
                 [
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::LauncherJob,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::LauncherJob,
                         job.handle() as usize as u64,
                     ),
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::ActiveRegistryDuplicate,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::ActiveRegistryDuplicate,
                         active_job_handle,
                     ),
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::DirectTargetProcess,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::DirectTargetProcess,
                         target.handle() as usize as u64,
                     ),
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::GuardianProcess,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::GuardianProcess,
                         guardian.raw() as usize as u64,
                     ),
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::ControlRelay,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::ControlRelay,
                         connection as usize as u64,
                     ),
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::FrontendRelay,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::FrontendRelay,
                         frontend.raw() as usize as u64,
                     ),
                     (
-                        memcordon_core::WindowsCapabilityOwnerRoleV1::LaunchGate,
+                        memcordon_core::WindowsCapabilityOwnerRoleV2::LaunchGate,
                         target.launch_gate_handle() as usize as u64,
                     ),
                 ],
@@ -3345,82 +3334,36 @@ fn launch_attempt(
     ) {
         retire_preauthorization_with_target!(failure);
     }
-    let policy_lease = match workload_admission
-        .as_ref()
-        .map(crate::admission::revalidate_windows)
-        .transpose()
-    {
-        Ok(lease) => lease,
-        Err(detail) => retire_preauthorization_with_target!(LaunchAttemptError::from(detail)),
-    };
-    let workload_checkpoint = if let Some(snapshot) = workload_admission.as_ref() {
-        let observed = (|| -> Result<_, String> {
-            use memcordon_core::workload_evidence::{
-                BaselineRestrictionObservationV1, RuntimeAttemptBinding, VerifiedCheckpointV1,
-            };
-            require_guardian_live(guardian.raw())?;
-            let binding = RuntimeAttemptBinding::from_snapshot(
-                snapshot,
-                super::package::installed_public_provider_binding()?,
-                memcordon_core::BoundedText::new(&cleanup_guard.record.boot_identity)
-                    .map_err(str::to_owned)?,
-                memcordon_core::BoundedText::new(&request.attempt_id).map_err(str::to_owned)?,
-                request.launch.restart_attempt,
-            )?;
-            // All target token, handle-list, Job membership and suspension checks
-            // above succeeded while this exact target remained behind the resume gate.
-            let checkpoint = VerifiedCheckpointV1::observed(
-                &binding,
-                BaselineRestrictionObservationV1::WindowsNetworkExternallyGoverned,
-                true,
-                true,
-                true,
-                true,
-                policy_lease.is_some(),
-                true,
-            )?;
-            cleanup_guard
-                .record
-                .bind_workload_checkpoint(binding.clone(), checkpoint.clone())?;
-            Ok((binding, checkpoint))
-        })();
-        match observed {
-            Ok(value) => Some(value),
-            Err(detail) => retire_preauthorization_with_target!(LaunchAttemptError::from(detail)),
-        }
-    } else {
-        None
-    };
     let owner_manifest = build_live_owner_manifest(
         &cleanup_guard.record,
         &control_identity,
         [
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::LauncherJob,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::LauncherJob,
                 job.handle() as usize as u64,
             ),
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::ActiveRegistryDuplicate,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::ActiveRegistryDuplicate,
                 active_job_handle,
             ),
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::DirectTargetProcess,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::DirectTargetProcess,
                 target.handle() as usize as u64,
             ),
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::GuardianProcess,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::GuardianProcess,
                 guardian.raw() as usize as u64,
             ),
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::ControlRelay,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::ControlRelay,
                 connection as usize as u64,
             ),
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::FrontendRelay,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::FrontendRelay,
                 frontend.raw() as usize as u64,
             ),
             (
-                memcordon_core::WindowsCapabilityOwnerRoleV1::LaunchGate,
+                memcordon_core::WindowsCapabilityOwnerRoleV2::LaunchGate,
                 target.launch_gate_handle() as usize as u64,
             ),
         ],
@@ -3442,8 +3385,8 @@ fn launch_attempt(
             .owner_manifest
             .as_ref()
             .expect("just frozen");
-        let contract = memcordon_core::WindowsJobClosureContractV1 {
-            schema_version: 1,
+        let contract = memcordon_core::WindowsJobClosureContractV2 {
+            schema_version: 2,
             attempt_id: cleanup_guard.record.attempt_id.clone(),
             nonce: cleanup_guard.record.nonce.clone(),
             request_sha256: cleanup_guard.record.request_sha256.clone(),
@@ -3471,7 +3414,50 @@ fn launch_attempt(
         memcordon_core::AttemptObservationPhaseV1::AuthorizedBeforeResume,
     );
     if let Err(detail) = require_guardian_live(guardian.raw()) {
-        retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
+        retire_postauthorization_before_resume!(LaunchAttemptError::from(detail));
+    }
+    let prepared = memcordon_core::WindowsWorkloadPreparedV1 {
+        format: "memcordon.windows-workload-prepared".into(),
+        revision: 1,
+        attempt_id: request.attempt_id.clone(),
+        nonce: request.launch.nonce.clone(),
+        request_sha256: request.request_sha256.clone(),
+        target: super::process::process_identity(target.handle())?,
+        owner_manifest_sha256: cleanup_guard
+            .record
+            .owner_manifest
+            .as_ref()
+            .expect("native owner set frozen before authorization")
+            .canonical_sha256()
+            .map_err(str::to_owned)?,
+    };
+    let prepared_sha256 = prepared.canonical_sha256()?;
+    if let Err(detail) = pipe::write_frame(
+        connection,
+        &WindowsLauncherResponseV4::WorkloadPrepared(prepared),
+    ) {
+        retire_postauthorization_before_resume!(LaunchAttemptError::from(detail));
+    }
+    match wait_for_prepared_acknowledgment(
+        connection,
+        &request.attempt_id,
+        &request.launch.nonce,
+        &request.request_sha256,
+        &prepared_sha256,
+        frontend.raw(),
+        guardian.raw(),
+        setup_cutoff,
+        request.launch.policy.absolute_deadline_millis,
+    ) {
+        Ok(None) => {}
+        Ok(Some(signal)) => retire_postauthorization_before_resume!(
+            LaunchAttemptError::from(format!(
+                "caller canceled held native target before release: signal={signal}"
+            )),
+            None,
+            Some(signal)
+        ),
+        Err(detail) => retire_postauthorization_before_resume!(LaunchAttemptError::from(detail)),
     }
     if request.certification_fault == Some(WindowsSealedFault::Resume) {
         retire_postauthorization_before_resume!(LaunchAttemptError::certification_fault(
@@ -3500,7 +3486,6 @@ fn launch_attempt(
     let stream_failure_observed = stream_close_failure.is_some();
     let authorization_offset = started.elapsed();
     cleanup_guard.record.mark_released()?;
-    drop(policy_lease);
     if let Some(hook_observation) = match request.certification_mutant {
         Some(memcordon_core::WindowsSealedMutant::SkipTargetTokenReadback) => Some(
             memcordon_core::WindowsMutantHookObservationV1::TargetTokenReadbackSkipped {
@@ -3518,9 +3503,9 @@ fn launch_attempt(
             super::process::duplicate_remote_process_query(target.handle(), frontend.raw())?;
         let result = pipe::write_frame(
             connection,
-            &WindowsLauncherResponseV3::CertificationMutantHookObserved(
-                memcordon_core::WindowsMutantNativeReceiptV1 {
-                    schema_version: 1,
+            &WindowsLauncherResponseV4::CertificationMutantHookObserved(
+                memcordon_core::WindowsMutantNativeReceiptV2 {
+                    schema_version: 2,
                     mutant: request.certification_mutant.expect("matched mutant"),
                     attempt_id: request.attempt_id.clone(),
                     nonce: request.launch.nonce.clone(),
@@ -3538,8 +3523,8 @@ fn launch_attempt(
     }
     let authorization_delivery = pipe::write_frame_detailed(
         connection,
-        &WindowsLauncherResponseV3::TargetAuthorized {
-            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        &WindowsLauncherResponseV4::TargetAuthorized {
+            schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
             attempt_id: request.attempt_id.clone(),
             nonce: request.launch.nonce.clone(),
             request_sha256: request.request_sha256.clone(),
@@ -3565,7 +3550,6 @@ fn launch_attempt(
     let monitored = match stream_close_failure.or(authorization_failure) {
         Some(failure) => Err(failure),
         None => monitor(
-            workload_admission.as_ref(),
             connection,
             &request,
             &job,
@@ -3652,11 +3636,6 @@ fn launch_attempt(
         }
     }
     let mut mutant_candidate = None;
-    if matches!(reason, TerminalReason::PolicyRevoked) {
-        // Retain the original reason before fallible cleanup, without starting
-        // a second termination path before the normal accounting snapshot.
-        super::diagnostics::merge_into(&mut cleanup_guard.record.causal_diagnostics);
-    }
     let mut mutant_observation = None;
     let mut success_before_zero_active_processes = None;
     let mut completion_accepted_without_accounting = false;
@@ -3824,8 +3803,8 @@ fn launch_attempt(
         );
         let delivered = pipe::write_frame_detailed(
             connection,
-            &WindowsLauncherResponseV3::TargetRetired {
-                schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+            &WindowsLauncherResponseV4::TargetRetired {
+                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
                 attempt_id: request.attempt_id.clone(),
                 nonce: request.launch.nonce.clone(),
                 request_sha256: request.request_sha256.clone(),
@@ -3998,9 +3977,6 @@ fn launch_attempt(
         loader_qualification: creation.loader_qualification,
     };
     let mut historical = build_terminal_receipt(&request, started, authorization_offset, completed);
-    if let Some((binding, checkpoint)) = workload_checkpoint {
-        bind_terminal_policy(&mut historical, binding, checkpoint)?;
-    }
     let receipt = authoritative_terminal_receipt(historical.clone(), process_observation, &record)?;
     record.stage_terminal_proof(&receipt, primary_failure)?;
     if let Some(mut failure) = monitor_failure {
@@ -4049,9 +4025,9 @@ fn launch_attempt(
     }
     fn stage_completed_terminal_response(
         record: &mut super::record::WindowsAttemptRecordV1,
-        receipt: memcordon_core::WindowsTerminalReceiptV2,
-    ) -> Result<(WindowsLauncherResponseV3, String), LaunchAttemptError> {
-        let response = WindowsLauncherResponseV3::Terminal(receipt.clone());
+        receipt: memcordon_core::WindowsTerminalReceiptV3,
+    ) -> Result<(WindowsLauncherResponseV4, String), LaunchAttemptError> {
+        let response = WindowsLauncherResponseV4::Terminal(receipt.clone());
         (|| -> Result<(), String> {
             record.stage_terminal_response(&response)?;
             Ok(())
@@ -4078,6 +4054,9 @@ fn launch_attempt(
     let (response, terminal_response_sha256) =
         stage_completed_terminal_response(&mut record, receipt)?;
     if control_connected {
+        let terminal_transport =
+            pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))
+                .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
         (|| -> Result<(), String> {
             pipe::write_frame(connection, &response)?;
             Ok(())
@@ -4091,6 +4070,10 @@ fn launch_attempt(
             &terminal_response_sha256,
         )
         .map_err(|error| LaunchAttemptError::terminal_transport("terminal-ack", error))?;
+        let terminal_cutoff = terminal_transport.cutoff();
+        terminal_transport
+            .finish()
+            .map_err(|error| LaunchAttemptError::terminal_transport("terminal-ack", error))?;
         (|| -> Result<(), String> {
             record.acknowledge_terminal_response()?;
             Ok(())
@@ -4099,9 +4082,10 @@ fn launch_attempt(
         let retired = record
             .completed_terminal_retired_receipt()
             .map_err(|error| LaunchAttemptError::terminal_transport("retirement-receipt", error))?;
-        pipe::write_frame(
+        pipe::write_frame_until(
             connection,
-            &WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+            &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+            terminal_cutoff,
         )
         .map_err(|error| LaunchAttemptError::terminal_transport("retirement-delivery", error))?;
     }
@@ -4113,13 +4097,13 @@ struct DirectTargetReaped;
 fn build_live_owner_manifest(
     record: &super::record::WindowsAttemptRecordV1,
     control_identity: &memcordon_core::WindowsProcessIdentityV1,
-    handles: [(memcordon_core::WindowsCapabilityOwnerRoleV1, u64); 7],
+    handles: [(memcordon_core::WindowsCapabilityOwnerRoleV2, u64); 7],
     desktop: Option<(memcordon_core::WindowsProcessIdentityV1, String, u64, u64)>,
     relay_retired_event_handle: u64,
     service_relay_event_handle: u64,
-) -> Result<memcordon_core::WindowsCapabilityOwnerManifestV1, String> {
+) -> Result<memcordon_core::WindowsCapabilityOwnerManifestV2, String> {
     use memcordon_core::{
-        WindowsCapabilityOwnerEntryV1 as Entry, WindowsCapabilityOwnerRoleV1 as Role,
+        WindowsCapabilityOwnerEntryV2 as Entry, WindowsCapabilityOwnerRoleV2 as Role,
     };
     let entries = std::array::from_fn(|index| {
         let role = Role::ALL[index];
@@ -4198,24 +4182,6 @@ fn build_live_owner_manifest(
                 Role::DesktopBootstrapProcess => {
                     desktop.as_ref().map(|(_, binding, _, _)| binding.clone())
                 }
-                Role::PolicyReference => record
-                    .workload_checkpoint
-                    .as_ref()
-                    .map(|(binding, _)| {
-                        let bytes =
-                            serde_json::to_vec(binding).expect("frozen policy binding serializes");
-                        super::record::digest(&bytes)
-                    })
-                    .or_else(|| {
-                        record.workload_admission.as_ref().map(|snapshot| {
-                            let bytes = serde_json::to_vec(&(
-                                "memcordon.windows-unadmitted-policy-reference-v1",
-                                snapshot,
-                            ))
-                            .expect("registered policy reference serializes");
-                            super::record::digest(&bytes)
-                        })
-                    }),
                 _ => None,
             });
         Entry {
@@ -4225,8 +4191,8 @@ fn build_live_owner_manifest(
             capability_binding_sha256,
         }
     });
-    let manifest = memcordon_core::WindowsCapabilityOwnerManifestV1 {
-        schema_version: 1,
+    let manifest = memcordon_core::WindowsCapabilityOwnerManifestV2 {
+        schema_version: 2,
         attempt_id: record.attempt_id.clone(),
         provider_generation: record.provider_generation.clone(),
         launch_incarnation: record.launch_incarnation.clone(),
@@ -4286,31 +4252,12 @@ struct CompletedRetirement {
     loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
 }
 
-fn bind_terminal_policy(
-    receipt: &mut WindowsTerminalReceiptV1,
-    binding: memcordon_core::workload_evidence::RuntimeAttemptBinding,
-    checkpoint: memcordon_core::workload_evidence::VerifiedCheckpointV1,
-) -> Result<(), String> {
-    let controls_preserved = matches!(&receipt.boundary_detail, memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(native)
-        if native.job_limits_verified && native.breakaway_denied && native.job_membership_independent_of_token && native.final_job_handles_closed);
-    receipt.policy_enforcement =
-        memcordon_core::workload_evidence::RuntimePolicyEnforcement::retired(
-            binding,
-            checkpoint,
-            controls_preserved,
-            receipt
-                .restart_safety
-                .is_safe_for(memcordon_core::BoundaryRequirement::Sealed),
-        )?;
-    Ok(())
-}
-
 fn build_terminal_receipt(
-    request: &WindowsLaunchBrokerRequestV1,
+    request: &WindowsLaunchBrokerRequestV2,
     started: Instant,
     authorization_offset: Duration,
     completed: CompletedRetirement,
-) -> WindowsTerminalReceiptV1 {
+) -> WindowsNativeTerminalObservationV1 {
     let cleanup_errors = completed
         .outcome
         .cleanup()
@@ -4319,9 +4266,7 @@ fn build_terminal_receipt(
         .map(|error| error.message.clone())
         .collect();
     let boundary_detail = complete_windows_boundary_evidence(&completed);
-    WindowsTerminalReceiptV1 {
-        policy_enforcement: Default::default(),
-        schema_version: 1,
+    WindowsNativeTerminalObservationV1 {
         attempt_id: request.attempt_id.clone(),
         nonce: request.launch.nonce.clone(),
         request_sha256: request.request_sha256.clone(),
@@ -4346,22 +4291,24 @@ fn build_terminal_receipt(
 }
 
 fn authoritative_terminal_receipt(
-    historical: WindowsTerminalReceiptV1,
+    mut historical: WindowsNativeTerminalObservationV1,
     process_observation: memcordon_core::WindowsProcessObservationV2,
     record: &super::record::WindowsAttemptRecordV1,
-) -> Result<memcordon_core::WindowsTerminalReceiptV2, String> {
+) -> Result<memcordon_core::WindowsTerminalReceiptV3, String> {
     let manifest = record
         .owner_manifest
         .as_ref()
         .ok_or_else(|| "terminal proof has no frozen capability owner manifest".to_owned())?;
     let owner_manifest_sha256 = manifest.canonical_sha256().map_err(str::to_owned)?;
-    let memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(native) =
-        &historical.boundary_detail
+    let memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV3(native) =
+        &mut historical.boundary_detail
     else {
         return Err("terminal proof has no native Windows Job evidence".to_owned());
     };
-    let retirement_proof = memcordon_core::WindowsRetirementProofV2 {
-        schema_version: 2,
+    native.target_identity = process_observation.root_identity.clone();
+    native.process_observation = Some(Box::new(process_observation.clone()));
+    let retirement_proof = memcordon_core::WindowsRetirementProofV3 {
+        schema_version: 3,
         source: memcordon_core::WindowsRetirementProofSourceV2::LiveNative,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
@@ -4377,22 +4324,16 @@ fn authoritative_terminal_receipt(
         guardian_completion_observed: historical.restart_safety.helpers_reaped,
         owner_capabilities_closed: historical.restart_safety.containment_removed,
         launch_gate_closed: native.final_job_handles_closed,
-        policy_reference_bound: record.workload_admission.is_none()
-            || record.workload_checkpoint.is_some(),
         guardian_receipt_sha256: None,
         current_boot_id: None,
         capability_extinction: None,
     };
-    let receipt = memcordon_core::WindowsTerminalReceiptV2 {
-        policy_enforcement: match historical.policy_enforcement {
-            memcordon_core::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified => None,
-            policy => Some(policy),
-        },
-        schema_version: 2,
+    let receipt = memcordon_core::WindowsTerminalReceiptV3 {
+        schema_version: 3,
         attempt_id: historical.attempt_id,
         nonce: historical.nonce,
         request_sha256: historical.request_sha256,
-        payload: memcordon_core::WindowsTerminalPayloadV2::Execution {
+        payload: memcordon_core::WindowsTerminalPayloadV3::Execution {
             child_pid: historical.child_pid,
             duration_millis: historical.duration_millis,
             authorization_offset_millis: historical.authorization_offset_millis,
@@ -4409,19 +4350,18 @@ fn authoritative_terminal_receipt(
 }
 
 fn build_premature_release_receipt(
-    request: &WindowsLaunchBrokerRequestV1,
+    request: &WindowsLaunchBrokerRequestV2,
     started: Instant,
     completed: CompletedRetirement,
     witness: memcordon_core::WindowsPrematureReleaseWitnessV1,
     process_observation: memcordon_core::WindowsProcessObservationV2,
     record: &super::record::WindowsAttemptRecordV1,
-) -> Result<memcordon_core::WindowsTerminalReceiptV2, String> {
+) -> Result<memcordon_core::WindowsTerminalReceiptV3, String> {
     if !witness.is_consistent()
         || request.certification_mutant != Some(witness.mutant)
         || record.authorization_unix_millis.is_some()
         || record.resume_attempted
         || !record.target_released
-        || record.workload_checkpoint.is_some()
         || record
             .terminal_disposition
             .and_then(|value| value.premature_release_mutant())
@@ -4433,25 +4373,6 @@ fn build_premature_release_receipt(
         .owner_manifest
         .as_ref()
         .ok_or("premature-release owner manifest absent")?;
-    let policy = manifest
-        .entries
-        .iter()
-        .find(|entry| entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::PolicyReference)
-        .ok_or("premature-release policy reference role absent")?;
-    let expected_policy = record
-        .workload_admission
-        .as_ref()
-        .map(|snapshot| {
-            serde_json::to_vec(&("memcordon.windows-unadmitted-policy-reference-v1", snapshot))
-                .map(|bytes| super::record::digest(&bytes))
-        })
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    if policy.present != expected_policy.is_some()
-        || policy.capability_binding_sha256 != expected_policy
-    {
-        return Err("premature-release registered policy reference differs".to_owned());
-    }
     let restart_safety = RestartSafetyProof {
         direct_child_reaped: completed.direct_target_reaped.verified(),
         workload_empty: Some(completed.active_processes_zero.verified()),
@@ -4467,8 +4388,8 @@ fn build_premature_release_receipt(
             .map(|error| error.message.clone())
             .collect(),
     };
-    let proof = memcordon_core::WindowsRetirementProofV2 {
-        schema_version: 2,
+    let proof = memcordon_core::WindowsRetirementProofV3 {
+        schema_version: 3,
         source: memcordon_core::WindowsRetirementProofSourceV2::LiveNative,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
@@ -4490,15 +4411,13 @@ fn build_premature_release_receipt(
         launch_gate_closed: completed.final_handles_closed.verified(),
         // This binds the registered reference, not a successful admission checkpoint.
         // Its actual retirement remains mandatory in the terminal ACK ledger.
-        policy_reference_bound: true,
     };
-    let receipt = memcordon_core::WindowsTerminalReceiptV2 {
-        schema_version: 2,
-        policy_enforcement: None,
+    let receipt = memcordon_core::WindowsTerminalReceiptV3 {
+        schema_version: 3,
         attempt_id: record.attempt_id.clone(),
         nonce: record.nonce.clone(),
         request_sha256: record.request_sha256.clone(),
-        payload: memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure {
+        payload: memcordon_core::WindowsTerminalPayloadV3::PrematureReleaseFailure {
             witness,
             child_pid: completed.child_pid,
             duration_millis: millis(started.elapsed()),
@@ -4515,7 +4434,7 @@ fn build_premature_release_receipt(
 
 #[allow(clippy::too_many_arguments)] // Mutants vary individual terminal predicates explicitly.
 fn build_terminal_candidate(
-    request: &WindowsLaunchBrokerRequestV1,
+    request: &WindowsLaunchBrokerRequestV2,
     child_pid: u32,
     started: Instant,
     authorization_offset: Duration,
@@ -4525,18 +4444,16 @@ fn build_terminal_candidate(
     relays_retired: bool,
     guardian_reaped: bool,
     final_job_handles_closed: bool,
-) -> WindowsTerminalReceiptV1 {
+) -> WindowsNativeTerminalObservationV1 {
     let mut evidence = match complete_windows_boundary_evidence_for_candidate() {
-        BoundaryMechanismEvidence::WindowsJobObjectV2(evidence) => evidence,
+        BoundaryMechanismEvidence::WindowsJobObjectV3(evidence) => evidence,
         _ => unreachable!("Windows terminal evidence constructor changed variants"),
     };
     evidence.active_processes_zero = active_processes_zero;
     evidence.relays_retired = relays_retired;
     evidence.guardian_reaped = guardian_reaped;
     evidence.final_job_handles_closed = final_job_handles_closed;
-    WindowsTerminalReceiptV1 {
-        policy_enforcement: Default::default(),
-        schema_version: 1,
+    WindowsNativeTerminalObservationV1 {
         attempt_id: request.attempt_id.clone(),
         nonce: request.launch.nonce.clone(),
         request_sha256: request.request_sha256.clone(),
@@ -4548,17 +4465,20 @@ fn build_terminal_candidate(
         cleanup_process_creation: None,
         outcome,
         restart_safety: RestartSafetyProof::default(),
-        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(evidence),
+        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV3(evidence),
     }
 }
 
 fn complete_windows_boundary_evidence(
     completed: &CompletedRetirement,
 ) -> BoundaryMechanismEvidence {
-    BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(WindowsSealedEvidenceV2 {
+    BoundaryMechanismEvidence::WindowsJobObjectV3(Box::new(WindowsSealedEvidenceV3 {
+        target_identity: None,
+        process_observation: None,
+        retirement: None,
         frontend_delivery: None,
         frontend_provider_association: None,
-        schema_version: 2,
+        schema_version: 3,
         service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
         caller_token_authenticated: true,
         initial_target_token_matches_caller: true,
@@ -4588,10 +4508,13 @@ fn complete_windows_boundary_evidence(
 }
 
 fn complete_windows_boundary_evidence_for_candidate() -> BoundaryMechanismEvidence {
-    BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(WindowsSealedEvidenceV2 {
+    BoundaryMechanismEvidence::WindowsJobObjectV3(Box::new(WindowsSealedEvidenceV3 {
+        target_identity: None,
+        process_observation: None,
+        retirement: None,
         frontend_delivery: None,
         frontend_provider_association: None,
-        schema_version: 2,
+        schema_version: 3,
         service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
         caller_token_authenticated: true,
         initial_target_token_matches_caller: true,
@@ -4647,21 +4570,23 @@ fn wait_for_relays_ready(
     request_sha256: &str,
     frontend: HANDLE,
     certification_fault: Option<WindowsSealedFault>,
+    cutoff: Instant,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
+    while Instant::now() < cutoff {
         // SAFETY: frontend remains a live synchronization handle.
         if unsafe { WaitForSingleObject(frontend, 0) } == WAIT_OBJECT_0 {
             return Err("frontend exited before relay readiness".to_owned());
         }
         if pipe::frame_available(connection)? {
-            return match pipe::read_frame::<WindowsLauncherRequestV3>(connection)? {
-                WindowsLauncherRequestV3::RelaysReady {
+            return match pipe::read_bound_control_frame::<WindowsLauncherRequestV4>(
+                connection, frontend, cutoff,
+            )? {
+                WindowsLauncherRequestV4::RelaysReady {
                     schema_version,
                     attempt_id: received,
                     nonce: received_nonce,
                     request_sha256: received_digest,
-                } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+                } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
                     && received == attempt_id
                     && received_nonce == nonce
                     && received_digest == request_sha256 =>
@@ -4678,6 +4603,70 @@ fn wait_for_relays_ready(
         pipe::wait_poll_interval();
     }
     Err("frontend did not acknowledge relay readiness".to_owned())
+}
+
+#[allow(clippy::too_many_arguments)] // Every binding comes from this held native attempt.
+fn wait_for_prepared_acknowledgment(
+    connection: HANDLE,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    prepared_sha256: &str,
+    frontend: HANDLE,
+    guardian: HANDLE,
+    cutoff: Instant,
+    absolute_deadline_millis: Option<u64>,
+) -> Result<Option<i32>, String> {
+    loop {
+        // SAFETY: both handles remain held by this native attempt.
+        if unsafe { WaitForSingleObject(frontend, 0) } == WAIT_OBJECT_0 {
+            return Err("frontend exited before prepared acknowledgment".into());
+        }
+        require_guardian_live(guardian)?;
+        if Instant::now() >= cutoff
+            || absolute_deadline_millis
+                .is_some_and(|deadline| unsafe { GetTickCount64() } >= deadline)
+        {
+            return Err(
+                "original preparation deadline exhausted before prepared acknowledgment".into(),
+            );
+        }
+        if pipe::frame_available(connection)? {
+            return match pipe::read_bound_control_frame::<WindowsLauncherRequestV4>(
+                connection, frontend, cutoff,
+            )? {
+                WindowsLauncherRequestV4::PreparedAcknowledged {
+                    schema_version,
+                    attempt_id: actual_attempt,
+                    nonce: actual_nonce,
+                    request_sha256: actual_request,
+                    prepared_sha256: actual_prepared,
+                } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
+                    && actual_attempt == attempt_id
+                    && actual_nonce == nonce
+                    && actual_request == request_sha256
+                    && actual_prepared == prepared_sha256 =>
+                {
+                    Ok(None)
+                }
+                WindowsLauncherRequestV4::Cancel {
+                    schema_version,
+                    attempt_id: actual_attempt,
+                    nonce: actual_nonce,
+                    request_sha256: actual_request,
+                    signal,
+                } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
+                    && actual_attempt == attempt_id
+                    && actual_nonce == nonce
+                    && actual_request == request_sha256 =>
+                {
+                    Ok(Some(signal))
+                }
+                _ => Err("prepared acknowledgment differs from held native attempt".into()),
+            };
+        }
+        pipe::wait_poll_interval();
+    }
 }
 
 enum RelayRetirementAcknowledgment {
@@ -4724,7 +4713,7 @@ fn wait_for_relays_retired(
             }
         };
         if available {
-            let frame = match pipe::read_frame_detailed::<WindowsLauncherRequestV3>(connection) {
+            let frame = match pipe::read_frame_detailed::<WindowsLauncherRequestV4>(connection) {
                 Ok(frame) => frame,
                 Err(error) if error.peer_closed => {
                     return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
@@ -4738,12 +4727,12 @@ fn wait_for_relays_retired(
                 }
             };
             return match frame {
-                WindowsLauncherRequestV3::RelaysRetired {
+                WindowsLauncherRequestV4::RelaysRetired {
                     schema_version,
                     attempt_id: received,
                     nonce: received_nonce,
                     request_sha256: received_digest,
-                } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+                } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
                     && received == attempt_id
                     && received_nonce == nonce
                     && received_digest == request_sha256 =>
@@ -4765,14 +4754,15 @@ fn wait_for_terminal_acknowledgment(
     request_sha256: &str,
     terminal_response_sha256: &str,
 ) -> Result<(), String> {
-    match pipe::read_frame::<WindowsLauncherRequestV3>(connection)? {
-        WindowsLauncherRequestV3::TerminalAcknowledged {
+    let transport = pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))?;
+    let result = (|| match pipe::read_frame::<WindowsLauncherRequestV4>(connection)? {
+        WindowsLauncherRequestV4::TerminalAcknowledged {
             schema_version,
             attempt_id: received_attempt_id,
             nonce: received_nonce,
             request_sha256: received_request_sha256,
             terminal_response_sha256: received_response_sha256,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
             && received_attempt_id == attempt_id
             && received_nonce == nonce
             && received_request_sha256 == request_sha256
@@ -4781,6 +4771,14 @@ fn wait_for_terminal_acknowledgment(
             Ok(())
         }
         _ => Err("control did not acknowledge the bound terminal response".to_owned()),
+    })();
+    let settlement = transport.finish();
+    match (result, settlement) {
+        (Err(primary), Err(secondary)) => {
+            Err(format!("{primary}; terminal transport: {secondary}"))
+        }
+        (Err(primary), _) => Err(primary),
+        (Ok(()), result) => result,
     }
 }
 
@@ -5294,7 +5292,6 @@ fn latch_certification_target_result(
 enum TerminalReason {
     Direct(u32),
     MonitorFailed,
-    PolicyRevoked,
     Deadline,
     Memory(u64),
     Interrupted(i32),
@@ -5303,9 +5300,7 @@ enum TerminalReason {
 impl TerminalReason {
     const fn termination_status(self) -> u32 {
         match self {
-            Self::Direct(_) | Self::MonitorFailed | Self::Interrupted(_) | Self::PolicyRevoked => {
-                CANCEL_STATUS
-            }
+            Self::Direct(_) | Self::MonitorFailed | Self::Interrupted(_) => CANCEL_STATUS,
             Self::Deadline => DEADLINE_STATUS,
             Self::Memory(_) => LIMIT_STATUS,
         }
@@ -5331,9 +5326,8 @@ fn terminate_certification_guardian(guardian: &GuardianProcess) -> Result<(), St
 }
 
 fn monitor(
-    workload_admission: Option<&crate::admission::FrozenAdmission>,
     connection: HANDLE,
-    request: &WindowsLaunchBrokerRequestV1,
+    request: &WindowsLaunchBrokerRequestV2,
     job: &Job,
     target: &SuspendedTarget,
     authenticated_primary: HANDLE,
@@ -5349,14 +5343,6 @@ fn monitor(
     let mut snapshot_offset = 0_usize;
     let mut guardian_loss_injected = false;
     let reason = 'monitor: loop {
-        if workload_admission
-            .map(crate::admission::revoked_windows)
-            .transpose()?
-            .unwrap_or(false)
-        {
-            let _revocation = policy_revocation_failure().captured();
-            break TerminalReason::PolicyRevoked;
-        }
         if matches!(
             request.certification_fault,
             Some(
@@ -5522,7 +5508,7 @@ fn monitor(
                 }
             };
             if available {
-                match pipe::read_frame_detailed::<WindowsLauncherRequestV3>(connection) {
+                match pipe::read_frame_detailed::<WindowsLauncherRequestV4>(connection) {
                     Err(error) => {
                         super::diagnostics::capture_native_with_injected_fault(
                             memcordon_core::FailureOperationV1::ReadControlFrame,
@@ -5540,13 +5526,13 @@ fn monitor(
                         }
                         control_connected = false;
                     }
-                    Ok(WindowsLauncherRequestV3::Cancel {
+                    Ok(WindowsLauncherRequestV4::Cancel {
                         schema_version,
                         attempt_id,
                         nonce,
                         request_sha256,
                         signal,
-                    }) if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+                    }) if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
                         && attempt_id == request.attempt_id
                         && nonce == request.launch.nonce
                         && request_sha256 == request.request_sha256 =>
@@ -5661,45 +5647,9 @@ fn monitor(
     })
 }
 
-fn policy_revocation_failure() -> LaunchAttemptError {
-    LaunchAttemptError {
-        code: "MCSEALED-POLICY-DRIFT",
-        detail: "active policy revoked".to_owned(),
-        os_code: None,
-        phase: Some(memcordon_core::BoundarySetupPhase::Monitoring),
-        connection_must_close: false,
-        mutant_observation: None,
-        loader_qualification: None,
-        terminal_candidate: None,
-        job_operation: None,
-        workload_admission: None,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn policy_revocation_observation_for_test() -> memcordon_core::CausalEventV1 {
-    policy_revocation_failure().observation()
-}
-
-fn policy_revocation_outcome(child: ChildTermination, cleanup: CleanupSummary) -> RunOutcome {
-    RunOutcome::MonitorFailed {
-        error: "MCSEALED-POLICY-DRIFT: active policy revoked".to_owned(),
-        child_after_termination: Some(child),
-        cleanup,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn policy_revocation_outcome_for_test(
-    status: u32,
-    cleanup: CleanupSummary,
-) -> RunOutcome {
-    policy_revocation_outcome(child_termination(status), cleanup)
-}
-
 fn build_outcome(
     reason: TerminalReason,
-    request: &WindowsLaunchBrokerRequestV1,
+    request: &WindowsLaunchBrokerRequestV2,
     target: &SuspendedTarget,
     started: Instant,
     peak_memory_bytes: u64,
@@ -5725,10 +5675,6 @@ fn build_outcome(
             peak,
             cleanup,
         }),
-        TerminalReason::PolicyRevoked => Ok(policy_revocation_outcome(
-            child_after_termination.expect("revocation queries the terminated target status"),
-            cleanup,
-        )),
         TerminalReason::Deadline => {
             let observed = millis(started.elapsed());
             let requested = request
@@ -5840,7 +5786,7 @@ pub(super) fn wait_for_certification_release_marker(
         if bytes.len() > 64 * 1024 {
             return Err("certification readiness descriptor exceeds bound".into());
         }
-        memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
         let descriptor: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         let path = std::path::PathBuf::from(
@@ -5886,7 +5832,7 @@ pub(super) fn wait_for_certification_release_marker(
                         }
                         let mut bytes = vec![0u8; length];
                         if file.read_exact(&mut bytes).is_ok() {
-                            memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)?;
                             let event: serde_json::Value = serde_json::from_slice(&bytes)
                                 .map_err(|error| error.to_string())?;
                             if event.get("sequence").and_then(serde_json::Value::as_u64)
@@ -6093,7 +6039,7 @@ impl<'a> AttemptCleanup<'a> {
     }
     fn retain_retirement_fault(
         &mut self,
-        request: &WindowsLaunchBrokerRequestV1,
+        request: &WindowsLaunchBrokerRequestV2,
         fault: WindowsSealedFault,
         primary: &mut Option<LaunchAttemptError>,
     ) {

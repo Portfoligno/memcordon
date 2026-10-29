@@ -1,13 +1,15 @@
 use memcordon_ci::{
     Result,
-    consumer_readiness_ledger::{CellEvidence, SourceIdentity},
+    consumer_readiness_current::CellEvidenceV2 as CellEvidence,
+    readiness_identity::SourceIdentity,
     release::{
         artifacts,
         http::{ReadBudget, Response, StreamedResponse, StreamingTransport, Transport},
         readiness_transport,
     },
 };
-use memcordon_readiness_verifier::{JobResult, ProducerManifest, ProductKey};
+use memcordon_readiness_verifier::current::ProducerManifestV2 as ProducerManifest;
+use memcordon_readiness_verifier::{JobResult, ProductKey};
 use std::{
     collections::BTreeMap,
     io::{Cursor, Write},
@@ -160,7 +162,7 @@ fn payload(original_attempt: u64, mismatched_cell: bool) -> (SourceIdentity, Rep
     };
     let mut cell = CellEvidence {
         format: "memcordon.consumer-readiness.cell".into(),
-        revision: 1,
+        revision: 2,
         identity: identity.clone(),
         key: ProductKey {
             target: "x86_64-unknown-linux-gnu".into(),
@@ -178,7 +180,7 @@ fn payload(original_attempt: u64, mismatched_cell: bool) -> (SourceIdentity, Rep
     }
     let manifest = ProducerManifest {
         format: "memcordon.consumer-readiness.producer".into(),
-        revision: 1,
+        revision: 2,
         job: "candidate-linux-x64-native".into(),
         run_id: identity.run_id.clone(),
         run_attempt: original_attempt,
@@ -209,9 +211,10 @@ fn payload(original_attempt: u64, mismatched_cell: bool) -> (SourceIdentity, Rep
 }
 
 fn packed_payload(omit_object: bool) -> (SourceIdentity, Replies) {
+    use memcordon_readiness_verifier::current::storage::PackedProducerManifestV2;
     use memcordon_readiness_verifier::{
         Artifact,
-        storage::{ArtifactBinding, PackedProducerManifestV1, object_path},
+        storage::{ArtifactBinding, object_path},
     };
     use std::io::Read;
     let (identity, original) = payload(3, false);
@@ -246,9 +249,9 @@ fn packed_payload(omit_object: bool) -> (SourceIdentity, Replies) {
         })
         .collect();
     producer.artifacts = cell.artifacts.clone();
-    let envelope = PackedProducerManifestV1 {
+    let envelope = PackedProducerManifestV2 {
         format: "memcordon.consumer-readiness.packed-producer".into(),
-        revision: 1,
+        revision: 2,
         bindings: cell
             .artifacts
             .iter()
@@ -284,7 +287,7 @@ fn packed_payload(omit_object: bool) -> (SourceIdentity, Replies) {
 
 #[test]
 fn packed_transport_and_report_keep_logical_custody_and_every_original_archive() {
-    use memcordon_ci::consumer_readiness_ledger::{self as ledger, PackedLedger};
+    use memcordon_ci::consumer_readiness_current::{self as ledger, PackedLedger};
     let root = if cfg!(unix) {
         tempfile::tempdir_in("/tmp").unwrap()
     } else {
@@ -315,7 +318,7 @@ fn packed_transport_and_report_keep_logical_custody_and_every_original_archive()
     std::fs::create_dir(&output).unwrap();
     let mut index = ledger::initialize(
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../ci/consumer-readiness-v1.toml")
+            .join("../../ci/consumer-readiness-v2.toml")
             .as_path(),
         identity.clone(),
     )
@@ -345,7 +348,7 @@ fn packed_transport_and_report_keep_logical_custody_and_every_original_archive()
     packed.persist(&index, &evidence, &output).unwrap();
     let bytes = std::fs::read(evidence).unwrap();
     let (logical, storage) =
-        memcordon_readiness_verifier::storage::decode_evidence(&bytes).unwrap();
+        memcordon_readiness_verifier::current::storage::decode_evidence(&bytes).unwrap();
     assert_eq!(logical.artifacts.len(), 3);
     assert_eq!(logical.producer_origins.len(), 1);
     assert_eq!(storage.physical_artifacts().count(), 2);

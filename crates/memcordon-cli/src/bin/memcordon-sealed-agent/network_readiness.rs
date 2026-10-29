@@ -1,22 +1,11 @@
 //! Internal network-launcher measurements; these are never ordinary probe replies.
 
-use memcordon_core::runtime_readiness::ReadinessObservation;
-
-const PROFILE_ID: &str = "linux-network-launcher-families-v1";
-const PROFILE_SEMANTICS: &[u8] = b"memcordon.network-launcher-families/rev1;unix-stream-dgram-seqpacket-and-pairs=allow;ipv4-stream=allow;netlink-route-raw=allow;ipv6-stream=EAFNOSUPPORT";
-
-pub(crate) fn profile() -> memcordon_core::workload_contract::ProfileRef {
-    memcordon_core::workload_contract::ProfileRef {
-        id: memcordon_core::workload_contract::ProfileId::new(PROFILE_ID.to_owned())
-            .expect("fixed readiness profile id is valid"),
-        semantic_digest: memcordon_core::workload_codec::hash_bytes(PROFILE_SEMANTICS),
-    }
-}
+use memcordon_core::native_readiness::ReadinessObservation;
 
 pub(crate) fn complete(observation: &ReadinessObservation) -> bool {
     observation.format == "memcordon.network-launcher-readiness"
         && observation.revision == 1
-        && observation.workload_profile == profile()
+        && observation.probe_role == "private-network-launcher"
         && observation.workload_profile_probe_verified
         && observation.version == env!("CARGO_PKG_VERSION")
         && observation.mechanism == "linux-pid-namespace-cgroup-v2"

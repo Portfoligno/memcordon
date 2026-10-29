@@ -1,35 +1,16 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use memcordon_core::workload_contract::reject_duplicate_json_keys;
-use memcordon_core::workload_evidence::*;
+use memcordon_core::result_v3::{ReleaseKnowledgeV3,ResultV3};
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
-        || reject_duplicate_json_keys(data).is_err()
-    {
-        return;
-    }
-    let Ok(receipt) = serde_json::from_slice::<RuntimePolicyEnforcement>(data) else {
-        return;
-    };
-    if receipt.terminal_success() {
-        assert!(receipt.is_consistent());
-        assert!(matches!(
-            receipt.resolution(),
-            Some(RuntimeWorkloadResolution::Admitted { .. })
-        ));
-        let mut unavailable = receipt.clone();
-        if let RuntimePolicyEnforcement::Authorized { terminal, .. } = &mut unavailable {
-            *terminal = PolicyTerminalEvidenceV1::Unavailable {
-                reason: AdmissionAvailabilityFailure::TerminalUnavailable,
-            };
+    if let Ok(result)=ResultV3::parse(data) {
+        assert!(result.validate().is_ok());
+        assert!(ResultV3::parse(&serde_json::to_vec(&result).unwrap()).is_ok());
+        let mut unsupported=result.clone();unsupported.revision=0;
+        assert!(unsupported.validate().is_err());
+        if result.outcome.native_termination.is_some() {
+            let mut unreleased=result;unreleased.release=ReleaseKnowledgeV3::NotReleased;
+            assert!(unreleased.validate().is_err());
         }
-        assert!(!unavailable.terminal_success());
-        let json = serde_json::to_vec(&receipt).unwrap();
-        assert!(
-            serde_json::from_slice::<RuntimePolicyEnforcement>(&json)
-                .unwrap()
-                .terminal_success()
-        );
     }
 });

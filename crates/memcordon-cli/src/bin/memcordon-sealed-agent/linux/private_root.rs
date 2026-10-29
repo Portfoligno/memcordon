@@ -1,10 +1,10 @@
 //! Fresh copied root construction. Only the single-threaded namespace init calls enter.
-use super::runtime_image::{InstalledRuntimeImage, directory_at, open_relative, parent_at};
-use memcordon_core::workload_contract_v3::RootRelativePath;
-use memcordon_core::workload_registry_v3::{ImageEntryV1, RootLayoutDefinitionV1};
+use super::workload_snapshot::{HeldSnapshot, directory_at, open_relative, parent_at};
+use memcordon_core::workload_files::ImageEntryV1;
+use memcordon_core::workload_files::RootRelativePath;
+use memcordon_core::workload_request::PrivateRootLayoutV1;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -72,10 +72,10 @@ pub struct NativeRootStaging {
 impl NativeRootStaging {
     pub(super) fn native_identity(
         &self,
-    ) -> Result<super::private_attempt::MixedDirectoryIdentityV2, String> {
+    ) -> Result<super::native_process::MixedDirectoryIdentityV2, String> {
         use std::os::unix::fs::MetadataExt;
         let metadata = self.held.metadata().map_err(io)?;
-        Ok(super::private_attempt::MixedDirectoryIdentityV2 {
+        Ok(super::native_process::MixedDirectoryIdentityV2 {
             device: metadata.dev(),
             inode: metadata.ino(),
         })
@@ -99,7 +99,7 @@ impl NativeRootStaging {
             .map_err(io)?;
         for component in ["run", "memcordon"] {
             parent = directory_at(parent.as_fd(), component, true)?;
-            super::runtime_image::protected_directory(&parent)?;
+            super::workload_snapshot::protected_directory(&parent)?;
         }
         let name = CString::new(format!("private-root-{attempt}"))
             .map_err(|_| "staging name contains NUL")?;
@@ -111,7 +111,7 @@ impl NativeRootStaging {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(io)?;
-        super::runtime_image::protected_directory(&held)?;
+        super::workload_snapshot::protected_directory(&held)?;
         parent.sync_all().map_err(io)?;
         Ok(Self {
             provider_owner: true,
@@ -122,7 +122,7 @@ impl NativeRootStaging {
     /// The provider retains the only pathname cleanup owner across clone. The
     /// namespace child receives a held copy, never a second TempDir owner.
     pub(super) fn for_namespace_child(&self) -> Result<Self, String> {
-        super::runtime_image::protected_directory(&self.held)?;
+        super::workload_snapshot::protected_directory(&self.held)?;
         if !self.provider_owner {
             return Err("namespace staging cleanup owner is absent".into());
         }
@@ -137,7 +137,7 @@ impl NativeRootStaging {
             return Err("only outer provider may retire staging pathname".into());
         }
         use std::os::unix::fs::MetadataExt;
-        super::runtime_image::protected_directory(&self.held)?;
+        super::workload_snapshot::protected_directory(&self.held)?;
         let held = self.held.metadata().map_err(io)?;
         match std::fs::symlink_metadata(&self.path) {
             Ok(current) => {
@@ -154,37 +154,45 @@ impl NativeRootStaging {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/run/memcordon")
             .map_err(io)?;
-        super::runtime_image::protected_directory(&parent)?;
+        super::workload_snapshot::protected_directory(&parent)?;
         parent.sync_all().map_err(io)?;
         Ok(())
     }
 }
 
 /// No deserializer or public constructor: this is the actual mounted root inode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RootOwnership {
+    Workload {
+        request_sha256: memcordon_core::DiagnosticSha256,
+        target_uid: u32,
+    },
+}
 pub struct MountedPrivateRoot {
     root: File,
     // Only the provider exports after namespace retirement. Init owns no extra
     // pins, so its target descriptor seal and transfer inventory stay exact.
     writable_mounts: Option<Vec<HeldWritableMount>>,
-    layout: RootLayoutDefinitionV1,
+    layout: PrivateRootLayoutV1,
     attempt_id: String,
-    identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
+    identity: RootOwnership,
     init_nondumpable: bool,
 }
 struct HeldWritableMount {
-    definition: memcordon_core::workload_registry_v3::WritableRootV1,
+    definition: memcordon_core::workload_files::WritableRootV1,
     directory: File,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeRootTransferV2 {
+struct WorkloadRootTransferV1 {
     format: String,
     revision: u32,
-    layout: memcordon_core::workload_contract_v3::BoundObjectRef,
+    layout_sha256: memcordon_core::DiagnosticSha256,
+    request_sha256: memcordon_core::DiagnosticSha256,
+    target_uid: u32,
     entrypoint: RootRelativePath,
     root_device: u64,
     root_inode: u64,
-    identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
     init_nondumpable: bool,
 }
 /// A dedicated startup channel; it is never an extension of the old runtime
@@ -212,289 +220,6 @@ pub(super) fn native_root_channel() -> Result<
     }
     Ok((provider, init))
 }
-/// Minted only by the owned export-and-close operation after aggregate retirement.
-/// No serialized observation or ordinary cgroup retirement can construct this proof.
-pub struct PrivateRootRetirement {
-    attempt: String,
-    layout: memcordon_core::workload_contract_v3::BoundObjectRef,
-    identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
-}
-pub(super) struct RootExportFailure {
-    pub detail: String,
-    pub root: MountedPrivateRoot,
-    pub staging: NativeRootStaging,
-    pub exported: Option<PathBuf>,
-    pub destination: NativeExportDirectory,
-}
-/// Native phase ownership exists before mkdir/copy. There is no implicit
-/// recursive cleanup and no deserializer that can adopt an existing output.
-pub(super) struct NativeExportDirectory {
-    path: PathBuf,
-    held: Option<File>,
-    created: bool,
-    published: bool,
-    #[cfg(test)]
-    component_empty_publication: bool,
-}
-impl NativeExportDirectory {
-    #[cfg(test)]
-    pub(super) fn component_retire_empty(
-        &mut self,
-        attempt: &str,
-        original_receipt: &[u8],
-        deadline: std::time::Instant,
-    ) -> Result<serde_json::Value, String> {
-        use std::os::unix::fs::MetadataExt;
-        self.verify()?;
-        if !self.published
-            || !self.component_empty_publication
-            || Self::intended(attempt)?.path != self.path
-        {
-            return Err("component export publication/attempt differs".into());
-        }
-        let receipt: serde_json::Value =
-            serde_json::from_slice(original_receipt).map_err(|e| e.to_string())?;
-        if receipt["format"] != "memcordon.private-export"
-            || receipt["revision"] != 1
-            || receipt["attempt_id"] != attempt
-            || receipt["files"]
-                .as_array()
-                .is_none_or(|files| !files.is_empty())
-        {
-            return Err("component export is not the original empty publication".into());
-        }
-        let held = self.held.as_ref().ok_or("component export owner absent")?;
-        let before = held.metadata().map_err(io)?;
-        let entries = rustix::fs::Dir::read_from(held).map_err(|e| e.to_string())?;
-        let mut names = Vec::new();
-        for entry in entries {
-            if std::time::Instant::now() >= deadline {
-                return Err("component export enumeration cutoff exhausted".into());
-            }
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name().to_bytes();
-            if name == b"." || name == b".." {
-                continue;
-            }
-            if names.len() == 1 || name != b"export-receipt.json" {
-                return Err("component empty export contains an unexpected member".into());
-            }
-            names.push(name.to_vec());
-        }
-        if names.len() != 1 {
-            return Err("component export receipt absent".into());
-        }
-        let flags =
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
-        let file = File::from(
-            rustix::fs::openat(
-                held,
-                "export-receipt.json",
-                flags,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(|e| e.to_string())?,
-        );
-        let metadata = file.metadata().map_err(io)?;
-        if !metadata.is_file()
-            || metadata.uid() != 0
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o400
-            || metadata.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
-        {
-            return Err("component export receipt custody differs".into());
-        }
-        let mut bytes = Vec::new();
-        (&file)
-            .take(metadata.len() + 1)
-            .read_to_end(&mut bytes)
-            .map_err(io)?;
-        if bytes != original_receipt {
-            return Err("component export receipt bytes changed".into());
-        }
-        let after = file.metadata().map_err(io)?;
-        if (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mode(),
-            metadata.uid(),
-            metadata.nlink(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-        ) != (
-            after.dev(),
-            after.ino(),
-            after.len(),
-            after.mode(),
-            after.uid(),
-            after.nlink(),
-            after.ctime(),
-            after.ctime_nsec(),
-            after.mtime(),
-            after.mtime_nsec(),
-        ) {
-            return Err("component export receipt changed through readback".into());
-        }
-        let named = rustix::fs::statat(
-            held,
-            "export-receipt.json",
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|e| e.to_string())?;
-        if (named.st_dev, named.st_ino, named.st_nlink) != (metadata.dev(), metadata.ino(), 1) {
-            return Err("component export receipt identity changed".into());
-        }
-        self.verify()?;
-        let parent = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/run/memcordon")
-            .map_err(io)?;
-        super::runtime_image::protected_directory(&parent)?;
-        let name = self
-            .path
-            .file_name()
-            .ok_or("component export basename absent")?;
-        let named = rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| e.to_string())?;
-        if (named.st_dev, named.st_ino) != (before.dev(), before.ino())
-            || std::time::Instant::now() >= deadline
-        {
-            return Err("component export owner/cutoff changed".into());
-        }
-        rustix::fs::unlinkat(held, "export-receipt.json", rustix::fs::AtFlags::empty())
-            .map_err(|e| e.to_string())?;
-        held.sync_all().map_err(io)?;
-        rustix::fs::unlinkat(&parent, name, rustix::fs::AtFlags::REMOVEDIR)
-            .map_err(|e| e.to_string())?;
-        parent.sync_all().map_err(io)?;
-        match rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-            Err(error) if error == rustix::io::Errno::NOENT => {}
-            Err(error) => return Err(error.to_string()),
-            Ok(_) => return Err("component export pathname remains present".into()),
-        }
-        if held.metadata().map_err(io)?.nlink() != 0
-            || file.metadata().map_err(io)?.nlink() != 0
-            || std::time::Instant::now() >= deadline
-        {
-            return Err("component export retirement/cutoff differs".into());
-        }
-        Ok(
-            serde_json::json!({"attempt_id":attempt,"path":self.path,"device":before.dev(),"inode":before.ino(),"receipt_sha256":memcordon_core::workload_codec::hash_bytes(original_receipt),"named_absent":true}),
-        )
-    }
-    pub(super) fn intended(attempt: &str) -> Result<Self, String> {
-        if !super::cgroup::valid_attempt_identity(attempt) {
-            return Err("invalid export attempt identity".into());
-        }
-        Ok(Self {
-            path: Path::new("/run/memcordon").join(format!("private-export-{attempt}")),
-            held: None,
-            created: false,
-            published: false,
-            #[cfg(test)]
-            component_empty_publication: false,
-        })
-    }
-    pub(super) fn path(&self) -> &Path {
-        &self.path
-    }
-    pub(super) fn native_identity(
-        &self,
-    ) -> Result<super::private_attempt::MixedDirectoryIdentityV2, String> {
-        self.verify()?;
-        use std::os::unix::fs::MetadataExt;
-        let metadata = self
-            .held
-            .as_ref()
-            .expect("verified export handle")
-            .metadata()
-            .map_err(io)?;
-        Ok(super::private_attempt::MixedDirectoryIdentityV2 {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    pub(super) fn allocate(&mut self) -> Result<(), String> {
-        let parent = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/run/memcordon")
-            .map_err(io)?;
-        super::runtime_image::protected_directory(&parent)?;
-        let name = text(Path::new(
-            self.path.file_name().ok_or("export basename absent")?,
-        ))?;
-        if !self.created {
-            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
-                return Err(io(std::io::Error::last_os_error()));
-            }
-            self.created = true;
-        }
-        if self.held.is_none() {
-            let raw = unsafe {
-                libc::openat(
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if raw < 0 {
-                return Err(io(std::io::Error::last_os_error()));
-            }
-            use std::os::fd::FromRawFd;
-            self.held = Some(unsafe { File::from_raw_fd(raw) });
-        }
-        self.verify()?;
-        parent.sync_all().map_err(io)
-    }
-    fn verify(&self) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt;
-        let held = self
-            .held
-            .as_ref()
-            .ok_or("export directory native handle absent")?;
-        super::runtime_image::protected_directory(held)?;
-        let expected = held.metadata().map_err(io)?;
-        let current = std::fs::symlink_metadata(&self.path).map_err(io)?;
-        if !self.created
-            || !current.is_dir()
-            || current.uid() != 0
-            || current.mode() & 0o7777 != 0o700
-            || (current.dev(), current.ino()) != (expected.dev(), expected.ino())
-        {
-            return Err("export directory native custody differs".into());
-        }
-        Ok(())
-    }
-}
-impl PrivateRootRetirement {
-    pub(super) fn unmaterialized_after_native_retirement(
-        retired: &super::private_lifecycle::PrivateRetirementObservation,
-        layout: memcordon_core::workload_contract_v3::BoundObjectRef,
-        identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
-    ) -> Self {
-        Self {
-            attempt: retired.attempt_id().to_owned(),
-            layout,
-            identity,
-        }
-    }
-    pub(super) fn require_binding(
-        &self,
-        attempt: &str,
-        layout: &memcordon_core::workload_contract_v3::BoundObjectRef,
-        identity: &memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
-    ) -> Result<(), String> {
-        if self.attempt != attempt || &self.layout != layout || &self.identity != identity {
-            return Err("private root/export retirement binding differs".into());
-        }
-        Ok(())
-    }
-}
 impl MountedPrivateRoot {
     pub(super) fn publish_to_provider(
         &self,
@@ -517,21 +242,28 @@ impl MountedPrivateRoot {
         if !init_nondumpable || unsafe { libc::getuid() } != 0 {
             return Err("native namespace init privilege/dumpability differs".into());
         }
-        let payload = NativeRootTransferV2 {
-            format: "memcordon.native-root-transfer".into(),
-            revision: 2,
-            layout: self.layout.reference()?,
-            entrypoint: entry.path().clone(),
-            root_device: root.dev(),
-            root_inode: root.ino(),
-            identity: self.identity.clone(),
-            init_nondumpable,
-        };
+        let payload = match &self.identity {
+            RootOwnership::Workload {
+                request_sha256,
+                target_uid,
+            } => serde_json::to_vec(&WorkloadRootTransferV1 {
+                format: "memcordon.workload-root-transfer".into(),
+                revision: 1,
+                layout_sha256: self.layout.digest().map_err(|e| e.to_string())?,
+                request_sha256: request_sha256.clone(),
+                target_uid: *target_uid,
+                entrypoint: entry.path().clone(),
+                root_device: root.dev(),
+                root_inode: root.ino(),
+                init_nondumpable,
+            }),
+        }
+        .map_err(|error| error.to_string())?;
         let frame = crate::protocol::Frame {
             kind: crate::protocol::MessageKind::LaunchPrepared,
             nonce,
             attempt_id: attempt,
-            payload: serde_json::to_vec(&payload).map_err(|error| error.to_string())?,
+            payload,
         };
         let mut encoded = Vec::new();
         crate::protocol::write_frame(&mut encoded, &frame).map_err(|error| error.to_string())?;
@@ -546,22 +278,22 @@ impl MountedPrivateRoot {
     /// cannot manufacture this root handle.
     #[expect(
         clippy::too_many_arguments,
-        reason = "Root transfer independently authenticates channel, held init identity, transaction, layout, administrator, and entrypoint"
+        reason = "Root transfer independently authenticates channel, held init identity, original request, layout, package account, and entrypoint"
     )]
     pub(super) fn receive_from_init(
         channel: &std::os::unix::net::UnixStream,
-        init: &super::private_attempt::ProcessIdentityV4,
+        init: &super::native_process::ProcessIdentityV4,
         init_pidfd: BorrowedFd<'_>,
         nonce: [u8; 16],
         attempt: [u8; 16],
-        layout: RootLayoutDefinitionV1,
-        identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
+        layout: PrivateRootLayoutV1,
+        identity: RootOwnership,
         entry: &ImageEntryV1,
         deadline: std::time::Instant,
     ) -> Result<(Self, super::entrypoint::VerifiedEntrypoint), String> {
         use std::os::unix::fs::MetadataExt;
         let observe = || {
-            super::private_attempt::ProcessIdentityV4::observe(
+            super::native_process::ProcessIdentityV4::observe(
                 i32::try_from(init.pid).map_err(|_| "init PID exceeds native bound")?,
                 init_pidfd,
             )
@@ -585,18 +317,31 @@ impl MountedPrivateRoot {
         if frame.payload.len() > 4096 {
             return Err("native root transfer exceeds bound".into());
         }
-        memcordon_core::workload_contract::reject_duplicate_json_keys(&frame.payload)?;
-        let transfer: NativeRootTransferV2 =
-            serde_json::from_slice(&frame.payload).map_err(|error| error.to_string())?;
-        layout.validate()?;
-        if transfer.format != "memcordon.native-root-transfer"
-            || transfer.revision != 2
-            || transfer.layout != layout.reference()?
-            || transfer.entrypoint != *entry.path()
-            || transfer.identity != identity
-        {
-            return Err("native root transfer layout/image/identity differs".into());
-        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&frame.payload)?;
+        layout.validate().map_err(|e| e.to_string())?;
+        let (root_device, root_inode, init_nondumpable) = match &identity {
+            RootOwnership::Workload {
+                request_sha256,
+                target_uid,
+            } => {
+                let transfer: WorkloadRootTransferV1 =
+                    serde_json::from_slice(&frame.payload).map_err(|e| e.to_string())?;
+                if transfer.format != "memcordon.workload-root-transfer"
+                    || transfer.revision != 1
+                    || transfer.layout_sha256 != layout.digest().map_err(|e| e.to_string())?
+                    || transfer.entrypoint != *entry.path()
+                    || &transfer.request_sha256 != request_sha256
+                    || transfer.target_uid != *target_uid
+                {
+                    return Err("workload native root transfer differs".into());
+                }
+                (
+                    transfer.root_device,
+                    transfer.root_inode,
+                    transfer.init_nondumpable,
+                )
+            }
+        };
         let mut descriptors = descriptors.into_iter();
         let root = File::from(descriptors.next().expect("checked root descriptor count"));
         let executable = File::from(
@@ -607,7 +352,7 @@ impl MountedPrivateRoot {
         let metadata = root.metadata().map_err(io)?;
         if !metadata.is_dir()
             || metadata.uid() != 0
-            || (metadata.dev(), metadata.ino()) != (transfer.root_device, transfer.root_inode)
+            || (metadata.dev(), metadata.ino()) != (root_device, root_inode)
         {
             return Err("native root inode readback differs".into());
         }
@@ -627,7 +372,7 @@ impl MountedPrivateRoot {
             return Err("private root is not readonly".into());
         }
         let attempt_id = attempt.iter().map(|byte| format!("{byte:02x}")).collect();
-        if !transfer.init_nondumpable {
+        if !init_nondumpable {
             return Err("native namespace init was dumpable at root publication".into());
         }
         let mut root = Self {
@@ -636,10 +381,10 @@ impl MountedPrivateRoot {
             layout,
             attempt_id,
             identity,
-            init_nondumpable: transfer.init_nondumpable,
+            init_nondumpable,
         };
         root.writable_mounts = Some(root.capture_writable_mounts(deadline)?);
-        let independently_opened = root.open_entrypoint(entry)?;
+        let independently_opened = root.open_entrypoint(entry, deadline)?;
         let expected = File::from(
             independently_opened
                 .as_fd()
@@ -652,8 +397,9 @@ impl MountedPrivateRoot {
         if (expected.dev(), expected.ino()) != (actual.dev(), actual.ino()) {
             return Err("native executable does not belong to transferred root".into());
         }
-        let executable =
-            super::entrypoint::VerifiedEntrypoint::from_private_root_image(executable, entry)?;
+        let executable = super::entrypoint::VerifiedEntrypoint::from_private_root_image(
+            executable, entry, deadline,
+        )?;
         if std::time::Instant::now() >= deadline {
             return Err("native root writable mount capture exceeded original setup cutoff".into());
         }
@@ -725,7 +471,7 @@ impl MountedPrivateRoot {
     }
     fn held_writable_mount(
         &self,
-        definition: &memcordon_core::workload_registry_v3::WritableRootV1,
+        definition: &memcordon_core::workload_files::WritableRootV1,
     ) -> Result<&File, String> {
         let mounts = self.validated_writable_mounts()?;
         mounts
@@ -757,7 +503,7 @@ impl MountedPrivateRoot {
     }
     fn open_pinned_output(
         &self,
-        writable: &memcordon_core::workload_registry_v3::WritableRootV1,
+        writable: &memcordon_core::workload_files::WritableRootV1,
         selected: &RootRelativePath,
         uid: u32,
     ) -> Result<(File, std::fs::Metadata), String> {
@@ -809,351 +555,13 @@ impl MountedPrivateRoot {
         }
         Ok((source, before))
     }
-    #[cfg(test)]
-    pub(crate) fn capture_for_test(
-        root: File,
-        layout: RootLayoutDefinitionV1,
-        identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
-        deadline: std::time::Instant,
-    ) -> Result<Self, String> {
-        layout.validate()?;
-        let mut value = Self {
-            root,
-            writable_mounts: None,
-            layout,
-            attempt_id: "test-mount-owner".into(),
-            identity,
-            init_nondumpable: true,
-        };
-        value.writable_mounts = Some(value.capture_writable_mounts(deadline)?);
-        Ok(value)
-    }
-    #[cfg(test)]
-    pub(crate) fn open_output_for_test(
-        &self,
-        selected: &RootRelativePath,
-        uid: u32,
-    ) -> Result<File, String> {
-        let writable = self
-            .layout
-            .writable_roots
-            .as_slice()
-            .iter()
-            .find(|root| memcordon_core::workload_registry_v3::is_beneath(selected, &root.path))
-            .ok_or("test output outside declared roots")?;
-        self.open_pinned_output(writable, selected, uid)
-            .map(|(file, _)| file)
-    }
-    #[cfg(test)]
-    pub(crate) fn invalidate_pin_for_test(&mut self, mismatch: bool) {
-        if mismatch {
-            self.writable_mounts.as_mut().expect("captured pins")[0]
-                .definition
-                .generated_execution ^= true;
-        } else {
-            self.writable_mounts = None;
-        }
-    }
     pub(super) fn open_entrypoint(
         &self,
         entry: &ImageEntryV1,
+        deadline: std::time::Instant,
     ) -> Result<super::entrypoint::VerifiedEntrypoint, String> {
         let file = open_relative(self.root.as_fd(), entry.path(), false)?;
-        super::entrypoint::VerifiedEntrypoint::from_private_root_image(file, entry)
-    }
-    /// Copies only administrator-selected regular outputs after the native owner
-    /// has retired the entire workload. The namespace root stays held until the
-    /// last output is durably published; it is never returned to the frontend.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Publication failure retains the original mounted root, staging, export state, and destination for mandatory cleanup"
-    )]
-    pub(super) fn export_and_close(
-        self,
-        retirement: &super::private_lifecycle::PrivateRetirementObservation,
-        identity: &memcordon_core::workload_registry_v3::ExclusiveIdentityDefinitionV3,
-        mut staging: NativeRootStaging,
-        mut destination: NativeExportDirectory,
-    ) -> Result<(PrivateRootRetirement, NativeExportDirectory), RootExportFailure> {
-        let mut exported = None;
-        let publish = (|| -> Result<_, String> {
-            let layout = self.layout.reference()?;
-            let identity_reference = identity.reference()?;
-            if self.attempt_id != retirement.attempt_id() || self.identity != identity_reference {
-                return Err("root export originating attempt/identity differs".into());
-            }
-            let path = self
-                .export_selected(retirement, identity, &staging, &mut destination)
-                .map_err(|error| format!("export selected private root outputs: {error}"))?;
-            exported = Some(path.clone());
-            staging
-                .retire_path()
-                .map_err(|error| format!("retire private root staging: {error}"))?;
-            Ok((layout, identity_reference, path))
-        })();
-        let (layout, identity, path) = match publish {
-            Ok(published) => published,
-            Err(detail) => {
-                return Err(RootExportFailure {
-                    detail,
-                    root: self,
-                    staging,
-                    exported,
-                    destination,
-                });
-            }
-        };
-        drop(self);
-        drop(staging);
-        let _published_path = path;
-        Ok((
-            PrivateRootRetirement {
-                attempt: retirement.attempt_id().to_owned(),
-                layout,
-                identity,
-            },
-            destination,
-        ))
-    }
-    fn export_selected(
-        &self,
-        retirement: &super::private_lifecycle::PrivateRetirementObservation,
-        identity: &memcordon_core::workload_registry_v3::ExclusiveIdentityDefinitionV3,
-        staging: &NativeRootStaging,
-        destination: &mut NativeExportDirectory,
-    ) -> Result<PathBuf, String> {
-        use sha2::{Digest, Sha256};
-        use std::io::Write;
-        use std::os::unix::fs::MetadataExt;
-        if !identity.enabled {
-            return Err("export identity is disabled".into());
-        }
-        self.validated_writable_mounts()?;
-        let identity_reference = identity.reference()?;
-        let layout_reference = self.layout.reference()?;
-        super::runtime_image::protected_directory(&staging.held)?;
-        destination.verify()?;
-        let output_root = destination
-            .held
-            .as_ref()
-            .expect("verified native export directory")
-            .try_clone()
-            .map_err(io)?;
-        super::runtime_image::protected_directory(&output_root)?;
-        let mut budgets = std::collections::BTreeMap::<String, u64>::new();
-        let mut receipts = Vec::new();
-        let mut export_directories = std::collections::BTreeSet::new();
-        if !destination.published {
-            // A failed copy keeps its native directory owner. Retire only the
-            // finite declared output paths before retrying from the held root.
-            let mut allowed = std::collections::BTreeSet::new();
-            for selected in self.layout.output_files.as_slice() {
-                allowed.insert(PathBuf::from(selected.as_str()));
-                let mut parent = Path::new(selected.as_str()).parent();
-                while let Some(path) = parent {
-                    if path.as_os_str().is_empty() {
-                        break;
-                    }
-                    allowed.insert(path.to_path_buf());
-                    parent = path.parent();
-                }
-            }
-            allowed.insert(PathBuf::from("export-receipt.json"));
-            fn clear(
-                directory: &Path,
-                relative: &Path,
-                allowed: &std::collections::BTreeSet<PathBuf>,
-                remaining: &mut usize,
-            ) -> Result<(), String> {
-                use std::os::unix::fs::MetadataExt;
-                for entry in std::fs::read_dir(directory).map_err(io)? {
-                    *remaining = remaining
-                        .checked_sub(1)
-                        .ok_or("partial export entry bound exceeded")?;
-                    let entry = entry.map_err(io)?;
-                    let member = relative.join(entry.file_name());
-                    if !allowed.contains(&member) {
-                        return Err("partial export contains an undeclared member".into());
-                    }
-                    let metadata = std::fs::symlink_metadata(entry.path()).map_err(io)?;
-                    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-                        return Err("partial export custody differs".into());
-                    }
-                    if metadata.is_dir() {
-                        clear(&entry.path(), &member, allowed, remaining)?;
-                        std::fs::remove_dir(entry.path()).map_err(io)?;
-                    } else if metadata.is_file() && metadata.nlink() == 1 {
-                        std::fs::remove_file(entry.path()).map_err(io)?;
-                    } else {
-                        return Err("partial export contains an unsafe member".into());
-                    }
-                }
-                Ok(())
-            }
-            clear(
-                &destination.path,
-                Path::new(""),
-                &allowed,
-                &mut allowed.len(),
-            )?;
-            output_root.sync_all().map_err(io)?;
-        }
-        for selected in self.layout.output_files.as_slice() {
-            let writable = self
-                .layout
-                .writable_roots
-                .as_slice()
-                .iter()
-                .find(|root| memcordon_core::workload_registry_v3::is_beneath(selected, &root.path))
-                .ok_or("selected output is outside writable roots")?;
-            // Namespace teardown may disconnect this submount from self.root.
-            // Resolve only from its original provider-owned pre-release pin.
-            let (mut source, before) =
-                self.open_pinned_output(writable, selected, identity.uid.get())?;
-            let used = budgets.entry(writable.id.as_str().to_owned()).or_default();
-            *used = used
-                .checked_add(before.len())
-                .ok_or("output budget overflow")?;
-            if *used > writable.byte_limit.get() {
-                return Err("selected outputs exceed work-root bound".into());
-            }
-            let mut output = if destination.published {
-                open_relative(output_root.as_fd(), selected, false).map_err(|error| {
-                    format!("open published export {}: {error}", selected.as_str())
-                })?
-            } else {
-                open_relative(output_root.as_fd(), selected, true).map_err(|error| {
-                    format!("create export output {}: {error}", selected.as_str())
-                })?
-            };
-            let mut hash = Sha256::new();
-            let mut copied = 0_u64;
-            let mut buffer = [0_u8; 65536];
-            loop {
-                let count = source.read(&mut buffer).map_err(io)?;
-                if count == 0 {
-                    break;
-                }
-                copied = copied
-                    .checked_add(count as u64)
-                    .ok_or("output copy overflow")?;
-                if copied > before.len() {
-                    return Err("selected output changed during copy".into());
-                }
-                hash.update(&buffer[..count]);
-                if destination.published {
-                    let mut existing = vec![0_u8; count];
-                    output.read_exact(&mut existing).map_err(io)?;
-                    if existing != buffer[..count] {
-                        return Err("published export bytes differ from held output".into());
-                    }
-                } else {
-                    output.write_all(&buffer[..count]).map_err(io)?;
-                }
-            }
-            let after = source.metadata().map_err(io)?;
-            let stamp = |value: &std::fs::Metadata| {
-                (
-                    value.dev(),
-                    value.ino(),
-                    value.len(),
-                    value.nlink(),
-                    value.uid(),
-                    value.mode(),
-                    value.mtime(),
-                    value.mtime_nsec(),
-                    value.ctime(),
-                    value.ctime_nsec(),
-                )
-            };
-            if copied != before.len() || stamp(&before) != stamp(&after) {
-                return Err("selected output native identity/content changed".into());
-            }
-            if destination.published {
-                let metadata = output.metadata().map_err(io)?;
-                let mut extra = [0_u8; 1];
-                if metadata.uid() != 0
-                    || metadata.nlink() != 1
-                    || metadata.mode() & 0o777 != 0o400
-                    || output.read(&mut extra).map_err(io)? != 0
-                {
-                    return Err("published export native custody differs".into());
-                }
-            } else {
-                output
-                    .set_permissions(std::fs::Permissions::from_mode(0o400))
-                    .map_err(io)?;
-                output.sync_all().map_err(io)?;
-            }
-            let digest = memcordon_core::DiagnosticSha256::from_bytes(hash.finalize().into());
-            receipts.push(
-                serde_json::json!({"path":selected.as_str(),"length":copied,"sha256":digest}),
-            );
-            let (parent, _) = parent_at(output_root.as_fd(), selected, false)?;
-            parent.sync_all().map_err(io)?;
-            let mut parent = Path::new(selected.as_str()).parent();
-            while let Some(path) = parent {
-                if path.as_os_str().is_empty() {
-                    break;
-                }
-                export_directories.insert(path.to_path_buf());
-                parent = path.parent();
-            }
-        }
-        let receipt=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-export","revision":1,"attempt_id":retirement.attempt_id(),"root_layout":layout_reference,"identity":identity_reference,"files":receipts})).map_err(|error|error.to_string())?;
-        let receipt_path = RootRelativePath::new("export-receipt.json".to_owned())?;
-        let mut receipt_file =
-            open_relative(output_root.as_fd(), &receipt_path, !destination.published)
-                .map_err(|error| format!("publish export receipt: {error}"))?;
-        if destination.published {
-            let metadata = receipt_file.metadata().map_err(io)?;
-            let mut bytes = Vec::new();
-            receipt_file
-                .take((receipt.len() + 1) as u64)
-                .read_to_end(&mut bytes)
-                .map_err(io)?;
-            if bytes != receipt
-                || metadata.uid() != 0
-                || metadata.nlink() != 1
-                || metadata.mode() & 0o777 != 0o400
-            {
-                return Err("published export receipt differs".into());
-            }
-        } else {
-            receipt_file.write_all(&receipt).map_err(io)?;
-            receipt_file
-                .set_permissions(std::fs::Permissions::from_mode(0o400))
-                .map_err(io)?;
-            receipt_file.sync_all().map_err(io)?;
-        }
-        let mut directories: Vec<_> = export_directories.into_iter().collect();
-        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-        for path in directories {
-            let mut directory = output_root.try_clone().map_err(io)?;
-            for component in path.components() {
-                let name = component
-                    .as_os_str()
-                    .to_str()
-                    .ok_or("export directory is not UTF-8")?;
-                directory = directory_at(directory.as_fd(), name, false)?;
-            }
-            directory.sync_all().map_err(io)?;
-        }
-        output_root.sync_all().map_err(io)?;
-        let parent = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/run/memcordon")
-            .map_err(io)?;
-        parent.sync_all().map_err(io)?;
-        drop(output_root);
-        destination.published = true;
-        #[cfg(test)]
-        {
-            destination.component_empty_publication =
-                self.layout.output_files.as_slice().is_empty();
-        }
-        Ok(destination.path.clone())
+        super::entrypoint::VerifiedEntrypoint::from_private_root_image(file, entry, deadline)
     }
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.root.as_fd()
@@ -1161,59 +569,142 @@ impl MountedPrivateRoot {
     pub(super) fn init_nondumpable(&self) -> bool {
         self.init_nondumpable
     }
-    pub fn layout(&self) -> &RootLayoutDefinitionV1 {
+    pub fn layout(&self) -> &PrivateRootLayoutV1 {
         &self.layout
     }
-    /// Readonly image directories are traversable by the exclusive target account.
-    /// Runtime store directories remain separately protected at mode 0700.
+    /// Collect only declared regular files from the original writable mount pins
+    /// after exact native process/relay retirement. No host output path is accepted.
+    pub(super) fn export_workload(
+        &self,
+        retired: &super::private_lifecycle::WorkloadProcessesRetired,
+        destination: &File,
+        deadline: std::time::Instant,
+    ) -> Result<
+        memcordon_core::BoundedVec<memcordon_core::result_v3::WorkloadOutputFileV1, 64>,
+        String,
+    > {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+        use std::os::unix::fs::MetadataExt;
+        if self.attempt_id != retired.attempt()
+            || !matches!(&self.identity, RootOwnership::Workload { target_uid, .. } if *target_uid == retired.target_uid())
+        {
+            return Err("output custody differs from original retired attempt".into());
+        }
+        super::workload_snapshot::protected_directory(destination)?;
+        self.validated_writable_mounts()?;
+        let mut used = std::collections::BTreeMap::<String, u64>::new();
+        let mut files = memcordon_core::BoundedVec::default();
+        let mut buffer = [0; memcordon_core::workload_bundle::STREAM_BYTES];
+        for selected in self.layout.output_files.as_slice() {
+            if std::time::Instant::now() >= deadline {
+                return Err("original output collection cutoff expired".into());
+            }
+            let writable = self
+                .layout
+                .writable_roots
+                .as_slice()
+                .iter()
+                .find(|root| memcordon_core::workload_files::is_beneath(selected, &root.path))
+                .ok_or("output is outside declared writable roots")?;
+            let (mut source, before) =
+                self.open_pinned_output(writable, selected, retired.target_uid())?;
+            let charge = used.entry(writable.id.as_str().into()).or_default();
+            *charge = charge
+                .checked_add(before.len())
+                .ok_or("output footprint overflow")?;
+            if *charge > writable.byte_limit.get() {
+                return Err("output inventory exceeds declared writable bound".into());
+            }
+            let mut output =
+                super::workload_snapshot::open_relative(destination.as_fd(), selected, true)?;
+            let mut remaining = before.len();
+            let mut digest = Sha256::new();
+            while remaining != 0 {
+                if std::time::Instant::now() >= deadline {
+                    return Err("original output copy cutoff expired".into());
+                }
+                let amount = usize::try_from(
+                    remaining.min(u64::try_from(buffer.len()).expect("buffer fits u64")),
+                )
+                .expect("bounded amount fits usize");
+                source.read_exact(&mut buffer[..amount]).map_err(io)?;
+                output.write_all(&buffer[..amount]).map_err(io)?;
+                digest.update(&buffer[..amount]);
+                remaining -= u64::try_from(amount).expect("bounded amount fits u64");
+            }
+            let after = source.metadata().map_err(io)?;
+            if (
+                before.dev(),
+                before.ino(),
+                before.len(),
+                before.uid(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+            ) != (
+                after.dev(),
+                after.ino(),
+                after.len(),
+                after.uid(),
+                after.mode(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ) {
+                return Err("output native content/custody changed during collection".into());
+            }
+            output
+                .set_permissions(std::fs::Permissions::from_mode(0o400))
+                .map_err(io)?;
+            output.sync_all().map_err(io)?;
+            files
+                .try_push(memcordon_core::result_v3::WorkloadOutputFileV1 {
+                    path: selected.clone(),
+                    size: before.len(),
+                    sha256: memcordon_core::DiagnosticSha256::from_bytes(digest.finalize().into()),
+                })
+                .map_err(|_| "output inventory exceeds bound")?;
+        }
+        destination.sync_all().map_err(io)?;
+        Ok(files)
+    }
+    /// Readonly snapshot directories are traversable by the locked package account.
+    /// Original provider staging remains separately protected at mode 0700.
     #[expect(
         clippy::too_many_arguments,
-        reason = "Private root entry binds independent owned images, layout, staging, exclusive account, attempt, and administrator identity"
+        reason = "Private root entry binds independent held snapshots, layout, staging, package account, and original attempt"
     )]
     pub fn enter(
-        runtime: InstalledRuntimeImage,
-        input: InstalledRuntimeImage,
-        layout: RootLayoutDefinitionV1,
+        runtime: HeldSnapshot,
+        input: HeldSnapshot,
+        layout: PrivateRootLayoutV1,
         staging: NativeRootStaging,
         uid: u32,
         gid: u32,
         attempt: [u8; 16],
-        identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
+        identity: impl Into<RootOwnership>,
     ) -> Result<Self, String> {
-        layout.validate()?;
-        if uid == 0
-            || gid == 0
-            || layout.runtime_image != *runtime.reference()
-            || layout.input_image != *input.reference()
-        {
+        let identity = identity.into();
+        let copy_cutoff = runtime.validation_cutoff().min(input.validation_cutoff());
+        layout.validate().map_err(|e| e.to_string())?;
+        if uid == 0 || gid == 0 {
             return Err("private root image/account binding differs".into());
         }
         runtime.revalidate()?;
         input.revalidate()?;
-        let entries: Vec<_> = [runtime.definition(), input.definition()]
-            .into_iter()
-            .flat_map(|image| image.entries.as_slice())
-            .collect();
-        if runtime.definition().target != input.definition().target
-            || runtime.reference() == input.reference()
-        {
+        if runtime.definition().target != input.definition().target {
             return Err("private root requires distinct same-target images".into());
         }
-        for (index, entry) in entries.iter().enumerate() {
-            use memcordon_core::workload_registry_v3::is_beneath;
-            if entries[..index].iter().any(|prior| {
-                prior.path() == entry.path()
-                    || is_beneath(prior.path(), entry.path())
-                    || is_beneath(entry.path(), prior.path())
-            }) || layout.writable_roots.as_slice().iter().any(|writable| {
-                &writable.path == entry.path()
-                    || is_beneath(&writable.path, entry.path())
-                    || is_beneath(entry.path(), &writable.path)
-            }) {
-                return Err("private root merged image/writable authority overlaps".into());
-            }
-        }
-        super::runtime_image::protected_directory(&staging.held)?;
+        memcordon_core::workload_bundle::validate_layout(
+            runtime.definition(),
+            input.definition(),
+            &layout,
+        )?;
+        super::workload_snapshot::protected_directory(&staging.held)?;
         // This is the fork child's owned copy. The outer native owner retains
         // its original TempDir until aggregate retirement; disarm only the
         // child's pathname cleanup before pivoting out of the host root.
@@ -1260,6 +751,7 @@ impl MountedPrivateRoot {
             .map_err(io)?;
         for image in [&runtime, &input] {
             for entry in image.definition().entries.as_slice() {
+                super::workload_snapshot::check_validation_cutoff(copy_cutoff)?;
                 if let ImageEntryV1::Regular {
                     size, executable, ..
                 } = entry
@@ -1271,7 +763,8 @@ impl MountedPrivateRoot {
                             .map_err(io)?,
                     );
                     let mut destination = open_relative(root.as_fd(), entry.path(), true)?;
-                    image_copy::copy_exact(&source, &mut destination, *size).map_err(io)?;
+                    image_copy::copy_exact(&source, &mut destination, *size, copy_cutoff)
+                        .map_err(io)?;
                     destination
                         .set_permissions(std::fs::Permissions::from_mode(if *executable {
                             0o555
@@ -1279,12 +772,18 @@ impl MountedPrivateRoot {
                             0o444
                         }))
                         .map_err(io)?;
-                    super::runtime_image::verify_regular(&destination, entry, true)?;
+                    super::workload_snapshot::verify_regular_until(
+                        &destination,
+                        entry,
+                        true,
+                        copy_cutoff,
+                    )?;
                 }
             }
         }
         for image in [&runtime, &input] {
             for entry in image.definition().entries.as_slice() {
+                super::workload_snapshot::check_validation_cutoff(copy_cutoff)?;
                 let parent = Path::new(entry.path().as_str())
                     .parent()
                     .expect("validated relative path");
@@ -1319,6 +818,11 @@ impl MountedPrivateRoot {
         runtime.revalidate()?;
         input.revalidate()?;
         for writable in layout.writable_roots.as_slice() {
+            super::workload_snapshot::check_validation_cutoff(copy_cutoff)?;
+            let inodes = super::workload_resources::writable_inode_limit(
+                writable.byte_limit.get(),
+                super::workload_resources::native_page_size()?,
+            )?;
             let path = staging.join(writable.path.as_str());
             directory(&path)?;
             let flags = libc::MS_NOSUID
@@ -1334,7 +838,7 @@ impl MountedPrivateRoot {
                 Some("tmpfs"),
                 flags,
                 Some(&format!(
-                    "mode=0700,size={},uid={uid},gid={gid}",
+                    "mode=0700,size={},nr_inodes={inodes},uid={uid},gid={gid}",
                     writable.byte_limit.get()
                 )),
             )?;
@@ -1380,7 +884,14 @@ impl MountedPrivateRoot {
             &shm,
             Some("tmpfs"),
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            Some(&format!("mode=0700,size=67108864,uid={uid},gid={gid}")),
+            Some(&format!(
+                "mode=0700,size={},nr_inodes={},uid={uid},gid={gid}",
+                super::workload_resources::SHARED_MEMORY_BYTES,
+                super::workload_resources::writable_inode_limit(
+                    super::workload_resources::SHARED_MEMORY_BYTES,
+                    super::workload_resources::native_page_size()?
+                )?
+            )),
         )?;
         mount(
             None,
@@ -1431,7 +942,7 @@ impl MountedPrivateRoot {
     }
     pub fn open_working_directory(&self, path: &RootRelativePath) -> Result<File, String> {
         if !self.layout.writable_roots.as_slice().iter().any(|root| {
-            path == &root.path || memcordon_core::workload_registry_v3::is_beneath(path, &root.path)
+            path == &root.path || memcordon_core::workload_files::is_beneath(path, &root.path)
         }) {
             return Err("working directory is outside declared writable roots".into());
         }

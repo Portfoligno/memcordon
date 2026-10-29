@@ -14,7 +14,7 @@ fn observe(mode: &str) -> (i32, Vec<Value>) {
         .unwrap()
         .lines()
         .map(|line| {
-            memcordon_core::workload_contract::reject_duplicate_json_keys(line.as_bytes()).unwrap();
+            memcordon_core::canonical_json::reject_duplicate_json_keys(line.as_bytes()).unwrap();
             let value: Value = serde_json::from_str(line).unwrap();
             assert_eq!(value["format"], "memcordon.prebound-listener");
             assert_eq!(value["revision"], 1);

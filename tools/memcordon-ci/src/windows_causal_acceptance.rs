@@ -193,13 +193,21 @@ impl InstalledChannel {
 pub enum InstalledCase {
     SamplingPopulation,
     GuardianLossAfterRelease,
+    GuardianLossLifetime,
 }
 impl InstalledCase {
     pub const fn name(self) -> &'static str {
         match self {
             Self::SamplingPopulation => "sampling-population",
             Self::GuardianLossAfterRelease => "guardian-loss-after-release",
+            Self::GuardianLossLifetime => "guardian-loss-lifetime",
         }
+    }
+    pub const fn is_guardian_loss(self) -> bool {
+        matches!(
+            self,
+            Self::GuardianLossAfterRelease | Self::GuardianLossLifetime
+        )
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -251,7 +259,8 @@ impl InstalledCaseResult {
                 .all(|digest| valid_sha256(digest))
                     && match self.case {
                         InstalledCase::SamplingPopulation => collection.provider_failure.is_none(),
-                        InstalledCase::GuardianLossAfterRelease => collection
+                        InstalledCase::GuardianLossAfterRelease
+                        | InstalledCase::GuardianLossLifetime => collection
                             .provider_failure
                             .as_ref()
                             .is_some_and(|projection| {
@@ -418,7 +427,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 /// Compare report facts to the separately queried, authenticated live native
 /// association. A self-consistent report from another invocation is insufficient.
 pub fn validate_live_guardian_association(
-    reported: &memcordon_core::result_v1::ProviderAttemptAssociationV1,
+    reported: &memcordon_core::execution_facts::ProviderAttemptAssociationV1,
     observed: &memcordon_core::WindowsGuardianAttemptObservation,
     provider: &memcordon_core::PublicProviderBindingV1,
 ) -> Result<()> {

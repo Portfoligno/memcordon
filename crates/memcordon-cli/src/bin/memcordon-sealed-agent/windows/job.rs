@@ -100,7 +100,7 @@ fn captured_native_message(operation: memcordon_core::FailureOperationV1) -> Str
     super::diagnostics::capture_native(
         operation,
         source.raw_os_error(),
-        memcordon_core::FailureCodeV1::PolicyReadback,
+        memcordon_core::FailureCodeV1::JobConfigurationReadback,
     );
     source.to_string()
 }
@@ -131,7 +131,7 @@ impl Job {
         // SAFETY: process is live; a null Job asks whether it belongs to any Job.
         if unsafe { IsProcessInJob(process, ptr::null_mut(), &raw mut inside) } == 0 {
             Err(captured_native_message(
-                memcordon_core::FailureOperationV1::VerifyPolicy,
+                memcordon_core::FailureOperationV1::VerifyJob,
             ))
         } else {
             Ok(inside != 0)
@@ -203,7 +203,7 @@ impl Job {
         let raw = unsafe { CreateJobObjectW(&raw const attributes, ptr::null()) };
         if raw.is_null() {
             return Err(captured_native_message(
-                memcordon_core::FailureOperationV1::InstallPolicy,
+                memcordon_core::FailureOperationV1::ConfigureJob,
             ));
         }
         let handle = OwnedHandle::new(raw)?;
@@ -213,7 +213,7 @@ impl Job {
         let raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
         if raw.is_null() {
             return Err(captured_native_message(
-                memcordon_core::FailureOperationV1::InstallPolicy,
+                memcordon_core::FailureOperationV1::ConfigureJob,
             ));
         }
         let completion_port = OwnedHandle::new(raw)?;
@@ -233,7 +233,7 @@ impl Job {
         } == 0
         {
             return Err(captured_native_message(
-                memcordon_core::FailureOperationV1::InstallPolicy,
+                memcordon_core::FailureOperationV1::ConfigureJob,
             ));
         }
         let job = Self {
@@ -285,7 +285,7 @@ impl Job {
         } == 0
         {
             Err(captured_native_message(
-                memcordon_core::FailureOperationV1::InstallPolicy,
+                memcordon_core::FailureOperationV1::ConfigureJob,
             ))
         } else {
             Ok(())
@@ -336,7 +336,7 @@ impl Job {
         } == 0
         {
             Err(captured_native_message(
-                memcordon_core::FailureOperationV1::InstallPolicy,
+                memcordon_core::FailureOperationV1::ConfigureJob,
             ))
         } else {
             Ok(())
@@ -361,7 +361,7 @@ impl Job {
         } == 0
         {
             return Err(captured_native_message(
-                memcordon_core::FailureOperationV1::VerifyPolicy,
+                memcordon_core::FailureOperationV1::VerifyJob,
             ));
         }
         let expected = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -389,7 +389,7 @@ impl Job {
         } == 0
         {
             return Err(captured_native_message(
-                memcordon_core::FailureOperationV1::VerifyPolicy,
+                memcordon_core::FailureOperationV1::VerifyJob,
             ));
         }
         if accounting.ActiveProcesses != 0 || accounting.TotalProcesses != 0 {

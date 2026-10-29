@@ -1,6 +1,6 @@
 use super::*;
 use crate::ci_operation_time::ClockReading;
-use crate::consumer_readiness_ledger::SourceIdentity;
+use crate::readiness_identity::SourceIdentity;
 use crate::windows_owned_guardian::{
     LauncherServiceQueryError, LauncherServiceQueryStage, LauncherServiceStatus,
 };
@@ -211,7 +211,7 @@ fn original_owner_without_diagnostic_clock_keeps_exact_serialization_and_hash() 
         removal: crate::windows_readiness_adapter::WindowsRemovalPlan {
             binary_root: directory.path().join("installed"),
             state_root: directory.path().join("state"),
-            policy_root: directory.path().join("policy"),
+            diagnostics_root: directory.path().join("diagnostics"),
         },
         original_work_unix_millis: selected.work_unix_millis,
         original_cleanup_unix_millis: selected.cleanup_unix_millis,

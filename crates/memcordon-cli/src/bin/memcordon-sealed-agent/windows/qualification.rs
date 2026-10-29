@@ -1,10 +1,11 @@
 use memcordon_core::{
     BoundaryMechanismEvidence, ChildTermination, NativeWindowsCommandV1, RestartSafetyProof,
-    RunOutcome, WINDOWS_CONTROL_PIPE, WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsLaunchPolicyV1,
-    WindowsLaunchRequestV1, WindowsLifetimeV1, WindowsProviderRequestV3, WindowsProviderResponseV3,
-    WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
-    WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsSealedEvidenceV2, WindowsStreamRoleV1,
-    WindowsTerminalReplayDecisionV1, WindowsTokenMatrixEvidenceV1, WindowsTokenScenarioEvidenceV1,
+    RunOutcome, WINDOWS_CONTROL_PIPE, WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+    WindowsLaunchPolicyV1, WindowsLaunchRequestV2, WindowsLifetimeV1, WindowsProviderRequestV4,
+    WindowsProviderResponseV4, WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1,
+    WindowsPublicTerminalRecoveryV1, WindowsRelayEventV1, WindowsRelayPhaseV1,
+    WindowsSealedEvidenceV3, WindowsStreamRoleV1, WindowsTerminalReplayDecisionV1,
+    WindowsTokenMatrixEvidenceV1, WindowsTokenScenarioEvidenceV1,
 };
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -513,8 +514,8 @@ fn acknowledge_and_confirm_terminal_retirement(
 ) -> Result<(), String> {
     super::pipe::write_frame(
         pipe,
-        &WindowsProviderRequestV3::TerminalAcknowledged {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        &WindowsProviderRequestV4::TerminalAcknowledged {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.to_owned(),
             nonce: nonce.to_owned(),
             request_sha256: request_sha256.to_owned(),
@@ -522,7 +523,7 @@ fn acknowledge_and_confirm_terminal_retirement(
         },
     )?;
     confirm_terminal_retirement_response(
-        super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe)?,
+        super::pipe::read_response_frame::<WindowsProviderResponseV4>(pipe)?,
         attempt_id,
         nonce,
         request_sha256,
@@ -531,14 +532,14 @@ fn acknowledge_and_confirm_terminal_retirement(
 }
 
 pub(crate) fn confirm_terminal_retirement_response(
-    response: WindowsProviderResponseV3,
+    response: WindowsProviderResponseV4,
     attempt_id: &str,
     nonce: &str,
     request_sha256: &str,
     terminal_response_sha256: &str,
 ) -> Result<(), String> {
     match response {
-        WindowsProviderResponseV3::TerminalRetiredV2(retired)
+        WindowsProviderResponseV4::TerminalRetiredV2(retired)
             if retired.is_consistent_for(
                 attempt_id,
                 nonce,
@@ -548,7 +549,7 @@ pub(crate) fn confirm_terminal_retirement_response(
         {
             Ok(())
         }
-        WindowsProviderResponseV3::AttemptRetainedV2(retained)
+        WindowsProviderResponseV4::AttemptRetainedV2(retained)
             if retained.is_consistent_for(
                 attempt_id,
                 nonce,
@@ -840,22 +841,22 @@ pub fn probe() -> Result<memcordon_core::WindowsProviderProbeV1, String> {
     let expected = super::package::installed_public_provider_binding()?;
     super::pipe::write_frame(
         pipe.raw(),
-        &memcordon_core::WindowsProviderRequestV3::Probe {
-            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        &memcordon_core::WindowsProviderRequestV4::Probe {
+            schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         },
     )?;
-    match super::pipe::read_response_frame::<memcordon_core::WindowsProviderResponseV3>(pipe.raw())?
+    match super::pipe::read_response_frame::<memcordon_core::WindowsProviderResponseV4>(pipe.raw())?
     {
-        memcordon_core::WindowsProviderResponseV3::Probe {
+        memcordon_core::WindowsProviderResponseV4::Probe {
             schema_version,
             observation,
-        } if schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+        } if schema_version == memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
             && observation.validate().is_ok()
             && observation.provider_binding == expected =>
         {
             Ok(observation)
         }
-        memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => {
+        memcordon_core::WindowsProviderResponseV4::Reject { rejection, .. } => {
             Err(format!("{}: {}", rejection.code, rejection.detail))
         }
         _ => Err("Windows sealed control service returned an invalid probe receipt".to_owned()),
@@ -934,7 +935,7 @@ pub(crate) fn terminal_frame_truncation_canary() -> Result<bool, String> {
         Ok(())
     });
     let rejected =
-        super::pipe::read_response_frame::<WindowsProviderResponseV3>(reader.raw()).is_err();
+        super::pipe::read_response_frame::<WindowsProviderResponseV4>(reader.raw()).is_err();
     writer_thread
         .join()
         .map_err(|_| "terminal-frame writer panicked".to_owned())??;
@@ -1102,7 +1103,7 @@ fn read_qualification_replay_response(
     pipe: windows_sys::Win32::Foundation::HANDLE,
     deadline: std::time::Instant,
     primary: &str,
-) -> Result<WindowsProviderResponseV3, String> {
+) -> Result<WindowsProviderResponseV4, String> {
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(format!(
@@ -1136,8 +1137,8 @@ fn write_qualification_terminal_replay(
 ) -> Result<(), String> {
     super::pipe::write_frame(
         pipe,
-        &WindowsProviderRequestV3::ReplayTerminal {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        &WindowsProviderRequestV4::ReplayTerminal {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.to_owned(),
             nonce: nonce.to_owned(),
             request_sha256: request_sha256.to_owned(),
@@ -1171,7 +1172,7 @@ pub(crate) fn validate_native_reject(
     returned_attempt: &str,
     returned_nonce: &str,
     returned_digest: &str,
-    rejection: &memcordon_core::WindowsProviderRejectionV2,
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
     active_attempt: Option<&str>,
     expected_process_attempt: &str,
     expected_pretarget_attempt: &str,
@@ -1179,7 +1180,7 @@ pub(crate) fn validate_native_reject(
     expected_digest: &str,
     relay_phase: WindowsRelayPhaseV1,
 ) -> Result<(), String> {
-    if schema_version != WINDOWS_PUBLIC_PROTOCOL_VERSION {
+    if schema_version != WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION {
         return Err(invalid_native_response("reject", relay_phase, "schema"));
     }
     let attempt_matches = active_attempt.map_or_else(
@@ -1233,39 +1234,37 @@ fn invalid_native_response(
     )
 }
 
-fn provider_response_variant(response: &WindowsProviderResponseV3) -> &'static str {
+fn provider_response_variant(response: &WindowsProviderResponseV4) -> &'static str {
     match response {
-        WindowsProviderResponseV3::Probe { .. } => "probe",
-        WindowsProviderResponseV3::WorkloadPlan { .. } => "workload-plan",
-        WindowsProviderResponseV3::WorkloadDiscovery { .. } => "workload-discovery",
-        WindowsProviderResponseV3::StreamsPrepared { .. } => "streams-prepared",
-        WindowsProviderResponseV3::RecoveryStatus { .. } => "recovery-status",
-        WindowsProviderResponseV3::RecoveryInventory(_) => "recovery-inventory",
-        WindowsProviderResponseV3::ReadOnlyQueryFailure(_) => "read-only-query-failure",
-        WindowsProviderResponseV3::RecoveryAttemptUnavailable { .. } => {
+        WindowsProviderResponseV4::Probe { .. } => "probe",
+        WindowsProviderResponseV4::WorkloadPrepared(_) => "workload-prepared",
+        WindowsProviderResponseV4::WorkloadAccepted(_) => "workload-accepted",
+        WindowsProviderResponseV4::PreallocationCancelled(_) => "preallocation-cancelled",
+        WindowsProviderResponseV4::StreamsPrepared { .. } => "streams-prepared",
+        WindowsProviderResponseV4::RecoveryStatus { .. } => "recovery-status",
+        WindowsProviderResponseV4::RecoveryInventory(_) => "recovery-inventory",
+        WindowsProviderResponseV4::ReadOnlyQueryFailure(_) => "read-only-query-failure",
+        WindowsProviderResponseV4::RecoveryAttemptUnavailable { .. } => {
             "recovery-attempt-unavailable"
         }
-        WindowsProviderResponseV3::PackageCleanupResult { .. } => "package-cleanup-result",
-        WindowsProviderResponseV3::CertificationMachineRestart { .. } => {
+        WindowsProviderResponseV4::PackageCleanupResult { .. } => "package-cleanup-result",
+        WindowsProviderResponseV4::CertificationMachineRestart { .. } => {
             "certification-machine-restart"
         }
-        WindowsProviderResponseV3::TargetAuthorized { .. } => "target-authorized",
-        WindowsProviderResponseV3::TargetRetired { .. } => "target-retired",
-        WindowsProviderResponseV3::RelaysAbort { .. } => "relays-abort",
-        WindowsProviderResponseV3::CertificationMutantHookObserved(_) => {
+        WindowsProviderResponseV4::TargetAuthorized { .. } => "target-authorized",
+        WindowsProviderResponseV4::TargetRetired { .. } => "target-retired",
+        WindowsProviderResponseV4::RelaysAbort { .. } => "relays-abort",
+        WindowsProviderResponseV4::CertificationMutantHookObserved(_) => {
             "certification-mutant-hook-observed"
         }
-        WindowsProviderResponseV3::CertificationMutantObserved(_) => {
+        WindowsProviderResponseV4::CertificationMutantObserved(_) => {
             "certification-mutant-observed"
         }
-        WindowsProviderResponseV3::Terminal(_) => "terminal",
-        WindowsProviderResponseV3::Reject { .. } => "reject",
-        WindowsProviderResponseV3::AttemptRetained(_) => "attempt-retained",
-        WindowsProviderResponseV3::AttemptRetainedV2(_) => "attempt-retained-v2",
-        WindowsProviderResponseV3::ReplayPending(_) => "replay-pending",
-        WindowsProviderResponseV3::ReplayPendingV2(_) => "replay-pending-v2",
-        WindowsProviderResponseV3::TerminalRetired(_) => "terminal-retired",
-        WindowsProviderResponseV3::TerminalRetiredV2(_) => "terminal-retired-v2",
+        WindowsProviderResponseV4::Terminal(_) => "terminal",
+        WindowsProviderResponseV4::Reject { .. } => "reject",
+        WindowsProviderResponseV4::AttemptRetainedV2(_) => "attempt-retained-v2",
+        WindowsProviderResponseV4::ReplayPendingV2(_) => "replay-pending-v2",
+        WindowsProviderResponseV4::TerminalRetiredV2(_) => "terminal-retired-v2",
     }
 }
 
@@ -1324,9 +1323,9 @@ pub(super) fn read_bound_target_result(
 }
 
 fn validate_qualification_terminal<'a>(
-    terminal: &'a memcordon_core::WindowsTerminalReceiptV2,
+    terminal: &'a memcordon_core::WindowsTerminalReceiptV3,
     target_result: &TargetResultReceiptV1,
-) -> Result<&'a WindowsSealedEvidenceV2, String> {
+) -> Result<&'a WindowsSealedEvidenceV3, String> {
     if terminal.schema_version != 2 {
         return Err(format!(
             "qualification terminal schema-version invariant failed: observed={}",
@@ -1339,7 +1338,7 @@ fn validate_qualification_terminal<'a>(
     {
         return Err("qualification terminal restart-safety invariant failed".to_owned());
     }
-    let Some((_, outcome, BoundaryMechanismEvidence::WindowsJobObjectV2(evidence))) =
+    let Some((_, outcome, BoundaryMechanismEvidence::WindowsJobObjectV3(evidence))) =
         terminal.execution()
     else {
         return Err("qualification terminal boundary-evidence variant invariant failed".to_owned());
@@ -2895,10 +2894,10 @@ fn recursive_provider_canary() -> Result<(), String> {
 
     let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
     let executable = crate::windows::package::installed_binary();
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let request = WindowsLaunchRequestV2 {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
         expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
+        workload_request: None,
         loader_diagnostic: None,
         restart_attempt: 0,
         nonce: format!("recursive-{}", std::process::id()),
@@ -2924,15 +2923,15 @@ fn recursive_provider_canary() -> Result<(), String> {
     let nonce = request.nonce.clone();
     let request_sha256 =
         super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV3::Launch(request))?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe.raw())? {
-        WindowsProviderResponseV3::Reject {
+    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV4::Launch(request))?;
+    match super::pipe::read_response_frame::<WindowsProviderResponseV4>(pipe.raw())? {
+        WindowsProviderResponseV4::Reject {
             schema_version,
             attempt_id,
             nonce: returned_nonce,
             request_sha256: returned_digest,
             rejection,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
             && !attempt_id.is_empty()
             && returned_nonce == nonce
             && returned_digest == request_sha256
@@ -3666,19 +3665,19 @@ pub fn recovery_status() -> Result<bool, String> {
     let challenge = control_request_challenge("recovery-status");
     super::pipe::write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV3::RecoveryStatus {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        &WindowsProviderRequestV4::RecoveryStatus {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             challenge: challenge.clone(),
         },
     )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe.raw())? {
-        WindowsProviderResponseV3::RecoveryStatus {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV4>(pipe.raw())? {
+        WindowsProviderResponseV4::RecoveryStatus {
             schema_version,
             challenge: returned_challenge,
             status,
             attempts_empty,
             detail,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
             && returned_challenge == challenge =>
         {
             match (status, attempts_empty) {
@@ -3704,21 +3703,21 @@ pub fn prepare_package_cleanup(
     let challenge = control_request_challenge("package-cleanup");
     super::pipe::write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV3::PackageCleanup {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        &WindowsProviderRequestV4::PackageCleanup {
+            schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             challenge: challenge.clone(),
             deadline_millis,
         },
     )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe.raw())? {
-        WindowsProviderResponseV3::PackageCleanupResult {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV4>(pipe.raw())? {
+        WindowsProviderResponseV4::PackageCleanupResult {
             schema_version,
             challenge: returned_challenge,
             status,
             attempts_empty,
             terminal_outboxes,
             detail,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+        } if schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
             && returned_challenge == challenge =>
         {
             let outcome = memcordon_core::WindowsPackageCleanupOutcomeV1 {

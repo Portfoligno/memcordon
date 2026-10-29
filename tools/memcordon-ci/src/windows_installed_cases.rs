@@ -346,23 +346,18 @@ pub struct InstalledWindowsPayload {
     pub output_directory: PathBuf,
 }
 
-/// Complete measured rc.19 Cargo runtime, acquired separately from this cell.
-/// Its CLI-only native archive cannot supply this predecessor.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowsUpgradePredecessor {
-    pub format: String,
-    pub revision: u32,
-    pub payload: InstalledWindowsPayload,
-}
+#[cfg(windows)]
+#[path = "windows_current_control_cases.rs"]
+mod current_controls;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsLeasePhase {
-    BeforeOldInstall,
-    AfterOldInstall,
-    AfterOldVerify,
+    BeforeFreshInstall,
+    AfterFreshInstall,
+    AfterFreshVerify,
     BeforeCurrentUpgrade,
     AfterCurrentUpgrade,
+    AfterCurrentVerify,
     BeforeUninstall,
     AfterUninstall,
 }
@@ -468,6 +463,17 @@ pub fn installed_public_command(
     report: &Path,
     mode: &str,
 ) -> Result<crate::command::CommandSpec> {
+    installed_public_command_format(cli, fixture, directory, report, mode, "result-v3")
+}
+
+fn installed_public_command_format(
+    cli: &Path,
+    fixture: &Path,
+    directory: &Path,
+    report: &Path,
+    mode: &str,
+    format: &str,
+) -> Result<crate::command::CommandSpec> {
     let cli = std::path::absolute(cli)?;
     let fixture = std::path::absolute(fixture)?;
     let directory = std::path::absolute(directory)?;
@@ -479,7 +485,7 @@ pub fn installed_public_command(
                 std::ffi::OsString::from("+120s"),
                 std::ffi::OsString::from("--sealed"),
                 std::ffi::OsString::from("--report-format"),
-                std::ffi::OsString::from("result-v1"),
+                std::ffi::OsString::from(format),
                 std::ffi::OsString::from("--report"),
                 report.into_os_string(),
                 std::ffi::OsString::from("--"),
@@ -508,7 +514,7 @@ impl InstalledWindowsPayload {
         output_directory: PathBuf,
     ) -> Result<Self> {
         use crate::release::{artifacts as files, target};
-        use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
+        use memcordon_core::runtime_components::RuntimeComponentRole;
         source.validate()?;
         distribution.validate()?;
         if let Some(diagnostic) = &workload_diagnostic {
@@ -546,11 +552,39 @@ impl InstalledWindowsPayload {
             ));
         }
         let bytes = files::read_file(&payload_directory.join("runtime-manifest.json"))?;
-        let manifest = RuntimeManifest::parse(&bytes).map_err(CiError::Message)?;
-        if manifest.source_commit != source.commit()
-            || manifest.version != source.version().to_string()
-            || manifest.target != distribution.target
-            || manifest.components.len() != distribution.binaries.len()
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
+            .map_err(CiError::Message)?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let (
+            manifest_source,
+            manifest_version,
+            manifest_target,
+            manifest_components,
+            manifest_provider,
+        ) = match header["revision"].as_u64() {
+            Some(2) => {
+                let manifest =
+                    memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&bytes)
+                        .map_err(CiError::Message)?;
+                let binding = manifest.public_binding(&bytes).map_err(CiError::Message)?;
+                (
+                    manifest.source_commit,
+                    manifest.version,
+                    manifest.target,
+                    manifest.components,
+                    binding,
+                )
+            }
+            _ => {
+                return Err(CiError::Message(
+                    "selected Windows runtime inventory revision is unsupported".into(),
+                ));
+            }
+        };
+        if manifest_source != source.commit()
+            || manifest_version != source.version().to_string()
+            || manifest_target != distribution.target
+            || manifest_components.len() != distribution.binaries.len()
         {
             return Err(CiError::Message(
                 "installed manifest differs from selected source/distribution".into(),
@@ -562,8 +596,7 @@ impl InstalledWindowsPayload {
         let mut installed_components = Vec::new();
         for binary in &distribution.binaries {
             let name = target::binary_name(binary, &distribution.target);
-            let component = manifest
-                .components
+            let component = manifest_components
                 .iter()
                 .find(|component| component.path == name)
                 .ok_or_else(|| {
@@ -598,8 +631,7 @@ impl InstalledWindowsPayload {
             }
         }
         // The fixture is a separate test input and never a production component.
-        if manifest
-            .components
+        if manifest_components
             .iter()
             .any(|component| component.path == "memcordon-test-fixture.exe")
         {
@@ -644,7 +676,7 @@ impl InstalledWindowsPayload {
             installed_components,
             fixture,
             workload_diagnostic,
-            provider: manifest.public_binding(&bytes).map_err(CiError::Message)?,
+            provider: manifest_provider,
             output_directory,
         })
     }
@@ -706,10 +738,11 @@ impl InstalledWindowsAssessment {
             && self.refusal_suite.is_ok()
             && crate::windows_readiness_refusals::accepted(&self.refusal_cases)
             && crate::windows_consumer_readiness::accepted(&self.positive_cases)
-            && self.cases.len() == 2
+            && self.cases.len() == 3
             && self.cases.iter().map(|case| case.case).eq([
                 crate::windows_causal_acceptance::InstalledCase::SamplingPopulation,
                 crate::windows_causal_acceptance::InstalledCase::GuardianLossAfterRelease,
+                crate::windows_causal_acceptance::InstalledCase::GuardianLossLifetime,
             ])
             && self.cases.iter().all(InstalledCaseResult::accepted)
     }
@@ -731,6 +764,15 @@ pub(crate) fn validate_installed_selection(config: &InstalledWindowsPayload) -> 
 }
 
 #[cfg(windows)]
+pub(crate) fn run_current_package(
+    config: &InstalledWindowsPayload,
+    operation: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<(), String> {
+    native::package(config, operation, deadline)
+}
+
+#[cfg(windows)]
 mod native {
     use std::fs;
     use std::io;
@@ -740,9 +782,8 @@ mod native {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use memcordon_core::result_v1::{
-        AuthorizationV1, CleanupStateV1, LaunchStateV1, OutcomeKindV1, ResultV1,
-    };
+    use memcordon_core::execution_facts::{CleanupStateV1, OutcomeKindV1};
+    use memcordon_core::result_v3::{ReleaseKnowledgeV3, ResultV3};
     use memcordon_testkit::{OutputSnapshot, ProcessTestError, WindowsImageProcess};
 
     use super::*;
@@ -874,7 +915,7 @@ mod native {
         Ok(())
     }
 
-    fn package(
+    pub(super) fn package(
         config: &InstalledWindowsPayload,
         operation: &str,
         deadline: std::time::Instant,
@@ -887,6 +928,14 @@ mod native {
                 "original Windows installation deadline exhausted before package mutation".into(),
             );
         }
+        use std::os::windows::ffi::OsStrExt;
+        let invocation=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-package-invocation","revision":1,"operation":operation,"program_utf16":config.agent.path.as_os_str().encode_wide().collect::<Vec<_>>(),"argv_utf16":["package".encode_utf16().collect::<Vec<_>>(),operation.encode_utf16().collect::<Vec<_>>()],"cwd_utf16":config.output_directory.as_os_str().encode_wide().collect::<Vec<_>>(),"image_sha256":config.agent.sha256,"budget_millis":u64::try_from(budget.as_millis()).map_err(|error|error.to_string())?})).map_err(|error|error.to_string())?;
+        retain_package_leaf(
+            &config.output_directory,
+            &format!("package-{operation}.invocation.json"),
+            &invocation,
+            None,
+        )?;
         let mut command = CommandSpec::new(&config.agent.path, &config.output_directory, budget)
             .args(["package", operation])
             .materialize()
@@ -913,14 +962,62 @@ mod native {
         report: &Path,
         mode: &str,
     ) -> Result<Command> {
-        installed_public_command(
-            &config.cli.path,
-            &config.fixture.path,
+        let request=memcordon_core::workload_request::WorkloadRequestV1::parse(br#"{"format":"memcordon.workload-request","revision":1,"runtime":{"kind":"windows-sealed","profile":"windows-sealed-current-token-v1"},"requirements":[]}"#).map_err(|error|CiError::Message(error.to_string()))?;
+        let request_path = report.with_extension("request.json");
+        retain_package_leaf(
             &config.output_directory,
-            report,
-            mode,
-        )?
-        .materialize()
+            request_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| CiError::Message("installed case request leaf absent".into()))?,
+            &request
+                .canonical_bytes()
+                .map_err(|error| CiError::Message(error.to_string()))?,
+            None,
+        )
+        .map_err(CiError::Message)?;
+        let specification = CommandSpec::new(
+            &config.cli.path,
+            &config.output_directory,
+            Duration::from_secs(180),
+        )
+        .args([
+            std::ffi::OsString::from("+4GiB"),
+            "+120s".into(),
+            "--sealed".into(),
+            "--report-format".into(),
+            "result-v3".into(),
+            "--report".into(),
+            report.as_os_str().to_owned(),
+            "--workload-request".into(),
+            request_path.into_os_string(),
+            "--windows-terminal-observation".into(),
+            report
+                .with_extension("terminal-observation.json")
+                .into_os_string(),
+            "--".into(),
+            config.fixture.path.as_os_str().to_owned(),
+            mode.into(),
+        ]);
+        let command = specification.materialize()?;
+        use std::os::windows::ffi::OsStrExt;
+        let invocation = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.windows-installed-special-invocation","revision":1,"program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),"argv_utf16":command.get_args().map(|value|value.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),"cwd_utf16":config.output_directory.as_os_str().encode_wide().collect::<Vec<_>>(),"image_sha256":config.cli.sha256,"mode":mode}),
+        )?;
+        retain_package_leaf(
+            &config.output_directory,
+            report
+                .with_extension("invocation.json")
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    CiError::Message("installed special invocation leaf absent".into())
+                })?,
+            &invocation,
+            None,
+        )
+        .map_err(CiError::Message)?;
+        Ok(command)
     }
 
     fn smoke(
@@ -931,8 +1028,29 @@ mod native {
         let budget = deadlines
             .work_budget(Duration::from_secs(180))
             .map_err(|error| error.to_string())?;
-        let mut command =
-            public_command(config, path, "exit").map_err(|error| error.to_string())?;
+        let metadata = read_bounded(&config.installed_manifest.path, 1024 * 1024)
+            .map_err(|error| error.to_string())?;
+        if acceptance::sha256(&metadata) != config.installed_manifest.sha256 {
+            return Err("selected smoke provider inventory bytes differ".into());
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&metadata)?;
+        let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&metadata)?;
+        let binding = manifest.public_binding(&metadata)?;
+        if binding != config.provider {
+            return Err(
+                "actual installed smoke provider differs from selected current image".into(),
+            );
+        }
+        let mut command = installed_public_command_format(
+            &config.cli.path,
+            &config.fixture.path,
+            &config.output_directory,
+            path,
+            "exit",
+            "result-v3",
+        )
+        .and_then(|spec| spec.materialize())
+        .map_err(|error| error.to_string())?;
         command.args(["--code", "0"]);
         let output = memcordon_testkit::run_with_deadline_output_limit(
             &mut command,
@@ -940,14 +1058,15 @@ mod native {
             MAX_STREAM_BYTES,
         )
         .map_err(|error| error.to_string())?;
-        let result = ResultV1::parse(
-            &read_bounded(path, MAX_REPORT_BYTES).map_err(|error| error.to_string())?,
-        )?;
-        if output.status.success()
-            && result.outcome.kind == OutcomeKindV1::Completed
-            && result.cleanup.state == CleanupStateV1::Complete
-            && result.authorization == AuthorizationV1::Granted
-        {
+        let bytes = read_bounded(path, MAX_REPORT_BYTES).map_err(|error| error.to_string())?;
+        let actual_success = {
+            let result = ResultV3::parse(&bytes)?;
+            result.outcome.kind == OutcomeKindV1::Completed
+                && result.cleanup.state == CleanupStateV1::Complete
+                && result.release == ReleaseKnowledgeV3::Released
+                && result.provider.as_ref() == Some(&config.provider)
+        };
+        if output.status.success() && actual_success {
             Ok(())
         } else {
             Err("installed public success smoke failed".to_owned())
@@ -1025,7 +1144,7 @@ mod native {
                     .is_ok_and(|family| {
                         family.len() == acceptance::WINDOWS_CAUSAL_CONCURRENT_CHILDREN + 1
                     }),
-                InstalledCase::GuardianLossAfterRelease => {
+                InstalledCase::GuardianLossAfterRelease | InstalledCase::GuardianLossLifetime => {
                     let marker = b"MEMCORDON-GUARDIAN-LOSS-READY:";
                     let records = stdout
                         .split(|byte| *byte == b'\n')
@@ -1072,7 +1191,8 @@ mod native {
                             .map(|process| (process.pid, process.birth))
                             .collect()
                     }
-                    InstalledCase::GuardianLossAfterRelease => {
+                    InstalledCase::GuardianLossAfterRelease
+                    | InstalledCase::GuardianLossLifetime => {
                         let record = stdout
                             .split(|byte| *byte == b'\n')
                             .find_map(|line| line.strip_prefix(b"MEMCORDON-GUARDIAN-LOSS-READY:"))
@@ -1136,7 +1256,9 @@ mod native {
             }
             let mode = match case {
                 InstalledCase::SamplingPopulation => "windows-inventory-capacity",
-                InstalledCase::GuardianLossAfterRelease => "windows-guardian-loss-hold",
+                InstalledCase::GuardianLossAfterRelease | InstalledCase::GuardianLossLifetime => {
+                    "windows-guardian-loss-hold"
+                }
             };
             let command = public_command(config, &report_path, mode)?;
             let observed_family = Arc::clone(&family);
@@ -1158,10 +1280,19 @@ mod native {
                         .map_err(|_| io::Error::other("output observer poisoned"))? =
                         Some(snapshot.clone());
                     let ready = wait_ready(&snapshot, case, &fixture, deadlines.work)?;
+                    let held_rows=ready.iter().map(|process|Ok(serde_json::json!({"pid":process.identity.pid,"birth":process.identity.birth,"live":!process.has_exited()?}))).collect::<io::Result<Vec<_>>>()?;
+                    let before=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-installed-special-native","revision":1,"case":case,"fixture_path":fixture,"expected_provider":expected_provider,"family":held_rows})).map_err(io::Error::other)?;
+                    retain_package_leaf(
+                        &output_directory,
+                        &format!("{}.native-before.json", case.name()),
+                        &before,
+                        None,
+                    )
+                    .map_err(io::Error::other)?;
                     *observed_family
                         .lock()
                         .map_err(|_| io::Error::other("fixture family owner poisoned"))? = ready;
-                    if case == InstalledCase::GuardianLossAfterRelease {
+                    if case.is_guardian_loss() {
                         let mut guardian =
                             baseline.hold_new_guardian().map_err(io::Error::other)?;
                         let query_budget = deadlines
@@ -1180,7 +1311,10 @@ mod native {
                             query_budget,
                             16 * 1024,
                         );
-                        retain_guardian_query_capture(&output_directory, &output)
+                        let query_directory =
+                            output_directory.join(format!("{}.guardian-query", case.name()));
+                        fs::create_dir(&query_directory)?;
+                        retain_guardian_query_capture(&query_directory, &output)
                             .map_err(io::Error::other)?;
                         let output = output.map_err(io::Error::other)?;
                         if output.stdout.len() > 16 * 1024 || !output.status.success() {
@@ -1192,7 +1326,8 @@ mod native {
                             return Err(io::Error::other(failure));
                         }
                         fs::write(
-                            output_directory.join("guardian-live-association.json"),
+                            output_directory
+                                .join(format!("{}.guardian-live-association.json", case.name())),
                             &output.stdout,
                         )?;
                         let observed: memcordon_core::WindowsGuardianAttemptObservation =
@@ -1210,7 +1345,16 @@ mod native {
                         *observed_association.lock().map_err(|_| {
                             io::Error::other("guardian association owner poisoned")
                         })? = Some(observed);
+                        let guardian_identity = guardian.identity.clone();
                         guardian.terminate_owned().map_err(io::Error::other)?;
+                        let action=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-installed-guardian-action","revision":1,"guardian":guardian_identity,"api":"TerminateProcess","exit_code_operand":137,"call_succeeded":true,"native_exit_status":guardian.native_exit_status().map_err(io::Error::other)?,"held_process_retired":guardian.has_retired().map_err(io::Error::other)?})).map_err(io::Error::other)?;
+                        retain_package_leaf(
+                            &output_directory,
+                            &format!("{}.guardian-action.json", case.name()),
+                            &action,
+                            None,
+                        )
+                        .map_err(io::Error::other)?;
                     }
                     Ok(())
                 },
@@ -1239,6 +1383,7 @@ mod native {
                 }
             };
             // Preserve raw observations before parsing or any package mutation.
+            retain_package_leaf(&config.output_directory,&format!("{}.native-exit.json",case.name()),&serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-installed-special-exit","revision":1,"case":case,"native_status":status,"timed_out":timed_out,"execution_error":execution_error}))?,None).map_err(CiError::Message)?;
             fs::write(
                 config
                     .output_directory
@@ -1257,13 +1402,9 @@ mod native {
                 return Err(CiError::Message(error));
             }
             let report_bytes = read_bounded(&report_path, MAX_REPORT_BYTES)?;
-            let result = ResultV1::parse(&report_bytes).map_err(CiError::Message)?;
-            let projection = if case == InstalledCase::GuardianLossAfterRelease {
-                let reported = result.provider_association.as_ref().ok_or_else(|| {
-                    CiError::Message(
-                        "public result omitted actual provider invocation association".to_owned(),
-                    )
-                })?;
+            let result = ResultV3::parse(&report_bytes).map_err(CiError::Message)?;
+            let projection = if case.is_guardian_loss() {
+                let reported = crate::windows_consumer_readiness::current_association(&result)?;
                 let held = association
                     .lock()
                     .map_err(|_| CiError::Message("guardian association owner poisoned".into()))?;
@@ -1278,7 +1419,7 @@ mod native {
                     &config.provider,
                 )?;
                 let association = &observed.association;
-                let projection = result.diagnostics.as_ref().ok_or_else(|| {
+                let projection = result.provider_failure.as_ref().ok_or_else(|| {
                     CiError::Message("public result omitted the causal original".to_owned())
                 })?;
                 Some(acceptance::validate_guardian_failure_projection(
@@ -1298,18 +1439,15 @@ mod native {
             });
             let behavior = !timed_out
                 && status == Some(result.outcome.wrapper_status)
-                && result.authorization == AuthorizationV1::Granted
-                && matches!(
-                    result.launch.state,
-                    LaunchStateV1::ReleaseIssued | LaunchStateV1::ExecObserved
-                )
+                && result.release == ReleaseKnowledgeV3::Released
                 && result.cleanup.state == CleanupStateV1::Complete
                 && match case {
                     InstalledCase::SamplingPopulation => {
                         result.outcome.kind == OutcomeKindV1::Deadline
-                            && result.diagnostics.is_none()
+                            && result.provider_failure.is_none()
                     }
-                    InstalledCase::GuardianLossAfterRelease => {
+                    InstalledCase::GuardianLossAfterRelease
+                    | InstalledCase::GuardianLossLifetime => {
                         result.outcome.kind == OutcomeKindV1::ProviderFailure
                     }
                 };
@@ -1363,6 +1501,8 @@ mod native {
                     )?
                     .is_empty()
                 {
+                    let rows=observed.iter().map(|process|Ok(serde_json::json!({"pid":process.identity.pid,"birth":process.identity.birth,"retired":process.has_exited()?,"native_exit_status":process.native_exit_status()?}))).collect::<io::Result<Vec<_>>>()?;
+                    retain_package_leaf(&config.output_directory,&format!("{}.native-retirement.json",case.name()),&serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-installed-special-retirement","revision":1,"case":case,"family":rows,"same_image_processes_absent":true}))?,None).map_err(CiError::Message)?;
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -1392,38 +1532,6 @@ mod native {
         }
         fs::create_dir_all(&config.output_directory)?;
         verify_selected(config)?;
-        let predecessor_bytes = read_bounded(
-            &config
-                .output_directory
-                .join("windows-upgrade-predecessor.json"),
-            2 * 1024 * 1024,
-        )?;
-        memcordon_core::workload_contract::reject_duplicate_json_keys(&predecessor_bytes)
-            .map_err(CiError::Message)?;
-        let predecessor: WindowsUpgradePredecessor = serde_json::from_slice(&predecessor_bytes)?;
-        let older = &predecessor.payload;
-        if predecessor.format != "memcordon.windows-upgrade-predecessor"
-            || predecessor.revision != 1
-            || older.channel != InstalledChannel::CargoPackage
-            || older.version != "0.5.7-rc.19"
-            || older.source_commit != "a02e8f1e845349e27706c11d6d57acb27090223a"
-            || older.target != config.target
-            || older.output_directory == config.output_directory
-            || semver::Version::parse(&older.version)
-                .map_err(|error| CiError::Message(error.to_string()))?
-                >= semver::Version::parse(&config.version)
-                    .map_err(|error| CiError::Message(error.to_string()))?
-        {
-            return Err(CiError::Message(
-                "Windows upgrade requires exact older complete rc.19 Cargo runtime".into(),
-            ));
-        }
-        verify_selected(older)?;
-        // Package commands use this owned diagnostic directory as their cwd.
-        // Materializing the predecessor payload does not create case output.
-        if source_root.is_some() {
-            fs::create_dir(&older.output_directory)?;
-        }
         if memcordon_testkit::windows_available_memory_bytes()? < 4 * 1024 * 1024 * 1024 {
             return Err(CiError::Message(
                 "selected Windows installed fixture requires 4 GiB available memory".to_owned(),
@@ -1451,44 +1559,42 @@ mod native {
             package_uninstall: Err("uninstall was not executed".to_owned()),
         };
         let mut current_upgrade_started = false;
-        let mut old_install_started = false;
+        let mut fresh_install_started = false;
+        let mut fresh = config.clone();
+        fresh.output_directory = config.output_directory.join("selected-fresh-lifetime");
+        fs::create_dir(&fresh.output_directory)?;
         let operation = (|| -> std::result::Result<(), String> {
             observer(lease_event(
-                WindowsLeasePhase::BeforeOldInstall,
-                older,
+                WindowsLeasePhase::BeforeFreshInstall,
+                &fresh,
                 Some("install"),
                 None,
             ))
             .map_err(|error| error.to_string())?;
-            old_install_started = true;
-            let old_install = package(older, "install", deadlines.work);
+            fresh_install_started = true;
+            let installed = package(&fresh, "install", deadlines.work);
             observer(lease_event(
-                WindowsLeasePhase::AfterOldInstall,
-                older,
+                WindowsLeasePhase::AfterFreshInstall,
+                &fresh,
                 Some("install"),
-                Some(&old_install),
+                Some(&installed),
             ))
             .map_err(|error| error.to_string())?;
-            old_install?;
-            let old_verify = package(older, "verify", deadlines.work);
+            installed?;
+            let verified = package(&fresh, "verify", deadlines.work);
             observer(lease_event(
-                WindowsLeasePhase::AfterOldVerify,
-                older,
+                WindowsLeasePhase::AfterFreshVerify,
+                &fresh,
                 Some("verify"),
-                Some(&old_verify),
+                Some(&verified),
             ))
             .map_err(|error| error.to_string())?;
-            old_verify?;
-            for component in &older.installed_components {
+            verified?;
+            verify_file(&fresh.installed_manifest).map_err(|error| error.to_string())?;
+            for component in &fresh.installed_components {
                 verify_file(component).map_err(|error| error.to_string())?;
             }
-            verify_file(&older.installed_manifest).map_err(|error| error.to_string())?;
-            drop(quiescent(older).map_err(|error| error.to_string())?);
-            smoke(
-                older,
-                &older.output_directory.join("predecessor-smoke.json"),
-                deadlines,
-            )?;
+            drop(quiescent(&fresh).map_err(|error| error.to_string())?);
             observer(lease_event(
                 WindowsLeasePhase::BeforeCurrentUpgrade,
                 config,
@@ -1506,7 +1612,16 @@ mod native {
             ))
             .map_err(|error| error.to_string())?;
             assessment.package_upgrade.clone()?;
-            package(config, "verify", deadlines.work)?;
+            let current_verify = package(config, "verify", deadlines.work);
+            observer(lease_event(
+                WindowsLeasePhase::AfterCurrentVerify,
+                config,
+                Some("verify"),
+                Some(&current_verify),
+            ))
+            .map_err(|error| error.to_string())?;
+            current_verify?;
+            current_controls::run(config, deadlines).map_err(|error| error.to_string())?;
             verify_file(&config.installed_agent).map_err(|error| error.to_string())?;
             verify_file(&config.installed_manifest).map_err(|error| error.to_string())?;
             for component in &config.installed_components {
@@ -1563,6 +1678,7 @@ mod native {
             for case in [
                 InstalledCase::SamplingPopulation,
                 InstalledCase::GuardianLossAfterRelease,
+                InstalledCase::GuardianLossLifetime,
             ] {
                 assessment.cases.push(run_case(config, case, deadlines));
                 let case = assessment.cases.last().expect("case was appended");
@@ -1590,9 +1706,9 @@ mod native {
         let cleanup_subject = if current_upgrade_started {
             config
         } else {
-            older
+            &fresh
         };
-        let before_uninstall = if old_install_started {
+        let before_uninstall = if fresh_install_started {
             observer(lease_event(
                 WindowsLeasePhase::BeforeUninstall,
                 cleanup_subject,
@@ -1602,12 +1718,12 @@ mod native {
         } else {
             Ok(())
         };
-        let uninstall = if old_install_started {
+        let uninstall = if fresh_install_started {
             package(cleanup_subject, "uninstall", deadlines.cleanup)
         } else {
-            Err("owned predecessor install never started; no package removal attempted".into())
+            Err("owned current install never started; no package removal attempted".into())
         };
-        let after_uninstall = if old_install_started {
+        let after_uninstall = if fresh_install_started {
             observer(lease_event(
                 WindowsLeasePhase::AfterUninstall,
                 cleanup_subject,

@@ -8,7 +8,7 @@ use memcordon_ci::{
     release::{
         artifacts::{self, FileRecord},
         bundle::{LoadedBundle, PreparedBundle, PublicManifest},
-        compatibility::{Compatibility, NativePackage},
+        compatibility::{CompatibilityV2 as Compatibility, NativePackage},
         distribution::Distribution,
         installed_consumer,
         publish::{Credentials, Publisher, RemoteState},
@@ -114,7 +114,8 @@ fn bundle(directory: &Path) -> LoadedBundle {
             );
         }
         let manifest =
-            installed_consumer::measured_manifest(&build, selection, native.path()).unwrap();
+            installed_consumer::measured_current_manifest(&build, selection, native.path())
+                .unwrap();
         members.insert(
             "runtime-manifest.json".into(),
             serde_json::to_vec(&manifest).unwrap(),
