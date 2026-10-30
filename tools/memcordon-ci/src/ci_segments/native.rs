@@ -9,13 +9,13 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
             product_only,
             source,
             build_source,
-            consumer_readiness,
+            runtime_components,
             failure_mode,
             ..
         } => {
             if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
-                let recipe = if *consumer_readiness {
-                    Suite::ReleaseReadiness
+                let recipe = if *runtime_components {
+                    Suite::ReleaseRuntime
                 } else {
                     Suite::ReleaseCompile
                 };
@@ -28,16 +28,16 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
                 build_source.as_deref(),
             )?;
             let distribution = Distribution::read(root)?;
-            let distribution = if *consumer_readiness {
-                distribution.consumer_readiness()?
+            let distribution = if *runtime_components {
+                distribution.with_runtime_components()?
             } else {
                 distribution
             };
             let native = distribution.native()?;
             let mode = *failure_mode;
             let product_only = *product_only;
-            let recipe = if *consumer_readiness {
-                Suite::ReleaseReadiness
+            let recipe = if *runtime_components {
+                Suite::ReleaseRuntime
             } else {
                 Suite::ReleaseCompile
             };
@@ -79,30 +79,6 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
                 )?;
             }
             release::run(root, command)
-        }
-        ReleaseCommand::NativeCoverageShard {
-            failure_mode,
-            shard,
-            ..
-        } => {
-            if super::coverage_cache_owner().map(|(owner, _)| owner) != Some(*shard) {
-                return Err(CiError::Message(
-                    "native coverage selector differs from its fixed workflow owner".into(),
-                ));
-            }
-            if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
-                *failure_mode = Suite::ReleaseReadiness.resolve_failure_mode(
-                    memcordon_ci::suite::ModeRequest::Workflow(super::event_mode()?),
-                )?;
-            }
-            let recipe = Suite::ReleaseReadiness;
-            let session = memcordon_ci::segment_cache::Session::begin_selected(
-                root,
-                super::scopes(recipe),
-                super::family(recipe),
-                false,
-            )?;
-            session.execute(root, || release::run(root, command))
         }
         _ => Err(CiError::Message(
             "native split adapter requires a fixed native phase".into(),

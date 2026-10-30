@@ -63,15 +63,5 @@ fn selected_macos_forms_require_both_architectures_and_actual_phase_collection()
         assert_ne!(work["continue-on-error"].as_bool(), Some(true));
         assert_eq!(work["if"].as_str(), Some("runner.os != 'Windows'"));
     }
-    let assessment = &workflow["jobs"]["macos-assessment"];
-    assert_eq!(
-        assessment["if"],
-        "!cancelled() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'"
-    );
-    assert_eq!(assessment["needs"].as_sequence().unwrap().len(), 4);
-    assert!(
-        assessment["steps"].as_sequence().unwrap().iter().any(
-            |step| step["run"] == "./target/ci-runtime/current/memcordon-ci ci aggregate-macos"
-        )
-    );
+    assert!(workflow["jobs"]["macos-assessment"].is_null());
 }

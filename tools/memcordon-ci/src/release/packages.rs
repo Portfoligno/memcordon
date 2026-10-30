@@ -29,7 +29,7 @@ pub struct PackageBundle {
 pub fn publish_install_lineage_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        drop(crate::windows_readiness_adapter::publish_receipt(
+        drop(crate::windows_native_files::publish_owned_file(
             path, bytes,
         )?);
     }

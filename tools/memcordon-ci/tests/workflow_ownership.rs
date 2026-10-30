@@ -290,18 +290,6 @@ fn standalone_routing_cannot_suppress_stress_optional_work_or_failure_assessment
             "optional {job} waits for common planner"
         );
     }
-    for condition in [
-        "always()",
-        "success()",
-        "needs.macos-combined.result == 'success'",
-    ] {
-        let mut changed = backend.clone();
-        set_condition(&mut changed, "macos-assessment", condition);
-        assert!(
-            validate(BACKEND, &changed).is_err(),
-            "assessment {condition}"
-        );
-    }
     for job in [
         "standard-linux",
         "standard-windows",

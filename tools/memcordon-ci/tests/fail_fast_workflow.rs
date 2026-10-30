@@ -87,23 +87,9 @@ fn validate(value: &Value) -> Result<(), String> {
         "windows-x64",
         "windows-arm64",
     ] {
-        let preparation = format!("readiness-tools-{host}");
+        let preparation = format!("test-tools-{host}");
         let native = format!("native-{host}");
-        let mut expected_native = BTreeSet::from(["select".to_owned(), preparation.clone()]);
-        if host == "macos-x64" {
-            expected_native.extend(
-                [
-                    "native-macos-x64-plan",
-                    "native-macos-x64-product",
-                    "native-macos-x64-shard-0",
-                    "native-macos-x64-shard-1",
-                    "native-macos-x64-shard-2",
-                    "native-macos-x64-shard-3",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            );
-        }
+        let expected_native = BTreeSet::from(["select".to_owned(), preparation.clone()]);
         if graph.get(&preparation) != Some(&select_only)
             || graph.get(&native) != Some(&expected_native)
         {
@@ -165,14 +151,12 @@ fn validate(value: &Value) -> Result<(), String> {
         "miri",
         "fuzz",
         "fuzz-setup",
-        "readiness-tools-linux-x64",
-        "readiness-tools-linux-arm64",
-        "readiness-tools-macos-x64",
-        "readiness-tools-macos-arm64",
-        "readiness-tools-windows-x64",
-        "readiness-tools-windows-arm64",
-        "native-macos-x64-plan",
-        "native-macos-x64-product",
+        "test-tools-linux-x64",
+        "test-tools-linux-arm64",
+        "test-tools-macos-x64",
+        "test-tools-macos-arm64",
+        "test-tools-windows-x64",
+        "test-tools-windows-arm64",
         "native-macos-x64-shard-0",
         "native-macos-x64-shard-1",
         "native-macos-x64-shard-2",
@@ -206,7 +190,7 @@ fn validate(value: &Value) -> Result<(), String> {
         }
     }
     for name in graph.keys().filter(|name| {
-        name.starts_with("readiness-tools-")
+        name.starts_with("test-tools-")
             || name.starts_with("native-")
             || name.starts_with("candidate-")
             || name.starts_with("installed-")
@@ -248,8 +232,6 @@ fn validate(value: &Value) -> Result<(), String> {
                 "supply-chain-audit",
                 "supply-chain-deny",
                 "fuzz-setup",
-                "native-macos-x64-plan",
-                "native-macos-x64-product",
                 "native-macos-x64-shard-0",
                 "native-macos-x64-shard-1",
                 "native-macos-x64-shard-2",
@@ -311,19 +293,17 @@ fn every_required_final_dependency_is_individually_enforced() {
         "miri",
         "fuzz",
         "fuzz-setup",
-        "readiness-tools-linux-x64",
-        "readiness-tools-linux-arm64",
-        "readiness-tools-macos-x64",
-        "readiness-tools-macos-arm64",
-        "readiness-tools-windows-x64",
-        "readiness-tools-windows-arm64",
+        "test-tools-linux-x64",
+        "test-tools-linux-arm64",
+        "test-tools-macos-x64",
+        "test-tools-macos-arm64",
+        "test-tools-windows-x64",
+        "test-tools-windows-arm64",
         "rehearse",
         "assemble-payload",
         "native-linux-x64",
         "native-linux-arm64",
         "native-macos-x64",
-        "native-macos-x64-plan",
-        "native-macos-x64-product",
         "native-macos-x64-shard-0",
         "native-macos-x64-shard-1",
         "native-macos-x64-shard-2",

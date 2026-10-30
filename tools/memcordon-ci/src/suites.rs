@@ -645,7 +645,7 @@ fn supply_owned_leaf_until(
     let name = if audit { "cargo-audit" } else { "cargo-deny" };
     let checkout = root.canonicalize()?;
     let commit = git(root, ["rev-parse", "HEAD"])?;
-    let lock = memcordon_ci::ci_operation_time::record_path(root, Path::new("Cargo.lock"))?;
+    let lock = memcordon_ci::native_paths::record_path(root, Path::new("Cargo.lock"))?;
     let before = supply_input_bytes(&lock, 16 * 1024 * 1024)?;
     let stable = config::toolchains(root)?.stable;
     let preparation_deadline = deadline.min(Instant::now() + Duration::from_secs(60 * 60));
@@ -710,8 +710,8 @@ fn supply_leaf(root: &Path, stable: &str, suite: Suite) -> Result<()> {
     let prepare = matches!(suite, Suite::SupplyAuditPrepare | Suite::SupplyDenyPrepare);
     let name = if audit { "cargo-audit" } else { "cargo-deny" };
     let relative = Path::new("target/ci-session/supply").join(name);
-    let handoff = memcordon_ci::ci_operation_time::record_path(root, &relative)?;
-    let lock = memcordon_ci::ci_operation_time::record_path(root, Path::new("Cargo.lock"))?;
+    let handoff = memcordon_ci::native_paths::record_path(root, &relative)?;
+    let lock = memcordon_ci::native_paths::record_path(root, Path::new("Cargo.lock"))?;
     let checkout = root.canonicalize()?;
     let commit = git(root, ["rev-parse", "HEAD"])?;
     let before = if prepare {
@@ -723,7 +723,7 @@ fn supply_leaf(root: &Path, stable: &str, suite: Suite) -> Result<()> {
             lock: bytes.clone(),
         };
         fs::create_dir_all(handoff.parent().expect("fixed parent"))?;
-        let path = memcordon_ci::ci_operation_time::record_path(root, &relative)?;
+        let path = memcordon_ci::native_paths::record_path(root, &relative)?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1486,15 +1486,7 @@ pub fn release_macos_native(root: &Path, stable: &str) -> Result<()> {
         )?;
     }
     macos_deadline(root, stable)?;
-    write_macos_report(
-        root,
-        "release-macos-native.json",
-        crate::native_acceptance_catalogue::MACOS_LIFECYCLE_SCENARIOS
-            .iter()
-            .chain(crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS)
-            .copied()
-            .collect(),
-    )
+    Ok(())
 }
 
 pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
@@ -1614,88 +1606,13 @@ pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
             "installed macOS typed consumer execution, collection or retirement failed".into(),
         ));
     }
-    write_macos_report(
-        root,
-        "release-macos-acceptance.json",
-        vec![
-            "installed_package_execution_probe_and_deadline",
-            "installed_package_typed_external_consumer",
-        ],
-    )
+    Ok(())
 }
 
-fn write_macos_report(root: &Path, filename: &str, scenarios: Vec<&str>) -> Result<()> {
-    let commit =
-        memcordon_ci::work_outcome::WorkOutcome::from_result(git(root, ["rev-parse", "HEAD"]))
-            .map_validated(|bytes| {
-                Ok(String::from_utf8(bytes)
-                    .map_err(|error| CiError::Message(error.to_string()))?
-                    .trim()
-                    .to_owned())
-            })
-            .into_result()?;
-    settled_validation(|| {
-        let report = memcordon_ci::native_results::NativeTestReport {
-            schema_version: 1,
-            backend: "macos-watchdog".into(),
-            tests_run: scenarios.len(),
-            tests_skipped: 0,
-            tests: scenarios
-                .into_iter()
-                .map(|name| memcordon_ci::native_results::NativeTestResult {
-                    name: name.into(),
-                    result: memcordon_ci::native_results::NativeTestOutcome::Passed,
-                })
-                .collect(),
-            source_commit: commit,
-        };
-        let reports = root.join("target").join("ci").join("reports");
-        fs::create_dir_all(&reports)?;
-        let mut bytes = if let Some(phase) = match filename {
-            "release-macos-native.json" => Some("native"),
-            "release-macos-acceptance.json" => Some("acceptance"),
-            _ => None,
-        } {
-            serde_json::to_vec_pretty(&memcordon_ci::macos_performance::MacosPhaseReport {
-                format: "memcordon.macos-executed-phase".into(),
-                revision: 1,
-                host_os: std::env::consts::OS.into(),
-                host_arch: std::env::consts::ARCH.into(),
-                phase: phase.into(),
-                native: report,
-            })?
-        } else {
-            serde_json::to_vec_pretty(&report)?
-        };
-        bytes.push(b'\n');
-        fs::write(reports.join(filename), bytes)?;
-        Ok(())
-    })
-}
-
-/// Complete sequential compatibility form. Optional job splitting changes
-/// scheduling only; each selected phase remains required by the workflow.
 pub fn release_macos(root: &Path, stable: &str) -> Result<()> {
     memcordon_ci::macos_performance::require_native_host(root, stable)?;
-    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
-        .map_err(|error| CiError::Message(error.to_string()))?
-        .trim()
-        .to_owned();
-    memcordon_ci::macos_performance::clear_local_phases(root)?;
     release_macos_native(root, stable)?;
-    release_macos_acceptance(root, stable)?;
-    settled_validation(|| {
-        memcordon_ci::macos_performance::validate_local_completed(
-            root,
-            &commit,
-            std::env::consts::ARCH,
-        )
-    })?;
-    write_macos_report(
-        root,
-        "backend-macos-watchdog.json",
-        crate::native_acceptance_catalogue::macos_scenarios(),
-    )
+    release_macos_acceptance(root, stable)
 }
 
 pub(crate) struct SuiteOptions {
@@ -1814,6 +1731,9 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         );
     }
     match suite {
+        Suite::NativeShard => Err(CiError::Message(
+            "native-shard requires explicit index, count and profile".into(),
+        )),
         Suite::WorkspaceFetch
         | Suite::FuzzFetch
         | Suite::PrepareTools
@@ -1825,9 +1745,7 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         | Suite::ReleaseValidatePackage
         | Suite::WorkingWindowsPrepare
         | Suite::RehearsalToolBuild
-        | Suite::ReleaseReadiness => {
-            crate::ci_segments::operation(root, suite, options.failure_mode)
-        }
+        | Suite::ReleaseRuntime => crate::ci_segments::operation(root, suite, options.failure_mode),
         Suite::Policy => policy::run(root),
         Suite::Quality => quality(root, &toolchains.stable, options.failure_mode),
         Suite::QualityCompile => quality_compile(root, &toolchains.stable, options.failure_mode),

@@ -204,7 +204,7 @@ pub fn workflow_breakdown(file: &str) -> Result<Vec<(String, BudgetEvaluation)>>
                 name.as_str()
                     .ok_or_else(|| CiError::Message("job id is not text".into()))?
                     .to_owned(),
-                super::adapters::job_budget_definition(job)?.breakdown()?,
+                super::workflow_budget::job_budget_definition(job)?.breakdown()?,
             ))
         })
         .collect()

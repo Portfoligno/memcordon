@@ -26,59 +26,6 @@ pub struct TargetBundle {
     pub archive: FileRecord,
     pub members: Vec<FileRecord>,
     pub fixture: FileRecord,
-    #[serde(default)]
-    pub workload_diagnostic: Option<FileRecord>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkloadDiagnosticBundle {
-    pub source: BuildSourceIdentity,
-    pub target: String,
-    pub executable: FileRecord,
-}
-
-fn validate_workload_diagnostic_record(record: &FileRecord, target: &str) -> Result<()> {
-    if !target.ends_with("-pc-windows-msvc")
-        || record.kind != "workload-diagnostic"
-        || record.name != "memcordon-windows-loader-lab.exe"
-        || record.target.as_deref() != Some(target)
-        || record.package.as_deref() != Some("memcordon-windows-loader-lab")
-        || record.byte_len == 0
-        || record.byte_len > 128 * 1024 * 1024
-    {
-        return Err(CiError::Message(
-            "qualified workload diagnostic record role/target/bound differs".into(),
-        ));
-    }
-    Ok(())
-}
-
-impl WorkloadDiagnosticBundle {
-    pub fn load(path: &Path, expected: &BuildSourceIdentity, target: &str) -> Result<Self> {
-        let record: Self = source::read_json(path)?;
-        record.source.validate()?;
-        validate_workload_diagnostic_record(&record.executable, target)?;
-        if &record.source != expected || record.target != target {
-            return Err(CiError::Message(
-                "qualified diagnostic companion source/target/role differs".into(),
-            ));
-        }
-        let directory = path
-            .parent()
-            .ok_or_else(|| CiError::Message("diagnostic companion parent absent".into()))?;
-        crate::windows_installed_cases::WorkloadDiagnosticInput {
-            source: record.source.clone(),
-            target: record.target.clone(),
-            executable: crate::windows_installed_cases::SelectedArtifact {
-                path: std::path::absolute(directory)?.join(&record.executable.name),
-                sha256: record.executable.sha256.clone(),
-            },
-            byte_len: record.executable.byte_len,
-        }
-        .validate_for(expected, target)?;
-        Ok(record)
-    }
 }
 
 pub fn binary_name(binary: &str, target: &str) -> String {
@@ -291,29 +238,6 @@ pub fn decode_archive(bytes: &[u8], target: &str) -> Result<BTreeMap<String, Vec
 }
 
 impl TargetBundle {
-    pub fn workload_diagnostic_input(
-        &self,
-        directory: &Path,
-    ) -> Result<Option<crate::windows_installed_cases::WorkloadDiagnosticInput>> {
-        self.workload_diagnostic
-            .as_ref()
-            .map(|record| {
-                validate_workload_diagnostic_record(record, &self.distribution.target)?;
-                let input = crate::windows_installed_cases::WorkloadDiagnosticInput {
-                    source: self.source.clone(),
-                    target: self.distribution.target.clone(),
-                    executable: crate::windows_installed_cases::SelectedArtifact {
-                        path: std::path::absolute(directory)?.join(&record.name),
-                        sha256: record.sha256.clone(),
-                    },
-                    byte_len: record.byte_len,
-                };
-                input.validate_for(&self.source, &self.distribution.target)?;
-                Ok(input)
-            })
-            .transpose()
-    }
-
     pub fn load(directory: &Path) -> Result<(Self, Vec<u8>)> {
         let bundle: Self = source::read_json(&directory.join("target.json"))?;
         bundle.source.validate()?;
@@ -329,23 +253,6 @@ impl TargetBundle {
         let fixture = artifacts::read_file(&directory.join(&bundle.fixture.name))?;
         artifacts::check_bytes(&bundle.fixture, &fixture)?;
         validate_executable(&fixture, &bundle.distribution.target)?;
-        if let Some(diagnostic) = &bundle.workload_diagnostic {
-            validate_workload_diagnostic_record(diagnostic, &bundle.distribution.target)?;
-            if diagnostic.name == bundle.fixture.name
-                || diagnostic.name == bundle.archive.name
-                || bundle
-                    .members
-                    .iter()
-                    .any(|member| member.name == diagnostic.name)
-            {
-                return Err(CiError::Message(
-                    "native workload diagnostic association differs".into(),
-                ));
-            }
-            let bytes = artifacts::read_file(&directory.join(&diagnostic.name))?;
-            artifacts::check_bytes(diagnostic, &bytes)?;
-            validate_executable(&bytes, &bundle.distribution.target)?;
-        }
         if bundle.format != "memcordon.target"
             || bundle.revision != 1
             || bundle.archive.kind != "archive"
@@ -464,14 +371,14 @@ pub fn build_selected_with_components(
     selected: &BuildSourceIdentity,
     distribution: &TargetDistribution,
     destination: &Path,
-    consumer_readiness: bool,
+    runtime_components: bool,
 ) -> Result<()> {
     build_selected_with_failure(
         root,
         selected,
         distribution,
         destination,
-        consumer_readiness,
+        runtime_components,
         crate::failure_mode::FailureMode::StopAfterFailure,
     )
 }
@@ -481,16 +388,10 @@ pub fn build_selected_with_failure(
     selected: &BuildSourceIdentity,
     distribution: &TargetDistribution,
     destination: &Path,
-    consumer_readiness: bool,
+    runtime_components: bool,
     failure_mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
-    let mode = if consumer_readiness
-        && (distribution.target.contains("linux") || distribution.target.contains("windows"))
-    {
-        NativeCompileMode::Original
-    } else {
-        NativeCompileMode::Local
-    };
+    let mode = NativeCompileMode::Local;
     let outer = std::time::Instant::now() + Duration::from_secs(140 * 60);
     crate::preparation::with_operation(failure_mode, outer, || {
         let prepared = prepare_native_compile(root, selected, distribution, failure_mode, mode)?;
@@ -502,9 +403,9 @@ pub fn build_selected_with_failure(
                 selected,
                 distribution,
                 destination,
-                consumer_readiness,
+                runtime_components,
                 failure_mode,
-                NativeTestEvidence::Local(deadline),
+                NativeValidation::RunTests(deadline),
             )
         })
     })
@@ -522,8 +423,6 @@ pub struct PreparedNativeCompile {
 pub enum NativeCompileMode {
     /// Complete local build: in-memory clock and product data, no handoff files.
     Local,
-    /// Existing local component owner retains its original clock for readiness.
-    Original,
     /// Fresh split workflow compiler: strict begin and local byte inputs.
     Split,
 }
@@ -567,7 +466,7 @@ fn retain_product_inputs(
     distribution: &TargetDistribution,
 ) -> Result<()> {
     let inputs = product_inputs(root, selected, distribution)?;
-    let path = crate::ci_operation_time::record_path(
+    let path = crate::native_paths::record_path(
         root,
         Path::new("target/ci-session/native-products.json"),
     )?;
@@ -585,7 +484,7 @@ fn verify_product_inputs(
     selected: &BuildSourceIdentity,
     distribution: &TargetDistribution,
 ) -> Result<()> {
-    let path = crate::ci_operation_time::record_path(
+    let path = crate::native_paths::record_path(
         root,
         Path::new("target/ci-session/native-products.json"),
     )?;
@@ -615,29 +514,9 @@ pub fn prepare_native_compile(
     } else {
         selected.recheck(root)?;
     }
-    let operation_deadline = match mode {
-        NativeCompileMode::Local => std::time::Instant::now()
-            .checked_add(Duration::from_secs(140 * 60))
-            .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?,
-        NativeCompileMode::Original
-            if root
-                .join(".release/native-operation-deadline.json")
-                .try_exists()? =>
-        {
-            super::native_component_harness::original_deadline(
-                root,
-                selected,
-                &distribution.target,
-            )?
-        }
-        NativeCompileMode::Original | NativeCompileMode::Split => {
-            super::native_component_harness::begin_original_deadline(
-                root,
-                selected,
-                &distribution.target,
-            )?
-        }
-    };
+    let operation_deadline = crate::preparation::active_group()
+        .map(|group| group.deadline())
+        .unwrap_or(std::time::Instant::now() + Duration::from_secs(140 * 60));
     crate::preparation::with_operation(failure_mode, operation_deadline, || {
         if matches!(mode, NativeCompileMode::Split) {
             selected.recheck(root)?;
@@ -828,7 +707,6 @@ pub fn compile_native_pair(
     )
 }
 
-/// One independently settled product owner exports bytes, not a writable target tree.
 pub fn compile_product_only(
     root: &Path,
     selected: &BuildSourceIdentity,
@@ -838,316 +716,44 @@ pub fn compile_product_only(
 ) -> Result<()> {
     if distribution.target != "x86_64-apple-darwin" || destination.try_exists()? {
         return Err(CiError::Message(
-            "partitioned product requires fresh macOS x64 ownership".into(),
+            "split payload requires fresh native macOS x64 output".into(),
         ));
     }
-    let cutoff = prepared.operation_deadline.min(
-        crate::preparation::active_group()
-            .map_or(prepared.operation_deadline, |group| group.deadline()),
-    );
-    super::native_coverage_owner::validate_product_plan(
+    let deadline = prepared.operation_deadline;
+    prepared.command.run_owned().into_result()?;
+    selected.recheck(root)?;
+    validate_and_package_native(
         root,
         selected,
-        &distribution.target,
-        cutoff,
-    )?;
-    crate::workflow_output::revoke_compilation("compiled-product-complete")?;
-    let result = prepared.command.run_owned();
-    if !result.writers().permits_reading() {
-        return Err(CiError::Message("product writers have not settled".into()));
-    }
-    result.into_result()?;
-    if std::time::Instant::now() >= cutoff {
-        return Err(CiError::Message(
-            "original product operation cutoff exhausted".into(),
-        ));
-    }
-    selected.recheck(root)?;
-    let inputs = product_inputs(root, selected, distribution)?;
-    fs::create_dir_all(destination)?;
-    for binary in &distribution.binaries {
-        let filename = binary_name(binary, &distribution.target);
-        let bytes = artifacts::read_file(
-            &root
-                .join("target/ci-build/product")
-                .join(&distribution.target)
-                .join("release")
-                .join(&filename),
-        )?;
-        fs::write(destination.join(filename), bytes)?;
-    }
-    source::write_json(&destination.join("product.json"), &inputs)?;
-    fs::write(
-        destination.join("original-deadline.json"),
-        artifacts::read_file(&root.join(".release/native-coverage-deadline.json"))?,
-    )?;
-    if std::time::Instant::now() >= cutoff {
-        return Err(CiError::Message(
-            "original product cutoff exhausted during export".into(),
-        ));
-    }
-    crate::workflow_output::compilation_complete("compiled-product-complete")?;
-    Ok(())
+        distribution,
+        destination,
+        false,
+        crate::failure_mode::FailureMode::StopAfterFailure,
+        NativeValidation::PackageOnly(deadline),
+    )
 }
 
-pub fn validate_covered_selected(
+pub fn build_native_payload(
     root: &Path,
     selected: &BuildSourceIdentity,
     distribution: &TargetDistribution,
     destination: &Path,
-    consumer_readiness: bool,
-    failure_mode: crate::failure_mode::FailureMode,
-    coverage: (&Path, &Path),
 ) -> Result<()> {
-    let (inputs, receipts) = coverage;
-    if distribution.target != "x86_64-apple-darwin" {
-        return Err(CiError::Message(
-            "distributed native coverage is only admitted for macOS x64".into(),
-        ));
-    }
-    selected.recheck(root)?;
-    distribution.validate()?;
-    let retained: NativeProductInputs =
-        serde_json::from_slice(&artifacts::read_file(&inputs.join("product.json"))?)?;
-    if retained.source != *selected || retained.distribution != *distribution {
-        return Err(CiError::Message(
-            "independent product source or distribution differs".into(),
-        ));
-    }
-    let deadline_path = root.join(".release/native-coverage-deadline.json");
-    let deadline_bytes = artifacts::read_file(&inputs.join("original-deadline.json"))?;
-    if artifacts::read_file(&deadline_path)? != deadline_bytes {
-        return Err(CiError::Message(
-            "product original distributed deadline differs".into(),
-        ));
-    }
-    let deadline =
-        super::native_coverage_owner::original_cutoff(root, selected, &distribution.target)?;
-    crate::preparation::with_operation(failure_mode, deadline, || {
-        let product = root
-            .join("target/ci-build/product")
-            .join(&distribution.target)
-            .join("release");
-        fs::create_dir_all(&product)?;
-        for binary in &distribution.binaries {
-            let filename = binary_name(binary, &distribution.target);
-            let bytes = artifacts::read_file(&inputs.join(&filename))?;
-            validate_executable(&bytes, &distribution.target)?;
-            if retained.products.get(&filename) != Some(&artifacts::checksum(&bytes)) {
-                return Err(CiError::Message(
-                    "independent product bytes differ from settled owner receipt".into(),
-                ));
-            }
-            let path = product.join(filename);
-            fs::write(&path, bytes)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
-            }
-        }
-        if product_inputs(root, selected, distribution)?.products != retained.products {
-            return Err(CiError::Message(
-                "independent product inventory differs".into(),
-            ));
-        }
-        super::native_coverage_owner::validate_all(
+    let failure_mode = crate::failure_mode::FailureMode::StopAfterFailure;
+    let outer = std::time::Instant::now() + Duration::from_secs(140 * 60);
+    crate::preparation::with_operation(failure_mode, outer, || {
+        let prepared = prepare_native_compile(
             root,
             selected,
             distribution,
-            receipts,
-            deadline,
-        )?;
-        validate_and_package_native(
-            root,
-            selected,
-            distribution,
-            destination,
-            consumer_readiness,
             failure_mode,
-            NativeTestEvidence::Distributed(deadline),
-        )
+            NativeCompileMode::Local,
+        )?;
+        compile_product_only(root, selected, distribution, prepared, destination)
     })
 }
 
-struct BuiltWorkloadDiagnostic {
-    record: FileRecord,
-    bytes: Vec<u8>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn build_workload_diagnostic(
-    root: &Path,
-    selected: &BuildSourceIdentity,
-    target: &str,
-    deadline: std::time::Instant,
-) -> Result<Option<BuiltWorkloadDiagnostic>> {
-    if !target.ends_with("-pc-windows-msvc") {
-        return Ok(None);
-    }
-    selected.recheck(root)?;
-    let toolchain = crate::config::toolchains(root)?.stable;
-    let metadata = rustup_cargo(
-        root,
-        &toolchain,
-        [
-            "metadata",
-            "--locked",
-            "--offline",
-            "--no-deps",
-            "--format-version",
-            "1",
-        ],
-        Duration::from_secs(120),
-    )
-    .bounded_until(deadline)
-    .selection(selected, Some(target))
-    .output_owned()
-    .map_validated(|output| {
-        if !output.status.success() {
-            return Err(CiError::Message(
-                "diagnostic producer metadata failed".into(),
-            ));
-        }
-        Ok(serde_json::from_slice::<cargo_metadata::Metadata>(
-            &output.stdout,
-        )?)
-    })
-    .into_result()?;
-    let packages: Vec<_> = metadata
-        .packages
-        .iter()
-        .filter(|package| package.name.as_str() == "memcordon-windows-loader-lab")
-        .collect();
-    if packages.len() != 1 {
-        return Err(CiError::Message(
-            "diagnostic producer package association differs".into(),
-        ));
-    }
-    let package = packages[0];
-    let targets: Vec<_> = package
-        .targets
-        .iter()
-        .filter(|entry| {
-            entry.name == "memcordon-windows-loader-lab"
-                && entry.kind.contains(&cargo_metadata::TargetKind::Bin)
-        })
-        .collect();
-    if targets.len() != 1 {
-        return Err(CiError::Message(
-            "diagnostic producer ordinary binary target differs".into(),
-        ));
-    }
-    let build_root = std::path::absolute(root.join("target/ci/native"))?;
-    let compile_budget = crate::native_test_plan::commands_with_failure(
-        true,
-        crate::failure_mode::FailureMode::StopAfterFailure,
-    )[0]
-    .deadline;
-    rustup_cargo(
-        root,
-        &toolchain,
-        [
-            "build",
-            "--release",
-            "--locked",
-            "--offline",
-            "--all-features",
-            "-p",
-            "memcordon-windows-loader-lab",
-            "--bin",
-            "memcordon-windows-loader-lab",
-            "--message-format=json-render-diagnostics",
-            "--target-dir",
-        ],
-        compile_budget,
-    )
-    .arg(&build_root)
-    .bounded_until(deadline)
-    .phase(crate::command::CiPhase::NativeCompile)
-    .selection(selected, Some(target))
-    .output_owned()
-    .map_validated(|output| {
-        if !output.status.success() {
-            return Err(CiError::Message(format!(
-                "ordinary diagnostic producer failed: {}",
-                crate::command::bounded_excerpt(&output.stderr)
-            )));
-        }
-        let mut executable = None;
-        let mut finished = false;
-        for message in cargo_metadata::Message::parse_stream(output.stdout.as_slice()) {
-            match message.map_err(|error| CiError::Message(error.to_string()))? {
-                cargo_metadata::Message::CompilerArtifact(artifact)
-                    if artifact.package_id == package.id
-                        && artifact.target == *targets[0]
-                        && !artifact.profile.test =>
-                {
-                    if let Some(path) = artifact.executable
-                        && executable.replace(path.into_std_path_buf()).is_some()
-                    {
-                        return Err(CiError::Message(
-                            "diagnostic Cargo output repeats the selected ordinary executable"
-                                .into(),
-                        ));
-                    }
-                }
-                cargo_metadata::Message::BuildFinished(status) => {
-                    if finished || !status.success {
-                        return Err(CiError::Message(
-                            "diagnostic Cargo completion differs".into(),
-                        ));
-                    }
-                    finished = true;
-                }
-                _ => {}
-            }
-        }
-        let executable = executable.ok_or_else(|| {
-            CiError::Message(
-                "diagnostic Cargo output lacks the selected ordinary executable".into(),
-            )
-        })?;
-        let name = binary_name("memcordon-windows-loader-lab", target);
-        if !finished || executable != build_root.join("release").join(&name) {
-            return Err(CiError::Message(
-                "diagnostic ordinary executable escapes its native producer".into(),
-            ));
-        }
-        let bytes = artifacts::read_file(&executable)?;
-        if bytes.is_empty() || bytes.len() > 128 * 1024 * 1024 {
-            return Err(CiError::Message(
-                "diagnostic executable exceeds existing bound".into(),
-            ));
-        }
-        validate_executable(&bytes, target)?;
-        selected.recheck(root)?;
-        if std::time::Instant::now() >= deadline {
-            return Err(CiError::Message(
-                "original native deadline expired producing diagnostic".into(),
-            ));
-        }
-        Ok(Some(BuiltWorkloadDiagnostic {
-            record: FileRecord {
-                name,
-                kind: "workload-diagnostic".into(),
-                target: Some(target.into()),
-                package: Some("memcordon-windows-loader-lab".into()),
-                byte_len: bytes.len() as u64,
-                sha256: artifacts::checksum(&bytes),
-            },
-            bytes,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }))
-    })
-    .into_result()
-}
-
-/// Replace the existing public fixture-preparation step under its same one-hour
-/// producer allowance. No compiler is started from an installed failure callback.
-pub fn prepare_readiness_tools(root: &Path, source_path: &Path) -> Result<()> {
+pub fn prepare_test_tools(root: &Path, source_path: &Path) -> Result<()> {
     let selected: BuildSourceIdentity = source::read_json(source_path)?;
     let target = super::distribution::native_target()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(60 * 60);
@@ -1179,30 +785,34 @@ pub fn prepare_readiness_tools(root: &Path, source_path: &Path) -> Result<()> {
             .phase(crate::command::CiPhase::NativeCompile)
             .selection(&selected, Some(target))
             .run()?;
-            if let Some(diagnostic) = build_workload_diagnostic(root, &selected, target, deadline)?
-            {
-                let directory = root.join("target/ci/native/release");
-                source::write_json(
-                    &directory.join("workload-diagnostic.json"),
-                    &WorkloadDiagnosticBundle {
-                        source: selected.clone(),
-                        target: target.to_owned(),
-                        executable: diagnostic.record,
-                    },
-                )?;
-                fs::write(
-                    directory.join("workload-diagnostic-cargo.jsonl"),
-                    diagnostic.stdout,
-                )?;
-                fs::write(
-                    directory.join("workload-diagnostic-cargo.stderr.bin"),
-                    diagnostic.stderr,
-                )?;
+            if target.ends_with("-unknown-linux-gnu") {
+                rustup_cargo(
+                    root,
+                    &toolchain,
+                    [
+                        "build",
+                        "--locked",
+                        "--release",
+                        "--target-dir",
+                        "target/ci/native",
+                        "-p",
+                        "memcordon",
+                        "--features",
+                        "test-fixtures",
+                        "--bin",
+                        "memcordon-linux-readiness-fixture",
+                    ],
+                    Duration::from_secs(60 * 60),
+                )
+                .bounded_until(deadline)
+                .phase(crate::command::CiPhase::NativeCompile)
+                .selection(&selected, Some(target))
+                .run()?;
             }
             selected.recheck(root)?;
             if std::time::Instant::now() >= deadline {
                 return Err(CiError::Message(
-                    "original readiness-tool producer deadline expired".into(),
+                    "test-tool preparation deadline expired".into(),
                 ));
             }
             Ok(())
@@ -1215,11 +825,10 @@ pub fn validate_selected(
     selected: &BuildSourceIdentity,
     distribution: &TargetDistribution,
     destination: &Path,
-    consumer_readiness: bool,
+    runtime_components: bool,
     failure_mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
-    let deadline =
-        super::native_component_harness::original_deadline(root, selected, &distribution.target)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(140 * 60);
     crate::preparation::with_operation(failure_mode, deadline, || {
         selected.recheck(root)?;
         distribution.validate()?;
@@ -1235,16 +844,16 @@ pub fn validate_selected(
             selected,
             distribution,
             destination,
-            consumer_readiness,
+            runtime_components,
             failure_mode,
-            NativeTestEvidence::Local(deadline),
+            NativeValidation::RunTests(deadline),
         )
     })
 }
 
-enum NativeTestEvidence {
-    Local(std::time::Instant),
-    Distributed(std::time::Instant),
+enum NativeValidation {
+    RunTests(std::time::Instant),
+    PackageOnly(std::time::Instant),
 }
 
 fn validate_and_package_native(
@@ -1252,22 +861,20 @@ fn validate_and_package_native(
     selected: &BuildSourceIdentity,
     distribution: &TargetDistribution,
     destination: &Path,
-    consumer_readiness: bool,
+    _runtime_components: bool,
     failure_mode: crate::failure_mode::FailureMode,
-    evidence: NativeTestEvidence,
+    validation: NativeValidation,
 ) -> Result<()> {
-    let (operation_deadline, coverage_verified) = match evidence {
-        NativeTestEvidence::Local(deadline) => (deadline, false),
-        NativeTestEvidence::Distributed(deadline) => (deadline, true),
+    let (operation_deadline, package_only) = match validation {
+        NativeValidation::RunTests(deadline) => (deadline, false),
+        NativeValidation::PackageOnly(deadline) => (deadline, true),
     };
     let product = root.join("target/ci-build/product");
     let toolchain = crate::config::toolchains(root)?.stable;
-    let workload_diagnostic =
-        build_workload_diagnostic(root, selected, &distribution.target, operation_deadline)?;
     for phase in crate::native_test_plan::commands_with_failure(true, failure_mode)
         .into_iter()
         .skip(1)
-        .filter(|_| !coverage_verified)
+        .filter(|_| !package_only)
     {
         crate::workflow_output::revoke_compilation("compiled-native-complete")?;
         let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
@@ -1444,17 +1051,6 @@ fn validate_and_package_native(
             artifacts::read_file(&root.join("target/ci/native/release").join(&fixture_name))?;
         validate_executable(&fixture_bytes, &distribution.target)?;
         fs::write(destination.join(&fixture_name), &fixture_bytes)?;
-        if let Some(diagnostic) = &workload_diagnostic {
-            fs::write(destination.join(&diagnostic.record.name), &diagnostic.bytes)?;
-            fs::write(
-                destination.join("workload-diagnostic-cargo.jsonl"),
-                &diagnostic.stdout,
-            )?;
-            fs::write(
-                destination.join("workload-diagnostic-cargo.stderr.bin"),
-                &diagnostic.stderr,
-            )?;
-        }
         let fixture = FileRecord {
             name: fixture_name,
             kind: "fixture".into(),
@@ -1473,31 +1069,9 @@ fn validate_and_package_native(
                 archive,
                 members: records,
                 fixture,
-                workload_diagnostic: workload_diagnostic
-                    .as_ref()
-                    .map(|diagnostic| diagnostic.record.clone()),
             },
         )?;
         TargetBundle::load(destination)?;
-        if consumer_readiness
-            && matches!(
-                distribution.target.as_str(),
-                "x86_64-unknown-linux-gnu"
-                    | "aarch64-unknown-linux-gnu"
-                    | "x86_64-pc-windows-msvc"
-                    | "aarch64-pc-windows-msvc"
-            )
-        {
-            assembly.observe(crate::work_outcome::WorkOutcome::from_result(
-                super::native_component_harness::build_original_roles(
-                    root,
-                    selected,
-                    &distribution.target,
-                    &root.join(".release/native-components"),
-                    operation_deadline,
-                ),
-            ))?;
-        }
         if std::time::Instant::now() >= operation_deadline {
             return Err(CiError::Message(
                 "native operation deadline exhausted during archive assembly".into(),

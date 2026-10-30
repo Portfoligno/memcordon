@@ -61,7 +61,7 @@ fn actual_nested_failure_preserves_distinct_status_streams_and_source_binding() 
         assert_eq!(record[name]["length"], bytes.len());
         assert_eq!(
             record[name]["sha256"],
-            memcordon_readiness_verifier::sha256(&bytes)
+            memcordon_ci::windows_causal_acceptance::sha256(&bytes)
         );
     }
 }

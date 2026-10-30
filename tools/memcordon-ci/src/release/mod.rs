@@ -2,40 +2,18 @@
 pub mod artifacts;
 pub mod bundle;
 pub mod compatibility;
-pub mod consumer_readiness_cell;
+pub mod component_tests;
 pub mod consumer_success;
 pub mod distribution;
 pub mod finalize;
 pub mod git;
 pub mod http;
 pub mod installed_consumer;
-#[cfg(any(windows, test))]
-mod installed_loader_support;
-pub mod linux_current_capture;
-#[cfg(target_os = "linux")]
-pub mod linux_current_case_capture;
-#[cfg(target_os = "linux")]
-pub mod linux_current_component_lifetime;
-#[cfg(target_os = "linux")]
-pub mod linux_current_components;
+pub mod installed_tests;
 pub mod linux_current_consumer;
 #[cfg(target_os = "linux")]
 pub mod linux_current_exports;
-#[cfg(target_os = "linux")]
-pub mod linux_current_image_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_current_inputs;
-#[cfg(target_os = "linux")]
-pub mod linux_current_installed;
-#[cfg(target_os = "linux")]
-pub mod linux_current_isolation_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_current_lease;
 pub mod linux_current_network;
-#[cfg(target_os = "linux")]
-pub mod linux_current_owner_cases;
-#[cfg(target_os = "linux")]
-pub mod linux_current_package;
 #[cfg(target_os = "linux")]
 pub mod linux_current_package_fault;
 #[cfg(target_os = "linux")]
@@ -43,17 +21,9 @@ pub mod linux_current_phase_gate;
 #[cfg(target_os = "linux")]
 pub mod linux_current_provider_state;
 #[cfg(target_os = "linux")]
-pub mod linux_current_refusals;
-#[cfg(target_os = "linux")]
 pub mod linux_current_relay;
 #[cfg(target_os = "linux")]
-pub mod linux_current_snapshot_cases;
-#[cfg(unix)]
-pub mod linux_lifecycle_diagnostics;
-#[cfg(target_os = "linux")]
-pub mod linux_native_component;
-#[cfg(unix)]
-pub mod linux_recovery_diagnostic;
+pub mod linux_installed_tests;
 pub mod linux_recovery_owners;
 #[cfg(unix)]
 pub mod linux_request_fixture;
@@ -63,36 +33,47 @@ pub mod linux_request_launch;
 pub mod linux_smoke_diagnostics;
 #[cfg(unix)]
 pub mod linux_snapshot_budget;
+#[cfg(target_os = "linux")]
+pub mod linux_test_assertions;
+#[cfg(target_os = "linux")]
+pub mod linux_test_execution;
+#[cfg(target_os = "linux")]
+pub mod linux_test_image_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_test_images;
+#[cfg(target_os = "linux")]
+pub mod linux_test_isolation;
+#[cfg(target_os = "linux")]
+pub mod linux_test_lifetime;
+#[cfg(target_os = "linux")]
+pub mod linux_test_lifetime_assertions;
+#[cfg(target_os = "linux")]
+pub mod linux_test_owners;
+#[cfg(target_os = "linux")]
+pub mod linux_test_refusals;
+#[cfg(target_os = "linux")]
+pub mod linux_test_scenarios;
+#[cfg(target_os = "linux")]
+pub mod linux_test_snapshots;
+#[cfg(target_os = "linux")]
+pub mod linux_test_socket_imports;
 pub mod linux_unit_diagnostics;
 #[cfg(target_os = "linux")]
 mod native_cargo_aliases;
-pub mod native_component_harness;
 pub mod native_coverage_owner;
 #[cfg(target_os = "linux")]
 mod native_executable;
 #[cfg(target_os = "linux")]
 mod native_execution_association;
-#[cfg(unix)]
-pub mod native_recipe_case;
-pub mod native_role_contract;
 #[cfg(target_os = "linux")]
 mod native_source_identity;
 #[cfg(target_os = "linux")]
 mod native_toolchain_search;
 pub mod ordinary_consumer_cache;
-#[cfg(any(target_os = "linux", windows))]
-pub mod original_native_components;
 pub mod packages;
 pub mod preparation;
 pub mod public_consumer;
 pub mod publish;
-pub mod readiness_artifact_catalog;
-#[cfg(unix)]
-pub mod readiness_producer_seal;
-#[cfg(any(target_os = "linux", windows))]
-pub mod readiness_product;
-pub mod readiness_report;
-pub mod readiness_transport;
 pub mod recovery;
 pub mod registry;
 pub mod rehearsal;
@@ -102,11 +83,9 @@ pub mod source;
 pub mod tag;
 pub mod target;
 pub mod windows_component_readback;
-pub mod windows_installed_consumer;
-#[cfg(any(windows, test))]
-mod windows_launcher_diagnostic;
 #[cfg(windows)]
-pub mod windows_readiness_lease;
+pub mod windows_component_tests;
+pub mod windows_installed_consumer;
 
 use crate::{CiError, Result};
 use clap::Subcommand;
@@ -122,15 +101,20 @@ pub enum ConsumerChannel {
 pub enum ReleaseCommand {
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
-    CurrentMaterializedSmoke {
+    InstalledLinuxSetup(linux_installed_tests::PrivilegedArgs),
+    TestInstalled(installed_tests::InstalledTestArgs),
+    TestComponents {
         #[arg(long)]
-        spec: PathBuf,
-        #[arg(long)]
-        cleanup_only: bool,
+        diagnostics: PathBuf,
     },
-    ConsumerReadinessReport(readiness_report::ReportArguments),
+    BuildNativePayload {
+        #[arg(long)]
+        build_source: PathBuf,
+        #[arg(long)]
+        runtime_components: bool,
+    },
     SelectPreparation,
-    PrepareReadinessTools {
+    PrepareTestTools {
         #[arg(long)]
         build_source: PathBuf,
     },
@@ -138,13 +122,13 @@ pub enum ReleaseCommand {
         #[arg(long)]
         build_source: PathBuf,
         #[arg(long)]
-        consumer_readiness: bool,
+        runtime_components: bool,
     },
     CheckSelectedInputs {
         #[arg(long)]
         build_source: PathBuf,
         #[arg(long)]
-        consumer_readiness: bool,
+        runtime_components: bool,
     },
     FinalizePreparation {
         #[arg(long)]
@@ -158,10 +142,6 @@ pub enum ReleaseCommand {
     },
     WorkingWindowsPrepare {
         #[arg(long, default_value = "target/ci/windows-prepared")]
-        destination: PathBuf,
-    },
-    CleanupInstalledLoaderSupport {
-        #[arg(long)]
         destination: PathBuf,
     },
     WorkingWindowsConsumer {
@@ -239,7 +219,7 @@ pub enum ReleaseCommand {
         #[arg(long, value_enum, default_value = "stop-after-failure")]
         failure_mode: crate::failure_mode::FailureMode,
         #[arg(long)]
-        consumer_readiness: bool,
+        runtime_components: bool,
         #[arg(long, conflicts_with = "build_source")]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -253,7 +233,7 @@ pub enum ReleaseCommand {
         #[arg(long, value_enum, default_value = "stop-after-failure")]
         failure_mode: crate::failure_mode::FailureMode,
         #[arg(long)]
-        consumer_readiness: bool,
+        runtime_components: bool,
         #[arg(long, conflicts_with = "build_source")]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -262,14 +242,10 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     ValidatePackage {
-        #[arg(long, requires = "product_inputs")]
-        native_coverage: Option<PathBuf>,
-        #[arg(long, requires = "native_coverage")]
-        product_inputs: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "stop-after-failure")]
         failure_mode: crate::failure_mode::FailureMode,
         #[arg(long)]
-        consumer_readiness: bool,
+        runtime_components: bool,
         #[arg(long, conflicts_with = "build_source")]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -277,23 +253,9 @@ pub enum ReleaseCommand {
         #[arg(long, default_value = ".release/target")]
         destination: PathBuf,
     },
-    NativeCoverageShard {
-        #[arg(long)]
-        build_source: PathBuf,
-        #[arg(long)]
-        shard: usize,
-        #[arg(long)]
-        destination: PathBuf,
-        #[arg(long, value_enum, default_value = "stop-after-failure")]
-        failure_mode: crate::failure_mode::FailureMode,
-    },
-    NativeCoveragePlan {
-        #[arg(long)]
-        build_source: PathBuf,
-    },
     Assemble {
         #[arg(long)]
-        consumer_readiness: bool,
+        runtime_components: bool,
         #[arg(long, conflicts_with = "build_source")]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -379,20 +341,40 @@ fn repository(root: &Path, supplied: Option<String>) -> Result<String> {
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
         #[cfg(target_os = "linux")]
-        ReleaseCommand::CurrentMaterializedSmoke { spec, cleanup_only } => {
-            installed_consumer::run_current_smoke_spec(root, &spec, cleanup_only)
+        ReleaseCommand::InstalledLinuxSetup(arguments) => {
+            linux_installed_tests::run_privileged(root, &arguments)
         }
-        ReleaseCommand::PrepareReadinessTools { build_source } => {
-            target::prepare_readiness_tools(root, &build_source)
+        ReleaseCommand::TestInstalled(arguments) => installed_tests::run(root, &arguments),
+        ReleaseCommand::TestComponents { diagnostics } => component_tests::run(root, &diagnostics),
+        ReleaseCommand::BuildNativePayload {
+            build_source,
+            runtime_components,
+        } => {
+            let selected = preparation::read_build_source(None, Some(&build_source))?;
+            let distribution = distribution::Distribution::read(root)?;
+            let distribution = if runtime_components {
+                distribution.with_runtime_components()?
+            } else {
+                distribution
+            };
+            target::build_native_payload(
+                root,
+                &selected,
+                distribution.native()?,
+                &root.join(".release/target"),
+            )
+        }
+        ReleaseCommand::PrepareTestTools { build_source } => {
+            target::prepare_test_tools(root, &build_source)
         }
         ReleaseCommand::CheckPreparation {
             build_source,
-            consumer_readiness,
-        } => finalize::check_preparation(root, &build_source, consumer_readiness),
+            runtime_components,
+        } => finalize::check_preparation(root, &build_source, runtime_components),
         ReleaseCommand::CheckSelectedInputs {
             build_source,
-            consumer_readiness,
-        } => finalize::check_selected_inputs(root, &build_source, consumer_readiness),
+            runtime_components,
+        } => finalize::check_selected_inputs(root, &build_source, runtime_components),
         ReleaseCommand::FinalizePreparation {
             build_source,
             input,
@@ -411,19 +393,6 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         }
         ReleaseCommand::WorkingWindowsPrepare { destination } => {
             windows_installed_consumer::prepare_working(root, &destination)
-        }
-        ReleaseCommand::CleanupInstalledLoaderSupport { destination } => {
-            #[cfg(windows)]
-            {
-                installed_loader_support::cleanup(root, &destination)
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = destination;
-                Err(CiError::Message(
-                    "installed support cleanup requires native Windows".into(),
-                ))
-            }
         }
         ReleaseCommand::WorkingWindowsConsumer {
             prepared,
@@ -562,9 +531,6 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 }
             }
         }
-        ReleaseCommand::ConsumerReadinessReport(arguments) => {
-            readiness_report::run(root, &arguments)
-        }
         ReleaseCommand::RecoveryInputs => recovery::recovery_inputs(root),
         ReleaseCommand::RehearsalTool { executable } => {
             rehearsal_tool::package_selected(root, executable.as_deref())
@@ -578,7 +544,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::Inspect { prepared } => publish::run(&prepared, false),
         ReleaseCommand::BuildTarget {
             failure_mode,
-            consumer_readiness,
+            runtime_components,
             source,
             build_source,
             destination,
@@ -586,8 +552,8 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             let selected =
                 preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
             let distribution = distribution::Distribution::read(root)?;
-            let distribution = if consumer_readiness {
-                distribution.consumer_readiness()?
+            let distribution = if runtime_components {
+                distribution.with_runtime_components()?
             } else {
                 distribution
             };
@@ -597,14 +563,14 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 &selected,
                 &distribution,
                 &destination,
-                consumer_readiness,
+                runtime_components,
                 failure_mode,
             )
         }
         ReleaseCommand::CompileTarget {
             product_only,
             failure_mode,
-            consumer_readiness,
+            runtime_components,
             source,
             build_source,
             destination,
@@ -612,17 +578,13 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             let selected =
                 preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
             let distribution = distribution::Distribution::read(root)?;
-            let distribution = if consumer_readiness {
-                distribution.consumer_readiness()?
+            let distribution = if runtime_components {
+                distribution.with_runtime_components()?
             } else {
                 distribution
             };
             let distribution = distribution.native()?;
-            let outer = if product_only {
-                native_coverage_owner::original_cutoff(root, &selected, &distribution.target)?
-            } else {
-                std::time::Instant::now() + std::time::Duration::from_secs(140 * 60)
-            };
+            let outer = std::time::Instant::now() + std::time::Duration::from_secs(140 * 60);
             crate::preparation::with_operation(failure_mode, outer, || {
                 let prepared = target::prepare_native_compile(
                     root,
@@ -652,10 +614,8 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             })
         }
         ReleaseCommand::ValidatePackage {
-            native_coverage,
-            product_inputs,
             failure_mode,
-            consumer_readiness,
+            runtime_components,
             source,
             build_source,
             destination,
@@ -663,65 +623,22 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             let selected =
                 preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
             let distribution = distribution::Distribution::read(root)?;
-            let distribution = if consumer_readiness {
-                distribution.consumer_readiness()?
+            let distribution = if runtime_components {
+                distribution.with_runtime_components()?
             } else {
                 distribution
             };
-            if let (Some(receipts), Some(inputs)) = (native_coverage, product_inputs) {
-                target::validate_covered_selected(
-                    root,
-                    &selected,
-                    distribution.native()?,
-                    &destination,
-                    consumer_readiness,
-                    failure_mode,
-                    (&inputs, &receipts),
-                )
-            } else {
-                target::validate_selected(
-                    root,
-                    &selected,
-                    distribution.native()?,
-                    &destination,
-                    consumer_readiness,
-                    failure_mode,
-                )
-            }
-        }
-        ReleaseCommand::NativeCoverageShard {
-            build_source,
-            shard,
-            destination,
-            failure_mode,
-        } => {
-            let selected = preparation::read_build_source(None, Some(&build_source))?;
-            let distribution = distribution::Distribution::read(root)?;
-            let native = distribution.native()?;
-            if native.target != "x86_64-apple-darwin" {
-                return Err(CiError::Message(
-                    "distributed coverage requires macOS x64".into(),
-                ));
-            }
-            native_coverage_owner::run_shard(
+            target::validate_selected(
                 root,
                 &selected,
-                &native.target,
-                shard,
+                distribution.native()?,
                 &destination,
+                runtime_components,
                 failure_mode,
             )
         }
-        ReleaseCommand::NativeCoveragePlan { build_source } => {
-            let selected = preparation::read_build_source(None, Some(&build_source))?;
-            native_coverage_owner::publish_plan(
-                root,
-                &selected,
-                &distribution::Distribution::read(root)?.native()?.target,
-            )
-        }
         ReleaseCommand::Assemble {
-            consumer_readiness,
+            runtime_components,
             source,
             build_source,
             packages,
@@ -760,7 +677,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 &packages,
                 &targets,
                 &destination,
-                consumer_readiness,
+                runtime_components,
             )
         }
         ReleaseCommand::Packages {

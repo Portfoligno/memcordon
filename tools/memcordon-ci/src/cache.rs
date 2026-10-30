@@ -46,7 +46,7 @@ pub struct CacheDiagnostics {
 #[serde(rename_all = "kebab-case")]
 pub enum ConsumerProfile {
     Ordinary,
-    Readiness,
+    Runtime,
 }
 
 pub fn emit_consumer_downloads(channel: &str, profile: ConsumerProfile) -> Result<()> {
@@ -588,24 +588,15 @@ fn collect_context(
         );
     }
     if partition != Some(crate::cache_restore::CompiledPartition::NativeTests)
-        && matches!(
-            purpose,
-            "consumer-readiness" | "native-readiness" | "windows-working" | "private"
-        )
+        && matches!(purpose, "native-readiness" | "windows-working" | "private")
     {
         let selected = distribution::Distribution::read(root)?
-            .consumer_readiness()?
+            .with_runtime_components()?
             .native()?
             .clone();
         inputs.insert(
             "consumer-runtime-selection".into(),
             serde_json::to_string(&selected)?,
-        );
-        inputs.insert(
-            "consumer-readiness-inventory".into(),
-            artifacts::checksum(&artifacts::read_file(
-                &root.join("ci/consumer-readiness-v2.toml"),
-            )?),
         );
         inputs.insert("consumer-profile".into(), "selected-product:release;owned-fixture:release;driver:release;generated-consumer:dev+release".into());
     }
@@ -634,7 +625,7 @@ fn collect_context(
             match distribution::Distribution::read(root).and_then(|selected| {
                 let selected =
                     if matches!(purpose, "native-readiness" | "windows-working" | "private") {
-                        selected.consumer_readiness()?
+                        selected.with_runtime_components()?
                     } else {
                         selected
                     };

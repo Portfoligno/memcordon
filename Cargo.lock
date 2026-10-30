@@ -721,7 +721,6 @@ dependencies = [
  "libc",
  "memcordon-core",
  "memcordon-platform",
- "memcordon-readiness-verifier",
  "memcordon-testkit",
  "memcordon-windows-launch-core",
  "memcordon-windows-loader-lab",
@@ -780,25 +779,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "memcordon-readiness-verifier"
-version = "0.5.8-dev"
-dependencies = [
- "base64",
- "clap",
- "hex",
- "memcordon-core",
- "rustix",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "toml",
- "windows-sys 0.61.2",
- "zip",
 ]
 
 [[package]]

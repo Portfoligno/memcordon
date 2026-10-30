@@ -34,7 +34,7 @@ pub enum RuntimeSelection {
 
 impl Distribution {
     /// Explicit full consumer profile; ordinary distribution defaults stay independent.
-    pub fn consumer_readiness(mut self) -> Result<Self> {
+    pub fn with_runtime_components(mut self) -> Result<Self> {
         for target in &mut self.targets {
             match target.target.as_str() {
                 "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" => {

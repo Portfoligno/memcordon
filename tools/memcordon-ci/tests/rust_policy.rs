@@ -576,15 +576,6 @@ fn only_the_macos_watchdog_may_resolve_the_current_executable() {
 }
 
 #[test]
-fn sealed_identity_transition_obeys_the_semantic_subprocess_policy() {
-    validate_rust_policy_bytes(
-        Path::new("tools/memcordon-ci/src/sealed_identity.rs"),
-        include_bytes!("../src/sealed_identity.rs"),
-    )
-    .expect("the native setpriv argv builder must remain shell- and environment-free");
-}
-
-#[test]
 fn retired_context_and_source_proof_paths_have_no_environment_exemption() {
     let source = br#"fn run(command: &mut std::process::Command) { command.env("RUSTC", "/pinned/rustc"); }"#;
     let removed = br#"fn generated_fixture_child(command: &mut std::process::Command) { command.env_remove("RUSTC"); }"#;

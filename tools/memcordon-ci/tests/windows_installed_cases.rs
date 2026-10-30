@@ -146,56 +146,11 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
             vec![archive.clone()],
             directory.path(),
             fixture.clone(),
-            None,
             &directory.path().join("installed"),
             relative_output.clone(),
         )
     };
     let payload = construct(&source).unwrap();
-    assert!(payload.workload_diagnostic.is_none());
-    assert!(payload.require_workload_diagnostic().is_err());
-    let helper_path = directory.path().join("memcordon-windows-loader-lab.exe");
-    std::fs::write(&helper_path, &pe).unwrap();
-    let diagnostic = memcordon_ci::windows_installed_cases::WorkloadDiagnosticInput {
-        source: BuildSourceIdentity::from(source.clone()),
-        target: distribution.target.clone(),
-        executable: SelectedArtifact {
-            path: helper_path.clone(),
-            sha256: artifacts::checksum(&pe),
-        },
-        byte_len: pe.len() as u64,
-    };
-    diagnostic
-        .validate_for(
-            &BuildSourceIdentity::from(source.clone()),
-            &distribution.target,
-        )
-        .unwrap();
-    let mut qualified = payload.clone();
-    qualified.workload_diagnostic = Some(diagnostic.clone());
-    qualified.require_workload_diagnostic().unwrap();
-    let mut other = source.clone();
-    other.version = semver::Version::parse("0.5.9").unwrap();
-    other.tag_ref = "refs/tags/0.5.9".into();
-    other.validate().unwrap();
-    assert!(
-        diagnostic
-            .validate_for(&BuildSourceIdentity::from(other), &distribution.target)
-            .is_err()
-    );
-    assert!(
-        diagnostic
-            .validate_for(
-                &BuildSourceIdentity::from(source.clone()),
-                "aarch64-pc-windows-msvc"
-            )
-            .is_err()
-    );
-    let mut substituted = pe.clone();
-    substituted[7] ^= 1;
-    std::fs::write(&helper_path, substituted).unwrap();
-    assert!(qualified.require_workload_diagnostic().is_err());
-    std::fs::write(&helper_path, &pe).unwrap();
     let select_agent = |source: &SelectedSource| {
         memcordon_ci::release::installed_consumer::materialized_windows_agent(
             &BuildSourceIdentity::from(source.clone()),

@@ -70,7 +70,7 @@ impl Trace {
                 "original guardian query capture exceeds existing stream bound",
             ));
         }
-        let digest = |bytes: &[u8]| memcordon_readiness_verifier::sha256(bytes);
+        let digest = |bytes: &[u8]| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes));
         let record = serde_json::to_vec(&serde_json::json!({
             "format":"memcordon.windows-original-guardian-query","revision":1,"diagnostic_only":true,
             "operation":"__observe-windows-guardian","binding":self.binding,"original_guardian":self.guardian,

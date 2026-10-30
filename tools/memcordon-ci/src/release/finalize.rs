@@ -13,22 +13,22 @@ fn failure(message: &str) -> CiError {
     CiError::Message(message.into())
 }
 
-pub fn check_preparation(root: &Path, build_source: &Path, consumer_readiness: bool) -> Result<()> {
+pub fn check_preparation(root: &Path, build_source: &Path, runtime_components: bool) -> Result<()> {
     crate::policy::run(root)?;
-    check_selected_inputs(root, build_source, consumer_readiness)
+    check_selected_inputs(root, build_source, runtime_components)
 }
 
 pub fn check_selected_inputs(
     root: &Path,
     build_source: &Path,
-    consumer_readiness: bool,
+    runtime_components: bool,
 ) -> Result<()> {
     let selected: BuildSourceIdentity = source::read_json(build_source)?;
     selected.recheck(root)?;
     let metadata = crate::policy::workspace_metadata(root)?;
     let distribution = Distribution::read(root)?;
-    let distribution = if consumer_readiness {
-        distribution.consumer_readiness()?
+    let distribution = if runtime_components {
+        distribution.with_runtime_components()?
     } else {
         distribution
     };
@@ -126,7 +126,7 @@ pub fn finalize_preparation(
     if actual != selected {
         return Err(failure("final preparation source differs from selection"));
     }
-    let expected_distribution = Distribution::read(root)?.consumer_readiness()?;
+    let expected_distribution = Distribution::read(root)?.with_runtime_components()?;
     if metadata["distribution"] != serde_json::to_value(&expected_distribution)? {
         return Err(failure(
             "final preparation effective feature distribution differs",

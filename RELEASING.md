@@ -5,9 +5,8 @@ from branch candidates or an existing unsigned annotated release tag. Only tagge
 preparation can be published. Source, package, native-test and installed-consumer
 checks gate final preparation. Mandatory runner-local HTTP rehearsal starts from
 early assembled payloads and must pass before final preparation and publication.
-Installed workload permission is checked separately through live authentication
-and native resource checks, with local administrator grants for contract-bound
-launches.
+Installed workloads use current requests, live authentication and native resource
+checks. CI outcomes do not grant workload permission.
 
 The selected distribution keeps four public crates and six native targets.
 Source-controlled distribution configuration selects actual packages, features,
@@ -70,7 +69,17 @@ the final `assemble` job, after all required checks and rehearsal pass, copies t
 unchanged input and publisher archive into the recoverable artifact pair. Early
 assembled input is never a publication-only recovery artifact. Four macOS
 installed jobs separately execute native and Cargo channels on both architectures;
-Linux/Windows candidate and public readiness coverage remains required.
+Eight Linux/Windows candidate and eight public delivery jobs remain required.
+Each installed job runs one direct `release test-installed` operation that owns
+installation, product assertions and cleanup. Native component jobs run
+`release test-components`; failures fail their actual jobs. Optional diagnostics
+are explanatory and are never consumed as a test-success certificate.
+
+The macOS x64 product job builds the payload independently of four native test
+shards. Each shard derives its tests locally with `suite native-shard`; final
+assembly depends directly on all four successful jobs. There is no transported
+coverage plan, readiness report or producer evidence archive. Maintainers must
+remove the retired readiness report check names from rulesets and dashboards.
 
 Native Cargo execution stops scheduling test executables after a failure by
 default. Local `suite native --failure-mode collect-all` retains diagnostic
@@ -270,11 +279,10 @@ fails, pause publication and fix it; removing its success dependency is a separa
 maintainer policy decision, never an automatic fallback. No required-check setting
 change or hosted rehearsal outcome is implied by the source change.
 
-The complete macOS suite validates current native and acceptance phase reports
-locally before reporting completion. Standalone macOS assessment remains for
-manual and uncovered-tag runs, including failed selected phases. Both validators
-reject missing, failed, skipped or wrong-source/architecture results. Release
-retains the actual phase diagnostics without treating them as publication grants.
+The complete macOS suite executes native and acceptance phases directly and
+returns their failures. Manual and uncovered-tag runs select the combined or
+split native jobs from the performance plan; each selected operation must
+succeed. The four Release macOS shards are direct final assembly dependencies.
 
 At the serial macOS layout, the job conditions suppress 18 duplicate runner
 executions on covered branch pushes and 12 on matching tags. These are structural
@@ -385,15 +393,15 @@ environments.
 No hosted acceptance, cache persistence or performance improvement follows from
 the generated graph or an action's successful conclusion alone.
 
-Release also requires the six `readiness-tools-{host}` preparation phases for
+Release also requires the six `test-tools-{host}` preparation phases for
 `linux-x64`, `linux-arm64`, `macos-x64`, `macos-arm64`, `windows-x64` and
-`windows-arm64`. These phases compile the existing readiness helper and its
-current-source driver on the selected native host. Native and installed jobs
+`windows-arm64`. These phases compile the current driver and concrete fixture
+executables on the selected native host. Native and installed jobs
 consume their exact same-run immutable artifact IDs; candidate and installed
 jobs still require their native test producer to succeed. These artifacts
-contain only selected program bytes and their checked identity, never native
-operation clocks or prepared test results. The original native work clock
-starts on the native runner and remains there through required retirement.
+contain selected program bytes and a member inventory, never acquisition
+attestations, native operation clocks or prepared test results. Each test's
+original work clock remains local through required retirement.
 This preparation boundary does not change executable cache enablement.
 
 `CI source formatting`, `Release source formatting` and `Release source policy`

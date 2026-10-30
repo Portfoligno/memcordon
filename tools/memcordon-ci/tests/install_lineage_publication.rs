@@ -9,8 +9,7 @@ fn published_lineage_is_exact_immutable_custody_and_cannot_replace_a_record() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     #[cfg(windows)]
     {
-        let held =
-            memcordon_ci::windows_readiness_adapter::hold_artifact(&path, None, 1024).unwrap();
+        let held = memcordon_ci::windows_native_files::hold_artifact(&path, None, 1024).unwrap();
         assert_eq!(held.bytes, bytes);
     }
     assert!(publish_install_lineage_file(&path, b"replacement").is_err());

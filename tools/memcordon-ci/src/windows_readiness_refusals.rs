@@ -143,7 +143,7 @@ mod native {
     ) -> Result<memcordon_testkit::ObservedOutput> {
         use std::sync::{Arc, Mutex};
         let image_path = std::path::PathBuf::from(command.get_program());
-        let image = crate::windows_readiness_adapter::hold_artifact(
+        let image = crate::windows_native_files::hold_artifact(
             &image_path,
             Some(image_sha256),
             512 * 1024 * 1024,
@@ -174,7 +174,7 @@ mod native {
             |_| Ok(()),
         )
         .map_err(|error| CiError::Message(error.to_string()))?;
-        crate::windows_readiness_adapter::verify_named_artifact(&image, &image_path)?;
+        crate::windows_native_files::verify_named_artifact(&image, &image_path)?;
         let (pid, birth) = held
             .lock()
             .expect("frontend identity mutex poisoned")

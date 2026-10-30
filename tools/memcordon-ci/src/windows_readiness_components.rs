@@ -1,8 +1,7 @@
-//! Native certification observations are collected from a separately measured
-//! test-support installation, never from the selected production distribution.
+//! Direct fault and mutant tests against a separate source test-support installation.
 #[cfg(windows)]
 use crate::{CiError, Result};
-use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::path::PathBuf;
 
 #[cfg(windows)]
@@ -26,31 +25,20 @@ pub fn launcher_settlement_before_recovery(
     )
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ComponentInput {
-    pub format: String,
-    pub revision: u32,
-    pub run_id: String,
-    pub recipe_id: String,
-    pub source_commit: String,
-    pub native_target: String,
-    pub features: Vec<String>,
-    pub selected_components: Vec<crate::windows_installed_cases::SelectedArtifact>,
+#[derive(Clone, Debug)]
+#[cfg(windows)]
+struct ComponentInput {
     pub suite_input: PathBuf,
-    pub artifact_prefix: PathBuf,
-    pub original_work_deadline_unix_millis: u64,
-    pub original_cleanup_deadline_unix_millis: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ComponentAssessment {
-    pub selector: serde_json::Value,
+#[derive(Clone, Debug)]
+#[cfg(windows)]
+struct ComponentAssessment {
     pub behavior: std::result::Result<(), String>,
     pub collection: std::result::Result<(), String>,
     pub retirement: std::result::Result<(), String>,
-    pub artifacts: Vec<crate::windows_installed_cases::SelectedArtifact>,
+    diagnostic_files: usize,
+    diagnostic_bytes: u64,
 }
 
 /// The guardian observer records the physical loss before the support-only
@@ -603,27 +591,15 @@ mod extinction_staging;
 mod component_barriers;
 
 #[cfg(windows)]
-pub fn run_installed(
-    config: &crate::windows_installed_cases::InstalledWindowsPayload,
-    input: &ComponentInput,
-    records: &mut Vec<ComponentAssessment>,
-) -> Result<()> {
-    run_installed_until(
-        config,
-        input,
-        records,
-        crate::windows_installed_cases::WindowsLeaseDeadlines::finite_default(),
-    )
-}
-
-#[cfg(windows)]
 pub fn run_installed_until(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
-    input: &ComponentInput,
-    records: &mut Vec<ComponentAssessment>,
+    suite_input: &std::path::Path,
     deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
 ) -> Result<()> {
-    native::run(config, input, records, deadlines)
+    let input = ComponentInput {
+        suite_input: suite_input.to_owned(),
+    };
+    native::run(config, &input, &mut Vec::new(), deadlines)
 }
 
 #[cfg(windows)]
@@ -774,7 +750,6 @@ mod native {
                                         "original_thread_exit_status":status,"replacement_process":replacement_identity,
                                         "selected_image_sha256":config.installed_agent.sha256,(status_key):scm,
                                         "endpoint_available":true,"provider_authority_authenticated":false,
-                                        "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
                                     }))?,
                                     record,
                                 )?;
@@ -921,12 +896,14 @@ mod native {
                 "component named artifact readback differs".into(),
             ));
         }
-        record
-            .artifacts
-            .push(crate::windows_installed_cases::SelectedArtifact {
-                path: path.to_owned(),
-                sha256: crate::windows_causal_acceptance::sha256(bytes),
-            });
+        record.diagnostic_files = record
+            .diagnostic_files
+            .checked_add(1)
+            .ok_or_else(|| CiError::Message("component diagnostic count overflow".into()))?;
+        record.diagnostic_bytes = record
+            .diagnostic_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| CiError::Message("component diagnostic size overflow".into()))?;
         Ok(())
     }
 
@@ -936,32 +913,15 @@ mod native {
         records: &mut Vec<ComponentAssessment>,
         deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
     ) -> Result<()> {
-        if input.format != "memcordon.windows-readiness-component"
-            || input.revision != 1
-            || input.artifact_prefix.as_os_str().is_empty()
-            || input
-                .artifact_prefix
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            || input.run_id.is_empty()
-            || input.run_id.len() > 128
-            || input.recipe_id.is_empty()
-            || input.recipe_id.len() > 128
-            || input.source_commit != config.provider.source_commit.as_str()
-            || !matches!(
-                input.native_target.as_str(),
-                "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
-            )
-            || input.features != ["test-support", "windows-sealed-runtime"]
-            || serde_json::to_vec(&input.selected_components)?
-                != serde_json::to_vec(&config.components)?
-        {
+        if !matches!(
+            config.target.as_str(),
+            "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
+        ) {
             return Err(CiError::Message(
-                "component runner requires exact separately measured support package descriptor"
-                    .into(),
+                "component runner requires its actual Windows test-support target".into(),
             ));
         }
-        for artifact in &input.selected_components {
+        for artifact in &config.components {
             if crate::windows_causal_acceptance::sha256(&read(&artifact.path, 512 * 1024 * 1024)?)
                 != artifact.sha256
             {
@@ -979,15 +939,14 @@ mod native {
             .ok_or_else(|| {
                 CiError::Message("component runner finite joint fixture absent".into())
             })?;
-        let mut first_error = None;
         for (ordinal, fault) in fault_selectors().into_iter().enumerate() {
             let selector = serde_json::json!({"kind":"fault", "fault":fault});
             records.push(ComponentAssessment {
-                selector: selector.clone(),
                 behavior: Err("not observed".into()),
                 collection: Err("not collected".into()),
                 retirement: Err("not observed".into()),
-                artifacts: Vec::new(),
+                diagnostic_files: 0,
+                diagnostic_bytes: 0,
             });
             let record = records.last_mut().expect("owned component row");
             let directory = config
@@ -1007,30 +966,22 @@ mod native {
                 deadlines,
             );
             if let Err(error) = result {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                return Err(error);
             }
             if record.retirement.is_err() {
-                break;
+                return Err(CiError::Message(
+                    "component fault retirement unresolved".into(),
+                ));
             }
-        }
-        if records
-            .last()
-            .is_some_and(|record| record.retirement.is_err())
-        {
-            return Err(first_error.unwrap_or_else(|| {
-                CiError::Message("component fault retirement unresolved".into())
-            }));
         }
         for (ordinal, mutant) in envelope_mutants().into_iter().enumerate() {
             let selector = serde_json::json!({"kind":"mutant", "mutant":mutant});
             records.push(ComponentAssessment {
-                selector: selector.clone(),
                 behavior: Err("not observed".into()),
                 collection: Err("not collected".into()),
                 retirement: Err("not observed".into()),
-                artifacts: Vec::new(),
+                diagnostic_files: 0,
+                diagnostic_bytes: 0,
             });
             let record = records.last_mut().expect("owned native mutant row");
             let directory = config
@@ -1049,21 +1000,17 @@ mod native {
                 record,
                 deadlines,
             ) {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                return Err(error);
             }
             if record.retirement.is_err() {
-                break;
+                return Err(CiError::Message(
+                    "component mutant retirement unresolved".into(),
+                ));
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        if records.len() != fault_selectors().len() + envelope_mutants().len()
-            || records.iter().any(|row| {
-                row.behavior.is_err() || row.collection.is_err() || row.retirement.is_err()
-            })
+        if records
+            .iter()
+            .any(|row| row.behavior.is_err() || row.collection.is_err() || row.retirement.is_err())
         {
             return Err(CiError::Message(
                 "native component fault observations incomplete".into(),
@@ -1158,13 +1105,11 @@ mod native {
         command.env_clear();
         let invocation = diagnostics.capture_diagnostic(serde_json::to_vec(&serde_json::json!({
             "format":"memcordon.windows-failed-collection-recovery-command","revision":1,
-            "run_id":input.run_id,"recipe_id":input.recipe_id,"source_commit":input.source_commit,
             "provider":config.provider,"held_association":held,"certification_failure_preserved":certification_failure_preserved,
             "executable_sha256":config.cli.sha256,
             "program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),
             "argv_utf16":command.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
             "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
-            "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis,
         })).map_err(CiError::from));
         let invocation_sha256 = invocation
             .as_ref()
@@ -1427,7 +1372,7 @@ mod native {
             &invocation_path,
             &serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.windows-native-component-invocation","revision":1,
-                "run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,
+                "native_target":config.target,
                 "executable_sha256":config.cli.sha256,
                 "program_utf16":actor_command.get_program().encode_wide().collect::<Vec<_>>(),
                 "argv_utf16":actor_command.get_args().map(|arg| arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
@@ -1507,7 +1452,8 @@ mod native {
         let progression_config = config.clone();
         let progression_input = input.clone();
         let mut progression_record = record.clone();
-        progression_record.artifacts.clear();
+        progression_record.diagnostic_files = 0;
+        progression_record.diagnostic_bytes = 0;
         let progression_record = Arc::new(Mutex::new(progression_record));
         let callback_progression_record = Arc::clone(&progression_record);
         let progression_response = Arc::new(Mutex::new(None));
@@ -1611,7 +1557,7 @@ mod native {
                     .materialize()
                     .map_err(io::Error::other)?;
                 query.env_clear();
-                crate::windows_component_query_evidence::retain_invocation(
+                if let Err(error) = crate::windows_component_query_evidence::retain_invocation(
                     &cwd,
                     &serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-live-association-query-invocation", "revision":1,
@@ -1623,12 +1569,18 @@ mod native {
                         "cwd_utf16":cwd.as_os_str().encode_wide().collect::<Vec<_>>(),
                         "environment_cleared":true,"planned_budget_ms":query_budget.as_millis(),
                     })).map_err(io::Error::other)?,
-                )?;
+                ) {
+                    eprintln!("optional live association invocation diagnostic unavailable: {error}");
+                }
                 let Some(query_remaining) = query_cutoff
                     .checked_duration_since(Instant::now())
                     .filter(|remaining| !remaining.is_zero())
                 else {
-                    crate::windows_component_query_evidence::retain_not_started(&cwd)?;
+                    if let Err(error) =
+                        crate::windows_component_query_evidence::retain_not_started(&cwd)
+                    {
+                        eprintln!("optional live association diagnostic unavailable: {error}");
+                    }
                     return Err(io::Error::other(
                         "original live association query work cutoff expired before spawn",
                     ));
@@ -1646,10 +1598,7 @@ mod native {
                     ))
                 })?;
                 if let Err(error) = retained {
-                    return Err(io::Error::other(format!(
-                        "live association query status={:?}; evidence retention failed: {error}",
-                        observation.status
-                    )));
+                    eprintln!("optional live association result diagnostic unavailable: {error}");
                 }
                 let observation: memcordon_core::WindowsGuardianAttemptObservation =
                     if observation.status.success() {
@@ -1840,8 +1789,7 @@ mod native {
                         // Keep ordering retries within the original finite
                         // capture envelope; every outcome remains retained.
                         if evidence
-                            .artifacts
-                            .len()
+                            .diagnostic_files
                             .checked_add(4)
                             .is_none_or(|files| files > 128)
                             || Instant::now() >= actor_cutoff
@@ -1863,18 +1811,9 @@ mod native {
                             Some(&frontend_identity),
                         )
                         .map_err(io::Error::other)?;
-                        let retained_bytes =
-                            evidence
-                                .artifacts
-                                .iter()
-                                .try_fold(0_u64, |total, artifact| {
-                                    total
-                                        .checked_add(std::fs::metadata(&artifact.path)?.len())
-                                        .ok_or_else(|| {
-                                            io::Error::other("recovery evidence size overflow")
-                                        })
-                                })?;
-                        if retained_bytes > 4 * 1024 * 1024 || evidence.artifacts.len() > 128 {
+                        if evidence.diagnostic_bytes > 4 * 1024 * 1024
+                            || evidence.diagnostic_files > 128
+                        {
                             return Err(io::Error::other(
                                 "original worker recovery evidence bound exceeded",
                             ));
@@ -1904,14 +1843,17 @@ mod native {
         // Capture failures are collection failures, not an early escape from
         // original retirement/recovery while the outer barriers are still owned.
         let post_spawn_retention = (|| -> Result<()> {
-            record.artifacts.extend(
-                progression_record
-                    .lock()
-                    .map_err(|_| CiError::Message("component recovery evidence poisoned".into()))?
-                    .artifacts
-                    .iter()
-                    .cloned(),
-            );
+            let progression = progression_record
+                .lock()
+                .map_err(|_| CiError::Message("component recovery diagnostics poisoned".into()))?;
+            record.diagnostic_files = record
+                .diagnostic_files
+                .checked_add(progression.diagnostic_files)
+                .ok_or_else(|| CiError::Message("component diagnostic count overflow".into()))?;
+            record.diagnostic_bytes = record
+                .diagnostic_bytes
+                .checked_add(progression.diagnostic_bytes)
+                .ok_or_else(|| CiError::Message("component diagnostic size overflow".into()))?;
             if let Some(live) = live
                 .lock()
                 .map_err(|_| CiError::Message("component observation poisoned".into()))?
@@ -1936,7 +1878,7 @@ mod native {
                     &directory.join("capture-failure.json"),
                     &serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-native-component-capture-failure","revision":1,
-                        "run_id":input.run_id,"recipe_id":input.recipe_id,"failure":error.to_string(),
+                        "failure":error.to_string(),
                         "capture_complete":false
                     }))?,
                     record,
@@ -1958,12 +1900,6 @@ mod native {
                 .as_ref()
                 .map_err(|error| CiError::Message(error.to_string()))?;
             let before = read(&directory.join("held-frontend-before.json"), 4096)?;
-            record
-                .artifacts
-                .push(crate::windows_installed_cases::SelectedArtifact {
-                    path: directory.join("held-frontend-before.json"),
-                    sha256: crate::windows_causal_acceptance::sha256(&before),
-                });
             {
                 let held = frontend.lock().map_err(|_| {
                     CiError::Message("component frontend ownership poisoned".into())
@@ -2006,7 +1942,7 @@ mod native {
                 &directory.join("actor-exit.json"),
                 &serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-native-component-exit","revision":1,
-                    "run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,
+                    "native_target":config.target,
                     "executable_sha256":config.cli.sha256,"native_status":output.status.code(),
                     "capture_complete":true
                 }))?,
@@ -2015,12 +1951,6 @@ mod native {
             retain(&directory.join("stdout.bin"), &output.stdout, record)?;
             retain(&directory.join("stderr.bin"), &output.stderr, record)?;
             let raw = read(&observation_path, 32 * 1024 * 1024)?;
-            record
-                .artifacts
-                .push(crate::windows_installed_cases::SelectedArtifact {
-                    path: observation_path.clone(),
-                    sha256: crate::windows_causal_acceptance::sha256(&raw),
-                });
             let observed: serde_json::Value = serde_json::from_slice(&raw)?;
             if observed.get("selection") != Some(selector)
                 || !observed
@@ -2359,7 +2289,6 @@ mod native {
                             "selected_fault":fault,
                             "native_exit_status":native_status,"process_retirement_observed":process_retired,
                             "phase_budget_ms":recovery_budget.as_millis(),"wait_elapsed_ms":wait_started.elapsed().as_millis(),
-                            "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis,
                             "terminal_authority_still_required":true
                         }))?,
                         record,
@@ -2467,7 +2396,7 @@ mod native {
                     &directory.join("terminal-recovery-invocation.json"),
                     &serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-component-recovery-command","revision":1,
-                        "run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,
+                        "native_target":config.target,
                         "executable_sha256":config.cli.sha256,
                         "program_utf16":recovery.get_program().encode_wide().collect::<Vec<_>>(),
                         "argv_utf16":recovery.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
@@ -2715,12 +2644,10 @@ mod native {
                 staging.env_clear();
                 let invocation = diagnostics.capture_diagnostic(serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-capability-extinction-staging-command","revision":1,
-                    "run_id":input.run_id,"recipe_id":input.recipe_id,"source_commit":input.source_commit,
                     "provider":config.provider,"executable_sha256":config.cli.sha256,
                     "program_utf16":staging.get_program().encode_wide().collect::<Vec<_>>(),
                     "argv_utf16":staging.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
                     "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
-                    "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
                 })).map_err(CiError::from));
                 let invocation_sha256=invocation.as_ref().map(|bytes|crate::windows_causal_acceptance::sha256(bytes));
                 if let Some(invocation)=&invocation { diagnostics.diagnostic(retain(
@@ -2843,13 +2770,10 @@ mod native {
                             converge.env_clear();
                             let invocation=diagnostics.capture_diagnostic(serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-component-settlement-command","revision":1,
-                    "run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,
-                    "source_commit":input.source_commit,"executable_sha256":config.cli.sha256,
+                    "native_target":config.target,"executable_sha256":config.cli.sha256,
                     "program_utf16":converge.get_program().encode_wide().collect::<Vec<_>>(),
                     "argv_utf16":converge.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
                     "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
-                    "work_deadline_unix_millis":input.original_work_deadline_unix_millis,
-                    "cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
                 })).map_err(CiError::from));
                             let invocation_sha256 = invocation
                                 .as_ref()

@@ -120,7 +120,7 @@ pub(super) fn run(
         .output_directory
         .join("current-controls/service-restart-fresh-request");
     fs::create_dir(&directory)?;
-    let _selected = crate::windows_readiness_adapter::hold_artifact(
+    let _selected = crate::windows_native_files::hold_artifact(
         &config.installed_agent.path,
         Some(&config.installed_agent.sha256),
         512 * 1024 * 1024,

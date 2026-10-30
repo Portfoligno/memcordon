@@ -76,7 +76,6 @@ impl Fixture {
             components: selected,
             installed_components: providers.clone(),
             fixture,
-            workload_diagnostic: None,
             installed_agent: providers[0].clone(),
             installed_manifest: SelectedArtifact {
                 path: installed.join("runtime-manifest.json"),

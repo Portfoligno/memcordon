@@ -81,7 +81,8 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
           restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
-      - id: driver-cold-build
+      - &shared_step_3
+        id: driver-cold-build
         if: runner.os != 'Windows'
         timeout-minutes: 30
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci
@@ -95,7 +96,7 @@ jobs:
         timeout-minutes: 15
       - name: Validate inexpensive preparation inputs
         if: (steps.source.outputs.recovery-mode == 'reprepare') && runner.os != 'Windows'
-        run: ./target/ci-driver-cold/release/memcordon-ci release check-selected-inputs --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-driver-cold/release/memcordon-ci release check-selected-inputs --build-source .release/build-source.json --runtime-components
         timeout-minutes: 20
       - run: ./target/ci-driver-cold/release/memcordon-ci release publication-tool
         if: runner.os != 'Windows'
@@ -124,7 +125,7 @@ jobs:
         if: '!cancelled() && runner.os != ''Windows'' && steps.driver-cold-build.outcome == ''success'''
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
-      - &shared_step_3
+      - &shared_step_4
         id: driver-cold-adopt-bootstrap-probe
         if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
@@ -134,7 +135,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
           lookup-only: true
-      - &shared_step_4
+      - &shared_step_5
         id: driver-cold-adopt-bootstrap-save
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -143,7 +144,7 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
-      - &shared_step_5
+      - &shared_step_6
         id: driver-cold-adopt-source-complete-probe
         if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
@@ -153,7 +154,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
           lookup-only: true
-      - &shared_step_6
+      - &shared_step_7
         id: driver-cold-adopt-source-complete-save
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -162,7 +163,7 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
-      - &shared_step_7
+      - &shared_step_8
         id: driver-cold-adopt-archives-partial-save
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
@@ -171,7 +172,7 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
-      - &shared_step_8
+      - &shared_step_9
         id: driver-cold-adopt-index-partial-save
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
@@ -180,12 +181,12 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
-      - &shared_step_9
+      - &shared_step_10
         id: driver-cold-cleanup
         if: always() && steps.driver-cold-adopt.outcome == 'success'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci ci driver-cleanup
-      - &shared_step_10
+      - &shared_step_11
         name: Retain bounded preparation diagnostics
         if: '!cancelled()'
         continue-on-error: true
@@ -194,7 +195,6 @@ jobs:
           name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/execution
-            target/ci/deadline-evidence
             target/ci/reports/release-macos-native.json
             target/ci/reports/release-macos-acceptance.json
             target/ci/reports/backend-macos-watchdog.json
@@ -214,14 +214,14 @@ jobs:
     outputs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
-      - &shared_step_11
+      - &shared_step_12
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.select.outputs.selected-commit }}
           persist-credentials: false
           fetch-depth: 0
         timeout-minutes: 6
-      - &shared_step_12
+      - &shared_step_13
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
@@ -229,10 +229,10 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - &shared_step_13
+      - &shared_step_14
         run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
-      - &shared_step_14
+      - &shared_step_15
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
@@ -240,18 +240,18 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - &shared_step_15
+      - &shared_step_16
         run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
         id: driver-build
         timeout-minutes: 15
-      - &shared_step_16
+      - &shared_step_17
         run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
         timeout-minutes: 15
-      - &shared_step_17
+      - &shared_step_18
         id: workspace-fetch-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests workspace-fetch
-      - &shared_step_18
+      - &shared_step_19
         id: workspace-fetch-request-source-restore
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
@@ -261,7 +261,7 @@ jobs:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.source-prefix }}
-      - &shared_step_19
+      - &shared_step_20
         id: workspace-fetch-request-archives-partial-restore
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
@@ -271,7 +271,7 @@ jobs:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
-      - &shared_step_20
+      - &shared_step_21
         id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
@@ -281,11 +281,11 @@ jobs:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
-      - &shared_step_21
+      - &shared_step_22
         id: workspace-fetch
         run: ./.release/tool/memcordon-ci ci segment workspace-fetch
         timeout-minutes: 25
-      - &shared_step_22
+      - &shared_step_23
         id: workspace-fetch-source-complete-probe
         if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
@@ -295,7 +295,7 @@ jobs:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
           lookup-only: true
-      - &shared_step_23
+      - &shared_step_24
         id: workspace-fetch-source-complete-save
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -304,7 +304,7 @@ jobs:
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
-      - &shared_step_24
+      - &shared_step_25
         id: workspace-fetch-archives-partial-save
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
@@ -313,7 +313,7 @@ jobs:
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
-      - &shared_step_25
+      - &shared_step_26
         id: workspace-fetch-index-partial-save
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
@@ -322,7 +322,7 @@ jobs:
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
-      - &shared_step_26
+      - &shared_step_27
         id: workspace-fetch-cleanup
         if: always() && (steps.workspace-fetch.outcome == 'success' || steps.workspace-fetch.outcome == 'failure')
         timeout-minutes: 2
@@ -339,19 +339,18 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-      - *shared_step_10
+      - *shared_step_11
   source-checks:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 231
     steps:
-      - *shared_step_11
       - *shared_step_12
-      - &shared_step_27
+      - *shared_step_13
+      - &shared_step_28
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
         timeout-minutes: 15
-      - *shared_step_14
       - *shared_step_15
       - *shared_step_16
       - *shared_step_17
@@ -364,10 +363,11 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - id: quality-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests release-quality-compiler
-      - &shared_step_28
+      - &shared_step_29
         id: quality-request-compiled-complete-restore
         if: steps.quality-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -377,7 +377,7 @@ jobs:
           key: ${{ steps.quality-request.outputs.compiled-complete-key }}
           path: ${{ steps.quality-request.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.quality-request.outputs.compiled-complete-prefix }}
-      - &shared_step_29
+      - &shared_step_30
         id: quality-request-compiled-partial-restore
         if: steps.quality-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
@@ -390,7 +390,7 @@ jobs:
       - id: quality
         run: ./.release/tool/memcordon-ci ci segment release-quality-compiler
         timeout-minutes: 100
-      - &shared_step_30
+      - &shared_step_31
         id: quality-compiled-complete-probe
         if: '!cancelled() && steps.quality.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
@@ -400,7 +400,7 @@ jobs:
           key: ${{ steps.quality.outputs.compiled-complete-key }}
           path: ${{ steps.quality.outputs.compiled-complete-path }}
           lookup-only: true
-      - &shared_step_31
+      - &shared_step_32
         id: quality-compiled-complete-save
         if: always() && steps.quality.outputs.compiled-complete-save == 'true' && steps.quality-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -409,7 +409,7 @@ jobs:
         with:
           key: ${{ steps.quality.outputs.compiled-complete-key }}
           path: ${{ steps.quality.outputs.compiled-complete-path }}
-      - &shared_step_32
+      - &shared_step_33
         id: quality-compiled-partial-save
         if: always() && steps.quality.outputs.compiled-partial-save == 'true'
         continue-on-error: true
@@ -422,7 +422,7 @@ jobs:
         if: always() && (steps.quality.outcome == 'success' || steps.quality.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers release-quality-compiler
-      - *shared_step_10
+      - *shared_step_11
     name: Source check and Clippy
   msrv:
     needs: select
@@ -430,10 +430,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 246
     steps:
-      - *shared_step_11
       - *shared_step_12
-      - *shared_step_27
-      - *shared_step_14
+      - *shared_step_13
+      - *shared_step_28
       - *shared_step_15
       - *shared_step_16
       - *shared_step_17
@@ -446,6 +445,7 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - run: rustup toolchain install 1.85.0 --profile minimal
         timeout-minutes: 15
       - id: msrv-request
@@ -501,17 +501,16 @@ jobs:
         if: always() && (steps.msrv.outcome == 'success' || steps.msrv.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers msrv
-      - *shared_step_10
+      - *shared_step_11
   source-docs:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 231
     steps:
-      - *shared_step_11
       - *shared_step_12
-      - *shared_step_27
-      - *shared_step_14
+      - *shared_step_13
+      - *shared_step_28
       - *shared_step_15
       - *shared_step_16
       - *shared_step_17
@@ -524,22 +523,23 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - id: quality-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests quality-documentation
-      - *shared_step_28
       - *shared_step_29
+      - *shared_step_30
       - id: quality
         run: ./.release/tool/memcordon-ci ci segment quality-documentation
         timeout-minutes: 100
-      - *shared_step_30
       - *shared_step_31
       - *shared_step_32
+      - *shared_step_33
       - id: quality-cleanup
         if: always() && (steps.quality.outcome == 'success' || steps.quality.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers quality-documentation
-      - *shared_step_10
+      - *shared_step_11
     name: Source documentation
   rehearsal-tool:
     needs: select
@@ -548,12 +548,11 @@ jobs:
     outputs:
       artifact-id: ${{ steps.helper.outputs.artifact-id }}
     steps:
-      - *shared_step_11
       - *shared_step_12
       - *shared_step_13
       - *shared_step_14
       - *shared_step_15
-      - *shared_step_17
+      - *shared_step_16
       - *shared_step_18
       - *shared_step_19
       - *shared_step_20
@@ -563,6 +562,7 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - id: helper-build-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests rehearsal-tool-build
@@ -635,7 +635,6 @@ jobs:
           name: diagnostics-rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/execution
-            target/ci/deadline-evidence
             target/ci/reports/release-macos-native.json
             target/ci/reports/release-macos-acceptance.json
             target/ci/reports/backend-macos-watchdog.json
@@ -656,7 +655,6 @@ jobs:
       matrix:
         shard: ["quarter-one", "quarter-two", "quarter-three", "quarter-four"]
     steps:
-      - *shared_step_11
       - *shared_step_12
       - *shared_step_13
       - *shared_step_14
@@ -672,6 +670,7 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - run: ./.release/tool/memcordon-ci ci segment prepare-miri-components
         id: miri-components
         timeout-minutes: 45
@@ -797,7 +796,7 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment miri-quarter-one
         if: matrix.shard == 'quarter-one'
         timeout-minutes: 70
-      - &shared_step_33
+      - &shared_step_34
         id: quarter-one-compiled-complete-probe
         if: '!cancelled() && steps.quarter-one.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
@@ -807,7 +806,7 @@ jobs:
           key: ${{ steps.quarter-one.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-one.outputs.compiled-complete-path }}
           lookup-only: true
-      - &shared_step_34
+      - &shared_step_35
         id: quarter-one-compiled-complete-save
         if: always() && steps.quarter-one.outputs.compiled-complete-save == 'true' && steps.quarter-one-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -816,7 +815,7 @@ jobs:
         with:
           key: ${{ steps.quarter-one.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-one.outputs.compiled-complete-path }}
-      - &shared_step_35
+      - &shared_step_36
         id: quarter-one-compiled-partial-save
         if: always() && steps.quarter-one.outputs.compiled-partial-save == 'true'
         continue-on-error: true
@@ -855,7 +854,7 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment miri-quarter-three
         if: matrix.shard == 'quarter-three'
         timeout-minutes: 70
-      - &shared_step_36
+      - &shared_step_37
         id: quarter-three-compiled-complete-probe
         if: '!cancelled() && steps.quarter-three.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
@@ -865,7 +864,7 @@ jobs:
           key: ${{ steps.quarter-three.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-three.outputs.compiled-complete-path }}
           lookup-only: true
-      - &shared_step_37
+      - &shared_step_38
         id: quarter-three-compiled-complete-save
         if: always() && steps.quarter-three.outputs.compiled-complete-save == 'true' && steps.quarter-three-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -874,7 +873,7 @@ jobs:
         with:
           key: ${{ steps.quarter-three.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-three.outputs.compiled-complete-path }}
-      - &shared_step_38
+      - &shared_step_39
         id: quarter-three-compiled-partial-save
         if: always() && steps.quarter-three.outputs.compiled-partial-save == 'true'
         continue-on-error: true
@@ -913,7 +912,7 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment miri-quarter-two
         if: matrix.shard == 'quarter-two'
         timeout-minutes: 70
-      - &shared_step_39
+      - &shared_step_40
         id: quarter-two-compiled-complete-probe
         if: '!cancelled() && steps.quarter-two.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
@@ -923,7 +922,7 @@ jobs:
           key: ${{ steps.quarter-two.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-two.outputs.compiled-complete-path }}
           lookup-only: true
-      - &shared_step_40
+      - &shared_step_41
         id: quarter-two-compiled-complete-save
         if: always() && steps.quarter-two.outputs.compiled-complete-save == 'true' && steps.quarter-two-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -932,7 +931,7 @@ jobs:
         with:
           key: ${{ steps.quarter-two.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-two.outputs.compiled-complete-path }}
-      - &shared_step_41
+      - &shared_step_42
         id: quarter-two-compiled-partial-save
         if: always() && steps.quarter-two.outputs.compiled-partial-save == 'true'
         continue-on-error: true
@@ -971,7 +970,7 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment miri-quarter-four
         if: matrix.shard == 'quarter-four'
         timeout-minutes: 70
-      - &shared_step_42
+      - &shared_step_43
         id: quarter-four-compiled-complete-probe
         if: '!cancelled() && steps.quarter-four.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
@@ -981,7 +980,7 @@ jobs:
           key: ${{ steps.quarter-four.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-four.outputs.compiled-complete-path }}
           lookup-only: true
-      - &shared_step_43
+      - &shared_step_44
         id: quarter-four-compiled-complete-save
         if: always() && steps.quarter-four.outputs.compiled-complete-save == 'true' && steps.quarter-four-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -990,7 +989,7 @@ jobs:
         with:
           key: ${{ steps.quarter-four.outputs.compiled-complete-key }}
           path: ${{ steps.quarter-four.outputs.compiled-complete-path }}
-      - &shared_step_44
+      - &shared_step_45
         id: quarter-four-compiled-partial-save
         if: always() && steps.quarter-four.outputs.compiled-partial-save == 'true'
         continue-on-error: true
@@ -1003,7 +1002,7 @@ jobs:
         if: always() && (steps.quarter-four.outcome == 'success' || steps.quarter-four.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers miri-quarter-four
-      - &shared_step_45
+      - &shared_step_46
         name: Retain bounded preparation diagnostics
         if: '!cancelled()'
         continue-on-error: true
@@ -1012,7 +1011,6 @@ jobs:
           name: diagnostics-${{ github.job }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/execution
-            target/ci/deadline-evidence
             target/ci/reports/release-macos-native.json
             target/ci/reports/release-macos-acceptance.json
             target/ci/reports/backend-macos-watchdog.json
@@ -1037,10 +1035,10 @@ jobs:
         run: 'false'
         timeout-minutes: 1
         if: needs.fuzz-setup.result != 'success'
-      - *shared_step_11
       - *shared_step_12
       - *shared_step_13
-      - &shared_step_46
+      - *shared_step_14
+      - &shared_step_47
         run: rustup toolchain install nightly-2026-07-31 --profile minimal
         timeout-minutes: 15
       - id: fuzz-setup-download
@@ -1310,9 +1308,9 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment fuzz-execute-quarter-one
         if: matrix.shard == 'quarter-one'
         timeout-minutes: 70
-      - *shared_step_33
       - *shared_step_34
       - *shared_step_35
+      - *shared_step_36
       - id: quarter-one-cleanup
         if: always() && (steps.quarter-one.outcome == 'success' || steps.quarter-one.outcome == 'failure')
         timeout-minutes: 2
@@ -1321,9 +1319,9 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment fuzz-execute-quarter-three
         if: matrix.shard == 'quarter-three'
         timeout-minutes: 70
-      - *shared_step_36
       - *shared_step_37
       - *shared_step_38
+      - *shared_step_39
       - id: quarter-three-cleanup
         if: always() && (steps.quarter-three.outcome == 'success' || steps.quarter-three.outcome == 'failure')
         timeout-minutes: 2
@@ -1442,9 +1440,9 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment fuzz-execute-quarter-two
         if: matrix.shard == 'quarter-two'
         timeout-minutes: 70
-      - *shared_step_39
       - *shared_step_40
       - *shared_step_41
+      - *shared_step_42
       - id: quarter-two-cleanup
         if: always() && (steps.quarter-two.outcome == 'success' || steps.quarter-two.outcome == 'failure')
         timeout-minutes: 2
@@ -1453,17 +1451,17 @@ jobs:
         run: ./.release/tool/memcordon-ci ci segment fuzz-execute-quarter-four
         if: matrix.shard == 'quarter-four'
         timeout-minutes: 70
-      - *shared_step_42
       - *shared_step_43
       - *shared_step_44
+      - *shared_step_45
       - id: quarter-four-cleanup
         if: always() && (steps.quarter-four.outcome == 'success' || steps.quarter-four.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers fuzz-execute-quarter-four
-      - *shared_step_45
+      - *shared_step_46
   native-linux-x64:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "readiness-tools-linux-x64"]
+    name: native-linux-x64
+    needs: ["select", "test-tools-linux-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
@@ -1471,80 +1469,79 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-            producer-job: native-linux-x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 316
     outputs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - &shared_step_47
+      - &shared_step_48
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
         timeout-minutes: 6
-      - *shared_step_12
       - *shared_step_13
-      - &shared_step_48
-        id: readiness-tools-download
-        name: Download readiness tools (attempt 1 of 2)
+      - *shared_step_14
+      - &shared_step_49
+        id: test-tools-download
+        name: Download test tools (attempt 1 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-linux-x64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-linux-x64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
         continue-on-error: true
-      - &shared_step_49
-        id: readiness-tools-download-retry
-        name: Download readiness tools (attempt 2 of 2)
+      - &shared_step_50
+        id: test-tools-download-retry
+        name: Download test tools (attempt 2 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-linux-x64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-linux-x64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
-        if: '!cancelled() && steps.readiness-tools-download.outcome == ''failure'''
-      - &shared_step_50
-        id: readiness-tools-extract
-        timeout-minutes: 15
-        run: tar -xzf .release/readiness-tools/readiness-tools.tar.gz
+        if: '!cancelled() && steps.test-tools-download.outcome == ''failure'''
       - &shared_step_51
-        id: readiness-tools-check
-        timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind readiness
+        id: test-tools-extract
+        timeout-minutes: 15
+        run: tar -xzf .release/test-tools/test-tools.tar.gz
       - &shared_step_52
+        id: test-tools-check
+        timeout-minutes: 5
+        run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind test
+      - &shared_step_53
         id: workspace-fetch-request
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci ci cache-requests workspace-fetch
         if: runner.os != 'Windows'
-      - *shared_step_18
       - *shared_step_19
       - *shared_step_20
-      - &shared_step_53
+      - *shared_step_21
+      - &shared_step_54
         id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
-      - *shared_step_22
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - &shared_step_54
+      - *shared_step_26
+      - &shared_step_55
         id: workspace-fetch-cleanup
         if: always() && (steps.workspace-fetch.outcome == 'success' || steps.workspace-fetch.outcome == 'failure')
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers workspace-fetch
-      - &shared_step_55
+      - &shared_step_56
         id: build-request
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests release-readiness
+        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests release-runtime
         if: runner.os != 'Windows'
-      - &shared_step_56
+      - &shared_step_57
         id: build-request-native-tests-complete-restore
         if: steps.build-request.outputs.native-tests-complete-restore == 'true'
         continue-on-error: true
@@ -1554,7 +1551,7 @@ jobs:
           key: ${{ steps.build-request.outputs.native-tests-complete-key }}
           path: ${{ steps.build-request.outputs.native-tests-complete-path }}
           restore-keys: ${{ steps.build-request.outputs.native-tests-complete-prefix }}
-      - &shared_step_57
+      - &shared_step_58
         id: build-request-native-tests-partial-restore
         if: steps.build-request.outputs.native-tests-partial-restore == 'true'
         continue-on-error: true
@@ -1564,7 +1561,7 @@ jobs:
           key: ${{ steps.build-request.outputs.native-tests-partial-key }}
           path: ${{ steps.build-request.outputs.native-tests-partial-path }}
           restore-keys: ${{ steps.build-request.outputs.native-tests-partial-prefix }}
-      - &shared_step_58
+      - &shared_step_59
         id: build-request-product-complete-restore
         if: steps.build-request.outputs.product-complete-restore == 'true'
         continue-on-error: true
@@ -1574,7 +1571,7 @@ jobs:
           key: ${{ steps.build-request.outputs.product-complete-key }}
           path: ${{ steps.build-request.outputs.product-complete-path }}
           restore-keys: ${{ steps.build-request.outputs.product-complete-prefix }}
-      - &shared_step_59
+      - &shared_step_60
         id: build-request-product-partial-restore
         if: steps.build-request.outputs.product-partial-restore == 'true'
         continue-on-error: true
@@ -1584,12 +1581,12 @@ jobs:
           key: ${{ steps.build-request.outputs.product-partial-key }}
           path: ${{ steps.build-request.outputs.product-partial-path }}
           restore-keys: ${{ steps.build-request.outputs.product-partial-prefix }}
-      - &shared_step_60
+      - &shared_step_61
         id: build
         timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --runtime-components
         if: runner.os != 'Windows'
-      - &shared_step_61
+      - &shared_step_62
         id: build-native-tests-complete-probe
         if: '!cancelled() && steps.build.outputs.native-tests-complete-save == ''true'''
         continue-on-error: true
@@ -1599,7 +1596,7 @@ jobs:
           key: ${{ steps.build.outputs.native-tests-complete-key }}
           path: ${{ steps.build.outputs.native-tests-complete-path }}
           lookup-only: true
-      - &shared_step_62
+      - &shared_step_63
         id: build-native-tests-complete-save
         if: always() && steps.build.outputs.native-tests-complete-save == 'true' && steps.build-native-tests-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -1608,7 +1605,7 @@ jobs:
         with:
           key: ${{ steps.build.outputs.native-tests-complete-key }}
           path: ${{ steps.build.outputs.native-tests-complete-path }}
-      - &shared_step_63
+      - &shared_step_64
         id: build-native-tests-partial-save
         if: always() && steps.build.outputs.native-tests-partial-save == 'true'
         continue-on-error: true
@@ -1617,7 +1614,7 @@ jobs:
         with:
           key: ${{ steps.build.outputs.native-tests-partial-key }}
           path: ${{ steps.build.outputs.native-tests-partial-path }}
-      - &shared_step_64
+      - &shared_step_65
         id: build-product-complete-probe
         if: '!cancelled() && steps.build.outputs.product-complete-save == ''true'''
         continue-on-error: true
@@ -1627,7 +1624,7 @@ jobs:
           key: ${{ steps.build.outputs.product-complete-key }}
           path: ${{ steps.build.outputs.product-complete-path }}
           lookup-only: true
-      - &shared_step_65
+      - &shared_step_66
         id: build-product-complete-save
         if: always() && steps.build.outputs.product-complete-save == 'true' && steps.build-product-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -1636,7 +1633,7 @@ jobs:
         with:
           key: ${{ steps.build.outputs.product-complete-key }}
           path: ${{ steps.build.outputs.product-complete-path }}
-      - &shared_step_66
+      - &shared_step_67
         id: build-product-partial-save
         if: always() && steps.build.outputs.product-partial-save == 'true'
         continue-on-error: true
@@ -1645,71 +1642,22 @@ jobs:
         with:
           key: ${{ steps.build.outputs.product-partial-key }}
           path: ${{ steps.build.outputs.product-partial-path }}
-      - &shared_step_67
+      - &shared_step_68
         id: build-cleanup
         if: always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure')
         timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers release-readiness
-      - &shared_step_68
+        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers release-runtime
+      - &shared_step_69
         id: build-validation
         timeout-minutes: 100
-        run: ./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --runtime-components
         if: runner.os != 'Windows'
-      - &shared_step_69
-        name: Bind original native readiness source
-        if: (runner.os == 'Linux' || runner.os == 'Windows') && runner.os != 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json
-        timeout-minutes: 10
       - &shared_step_70
-        id: native_readiness
-        name: Execute original measured native components
-        if: (runner.os == 'Linux' || runner.os == 'Windows') && runner.os != 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness
-        timeout-minutes: 155
+        id: native-components
+        name: Run required native component regressions
+        timeout-minutes: 160
+        run: ./target/ci-runtime/current/memcordon-ci release test-components --diagnostics target/ci/reports/components
       - &shared_step_71
-        id: native_readiness_cleanup
-        name: Settle original native component owners
-        if: (always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')) && runner.os != 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness --cleanup
-        timeout-minutes: 20
-      - &shared_step_72
-        name: Retain original native producer evidence
-        if: '!cancelled() && (steps.native_readiness.outcome == ''success'' || steps.native_readiness.outcome == ''failure'' || steps.native_readiness.outcome == ''cancelled'') && (runner.os == ''Linux'' || runner.os == ''Windows'')'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: readiness-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-readiness
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - &shared_step_73
-        id: support_loader_diagnostic
-        name: Observe separate support bootstrap startup
-        if: (!cancelled() && runner.os == 'Windows' && steps.native_readiness_cleanup.outcome == 'success' && steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && runner.os != 'Windows'
-        continue-on-error: true
-        run: ./target/ci-runtime/current/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic
-        timeout-minutes: 10
-      - &shared_step_74
-        id: support_loader_diagnostic_cleanup
-        name: Settle separate support bootstrap owners
-        if: (always() && runner.os == 'Windows' && steps.support_loader_diagnostic.outputs.diagnostic-started == 'true') && runner.os != 'Windows'
-        continue-on-error: true
-        run: ./target/ci-runtime/current/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic --cleanup
-        timeout-minutes: 10
-      - &shared_step_75
-        name: Retain non-authoritative support bootstrap observations
-        if: '!cancelled() && runner.os == ''Windows'' && steps.support_loader_diagnostic.outputs.diagnostic-started == ''true'''
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: support-loader-diagnostic-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/support-loader-diagnostic/diagnostic-artifacts
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - &shared_step_76
         id: payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -1719,7 +1667,7 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-      - &shared_step_77
+      - &shared_step_72
         name: Retain bounded preparation diagnostics
         if: '!cancelled()'
         continue-on-error: true
@@ -1728,72 +1676,78 @@ jobs:
           name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/execution
-            target/ci/deadline-evidence
             target/ci/reports/release-macos-native.json
             target/ci/reports/release-macos-acceptance.json
             target/ci/reports/backend-macos-watchdog.json
             target/ci/reports/memcordon-macos-acceptance-*
             .release/installed-results
-            .release/native-components/measured-harnesses.json
-            .release/native-components/acquisition-origin.json
-            .release/native-components/native-host.json
-            .release/native-operation-deadline.json
-            .release/native-readiness-identity.json
           if-no-files-found: warn
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
+      - &shared_step_73
+        name: Retain bounded components diagnostics
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: components-diagnostics-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/components
+          if-no-files-found: warn
+          retention-days: 7
+          include-hidden-files: true
+          overwrite: false
   native-linux-arm64:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "readiness-tools-linux-arm64"]
+    name: native-linux-arm64
+    needs: ["select", "test-tools-linux-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "producer-job": "native-linux-arm64"}]
+        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 316
     outputs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
-      - &shared_step_78
-        id: readiness-tools-download
-        name: Download readiness tools (attempt 1 of 2)
+      - *shared_step_14
+      - &shared_step_74
+        id: test-tools-download
+        name: Download test tools (attempt 1 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-linux-arm64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-linux-arm64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
         continue-on-error: true
-      - &shared_step_79
-        id: readiness-tools-download-retry
-        name: Download readiness tools (attempt 2 of 2)
+      - &shared_step_75
+        id: test-tools-download-retry
+        name: Download test tools (attempt 2 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-linux-arm64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-linux-arm64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
-        if: '!cancelled() && steps.readiness-tools-download.outcome == ''failure'''
-      - *shared_step_50
+        if: '!cancelled() && steps.test-tools-download.outcome == ''failure'''
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
+      - *shared_step_26
       - *shared_step_55
       - *shared_step_56
       - *shared_step_57
@@ -1813,12 +1767,8 @@ jobs:
       - *shared_step_71
       - *shared_step_72
       - *shared_step_73
-      - *shared_step_74
-      - *shared_step_75
-      - *shared_step_76
-      - *shared_step_77
-  native-macos-x64-plan:
-    needs: ["select", "readiness-tools-macos-x64"]
+  native-macos-x64-shard-0:
+    needs: ["select", "test-tools-macos-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
@@ -1826,63 +1776,175 @@ jobs:
         include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
-    outputs:
-      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
-      - &shared_step_80
-        id: readiness-tools-download
-        name: Download readiness tools (attempt 1 of 2)
+      - *shared_step_14
+      - &shared_step_76
+        id: test-tools-download
+        name: Download test tools (attempt 1 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-macos-x64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-macos-x64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
         continue-on-error: true
-      - &shared_step_81
-        id: readiness-tools-download-retry
-        name: Download readiness tools (attempt 2 of 2)
+      - &shared_step_77
+        id: test-tools-download-retry
+        name: Download test tools (attempt 2 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-macos-x64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-macos-x64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
-        if: '!cancelled() && steps.readiness-tools-download.outcome == ''failure'''
-      - *shared_step_50
+        if: '!cancelled() && steps.test-tools-download.outcome == ''failure'''
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_56
+      - *shared_step_57
+      - *shared_step_58
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci suite native-shard --index 0 --count 4 --profile release
+      - *shared_step_62
+      - *shared_step_63
+      - *shared_step_64
+      - *shared_step_68
+      - *shared_step_72
+  native-macos-x64-shard-1:
+    needs: ["select", "test-tools-macos-x64"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *shared_step_0
+      - *shared_step_48
+      - *shared_step_13
+      - *shared_step_14
+      - *shared_step_76
+      - *shared_step_77
+      - *shared_step_51
+      - *shared_step_52
+      - *shared_step_53
+      - *shared_step_19
+      - *shared_step_20
+      - *shared_step_21
       - *shared_step_54
-      - name: Certify complete native coverage selection
-        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-plan --build-source .release/build-source.json
-        timeout-minutes: 10
-      - id: payload
-        uses: *action_0
-        with:
-          name: native-coverage-plan-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .release/native-coverage-plan.json
-            .release/native-coverage-deadline.json
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-  native-macos-x64-product:
-    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
+      - *shared_step_23
+      - *shared_step_24
+      - *shared_step_25
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_56
+      - *shared_step_57
+      - *shared_step_58
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci suite native-shard --index 1 --count 4 --profile release
+      - *shared_step_62
+      - *shared_step_63
+      - *shared_step_64
+      - *shared_step_68
+      - *shared_step_72
+  native-macos-x64-shard-2:
+    needs: ["select", "test-tools-macos-x64"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *shared_step_0
+      - *shared_step_48
+      - *shared_step_13
+      - *shared_step_14
+      - *shared_step_76
+      - *shared_step_77
+      - *shared_step_51
+      - *shared_step_52
+      - *shared_step_53
+      - *shared_step_19
+      - *shared_step_20
+      - *shared_step_21
+      - *shared_step_54
+      - *shared_step_23
+      - *shared_step_24
+      - *shared_step_25
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_56
+      - *shared_step_57
+      - *shared_step_58
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci suite native-shard --index 2 --count 4 --profile release
+      - *shared_step_62
+      - *shared_step_63
+      - *shared_step_64
+      - *shared_step_68
+      - *shared_step_72
+  native-macos-x64-shard-3:
+    needs: ["select", "test-tools-macos-x64"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *shared_step_0
+      - *shared_step_48
+      - *shared_step_13
+      - *shared_step_14
+      - *shared_step_76
+      - *shared_step_77
+      - *shared_step_51
+      - *shared_step_52
+      - *shared_step_53
+      - *shared_step_19
+      - *shared_step_20
+      - *shared_step_21
+      - *shared_step_54
+      - *shared_step_23
+      - *shared_step_24
+      - *shared_step_25
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_56
+      - *shared_step_57
+      - *shared_step_58
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci suite native-shard --index 3 --count 4 --profile release
+      - *shared_step_62
+      - *shared_step_63
+      - *shared_step_64
+      - *shared_step_68
+      - *shared_step_72
+  native-macos-x64:
+    needs: ["select", "test-tools-macos-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
@@ -1894,347 +1956,37 @@ jobs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_76
+      - *shared_step_77
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - &shared_step_82
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          artifact-ids: ${{ needs.native-macos-x64-plan.outputs.artifact-id }}
-          path: .release
-          merge-multiple: true
-          digest-mismatch: error
-        timeout-minutes: 6
+      - *shared_step_26
       - *shared_step_55
-      - *shared_step_58
+      - *shared_step_56
       - *shared_step_59
+      - *shared_step_60
       - id: build
         timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --consumer-readiness --product-only --destination .release/native-product
-        if: runner.os != 'Windows'
-      - *shared_step_64
+        run: ./target/ci-runtime/current/memcordon-ci release build-native-payload --build-source .release/build-source.json --runtime-components
       - *shared_step_65
       - *shared_step_66
       - *shared_step_67
-      - id: payload
-        uses: *action_0
-        with:
-          name: native-product-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-product
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - &shared_step_83
-        name: Retain bounded preparation diagnostics
-        if: '!cancelled()'
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/execution
-            target/ci/deadline-evidence
-            target/ci/reports/release-macos-native.json
-            target/ci/reports/release-macos-acceptance.json
-            target/ci/reports/backend-macos-watchdog.json
-            target/ci/reports/memcordon-macos-acceptance-*
-            .release/installed-results
-          if-no-files-found: warn
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-  native-macos-x64-shard-0:
-    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 300
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_52
-      - *shared_step_18
-      - *shared_step_19
-      - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
-      - *shared_step_23
-      - *shared_step_24
-      - *shared_step_25
-      - *shared_step_54
-      - *shared_step_82
-      - *shared_step_55
-      - *shared_step_56
-      - *shared_step_57
-      - id: build
-        timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 0 --destination .release/native-coverage/0
-        if: runner.os != 'Windows'
-      - *shared_step_61
-      - *shared_step_62
-      - *shared_step_63
-      - *shared_step_67
-      - id: payload
-        uses: *action_0
-        with:
-          name: native-coverage-${{ matrix.target }}-0-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/0
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - *shared_step_83
-  native-macos-x64-shard-1:
-    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 300
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_52
-      - *shared_step_18
-      - *shared_step_19
-      - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
-      - *shared_step_23
-      - *shared_step_24
-      - *shared_step_25
-      - *shared_step_54
-      - *shared_step_82
-      - *shared_step_55
-      - *shared_step_56
-      - *shared_step_57
-      - id: build
-        timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 1 --destination .release/native-coverage/1
-        if: runner.os != 'Windows'
-      - *shared_step_61
-      - *shared_step_62
-      - *shared_step_63
-      - *shared_step_67
-      - id: payload
-        uses: *action_0
-        with:
-          name: native-coverage-${{ matrix.target }}-1-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/1
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - *shared_step_83
-  native-macos-x64-shard-2:
-    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 300
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_52
-      - *shared_step_18
-      - *shared_step_19
-      - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
-      - *shared_step_23
-      - *shared_step_24
-      - *shared_step_25
-      - *shared_step_54
-      - *shared_step_82
-      - *shared_step_55
-      - *shared_step_56
-      - *shared_step_57
-      - id: build
-        timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 2 --destination .release/native-coverage/2
-        if: runner.os != 'Windows'
-      - *shared_step_61
-      - *shared_step_62
-      - *shared_step_63
-      - *shared_step_67
-      - id: payload
-        uses: *action_0
-        with:
-          name: native-coverage-${{ matrix.target }}-2-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/2
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - *shared_step_83
-  native-macos-x64-shard-3:
-    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 300
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_52
-      - *shared_step_18
-      - *shared_step_19
-      - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
-      - *shared_step_23
-      - *shared_step_24
-      - *shared_step_25
-      - *shared_step_54
-      - *shared_step_82
-      - *shared_step_55
-      - *shared_step_56
-      - *shared_step_57
-      - id: build
-        timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 3 --destination .release/native-coverage/3
-        if: runner.os != 'Windows'
-      - *shared_step_61
-      - *shared_step_62
-      - *shared_step_63
-      - *shared_step_67
-      - id: payload
-        uses: *action_0
-        with:
-          name: native-coverage-${{ matrix.target }}-3-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/3
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - *shared_step_83
-  native-macos-x64:
-    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan", "native-macos-x64-product", "native-macos-x64-shard-0", "native-macos-x64-shard-1", "native-macos-x64-shard-2", "native-macos-x64-shard-3"]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 300
-    outputs:
-      artifact-id: ${{ steps.payload.outputs.artifact-id }}
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_52
-      - *shared_step_18
-      - *shared_step_19
-      - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
-      - *shared_step_23
-      - *shared_step_24
-      - *shared_step_25
-      - *shared_step_54
-      - *shared_step_82
-      - uses: *action_3
-        with:
-          artifact-ids: ${{ needs.native-macos-x64-product.outputs.artifact-id }}
-          path: .release/native-product
-          merge-multiple: true
-          digest-mismatch: error
-        timeout-minutes: 6
-      - uses: *action_3
-        with:
-          name: native-coverage-${{ matrix.target }}-0-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/0
-          digest-mismatch: error
-        timeout-minutes: 6
-      - uses: *action_3
-        with:
-          name: native-coverage-${{ matrix.target }}-1-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/1
-          digest-mismatch: error
-        timeout-minutes: 6
-      - uses: *action_3
-        with:
-          name: native-coverage-${{ matrix.target }}-2-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/2
-          digest-mismatch: error
-        timeout-minutes: 6
-      - uses: *action_3
-        with:
-          name: native-coverage-${{ matrix.target }}-3-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/native-coverage/3
-          digest-mismatch: error
-        timeout-minutes: 6
-      - id: build-validation
-        timeout-minutes: 100
-        run: ./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness --native-coverage .release/native-coverage --product-inputs .release/native-product
-        if: runner.os != 'Windows'
-      - *shared_step_69
-      - *shared_step_70
+      - *shared_step_68
       - *shared_step_71
       - *shared_step_72
-      - *shared_step_73
-      - *shared_step_74
-      - *shared_step_75
-      - *shared_step_76
-      - *shared_step_83
   native-macos-arm64:
-    needs: ["select", "readiness-tools-macos-arm64"]
+    needs: ["select", "test-tools-macos-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
@@ -2246,43 +1998,42 @@ jobs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
-      - &shared_step_84
-        id: readiness-tools-download
-        name: Download readiness tools (attempt 1 of 2)
+      - *shared_step_14
+      - &shared_step_78
+        id: test-tools-download
+        name: Download test tools (attempt 1 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-macos-arm64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-macos-arm64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
         continue-on-error: true
-      - &shared_step_85
-        id: readiness-tools-download-retry
-        name: Download readiness tools (attempt 2 of 2)
+      - &shared_step_79
+        id: test-tools-download-retry
+        name: Download test tools (attempt 2 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-macos-arm64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-macos-arm64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
-        if: '!cancelled() && steps.readiness-tools-download.outcome == ''failure'''
-      - *shared_step_50
+        if: '!cancelled() && steps.test-tools-download.outcome == ''failure'''
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
+      - *shared_step_26
       - *shared_step_55
       - *shared_step_56
       - *shared_step_57
@@ -2302,142 +2053,110 @@ jobs:
       - *shared_step_71
       - *shared_step_72
       - *shared_step_73
-      - *shared_step_74
-      - *shared_step_75
-      - *shared_step_76
-      - *shared_step_83
   native-windows-x64:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "readiness-tools-windows-x64"]
+    name: native-windows-x64
+    needs: ["select", "test-tools-windows-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025", "producer-job": "native-windows-x64"}]
+        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 348
     outputs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
-      - &shared_step_86
-        id: readiness-tools-download
-        name: Download readiness tools (attempt 1 of 2)
+      - *shared_step_14
+      - &shared_step_80
+        id: test-tools-download
+        name: Download test tools (attempt 1 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-windows-x64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-windows-x64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
         continue-on-error: true
-      - &shared_step_87
-        id: readiness-tools-download-retry
-        name: Download readiness tools (attempt 2 of 2)
+      - &shared_step_81
+        id: test-tools-download-retry
+        name: Download test tools (attempt 2 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-windows-x64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-windows-x64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
-        if: '!cancelled() && steps.readiness-tools-download.outcome == ''failure'''
-      - *shared_step_50
-      - &shared_step_88
-        id: readiness-tools-check
+        if: '!cancelled() && steps.test-tools-download.outcome == ''failure'''
+      - *shared_step_51
+      - &shared_step_82
+        id: test-tools-check
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci.exe ci preparation-tools check --kind readiness
-      - &shared_step_89
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci preparation-tools check --kind test
+      - &shared_step_83
         id: workspace-fetch-request
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci.exe ci cache-requests workspace-fetch
         if: runner.os == 'Windows'
-      - *shared_step_18
       - *shared_step_19
       - *shared_step_20
-      - &shared_step_90
+      - *shared_step_21
+      - &shared_step_84
         id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci.exe ci segment workspace-fetch
         if: runner.os == 'Windows'
         timeout-minutes: 25
-      - *shared_step_22
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - &shared_step_91
+      - *shared_step_26
+      - &shared_step_85
         id: workspace-fetch-cleanup
         if: always() && (steps.workspace-fetch.outcome == 'success' || steps.workspace-fetch.outcome == 'failure')
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers workspace-fetch
-      - &shared_step_92
+      - &shared_step_86
         id: build-request
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci.exe ci cache-requests release-readiness
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci cache-requests release-runtime
         if: runner.os == 'Windows'
-      - *shared_step_56
       - *shared_step_57
       - *shared_step_58
       - *shared_step_59
-      - &shared_step_93
+      - *shared_step_60
+      - &shared_step_87
         id: build
         timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci.exe release compile-target --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-runtime/current/memcordon-ci.exe release compile-target --build-source .release/build-source.json --runtime-components
         if: runner.os == 'Windows'
-      - *shared_step_61
       - *shared_step_62
       - *shared_step_63
       - *shared_step_64
       - *shared_step_65
       - *shared_step_66
-      - &shared_step_94
+      - *shared_step_67
+      - &shared_step_88
         id: build-cleanup
         if: always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure')
         timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers release-readiness
-      - &shared_step_95
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers release-runtime
+      - &shared_step_89
         id: build-validation
         timeout-minutes: 100
-        run: ./target/ci-runtime/current/memcordon-ci.exe release validate-package --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-runtime/current/memcordon-ci.exe release validate-package --build-source .release/build-source.json --runtime-components
         if: runner.os == 'Windows'
-      - &shared_step_96
-        name: Bind original native readiness source
-        if: (runner.os == 'Linux' || runner.os == 'Windows') && runner.os == 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness.exe identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json
-        timeout-minutes: 10
-      - &shared_step_97
-        id: native_readiness
-        name: Execute original measured native components
-        if: (runner.os == 'Linux' || runner.os == 'Windows') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness
-        timeout-minutes: 155
-      - &shared_step_98
-        id: native_readiness_cleanup
-        name: Settle original native component owners
-        if: (always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')) && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness --cleanup
-        timeout-minutes: 20
+      - &shared_step_90
+        id: native-components
+        name: Run required native component regressions
+        timeout-minutes: 160
+        run: ./target/ci-runtime/current/memcordon-ci.exe release test-components --diagnostics target/ci/reports/components
+      - *shared_step_71
       - *shared_step_72
-      - &shared_step_99
-        id: support_loader_diagnostic
-        name: Observe separate support bootstrap startup
-        if: (!cancelled() && runner.os == 'Windows' && steps.native_readiness_cleanup.outcome == 'success' && steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && runner.os == 'Windows'
-        continue-on-error: true
-        run: ./target/ci-runtime/current/memcordon-ci.exe consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic
-        timeout-minutes: 10
-      - &shared_step_100
-        id: support_loader_diagnostic_cleanup
-        name: Settle separate support bootstrap owners
-        if: (always() && runner.os == 'Windows' && steps.support_loader_diagnostic.outputs.diagnostic-started == 'true') && runner.os == 'Windows'
-        continue-on-error: true
-        run: ./target/ci-runtime/current/memcordon-ci.exe consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic --cleanup
-        timeout-minutes: 10
-      - *shared_step_75
-      - *shared_step_76
-      - *shared_step_77
-      - &shared_step_101
+      - &shared_step_91
         name: Retain passive Win32 module evidence
         if: '!cancelled() && runner.os == ''Windows'''
         uses: ./.github/actions/upload-artifact
@@ -2447,98 +2166,91 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
         timeout-minutes: 6
+      - *shared_step_73
   native-windows-arm64:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "readiness-tools-windows-arm64"]
+    name: native-windows-arm64
+    needs: ["select", "test-tools-windows-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "producer-job": "native-windows-arm64"}]
+        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 348
     outputs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
-      - &shared_step_102
-        id: readiness-tools-download
-        name: Download readiness tools (attempt 1 of 2)
+      - *shared_step_14
+      - &shared_step_92
+        id: test-tools-download
+        name: Download test tools (attempt 1 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-windows-arm64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-windows-arm64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
         continue-on-error: true
-      - &shared_step_103
-        id: readiness-tools-download-retry
-        name: Download readiness tools (attempt 2 of 2)
+      - &shared_step_93
+        id: test-tools-download-retry
+        name: Download test tools (attempt 2 of 2)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 3
         with:
-          artifact-ids: ${{ needs.readiness-tools-windows-arm64.outputs.artifact-id }}
-          path: .release/readiness-tools
+          artifact-ids: ${{ needs.test-tools-windows-arm64.outputs.artifact-id }}
+          path: .release/test-tools
           merge-multiple: false
           digest-mismatch: error
-        if: '!cancelled() && steps.readiness-tools-download.outcome == ''failure'''
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_89
-      - *shared_step_18
+        if: '!cancelled() && steps.test-tools-download.outcome == ''failure'''
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_83
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_90
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_84
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_91
-      - *shared_step_92
-      - *shared_step_56
+      - *shared_step_26
+      - *shared_step_85
+      - *shared_step_86
       - *shared_step_57
       - *shared_step_58
       - *shared_step_59
-      - *shared_step_93
-      - *shared_step_61
+      - *shared_step_60
+      - *shared_step_87
       - *shared_step_62
       - *shared_step_63
       - *shared_step_64
       - *shared_step_65
       - *shared_step_66
-      - *shared_step_94
-      - *shared_step_95
-      - *shared_step_96
-      - *shared_step_97
-      - *shared_step_98
+      - *shared_step_67
+      - *shared_step_88
+      - *shared_step_89
+      - *shared_step_90
+      - *shared_step_71
       - *shared_step_72
-      - *shared_step_99
-      - *shared_step_100
-      - *shared_step_75
-      - *shared_step_76
-      - *shared_step_77
-      - *shared_step_101
+      - *shared_step_91
+      - *shared_step_73
   candidate-linux-x64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-linux-x64", "readiness-tools-linux-x64"]
+    name: candidate-linux-x64-native
+    needs: ["select", "packages", "native-linux-x64", "test-tools-linux-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "native-job": "native-linux-x64", "channel": "candidate-native", "producer-job": "candidate-linux-x64-native"}]
+        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "native-job": "native-linux-x64", "channel": "candidate-native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 312
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - &shared_step_104
+      - *shared_step_48
+      - &shared_step_94
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs[matrix.native-job].outputs.artifact-id }}
@@ -2546,7 +2258,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - &shared_step_105
+      - &shared_step_95
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.packages.outputs.artifact-id }}
@@ -2554,80 +2266,28 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - &shared_step_106
-        if: matrix.producer-job != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
-          path: .release
-          merge-multiple: true
-          digest-mismatch: error
-        timeout-minutes: 6
       - *shared_step_13
-      - *shared_step_48
+      - *shared_step_14
       - *shared_step_49
       - *shared_step_50
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - &shared_step_107
-        if: matrix.producer-job != ''
-        run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
-        timeout-minutes: 10
-      - &shared_step_108
-        id: readiness
-        if: (matrix.producer-job != '') && runner.os != 'Windows'
-        run: ./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
+      - *shared_step_26
+      - *shared_step_55
+      - &shared_step_96
+        id: installed-test
+        name: Test selected installed distribution
         timeout-minutes: 160
-      - &shared_step_109
-        id: readiness-cleanup
-        if: (always() && matrix.producer-job != '') && runner.os != 'Windows'
-        run: ./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
-        timeout-minutes: 20
-      - &shared_step_110
-        if: '!cancelled() && matrix.producer-job != '''''
-        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
-        timeout-minutes: 10
-      - &shared_step_111
-        id: readiness-upload
-        if: '!cancelled() && matrix.producer-job != '''''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-cell/producer-packed
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - &shared_step_112
-        id: cache
-        if: (matrix.producer-job == '' && matrix.channel == 'cargo') && runner.os != 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci release consumer-cache --channel cargo --profile readiness
-        timeout-minutes: 20
-      - &shared_step_113
-        id: native-cache
-        if: (matrix.producer-job == '' && matrix.channel != 'cargo') && runner.os != 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci release consumer-cache --channel native --profile readiness
-        timeout-minutes: 20
-      - &shared_step_114
-        id: native
-        if: (matrix.producer-job == '' && matrix.channel != 'cargo') && runner.os != 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci release installed-consumers --channel native --destination .release/installed-results/native
-        timeout-minutes: 210
-      - &shared_step_115
-        id: cargo
-        if: (matrix.producer-job == '' && matrix.channel != 'native') && runner.os != 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci release installed-consumers --channel cargo --destination .release/installed-results/cargo
-        timeout-minutes: 210
-      - &shared_step_116
+        run: ./target/ci-runtime/current/memcordon-ci release test-installed --delivery candidate-native --target .release/target --packages .release/packages --diagnostics target/ci/reports/installed
+      - &shared_step_97
         if: '!cancelled()'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -2638,7 +2298,7 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-      - &shared_step_117
+      - &shared_step_98
         name: Retain bounded preparation diagnostics
         if: '!cancelled()'
         continue-on-error: true
@@ -2647,7 +2307,6 @@ jobs:
           name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/execution
-            target/ci/deadline-evidence
             target/ci/reports/release-macos-native.json
             target/ci/reports/release-macos-acceptance.json
             target/ci/reports/backend-macos-watchdog.json
@@ -2657,362 +2316,280 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
+      - &shared_step_99
+        name: Retain bounded installed diagnostics
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: installed-diagnostics-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/installed
+          if-no-files-found: warn
+          retention-days: 7
+          include-hidden-files: true
+          overwrite: false
   candidate-linux-arm64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-linux-arm64", "readiness-tools-linux-arm64"]
+    name: candidate-linux-arm64-native
+    needs: ["select", "packages", "native-linux-arm64", "test-tools-linux-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "native-job": "native-linux-arm64", "channel": "candidate-native", "producer-job": "candidate-linux-arm64-native"}]
+        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "native-job": "native-linux-arm64", "channel": "candidate-native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 312
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_78
-      - *shared_step_79
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_74
+      - *shared_step_75
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_110
-      - *shared_step_111
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_96
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
   candidate-linux-x64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-linux-x64", "readiness-tools-linux-x64"]
+    name: candidate-linux-x64-cargo
+    needs: ["select", "packages", "native-linux-x64", "test-tools-linux-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "native-job": "native-linux-x64", "channel": "candidate-cargo", "producer-job": "candidate-linux-x64-cargo"}]
+        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "native-job": "native-linux-x64", "channel": "candidate-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 312
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
-      - *shared_step_13
       - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
+      - *shared_step_13
+      - *shared_step_14
       - *shared_step_49
       - *shared_step_50
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_110
-      - *shared_step_111
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_55
+      - &shared_step_100
+        id: installed-test
+        name: Test selected installed distribution
+        timeout-minutes: 160
+        run: ./target/ci-runtime/current/memcordon-ci release test-installed --delivery candidate-cargo --target .release/target --packages .release/packages --diagnostics target/ci/reports/installed
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
   candidate-linux-arm64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-linux-arm64", "readiness-tools-linux-arm64"]
+    name: candidate-linux-arm64-cargo
+    needs: ["select", "packages", "native-linux-arm64", "test-tools-linux-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "native-job": "native-linux-arm64", "channel": "candidate-cargo", "producer-job": "candidate-linux-arm64-cargo"}]
+        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "native-job": "native-linux-arm64", "channel": "candidate-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 312
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_78
-      - *shared_step_79
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_74
+      - *shared_step_75
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
-      - *shared_step_19
-      - *shared_step_20
       - *shared_step_53
-      - *shared_step_22
-      - *shared_step_23
-      - *shared_step_24
-      - *shared_step_25
+      - *shared_step_19
+      - *shared_step_20
+      - *shared_step_21
       - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_110
-      - *shared_step_111
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_23
+      - *shared_step_24
+      - *shared_step_25
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_100
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
   candidate-windows-x64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-windows-x64", "readiness-tools-windows-x64"]
+    name: candidate-windows-x64-native
+    needs: ["select", "packages", "native-windows-x64", "test-tools-windows-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025", "native-job": "native-windows-x64", "channel": "candidate-native", "producer-job": "candidate-windows-x64-native"}]
+        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025", "native-job": "native-windows-x64", "channel": "candidate-native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 318
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_86
-      - *shared_step_87
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_89
-      - *shared_step_18
+      - *shared_step_14
+      - *shared_step_80
+      - *shared_step_81
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_83
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_90
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_84
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_91
-      - *shared_step_107
-      - &shared_step_118
-        id: readiness
-        if: (matrix.producer-job != '') && runner.os == 'Windows'
-        run: ./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell
+      - *shared_step_26
+      - *shared_step_85
+      - &shared_step_101
+        id: installed-test
+        name: Test selected installed distribution
         timeout-minutes: 160
-      - &shared_step_119
-        id: readiness-cleanup
-        if: (always() && matrix.producer-job != '') && runner.os == 'Windows'
-        run: ./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell
-        timeout-minutes: 20
-      - &shared_step_120
-        if: '!cancelled() && matrix.producer-job != '''''
-        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
-        timeout-minutes: 10
-      - &shared_step_121
-        id: readiness-upload
-        if: '!cancelled() && matrix.producer-job != '''''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-cell
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - &shared_step_122
-        id: cache
-        if: (matrix.producer-job == '' && matrix.channel == 'cargo') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --channel cargo --profile readiness
-        timeout-minutes: 20
-      - &shared_step_123
-        id: native-cache
-        if: (matrix.producer-job == '' && matrix.channel != 'cargo') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --channel native --profile readiness
-        timeout-minutes: 20
-      - &shared_step_124
-        id: native
-        if: (matrix.producer-job == '' && matrix.channel != 'cargo') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release installed-consumers --channel native --destination .release/installed-results/native
-        timeout-minutes: 210
-      - &shared_step_125
-        id: cargo
-        if: (matrix.producer-job == '' && matrix.channel != 'native') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release installed-consumers --channel cargo --destination .release/installed-results/cargo
-        timeout-minutes: 210
-      - *shared_step_116
-      - *shared_step_117
-      - *shared_step_101
+        run: ./target/ci-runtime/current/memcordon-ci.exe release test-installed --delivery candidate-native --target .release/target --packages .release/packages --diagnostics target/ci/reports/installed
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_91
+      - *shared_step_99
   candidate-windows-x64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-windows-x64", "readiness-tools-windows-x64"]
+    name: candidate-windows-x64-cargo
+    needs: ["select", "packages", "native-windows-x64", "test-tools-windows-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025", "native-job": "native-windows-x64", "channel": "candidate-cargo", "producer-job": "candidate-windows-x64-cargo"}]
+        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025", "native-job": "native-windows-x64", "channel": "candidate-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 318
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_86
-      - *shared_step_87
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_89
-      - *shared_step_18
+      - *shared_step_14
+      - *shared_step_80
+      - *shared_step_81
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_83
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_90
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_84
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
+      - *shared_step_26
+      - *shared_step_85
+      - &shared_step_102
+        id: installed-test
+        name: Test selected installed distribution
+        timeout-minutes: 160
+        run: ./target/ci-runtime/current/memcordon-ci.exe release test-installed --delivery candidate-cargo --target .release/target --packages .release/packages --diagnostics target/ci/reports/installed
+      - *shared_step_97
+      - *shared_step_98
       - *shared_step_91
-      - *shared_step_107
-      - *shared_step_118
-      - *shared_step_119
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_122
-      - *shared_step_123
-      - *shared_step_124
-      - *shared_step_125
-      - *shared_step_116
-      - *shared_step_117
-      - *shared_step_101
+      - *shared_step_99
   candidate-windows-arm64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-windows-arm64", "readiness-tools-windows-arm64"]
+    name: candidate-windows-arm64-native
+    needs: ["select", "packages", "native-windows-arm64", "test-tools-windows-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "native-job": "native-windows-arm64", "channel": "candidate-native", "producer-job": "candidate-windows-arm64-native"}]
+        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "native-job": "native-windows-arm64", "channel": "candidate-native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 318
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_102
-      - *shared_step_103
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_89
-      - *shared_step_18
+      - *shared_step_14
+      - *shared_step_92
+      - *shared_step_93
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_83
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_90
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_84
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_91
-      - *shared_step_107
-      - *shared_step_118
-      - *shared_step_119
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_122
-      - *shared_step_123
-      - *shared_step_124
-      - *shared_step_125
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_85
       - *shared_step_101
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_91
+      - *shared_step_99
   candidate-windows-arm64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "packages", "native-windows-arm64", "readiness-tools-windows-arm64"]
+    name: candidate-windows-arm64-cargo
+    needs: ["select", "packages", "native-windows-arm64", "test-tools-windows-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "native-job": "native-windows-arm64", "channel": "candidate-cargo", "producer-job": "candidate-windows-arm64-cargo"}]
+        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "native-job": "native-windows-arm64", "channel": "candidate-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 318
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_102
-      - *shared_step_103
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_89
-      - *shared_step_18
+      - *shared_step_14
+      - *shared_step_92
+      - *shared_step_93
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_83
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_90
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_84
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
+      - *shared_step_26
+      - *shared_step_85
+      - *shared_step_102
+      - *shared_step_97
+      - *shared_step_98
       - *shared_step_91
-      - *shared_step_107
-      - *shared_step_118
-      - *shared_step_119
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_122
-      - *shared_step_123
-      - *shared_step_124
-      - *shared_step_125
-      - *shared_step_116
-      - *shared_step_117
-      - *shared_step_101
+      - *shared_step_99
   assemble-payload:
     needs: ["select", "packages", "native-linux-x64", "native-linux-arm64", "native-macos-x64", "native-macos-arm64", "native-windows-x64", "native-windows-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
@@ -3021,14 +2598,14 @@ jobs:
     outputs:
       assembled-artifact-id: ${{ steps.assembled.outputs.artifact-id }}
     steps:
-      - *shared_step_13
-      - *shared_step_47
       - *shared_step_14
-      - &shared_step_126
+      - *shared_step_48
+      - *shared_step_15
+      - &shared_step_103
         run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
         timeout-minutes: 15
-      - *shared_step_12
-      - *shared_step_105
+      - *shared_step_13
+      - *shared_step_95
       - uses: *action_3
         with:
           artifact-ids: ${{ needs.native-linux-x64.outputs.artifact-id }}
@@ -3071,7 +2648,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness --destination .release/assembled
+      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --runtime-components --destination .release/assembled
         timeout-minutes: 20
       - id: assembled
         uses: *action_0
@@ -3090,7 +2667,6 @@ jobs:
           name: diagnostics-assemble-payload-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/execution
-            target/ci/deadline-evidence
             target/ci/reports/release-macos-native.json
             target/ci/reports/release-macos-acceptance.json
             target/ci/reports/backend-macos-watchdog.json
@@ -3101,7 +2677,7 @@ jobs:
           overwrite: false
         timeout-minutes: 6
   assemble:
-    needs: ["select", "packages", "source-checks", "msrv", "supply-chain-audit", "supply-chain-deny", "assemble-payload", "rehearse", "miri", "fuzz", "native-linux-x64", "native-linux-arm64", "native-macos-x64", "native-macos-arm64", "native-windows-x64", "native-windows-arm64", "candidate-linux-x64-native", "candidate-linux-x64-cargo", "candidate-linux-arm64-native", "candidate-linux-arm64-cargo", "installed-macos-x64-native", "installed-macos-x64-cargo", "installed-macos-arm64-native", "installed-macos-arm64-cargo", "candidate-windows-x64-native", "candidate-windows-x64-cargo", "candidate-windows-arm64-native", "candidate-windows-arm64-cargo", "source-docs", "source-policy", "format"]
+    needs: ["select", "packages", "source-checks", "msrv", "supply-chain-audit", "supply-chain-deny", "assemble-payload", "rehearse", "miri", "fuzz", "native-linux-x64", "native-linux-arm64", "native-macos-x64", "native-macos-arm64", "native-windows-x64", "native-windows-arm64", "candidate-linux-x64-native", "candidate-linux-x64-cargo", "candidate-linux-arm64-native", "candidate-linux-arm64-cargo", "installed-macos-x64-native", "installed-macos-x64-cargo", "installed-macos-arm64-native", "installed-macos-arm64-cargo", "candidate-windows-x64-native", "candidate-windows-x64-cargo", "candidate-windows-arm64-native", "candidate-windows-arm64-cargo", "source-docs", "source-policy", "format", "native-macos-x64-shard-0", "native-macos-x64-shard-1", "native-macos-x64-shard-2", "native-macos-x64-shard-3"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 103
@@ -3110,11 +2686,11 @@ jobs:
       prepared-artifact-id: ${{ steps.prepared.outputs.artifact-id }}
       publication-tool-artifact-id: ${{ steps.publication-tool.outputs.artifact-id }}
     steps:
-      - *shared_step_13
-      - *shared_step_47
       - *shared_step_14
-      - *shared_step_126
-      - *shared_step_12
+      - *shared_step_48
+      - *shared_step_15
+      - *shared_step_103
+      - *shared_step_13
       - uses: *action_3
         with:
           artifact-ids: ${{ needs.assemble-payload.outputs.assembled-artifact-id }}
@@ -3155,7 +2731,7 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-      - *shared_step_10
+      - *shared_step_11
   rehearse:
     name: Release rehearsal
     needs: ["select", "assemble-payload", "rehearsal-tool"]
@@ -3165,7 +2741,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - &shared_step_127
+      - &shared_step_104
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.rehearsal-tool.outputs.artifact-id }}
@@ -3173,7 +2749,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_14
+      - *shared_step_15
       - uses: *action_3
         with:
           artifact-ids: ${{ needs.assemble-payload.outputs.assembled-artifact-id }}
@@ -3181,11 +2757,11 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - &shared_step_128
+      - &shared_step_105
         run: tar -xzf .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz -C .release/rehearsal-tool
         timeout-minutes: 15
-      - *shared_step_126
-      - &shared_step_129
+      - *shared_step_103
+      - &shared_step_106
         id: rehearsal
         run: ./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results --jobs 2
         timeout-minutes: 60
@@ -3214,10 +2790,10 @@ jobs:
       prepared-artifact-id: ${{ steps.recovery.outputs.prepared-artifact-id }}
       tool-artifact-id: ${{ steps.recovery.outputs.tool-artifact-id }}
     steps:
-      - *shared_step_47
-      - *shared_step_13
+      - *shared_step_48
       - *shared_step_14
-      - *shared_step_126
+      - *shared_step_15
+      - *shared_step_103
       - run: ./.release/tool/memcordon-ci release select-preparation
         timeout-minutes: 15
       - id: recovery
@@ -3226,7 +2802,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         timeout-minutes: 15
-      - *shared_step_10
+      - *shared_step_11
   recovery-rehearse:
     name: Release recovery rehearsal
     needs: ["select", "recovery-inputs", "rehearsal-tool"]
@@ -3237,8 +2813,8 @@ jobs:
       contents: read
       actions: read
     steps:
-      - *shared_step_127
-      - &shared_step_130
+      - *shared_step_104
+      - &shared_step_107
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.tool-artifact-id }}
@@ -3259,9 +2835,9 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_128
-      - *shared_step_126
-      - *shared_step_129
+      - *shared_step_105
+      - *shared_step_103
+      - *shared_step_106
       - name: Retain recovery rehearsal diagnostics
         if: '!cancelled()'
         continue-on-error: true
@@ -3305,8 +2881,8 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_126
-      - &shared_step_131
+      - *shared_step_103
+      - &shared_step_108
         id: registry-auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
         timeout-minutes: 6
@@ -3329,7 +2905,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - *shared_step_130
+      - *shared_step_107
       - uses: *action_3
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
@@ -3340,8 +2916,8 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_126
-      - *shared_step_131
+      - *shared_step_103
+      - *shared_step_108
       - name: Publish original prepared bytes
         run: ./.release/tool/memcordon-ci release publish
         env:
@@ -3349,8 +2925,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.registry-auth.outputs.token }}
         timeout-minutes: 30
   public-linux-x64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-x64"]
+    name: public-linux-x64-native
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-linux-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3358,17 +2934,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "channel": "public-native", "producer-job": "public-linux-x64-native"}]
+        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "channel": "public-native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 317
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - &shared_step_132
+      - *shared_step_48
+      - *shared_step_13
+      - &shared_step_109
         if: needs.select.outputs.recovery-mode == 'reprepare'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -3377,7 +2950,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - &shared_step_133
+      - &shared_step_110
         if: needs.select.outputs.recovery-mode == 'publication-only'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -3389,46 +2962,20 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_13
-      - *shared_step_48
+      - *shared_step_14
       - *shared_step_49
       - *shared_step_50
       - *shared_step_51
-      - &shared_step_134
-        run: ./target/ci-runtime/current/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json
-        if: runner.os != 'Windows'
-        timeout-minutes: 60
-      - &shared_step_135
-        run: ./target/ci-driver-cold/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
-        if: runner.os != 'Windows'
-        timeout-minutes: 10
-      - &shared_step_136
-        run: ./target/ci-driver-cold/release/consumer-readiness acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
-        if: runner.os != 'Windows'
+      - *shared_step_52
+      - &shared_step_111
+        id: installed-test
+        name: Test selected installed distribution
         timeout-minutes: 160
-      - &shared_step_137
-        id: readiness-cleanup
-        if: (always()) && runner.os != 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
-        timeout-minutes: 20
-      - &shared_step_138
-        if: (!cancelled()) && runner.os != 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
-        timeout-minutes: 10
-      - &shared_step_139
-        id: readiness-upload
-        if: '!cancelled()'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-cell/producer-packed
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
+        run: ./target/ci-runtime/current/memcordon-ci release test-installed --delivery public-native --prepared .release/prepared --diagnostics target/ci/reports/installed
+      - *shared_step_99
   public-linux-x64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-x64"]
+    name: public-linux-x64-cargo
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-linux-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3436,158 +2983,112 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "channel": "public-cargo", "producer-job": "public-linux-x64-cargo"}]
+        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "channel": "public-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 317
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_13
       - *shared_step_48
+      - *shared_step_13
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
       - *shared_step_49
       - *shared_step_50
       - *shared_step_51
-      - *shared_step_134
-      - *shared_step_135
-      - *shared_step_136
-      - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-  public-linux-arm64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-arm64"]
-    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "channel": "public-native", "producer-job": "public-linux-arm64-native"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 317
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_13
-      - *shared_step_78
-      - *shared_step_79
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_134
-      - *shared_step_135
-      - *shared_step_136
-      - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-  public-linux-arm64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-linux-arm64"]
-    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "channel": "public-cargo", "producer-job": "public-linux-arm64-cargo"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 317
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_13
-      - *shared_step_78
-      - *shared_step_79
-      - *shared_step_50
-      - *shared_step_51
-      - *shared_step_134
-      - *shared_step_135
-      - *shared_step_136
-      - *shared_step_137
-      - *shared_step_138
-      - *shared_step_139
-  public-windows-x64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-x64"]
-    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "channel": "public-native", "producer-job": "public-windows-x64-native"}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 323
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_13
-      - *shared_step_86
-      - *shared_step_87
-      - *shared_step_50
-      - *shared_step_88
-      - &shared_step_140
-        run: ./target/ci-runtime/current/memcordon-ci.exe release prepare-readiness-tools --build-source .release/build-source.json
-        if: runner.os == 'Windows'
-        timeout-minutes: 60
-      - &shared_step_141
-        run: ./target/ci-driver-cold/release/consumer-readiness.exe identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
-        if: runner.os == 'Windows'
-        timeout-minutes: 10
-      - &shared_step_142
-        run: ./target/ci-driver-cold/release/consumer-readiness.exe acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell
-        if: runner.os == 'Windows'
+      - *shared_step_52
+      - &shared_step_112
+        id: installed-test
+        name: Test selected installed distribution
         timeout-minutes: 160
-      - &shared_step_143
-        id: readiness-cleanup
-        if: (always()) && runner.os == 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness.exe cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell
-        timeout-minutes: 20
-      - &shared_step_144
-        if: (!cancelled()) && runner.os == 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness.exe seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v2.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
-        timeout-minutes: 10
-      - &shared_step_145
-        id: readiness-upload
-        if: '!cancelled()'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-cell
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-      - *shared_step_101
+        run: ./target/ci-runtime/current/memcordon-ci release test-installed --delivery public-cargo --prepared .release/prepared --diagnostics target/ci/reports/installed
+      - *shared_step_99
+  public-linux-arm64-native:
+    name: public-linux-arm64-native
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-linux-arm64"]
+    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "channel": "public-native"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 317
+    steps:
+      - *shared_step_0
+      - *shared_step_48
+      - *shared_step_13
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
+      - *shared_step_74
+      - *shared_step_75
+      - *shared_step_51
+      - *shared_step_52
+      - *shared_step_111
+      - *shared_step_99
+  public-linux-arm64-cargo:
+    name: public-linux-arm64-cargo
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-linux-arm64"]
+    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "channel": "public-cargo"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 317
+    steps:
+      - *shared_step_0
+      - *shared_step_48
+      - *shared_step_13
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
+      - *shared_step_74
+      - *shared_step_75
+      - *shared_step_51
+      - *shared_step_52
+      - *shared_step_112
+      - *shared_step_99
+  public-windows-x64-native:
+    name: public-windows-x64-native
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-windows-x64"]
+    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "channel": "public-native"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 323
+    steps:
+      - *shared_step_0
+      - *shared_step_48
+      - *shared_step_13
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
+      - *shared_step_80
+      - *shared_step_81
+      - *shared_step_51
+      - *shared_step_82
+      - &shared_step_113
+        id: installed-test
+        name: Test selected installed distribution
+        timeout-minutes: 160
+        run: ./target/ci-runtime/current/memcordon-ci.exe release test-installed --delivery public-native --prepared .release/prepared --diagnostics target/ci/reports/installed
+      - *shared_step_91
+      - *shared_step_99
   public-windows-x64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-x64"]
+    name: public-windows-x64-cargo
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-windows-x64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3595,33 +3096,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "channel": "public-cargo", "producer-job": "public-windows-x64-cargo"}]
+        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "channel": "public-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 323
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
+      - *shared_step_48
       - *shared_step_13
-      - *shared_step_86
-      - *shared_step_87
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
-      - *shared_step_145
-      - *shared_step_101
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
+      - *shared_step_80
+      - *shared_step_81
+      - *shared_step_51
+      - *shared_step_82
+      - &shared_step_114
+        id: installed-test
+        name: Test selected installed distribution
+        timeout-minutes: 160
+        run: ./target/ci-runtime/current/memcordon-ci.exe release test-installed --delivery public-cargo --prepared .release/prepared --diagnostics target/ci/reports/installed
+      - *shared_step_91
+      - *shared_step_99
   public-windows-arm64-native:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-arm64"]
+    name: public-windows-arm64-native
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-windows-arm64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3629,33 +3127,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "channel": "public-native", "producer-job": "public-windows-arm64-native"}]
+        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "channel": "public-native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 323
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
+      - *shared_step_48
       - *shared_step_13
-      - *shared_step_102
-      - *shared_step_103
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
-      - *shared_step_145
-      - *shared_step_101
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
+      - *shared_step_92
+      - *shared_step_93
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_113
+      - *shared_step_91
+      - *shared_step_99
   public-windows-arm64-cargo:
-    name: ${{ matrix.producer-job }}
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "readiness-tools-windows-arm64"]
+    name: public-windows-arm64-cargo
+    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "test-tools-windows-arm64"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
     permissions:
       contents: read
@@ -3663,132 +3154,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "channel": "public-cargo", "producer-job": "public-windows-arm64-cargo"}]
+        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "channel": "public-cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 323
-    outputs:
-      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
+      - *shared_step_48
       - *shared_step_13
-      - *shared_step_102
-      - *shared_step_103
-      - *shared_step_50
-      - *shared_step_88
-      - *shared_step_140
-      - *shared_step_141
-      - *shared_step_142
-      - *shared_step_143
-      - *shared_step_144
-      - *shared_step_145
-      - *shared_step_101
-  readiness-candidate-report:
-    needs: ["select", "native-linux-x64", "native-linux-arm64", "native-windows-x64", "native-windows-arm64", "candidate-linux-x64-native", "candidate-linux-x64-cargo", "candidate-linux-arm64-native", "candidate-linux-arm64-cargo", "candidate-windows-x64-native", "candidate-windows-x64-cargo", "candidate-windows-arm64-native", "candidate-windows-arm64-cargo"]
-    if: '!cancelled() && needs.select.result == ''success'' && needs.select.outputs.recovery-mode == ''reprepare'''
-    runs-on: ubuntu-24.04
-    timeout-minutes: 188
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_13
-      - *shared_step_2
-      - &shared_step_146
-        id: driver-cold-build
-        if: runner.os != 'Windows'
-        timeout-minutes: 30
-        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
-      - &shared_step_147
-        id: driver-cold-adopt
-        if: steps.driver-cold-build.outcome == 'success'
-        timeout-minutes: 15
-        run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
-      - *shared_step_3
-      - *shared_step_4
-      - *shared_step_5
-      - *shared_step_6
-      - *shared_step_7
-      - *shared_step_8
-      - *shared_step_9
-      - &shared_step_148
-        id: driver-workflows-check
-        if: runner.os != 'Windows'
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci workflows --check
-      - &shared_step_149
-        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-readiness-verifier
-        timeout-minutes: 60
-      - *shared_step_135
-      - name: Read candidate consumer readiness observations
-        run: ./target/ci-runtime/current/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope candidate-before-publication --destination .release/readiness-report
-        env:
-          GH_TOKEN: ${{ github.token }}
-        if: runner.os != 'Windows'
-        timeout-minutes: 20
-      - if: '!cancelled()'
-        uses: *action_0
-        with:
-          name: readiness-candidate-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-report
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
-  readiness-complete-report:
-    needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish", "native-linux-x64", "native-linux-arm64", "native-windows-x64", "native-windows-arm64", "candidate-linux-x64-native", "candidate-linux-x64-cargo", "candidate-linux-arm64-native", "candidate-linux-arm64-cargo", "candidate-windows-x64-native", "candidate-windows-x64-cargo", "candidate-windows-arm64-native", "candidate-windows-arm64-cargo", "public-linux-x64-native", "public-linux-x64-cargo", "public-linux-arm64-native", "public-linux-arm64-cargo", "public-windows-x64-native", "public-windows-x64-cargo", "public-windows-arm64-native", "public-windows-arm64-cargo"]
-    if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'''
-    runs-on: ubuntu-24.04
-    timeout-minutes: 200
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
-      - *shared_step_132
-      - *shared_step_133
-      - *shared_step_13
-      - *shared_step_2
-      - *shared_step_146
-      - *shared_step_147
-      - *shared_step_3
-      - *shared_step_4
-      - *shared_step_5
-      - *shared_step_6
-      - *shared_step_7
-      - *shared_step_8
-      - *shared_step_9
-      - *shared_step_148
-      - *shared_step_149
-      - *shared_step_135
-      - name: Read complete consumer readiness observations
-        run: ./target/ci-runtime/current/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope complete-profile --destination .release/readiness-report
-        env:
-          GH_TOKEN: ${{ github.token }}
-        if: runner.os != 'Windows'
-        timeout-minutes: 20
-      - if: '!cancelled()'
-        uses: *action_0
-        with:
-          name: readiness-complete-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-report
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
-    env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+      - *shared_step_109
+      - *shared_step_110
+      - *shared_step_14
+      - *shared_step_92
+      - *shared_step_93
+      - *shared_step_51
+      - *shared_step_82
+      - *shared_step_114
+      - *shared_step_91
+      - *shared_step_99
   published-consumer:
     needs: ["select", "assemble", "publish", "recovery-inputs", "recovery-publish"]
     if: '!cancelled() && (needs.publish.result == ''success'' || needs.recovery-publish.result == ''success'') && needs.select.outputs.preparation-kind == ''tagged'' && needs.select.outputs.public-consumer == ''true'''
@@ -3806,7 +3188,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_132
+      - *shared_step_109
       - if: needs.select.outputs.recovery-mode == 'publication-only'
         uses: *action_3
         with:
@@ -3818,9 +3200,9 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - *shared_step_133
-      - *shared_step_126
-      - *shared_step_13
+      - *shared_step_110
+      - *shared_step_103
+      - *shared_step_14
       - run: ./.release/tool/memcordon-ci release public-consumer
         timeout-minutes: 70
       - if: '!cancelled()'
@@ -3832,179 +3214,154 @@ jobs:
           include-hidden-files: true
         timeout-minutes: 6
   installed-macos-x64-native:
-    needs: ["select", "packages", "native-macos-x64", "readiness-tools-macos-x64"]
+    needs: ["select", "packages", "native-macos-x64", "test-tools-macos-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "native-job": "native-macos-x64", "channel": "native", "producer-job": ""}]
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "native-job": "native-macos-x64", "channel": "native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_76
+      - *shared_step_77
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_96
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
+    name: installed-macos-x64-native
   installed-macos-x64-cargo:
-    needs: ["select", "packages", "native-macos-x64", "readiness-tools-macos-x64"]
+    needs: ["select", "packages", "native-macos-x64", "test-tools-macos-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "native-job": "native-macos-x64", "channel": "cargo", "producer-job": ""}]
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "native-job": "native-macos-x64", "channel": "cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_80
-      - *shared_step_81
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_76
+      - *shared_step_77
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_100
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
+    name: installed-macos-x64-cargo
   installed-macos-arm64-native:
-    needs: ["select", "packages", "native-macos-arm64", "readiness-tools-macos-arm64"]
+    needs: ["select", "packages", "native-macos-arm64", "test-tools-macos-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-apple-darwin", "runner": "macos-15", "native-job": "native-macos-arm64", "channel": "native", "producer-job": ""}]
+        include: [{"target": "aarch64-apple-darwin", "runner": "macos-15", "native-job": "native-macos-arm64", "channel": "native"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_84
-      - *shared_step_85
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_78
+      - *shared_step_79
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_96
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
+    name: installed-macos-arm64-native
   installed-macos-arm64-cargo:
-    needs: ["select", "packages", "native-macos-arm64", "readiness-tools-macos-arm64"]
+    needs: ["select", "packages", "native-macos-arm64", "test-tools-macos-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-apple-darwin", "runner": "macos-15", "native-job": "native-macos-arm64", "channel": "cargo", "producer-job": ""}]
+        include: [{"target": "aarch64-apple-darwin", "runner": "macos-15", "native-job": "native-macos-arm64", "channel": "cargo"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_104
-      - *shared_step_105
-      - *shared_step_106
+      - *shared_step_48
+      - *shared_step_94
+      - *shared_step_95
       - *shared_step_13
-      - *shared_step_84
-      - *shared_step_85
-      - *shared_step_50
+      - *shared_step_14
+      - *shared_step_78
+      - *shared_step_79
       - *shared_step_51
       - *shared_step_52
-      - *shared_step_18
+      - *shared_step_53
       - *shared_step_19
       - *shared_step_20
-      - *shared_step_53
-      - *shared_step_22
+      - *shared_step_21
+      - *shared_step_54
       - *shared_step_23
       - *shared_step_24
       - *shared_step_25
-      - *shared_step_54
-      - *shared_step_107
-      - *shared_step_108
-      - *shared_step_109
-      - *shared_step_120
-      - *shared_step_121
-      - *shared_step_112
-      - *shared_step_113
-      - *shared_step_114
-      - *shared_step_115
-      - *shared_step_116
-      - *shared_step_117
+      - *shared_step_26
+      - *shared_step_55
+      - *shared_step_100
+      - *shared_step_97
+      - *shared_step_98
+      - *shared_step_99
+    name: installed-macos-arm64-cargo
   supply-chain-audit:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 282
     steps:
-      - *shared_step_11
       - *shared_step_12
-      - *shared_step_27
-      - *shared_step_14
+      - *shared_step_13
+      - *shared_step_28
       - *shared_step_15
       - *shared_step_16
       - *shared_step_17
@@ -4017,10 +3374,11 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - id: supply-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests supply-audit
-      - &shared_step_150
+      - &shared_step_115
         id: supply-request-source-restore
         if: steps.supply-request.outputs.source-restore == 'true'
         continue-on-error: true
@@ -4030,7 +3388,7 @@ jobs:
           key: ${{ steps.supply-request.outputs.source-key }}
           path: ${{ steps.supply-request.outputs.source-path }}
           restore-keys: ${{ steps.supply-request.outputs.source-prefix }}
-      - &shared_step_151
+      - &shared_step_116
         id: supply-request-archives-partial-restore
         if: steps.supply-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
@@ -4040,7 +3398,7 @@ jobs:
           key: ${{ steps.supply-request.outputs.archives-partial-key }}
           path: ${{ steps.supply-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.supply-request.outputs.archives-partial-prefix }}
-      - &shared_step_152
+      - &shared_step_117
         id: supply-request-index-partial-restore
         if: steps.supply-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
@@ -4089,7 +3447,7 @@ jobs:
       - id: supply
         timeout-minutes: 130
         run: ./.release/tool/memcordon-ci ci segment supply-audit
-      - &shared_step_153
+      - &shared_step_118
         id: supply-source-complete-probe
         if: '!cancelled() && steps.supply.outputs.source-complete-save == ''true'''
         continue-on-error: true
@@ -4099,7 +3457,7 @@ jobs:
           key: ${{ steps.supply.outputs.source-complete-key }}
           path: ${{ steps.supply.outputs.source-complete-path }}
           lookup-only: true
-      - &shared_step_154
+      - &shared_step_119
         id: supply-source-complete-save
         if: always() && steps.supply.outputs.source-complete-save == 'true' && steps.supply-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -4108,7 +3466,7 @@ jobs:
         with:
           key: ${{ steps.supply.outputs.source-complete-key }}
           path: ${{ steps.supply.outputs.source-complete-path }}
-      - &shared_step_155
+      - &shared_step_120
         id: supply-archives-partial-save
         if: always() && steps.supply.outputs.archives-partial-save == 'true'
         continue-on-error: true
@@ -4117,7 +3475,7 @@ jobs:
         with:
           key: ${{ steps.supply.outputs.archives-partial-key }}
           path: ${{ steps.supply.outputs.archives-partial-path }}
-      - &shared_step_156
+      - &shared_step_121
         id: supply-index-partial-save
         if: always() && steps.supply.outputs.index-partial-save == 'true'
         continue-on-error: true
@@ -4189,7 +3547,7 @@ jobs:
         if: always() && (steps.supply.outcome == 'success' || steps.supply.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers supply-audit
-      - *shared_step_10
+      - *shared_step_11
     name: Supply chain / audit
   supply-chain-deny:
     needs: select
@@ -4197,10 +3555,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 282
     steps:
-      - *shared_step_11
       - *shared_step_12
-      - *shared_step_27
-      - *shared_step_14
+      - *shared_step_13
+      - *shared_step_28
       - *shared_step_15
       - *shared_step_16
       - *shared_step_17
@@ -4213,12 +3570,13 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
+      - *shared_step_27
       - id: supply-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests supply-deny
-      - *shared_step_150
-      - *shared_step_151
-      - *shared_step_152
+      - *shared_step_115
+      - *shared_step_116
+      - *shared_step_117
       - id: supply-request-cargo-deny-image-restore
         if: steps.supply-request.outputs.cargo-deny-image-restore == 'true'
         continue-on-error: true
@@ -4258,10 +3616,10 @@ jobs:
       - id: supply
         timeout-minutes: 130
         run: ./.release/tool/memcordon-ci ci segment supply-deny
-      - *shared_step_153
-      - *shared_step_154
-      - *shared_step_155
-      - *shared_step_156
+      - *shared_step_118
+      - *shared_step_119
+      - *shared_step_120
+      - *shared_step_121
       - id: supply-cargo-deny-image-probe
         if: '!cancelled() && steps.supply.outputs.cargo-deny-image-save == ''true'''
         continue-on-error: true
@@ -4325,7 +3683,7 @@ jobs:
         if: always() && (steps.supply.outcome == 'success' || steps.supply.outcome == 'failure')
         timeout-minutes: 2
         run: ./.release/tool/memcordon-ci ci cleanup-transfers supply-deny
-      - *shared_step_10
+      - *shared_step_11
     name: Supply chain / deny
   fuzz-setup:
     needs: select
@@ -4333,7 +3691,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 229
     steps:
-      - *shared_step_11
       - *shared_step_12
       - *shared_step_13
       - *shared_step_14
@@ -4349,7 +3706,8 @@ jobs:
       - *shared_step_24
       - *shared_step_25
       - *shared_step_26
-      - *shared_step_46
+      - *shared_step_27
+      - *shared_step_47
       - id: prepare-request
         timeout-minutes: 5
         run: ./.release/tool/memcordon-ci ci cache-requests prepare-fuzz
@@ -4532,93 +3890,101 @@ jobs:
     name: Release fuzz setup
     outputs:
       artifact-id: ${{ steps.fuzz-setup-upload.outputs.artifact-id }}
-  readiness-tools-linux-x64:
-    name: Readiness helper / linux-x64
+  test-tools-linux-x64:
+    name: Native test tools / linux-x64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "producer-job": "native-linux-x64"}]
+        include: [{"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 108
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
+      - *shared_step_14
       - *shared_step_2
-      - *shared_step_146
-      - *shared_step_147
       - *shared_step_3
+      - &shared_step_122
+        id: driver-cold-adopt
+        if: steps.driver-cold-build.outcome == 'success'
+        timeout-minutes: 15
+        run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - *shared_step_4
       - *shared_step_5
       - *shared_step_6
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_148
-      - &shared_step_157
-        id: readiness-tools-bind
+      - *shared_step_10
+      - &shared_step_123
+        id: driver-workflows-check
+        if: runner.os != 'Windows'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci ci workflows --check
+      - &shared_step_124
+        id: test-tools-bind
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind readiness
-      - &shared_step_158
-        id: readiness-tools-package
+        run: ./target/ci-runtime/current/memcordon-ci release prepare-test-tools --build-source .release/build-source.json
+      - &shared_step_125
+        id: test-tools-package
         timeout-minutes: 5
-        run: tar -czf target/readiness-tools.tar.gz target/ci-runtime/current target/ci-driver-cold/release/consumer-readiness target/ci/release/consumer-readiness target/ci-preparation/readiness.json
-      - id: readiness-tools-upload
+        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json
+      - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
         with:
-          name: readiness-tools-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/readiness-tools.tar.gz
+          name: test-tools-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-tools.tar.gz
           if-no-files-found: error
           overwrite: false
     outputs:
-      artifact-id: ${{ steps.readiness-tools-upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.test-tools-upload.outputs.artifact-id }}
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
-  readiness-tools-linux-arm64:
-    name: Readiness helper / linux-arm64
+  test-tools-linux-arm64:
+    name: Native test tools / linux-arm64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "producer-job": "native-linux-arm64"}]
+        include: [{"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 108
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
+      - *shared_step_14
       - *shared_step_2
-      - *shared_step_146
-      - *shared_step_147
       - *shared_step_3
+      - *shared_step_122
       - *shared_step_4
       - *shared_step_5
       - *shared_step_6
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_148
-      - *shared_step_157
-      - *shared_step_158
-      - id: readiness-tools-upload
+      - *shared_step_10
+      - *shared_step_123
+      - *shared_step_124
+      - *shared_step_125
+      - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
         with:
-          name: readiness-tools-linux-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/readiness-tools.tar.gz
+          name: test-tools-linux-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-tools.tar.gz
           if-no-files-found: error
           overwrite: false
     outputs:
-      artifact-id: ${{ steps.readiness-tools-upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.test-tools-upload.outputs.artifact-id }}
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
-  readiness-tools-macos-x64:
+  test-tools-macos-x64:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -4629,36 +3995,39 @@ jobs:
     timeout-minutes: 108
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
+      - *shared_step_14
       - *shared_step_2
-      - *shared_step_146
-      - *shared_step_147
       - *shared_step_3
+      - *shared_step_122
       - *shared_step_4
       - *shared_step_5
       - *shared_step_6
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_148
-      - *shared_step_157
-      - *shared_step_158
-      - id: readiness-tools-upload
+      - *shared_step_10
+      - *shared_step_123
+      - *shared_step_124
+      - &shared_step_126
+        id: test-tools-package
+        timeout-minutes: 5
+        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json
+      - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
         with:
-          name: readiness-tools-macos-x64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/readiness-tools.tar.gz
+          name: test-tools-macos-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-tools.tar.gz
           if-no-files-found: error
           overwrite: false
-    name: Readiness helper / macos-x64
+    name: Native test tools / macos-x64
     outputs:
-      artifact-id: ${{ steps.readiness-tools-upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.test-tools-upload.outputs.artifact-id }}
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
-  readiness-tools-macos-arm64:
+  test-tools-macos-arm64:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -4669,62 +4038,62 @@ jobs:
     timeout-minutes: 108
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
+      - *shared_step_14
       - *shared_step_2
-      - *shared_step_146
-      - *shared_step_147
       - *shared_step_3
+      - *shared_step_122
       - *shared_step_4
       - *shared_step_5
       - *shared_step_6
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
-      - *shared_step_148
-      - *shared_step_157
-      - *shared_step_158
-      - id: readiness-tools-upload
+      - *shared_step_10
+      - *shared_step_123
+      - *shared_step_124
+      - *shared_step_126
+      - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
         with:
-          name: readiness-tools-macos-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/readiness-tools.tar.gz
+          name: test-tools-macos-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-tools.tar.gz
           if-no-files-found: error
           overwrite: false
-    name: Readiness helper / macos-arm64
+    name: Native test tools / macos-arm64
     outputs:
-      artifact-id: ${{ steps.readiness-tools-upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.test-tools-upload.outputs.artifact-id }}
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
-  readiness-tools-windows-x64:
-    name: Readiness helper / windows-x64
+  test-tools-windows-x64:
+    name: Native test tools / windows-x64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025", "producer-job": "native-windows-x64"}]
+        include: [{"target": "x86_64-pc-windows-msvc", "runner": "windows-2025"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 114
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
+      - *shared_step_14
       - *shared_step_2
-      - &shared_step_159
+      - &shared_step_127
         id: driver-cold-build-windows
         if: runner.os == 'Windows'
         timeout-minutes: 30
-        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
-      - &shared_step_160
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci
+      - &shared_step_128
         id: driver-cold-adopt-windows
         if: steps.driver-cold-build-windows.outcome == 'success'
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci.exe ci driver-adopt-cold
-      - &shared_step_161
+      - &shared_step_129
         id: driver-cold-adopt-windows-bootstrap-probe
         if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == ''true'''
         continue-on-error: true
@@ -4734,7 +4103,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
           lookup-only: true
-      - &shared_step_162
+      - &shared_step_130
         id: driver-cold-adopt-windows-bootstrap-save
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -4743,7 +4112,7 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
-      - &shared_step_163
+      - &shared_step_131
         id: driver-cold-adopt-windows-source-complete-probe
         if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.source-complete-save == ''true'''
         continue-on-error: true
@@ -4753,7 +4122,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
           lookup-only: true
-      - &shared_step_164
+      - &shared_step_132
         id: driver-cold-adopt-windows-source-complete-save
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -4762,7 +4131,7 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
-      - &shared_step_165
+      - &shared_step_133
         id: driver-cold-adopt-windows-archives-partial-save
         if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
@@ -4771,7 +4140,7 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
-      - &shared_step_166
+      - &shared_step_134
         id: driver-cold-adopt-windows-index-partial-save
         if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
@@ -4780,76 +4149,76 @@ jobs:
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
-      - &shared_step_167
+      - &shared_step_135
         id: driver-cold-cleanup-windows
         if: always() && steps.driver-cold-adopt-windows.outcome == 'success'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci driver-cleanup
-      - &shared_step_168
+      - &shared_step_136
         id: driver-workflows-check-windows
         if: runner.os == 'Windows'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
-      - &shared_step_169
-        id: readiness-tools-bind
+      - &shared_step_137
+        id: test-tools-bind
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci.exe ci preparation-tools package --kind readiness
-      - &shared_step_170
-        id: readiness-tools-package
+        run: ./target/ci-runtime/current/memcordon-ci.exe release prepare-test-tools --build-source .release/build-source.json
+      - &shared_step_138
+        id: test-tools-package
         timeout-minutes: 5
-        run: tar -czf target/readiness-tools.tar.gz target/ci-runtime/current target/ci-driver-cold/release/consumer-readiness.exe target/ci/release/consumer-readiness.exe target/ci-preparation/readiness.json
-      - id: readiness-tools-upload
+        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json
+      - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
         with:
-          name: readiness-tools-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/readiness-tools.tar.gz
+          name: test-tools-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-tools.tar.gz
           if-no-files-found: error
           overwrite: false
-      - *shared_step_101
+      - *shared_step_91
     outputs:
-      artifact-id: ${{ steps.readiness-tools-upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.test-tools-upload.outputs.artifact-id }}
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
-  readiness-tools-windows-arm64:
-    name: Readiness helper / windows-arm64
+  test-tools-windows-arm64:
+    name: Native test tools / windows-arm64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "producer-job": "native-windows-arm64"}]
+        include: [{"target": "aarch64-pc-windows-msvc", "runner": "windows-11-arm"}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 114
     steps:
       - *shared_step_0
-      - *shared_step_47
-      - *shared_step_12
+      - *shared_step_48
       - *shared_step_13
+      - *shared_step_14
       - *shared_step_2
-      - *shared_step_159
-      - *shared_step_160
-      - *shared_step_161
-      - *shared_step_162
-      - *shared_step_163
-      - *shared_step_164
-      - *shared_step_165
-      - *shared_step_166
-      - *shared_step_167
-      - *shared_step_168
-      - *shared_step_169
-      - *shared_step_170
-      - id: readiness-tools-upload
+      - *shared_step_127
+      - *shared_step_128
+      - *shared_step_129
+      - *shared_step_130
+      - *shared_step_131
+      - *shared_step_132
+      - *shared_step_133
+      - *shared_step_134
+      - *shared_step_135
+      - *shared_step_136
+      - *shared_step_137
+      - *shared_step_138
+      - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
         with:
-          name: readiness-tools-windows-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/readiness-tools.tar.gz
+          name: test-tools-windows-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-tools.tar.gz
           if-no-files-found: error
           overwrite: false
-      - *shared_step_101
+      - *shared_step_91
     outputs:
-      artifact-id: ${{ steps.readiness-tools-upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.test-tools-upload.outputs.artifact-id }}
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   source-policy:
@@ -5053,13 +4422,13 @@ jobs:
         if: steps.driver-cold-build.outcome == 'success'
         timeout-minutes: 77
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold --feedback repository-policy
-      - *shared_step_3
       - *shared_step_4
       - *shared_step_5
       - *shared_step_6
       - *shared_step_7
       - *shared_step_8
       - *shared_step_9
+      - *shared_step_10
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
     permissions:
@@ -5083,12 +4452,12 @@ jobs:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
     steps:
       - *shared_step_0
-      - &shared_step_171
+      - &shared_step_139
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - &shared_step_172
+      - &shared_step_140
         name: Install pinned Cargo toolchain
         run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
@@ -5109,7 +4478,7 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
-      - *shared_step_101
+      - *shared_step_91
   format:
     name: Release source formatting
     if: github.event.deleted != true && (github.event_name != 'workflow_dispatch' || inputs.recovery-mode == 'reprepare')
@@ -5133,8 +4502,8 @@ jobs:
       contents: read
     steps:
       - *shared_step_0
-      - *shared_step_171
-      - *shared_step_172
+      - *shared_step_139
+      - *shared_step_140
       - *shared_step_2
       - id: current-contracts-restore
         uses: *action_1
@@ -5170,7 +4539,7 @@ jobs:
         with:
           path: target/ci-current-contracts
           key: mc-current-contracts-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
-      - &shared_step_173
+      - &shared_step_141
         id: current-contracts-source-save
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
@@ -5194,8 +4563,8 @@ jobs:
       contents: read
     steps:
       - *shared_step_0
-      - *shared_step_171
-      - *shared_step_172
+      - *shared_step_139
+      - *shared_step_140
       - *shared_step_2
       - id: tooling-contracts-restore
         uses: *action_1
@@ -5206,7 +4575,7 @@ jobs:
           key: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('tools/memcordon-ci/**/*.rs', 'crates/**/*.rs', 'fuzz/Cargo.toml', 'fuzz/corpus/**', '.github/workflows/deep-ci.yml') }}
           restore-keys: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-
       - name: Current external consumer contracts
-        run: rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test original_native_roles --test workflow_policy
+        run: rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy
         timeout-minutes: 10
       - id: tooling-contracts-save
         uses: *action_2
@@ -5216,7 +4585,7 @@ jobs:
         with:
           path: target/ci-tooling-contracts
           key: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('tools/memcordon-ci/**/*.rs', 'crates/**/*.rs', 'fuzz/Cargo.toml', 'fuzz/corpus/**', '.github/workflows/deep-ci.yml') }}
-      - *shared_step_173
+      - *shared_step_141
     runs-on: ubuntu-24.04
     timeout-minutes: 47
     env:
@@ -5228,8 +4597,8 @@ jobs:
       contents: read
     steps:
       - *shared_step_0
-      - *shared_step_171
-      - *shared_step_172
+      - *shared_step_139
+      - *shared_step_140
       - *shared_step_2
       - id: current-contracts-restore
         uses: *action_1
@@ -5250,7 +4619,7 @@ jobs:
         with:
           path: target/ci-current-contracts
           key: mc-macos-administrative-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
-      - *shared_step_173
+      - *shared_step_141
     runs-on: macos-15
     timeout-minutes: 47
     env:

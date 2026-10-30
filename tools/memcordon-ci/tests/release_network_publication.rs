@@ -1126,7 +1126,6 @@ fn shared_assembler_notes_fixture(
             archive,
             members: records,
             fixture,
-            workload_diagnostic: None,
         };
         source::write_json(&directory.join("target.json"), &target).unwrap();
         targets.push(directory);

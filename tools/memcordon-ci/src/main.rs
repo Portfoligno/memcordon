@@ -35,14 +35,6 @@ enum TopLevel {
         #[arg(long)]
         output: PathBuf,
     },
-    #[cfg(target_os = "windows")]
-    ConsumerReadinessLoaderDiagnostic(
-        memcordon_ci::release::original_native_components::loader_diagnostic::Args,
-    ),
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    ConsumerReadinessNativeComponents(memcordon_ci::release::original_native_components::Args),
-    ConsumerReadinessCell(memcordon_ci::release::consumer_readiness_cell::CellArguments),
-    ConsumerReadinessCleanup(memcordon_ci::release::consumer_readiness_cell::CellArguments),
     Ci {
         #[command(subcommand)]
         command: CiCommand,
@@ -67,6 +59,12 @@ enum TopLevel {
     Suite {
         #[arg(value_enum)]
         suite: Suite,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        count: Option<usize>,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long, value_enum, default_value = "stop-after-failure")]
         failure_mode: memcordon_ci::failure_mode::FailureMode,
     },
@@ -209,12 +207,6 @@ enum CiCommand {
         #[arg(long, default_value = "target/ci/reports/stress-assessment.json")]
         destination: PathBuf,
     },
-    AggregateMacos {
-        #[arg(long, default_value = "target/ci/macos-artifacts")]
-        input: PathBuf,
-        #[arg(long, default_value = "target/ci/reports/macos-assessment.json")]
-        destination: PathBuf,
-    },
 }
 
 fn workspace_root(start: &Path) -> Result<PathBuf> {
@@ -235,7 +227,8 @@ fn run() -> Result<()> {
     let backend = |suite: &Suite| {
         matches!(
             suite,
-            Suite::BackendLinuxCgroup
+            Suite::NativeShard
+                | Suite::BackendLinuxCgroup
                 | Suite::BackendLinuxPrivate
                 | Suite::BackendLinuxPrivatePrepare
                 | Suite::BackendLinuxPrivateRuntime
@@ -256,7 +249,6 @@ fn run() -> Result<()> {
             command,
             memcordon_ci::release::ReleaseCommand::WorkingWindowsPrepare { .. }
                 | memcordon_ci::release::ReleaseCommand::WorkingWindowsConsumer { .. }
-                | memcordon_ci::release::ReleaseCommand::CleanupInstalledLoaderSupport { .. }
         ),
         _ => false,
     };
@@ -265,8 +257,6 @@ fn run() -> Result<()> {
         .transpose()?;
     let current = std::env::current_dir()?;
     let root = match &cli.command {
-        #[cfg(target_os = "linux")]
-        Some(TopLevel::CurrentLinuxOwnerProbe { .. }) => current,
         #[cfg(target_os = "linux")]
         Some(TopLevel::CurrentLinuxSnapshotProbe { .. }) => current,
         Some(TopLevel::ExternalConsumer { .. }) => current,
@@ -282,59 +272,11 @@ fn run() -> Result<()> {
     let result = (|| match cli.command {
         #[cfg(target_os = "linux")]
         Some(TopLevel::CurrentLinuxOwnerProbe { input, output }) => {
-            memcordon_ci::release::linux_current_owner_cases::probe(&input, &output)
+            memcordon_ci::release::linux_test_owners::probe(&input, &output)
         }
         #[cfg(target_os = "linux")]
         Some(TopLevel::CurrentLinuxSnapshotProbe { input, output }) => {
             memcordon_ci::linux_snapshot_probe::run(&input, &output)
-        }
-        #[cfg(target_os = "windows")]
-        Some(TopLevel::ConsumerReadinessLoaderDiagnostic(arguments)) => {
-            let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
-                memcordon_ci::release::original_native_components::loader_diagnostic::run(
-                    &root, &arguments,
-                ),
-            );
-            if arguments.cleanup {
-                operation.into_result()
-            } else {
-                let mut cleanup = arguments;
-                cleanup.cleanup = true;
-                let cleanup = memcordon_ci::work_outcome::WorkOutcome::from_result(
-                    memcordon_ci::release::original_native_components::loader_diagnostic::run(
-                        &root, &cleanup,
-                    ),
-                );
-                memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
-            }
-        }
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        Some(TopLevel::ConsumerReadinessNativeComponents(arguments)) => {
-            let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
-                memcordon_ci::release::original_native_components::run(&root, &arguments),
-            );
-            if arguments.cleanup {
-                operation.into_result()
-            } else {
-                let mut cleanup = arguments;
-                cleanup.cleanup = true;
-                let cleanup = memcordon_ci::work_outcome::WorkOutcome::from_result(
-                    memcordon_ci::release::original_native_components::run(&root, &cleanup),
-                );
-                memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
-            }
-        }
-        Some(TopLevel::ConsumerReadinessCell(arguments)) => {
-            let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
-                memcordon_ci::release::consumer_readiness_cell::execute(&root, &arguments),
-            );
-            let cleanup = memcordon_ci::work_outcome::WorkOutcome::from_result(
-                memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments),
-            );
-            memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
-        }
-        Some(TopLevel::ConsumerReadinessCleanup(arguments)) => {
-            memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments)
         }
         Some(TopLevel::Ci { command }) => match command {
             CiCommand::Workflows { check: _, write } => {
@@ -435,26 +377,22 @@ fn run() -> Result<()> {
             CiCommand::AggregateStress { input, destination } => {
                 memcordon_ci::performance_plan::aggregate_stress(&root, &input, &destination)
             }
-            CiCommand::AggregateMacos { input, destination } => {
-                memcordon_ci::macos_performance::aggregate(&root, &input, &destination)
-            }
         },
         Some(TopLevel::Release { mut command }) => {
             if matches!(
                 &command,
                 memcordon_ci::release::ReleaseCommand::CompileTarget { .. }
                     | memcordon_ci::release::ReleaseCommand::ValidatePackage { .. }
-                    | memcordon_ci::release::ReleaseCommand::NativeCoverageShard { .. }
             ) {
                 ci_segments::native::run(&root, command)
             } else if let memcordon_ci::release::ReleaseCommand::BuildTarget {
-                consumer_readiness,
+                runtime_components,
                 failure_mode,
                 ..
             } = &mut command
             {
-                let recipe = if *consumer_readiness {
-                    Suite::ReleaseReadiness
+                let recipe = if *runtime_components {
+                    Suite::ReleaseRuntime
                 } else {
                     Suite::ReleaseBuild
                 };
@@ -502,8 +440,41 @@ fn run() -> Result<()> {
         }
         Some(TopLevel::Suite {
             suite,
+            index,
+            count,
+            profile,
             failure_mode,
-        }) => suites::run(&root, suite, suites::SuiteOptions { failure_mode }),
+        }) => {
+            if matches!(suite, Suite::NativeShard) {
+                let session = memcordon_ci::segment_cache::Session::begin_selected(
+                    &root,
+                    ci_segments::scopes(suite),
+                    ci_segments::family(suite),
+                    false,
+                )?;
+                session.execute(&root, || {
+                    memcordon_ci::release::native_coverage_owner::run_shard(
+                        &root,
+                        index.ok_or_else(|| {
+                            CiError::Message("native-shard requires --index".into())
+                        })?,
+                        count.ok_or_else(|| {
+                            CiError::Message("native-shard requires --count".into())
+                        })?,
+                        profile.as_deref().ok_or_else(|| {
+                            CiError::Message("native-shard requires --profile".into())
+                        })?,
+                        failure_mode,
+                    )
+                })
+            } else if index.is_some() || count.is_some() || profile.is_some() {
+                Err(CiError::Message(
+                    "shard options require native-shard".into(),
+                ))
+            } else {
+                suites::run(&root, suite, suites::SuiteOptions { failure_mode })
+            }
+        }
         None => Err(CiError::Message(
             "exactly one CI command is required".to_owned(),
         )),
@@ -527,17 +498,6 @@ fn main() {
         }
     }
     let result = run();
-    #[cfg(windows)]
-    let result = match (
-        result,
-        memcordon_ci::windows_consumer_readiness::observe_transferred_helper_wait_cleanup(),
-    ) {
-        (Err(original), Err(cleanup)) => Err(CiError::Message(format!(
-            "{original}; isolated diagnostic cleanup={cleanup}"
-        ))),
-        (Err(original), _) => Err(original),
-        (Ok(()), cleanup) => cleanup.map_err(CiError::Io),
-    };
     if let Err(error) = result {
         eprintln!("memcordon-ci: {error}");
         let mut source = std::error::Error::source(&error);

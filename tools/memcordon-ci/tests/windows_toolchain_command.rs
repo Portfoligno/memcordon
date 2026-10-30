@@ -18,7 +18,7 @@ fn input(target: &str) -> Toolchain {
         [rustc.clone(), linker.clone()].into_iter().map(|path| {
             (
                 path,
-                memcordon_readiness_verifier::sha256(b"frozen selected-image fixture"),
+                memcordon_ci::windows_causal_acceptance::sha256(b"frozen selected-image fixture"),
             )
         }),
     )

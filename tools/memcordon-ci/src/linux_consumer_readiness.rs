@@ -367,8 +367,8 @@ impl HeldLinuxProcess {
 
     pub fn retirement_identity(
         &self,
-    ) -> Result<memcordon_readiness_verifier::HeldProcessIdentity, String> {
-        Ok(memcordon_readiness_verifier::HeldProcessIdentity {
+    ) -> Result<crate::release::linux_recovery_owners::HeldProcessIdentity, String> {
+        Ok(crate::release::linux_recovery_owners::HeldProcessIdentity {
             pid: self.process_id,
             birth: self.birth,
             parent_pid: self.observed_parent.map(|parent| parent.0),

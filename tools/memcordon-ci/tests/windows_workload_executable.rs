@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
-use memcordon_ci::windows_readiness_adapter::{
-    copy_compiler_artifact, hold_artifact, prepare_workload_executable, verify_named_artifact,
+use memcordon_ci::windows_native_files::{
+    copy_compiler_artifact, hold_artifact, verify_named_artifact,
 };
 use std::{fs, os::windows::io::AsRawHandle, path::Path};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -41,14 +41,13 @@ fn workload_preparation_materializes_cargo_alias_into_independent_held_executabl
     assert_eq!(identity(&alias), before);
     assert!(hold_artifact(&source, None, 128 * 1024 * 1024).is_err());
 
-    let report = reports.join("result.json");
+    let executable = reports.join("result.exe");
     let expected = memcordon_ci::windows_causal_acceptance::sha256(bytes);
-    let wrong_report = reports.join("wrong-source.json");
+    let wrong_report = reports.join("wrong-source.exe");
     let foreign_digest = memcordon_ci::windows_causal_acceptance::sha256(b"foreign bytes");
-    assert!(prepare_workload_executable(&source, &foreign_digest, &wrong_report).is_err());
-    assert!(!wrong_report.with_extension("workload-lab.exe").exists());
-    let (executable, held) = prepare_workload_executable(&source, &expected, &report).unwrap();
-    assert_eq!(executable, report.with_extension("workload-lab.exe"));
+    assert!(copy_compiler_artifact(&source, &build, &wrong_report, &foreign_digest).is_err());
+    assert!(!wrong_report.exists());
+    let held = copy_compiler_artifact(&source, &build, &executable, &expected).unwrap();
     assert!(!executable.starts_with(&build));
     assert_eq!(executable.parent(), Some(reports.as_path()));
     let copied = identity(&executable);
@@ -66,7 +65,7 @@ fn workload_preparation_materializes_cargo_alias_into_independent_held_executabl
     assert_eq!(fs::read(&alias).unwrap(), bytes);
     assert!(hold_artifact(&source, None, 128 * 1024 * 1024).is_err());
 
-    assert!(prepare_workload_executable(&source, &expected, &report).is_err());
+    assert!(copy_compiler_artifact(&source, &build, &executable, &expected).is_err());
     verify_named_artifact(&held, &executable).unwrap();
     let wrong = reports.join("wrong-digest.exe");
     let foreign_digest = memcordon_ci::windows_causal_acceptance::sha256(b"foreign bytes");
@@ -87,13 +86,13 @@ fn oversized_compiler_output_is_rejected_before_publication() {
     fs::create_dir(&reports).unwrap();
     let source = release.join("memcordon-windows-loader-lab.exe");
     let file = fs::File::create(&source).unwrap();
-    let oversized = 128 * 1024 * 1024 + 1;
+    let oversized = 512 * 1024 * 1024 + 1;
     file.set_len(oversized).unwrap();
     assert_eq!(file.metadata().unwrap().len(), oversized);
     drop(file);
-    let report = reports.join("result.json");
+    let report = reports.join("result.exe");
     let expected = memcordon_ci::windows_causal_acceptance::sha256(b"selected bounded source");
-    assert!(prepare_workload_executable(&source, &expected, &report).is_err());
-    assert!(!report.with_extension("workload-lab.exe").exists());
+    assert!(copy_compiler_artifact(&source, &build, &report, &expected).is_err());
+    assert!(!report.exists());
     assert_eq!(fs::metadata(&source).unwrap().len(), oversized);
 }

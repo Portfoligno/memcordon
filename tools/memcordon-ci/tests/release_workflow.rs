@@ -26,58 +26,6 @@ fn unique_step(steps: &[Value], role: &str, predicate: impl Fn(&Value) -> bool) 
 }
 
 #[test]
-fn assessed_producers_use_one_exact_matrix_derived_job_name() {
-    let workflow: Value =
-        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
-    check(&workflow).unwrap();
-    for producer in [
-        "native-linux-x64",
-        "candidate-linux-x64-native",
-        "public-linux-x64-native",
-    ] {
-        for mutation in [
-            "missing-name",
-            "static-name",
-            "other-expression",
-            "wrong-producer",
-            "duplicate-row",
-            "additional-axis",
-        ] {
-            let mut changed = workflow.clone();
-            let job = &mut changed["jobs"][producer];
-            match mutation {
-                "missing-name" => {
-                    job.as_mapping_mut()
-                        .unwrap()
-                        .remove(Value::String("name".into()));
-                }
-                "static-name" => job["name"] = producer.into(),
-                "other-expression" => job["name"] = "${{ matrix.target }}".into(),
-                "wrong-producer" => {
-                    job["strategy"]["matrix"]["include"][0]["producer-job"] =
-                        "unrelated-producer".into();
-                }
-                "duplicate-row" => {
-                    let rows = job["strategy"]["matrix"]["include"]
-                        .as_sequence_mut()
-                        .unwrap();
-                    rows.push(rows[0].clone());
-                }
-                "additional-axis" => {
-                    job["strategy"]["matrix"]["extra"] =
-                        serde_yaml::from_str("[first, second]").unwrap();
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                check(&changed).is_err(),
-                "{producer} accepted {mutation} in assessed job identity"
-            );
-        }
-    }
-}
-
-#[test]
 fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_source() {
     let workflow: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
@@ -88,7 +36,7 @@ fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_sou
     let assembly = unique_step(steps, "early assembly", |step| {
         step["run"].as_str()
             == Some(
-                "./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness --destination .release/assembled",
+                "./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --runtime-components --destination .release/assembled",
             )
     });
     let stable = memcordon_ci::config::toolchains(&root()).unwrap().stable;
@@ -183,37 +131,29 @@ fn windows_release_jobs_configure_lf_before_checkout() {
 }
 
 #[test]
-fn public_readiness_owners_cannot_drop_cleanup_or_rewrite_original_publication_dependencies() {
-    let workflow: Value =
+fn public_installed_jobs_require_local_tests_and_the_selected_writer() {
+    let baseline: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
-    check(&workflow).unwrap();
-    let mut missing = workflow.clone();
-    missing["jobs"]
-        .as_mapping_mut()
-        .unwrap()
-        .remove(Value::String("public-linux-arm64-cargo".into()));
-    assert!(check(&missing).is_err());
-    let mut skipped = workflow.clone();
-    let steps = skipped["jobs"]["public-windows-x64-native"]["steps"]
-        .as_sequence_mut()
-        .unwrap();
-    let cleanup = unique_step(steps, "required public Windows cleanup", |step| {
-        step["id"].as_str() == Some("readiness-cleanup")
-    });
-    assert_eq!(
-        steps[cleanup]["run"].as_str(),
-        Some(
-            "./target/ci-driver-cold/release/consumer-readiness.exe cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell"
-        )
-    );
-    steps[cleanup]["if"] = Value::String("success()".into());
-    assert!(check(&skipped).is_err());
-    let mut fresh_candidate = workflow.clone();
-    fresh_candidate["jobs"]["public-linux-x64-native"]["needs"]
-        .as_sequence_mut()
-        .unwrap()
-        .push(Value::String("candidate-linux-x64-native".into()));
-    assert!(check(&fresh_candidate).is_err());
+    check(&baseline).unwrap();
+    for job in ["public-linux-x64-native", "public-windows-arm64-cargo"] {
+        let mut changed = baseline.clone();
+        let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+        let test = unique_step(steps, "direct installed test", |step| {
+            step["id"] == "installed-test"
+        });
+        assert!(
+            steps[test]["run"]
+                .as_str()
+                .unwrap()
+                .contains(" release test-installed --delivery public-")
+        );
+        assert!(steps[test]["continue-on-error"].is_null());
+        steps[test]["continue-on-error"] = true.into();
+        assert!(check(&changed).is_err());
+        let mut changed = baseline.clone();
+        changed["jobs"][job]["if"] = "always()".into();
+        assert!(check(&changed).is_err());
+    }
 }
 
 #[test]
@@ -239,81 +179,26 @@ fn release_quality_installs_required_components_before_running_the_suite() {
 }
 
 #[test]
-fn original_native_component_jobs_preserve_execution_cleanup_and_immutable_upload() {
-    let original: Value =
+fn source_component_failures_are_required_local_job_failures() {
+    let baseline: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
-    check(&original).unwrap();
+    check(&baseline).unwrap();
     for job in [
         "native-linux-x64",
         "native-linux-arm64",
         "native-windows-x64",
         "native-windows-arm64",
     ] {
-        for mutation in 0..7 {
-            let mut changed = original.clone();
-            let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
-            match mutation {
-                0 => {
-                    let position = steps
-                        .iter()
-                        .position(|step| step["id"].as_str() == Some("native_readiness"))
-                        .unwrap();
-                    steps.remove(position);
-                }
-                1 => {
-                    let cleanup = steps
-                        .iter_mut()
-                        .find(|step| step["id"].as_str() == Some("native_readiness_cleanup"))
-                        .unwrap();
-                    cleanup["if"] = Value::String("success()".into());
-                }
-                2 => {
-                    let upload = steps
-                        .iter_mut()
-                        .find(|step| {
-                            step["with"]["path"].as_str() == Some(".release/native-readiness")
-                        })
-                        .unwrap();
-                    upload["with"]["overwrite"] = Value::Bool(true);
-                }
-                3 | 4 => {
-                    let cleanup = steps
-                        .iter_mut()
-                        .find(|step| step["id"].as_str() == Some("native_readiness_cleanup"))
-                        .unwrap();
-                    cleanup["if"] = if mutation == 3 {
-                        "always() && (runner.os == 'Linux' || runner.os == 'Windows')".into()
-                    } else {
-                        cleanup["if"]
-                            .as_str()
-                            .unwrap()
-                            .replace(" || steps.native_readiness.outcome == 'cancelled'", "")
-                            .into()
-                    };
-                }
-                _ => {
-                    let upload = steps
-                        .iter_mut()
-                        .find(|step| {
-                            step["with"]["path"].as_str() == Some(".release/native-readiness")
-                        })
-                        .unwrap();
-                    upload["if"] = if mutation == 5 {
-                        "always() && (runner.os == 'Linux' || runner.os == 'Windows')".into()
-                    } else {
-                        upload["if"]
-                            .as_str()
-                            .unwrap()
-                            .replace(" || steps.native_readiness.outcome == 'cancelled'", "")
-                            .into()
-                    };
-                }
-            }
-            assert!(
-                check(&changed).is_err(),
-                "{job} original producer mutation {mutation}"
-            );
-        }
+        let mut changed = baseline.clone();
+        let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+        let test = unique_step(steps, "native components", |step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|command| command.contains(" release test-components "))
+        });
+        assert!(steps[test]["continue-on-error"].is_null());
+        steps[test]["continue-on-error"] = true.into();
+        assert!(check(&changed).is_err());
     }
 }
 
@@ -339,12 +224,12 @@ fn release_graph_retains_six_native_consumers_and_isolated_publisher() {
     let steps = skip["jobs"]["candidate-linux-x64-native"]["steps"]
         .as_sequence_mut()
         .unwrap();
-    let readiness = unique_step(steps, "selected required readiness", |step| {
-        step["id"] == "readiness"
+    let readiness = unique_step(steps, "selected installed test", |step| {
+        step["id"] == "installed-test"
     });
     assert_eq!(
         steps[readiness]["run"],
-        "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell"
+        "./target/ci-runtime/current/memcordon-ci release test-installed --delivery candidate-native --target .release/target --packages .release/packages --diagnostics target/ci/reports/installed"
     );
     assert!(steps[readiness]["continue-on-error"].is_null());
     steps[readiness]["continue-on-error"] = Value::Bool(true);
@@ -408,11 +293,11 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
         match case {
             "serialproducer" => {
                 changed["jobs"]["native-linux-x64"]["needs"] =
-                    serde_yaml::from_str("[select, readiness-tools-linux-x64, packages]").unwrap()
+                    serde_yaml::from_str("[select, test-tools-linux-x64, packages]").unwrap()
             }
             "wrongtarget" => {
                 changed["jobs"]["candidate-linux-x64-native"]["needs"] = serde_yaml::from_str(
-                    "[select, packages, readiness-tools-linux-x64, native-linux-arm64]",
+                    "[select, packages, test-tools-linux-x64, native-linux-arm64]",
                 )
                 .unwrap()
             }
@@ -441,7 +326,7 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
         assert_eq!(matrix[0]["native-job"], format!("native-{target}"));
         let steps = baseline["jobs"][job]["steps"].as_sequence().unwrap();
         let selected = unique_step(steps, "selected installed channel", |step| {
-            step["id"].as_str() == Some(channel)
+            step["id"].as_str() == Some("installed-test")
         });
         assert!(steps[selected]["continue-on-error"].is_null());
         let mut optional = baseline.clone();

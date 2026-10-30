@@ -1,5 +1,5 @@
+use memcordon_ci::release::linux_recovery_owners::HeldProcessIdentity;
 use memcordon_ci::release::linux_recovery_owners::{Owners, await_retirement};
-use memcordon_readiness_verifier::HeldProcessIdentity;
 use std::time::{Duration, Instant};
 
 fn owners(frontend_retired: bool, worker_retired: bool) -> Owners {

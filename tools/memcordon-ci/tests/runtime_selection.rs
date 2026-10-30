@@ -14,7 +14,7 @@ fn readiness_profile_is_explicit_and_keeps_ordinary_macos_selection() {
             .iter()
             .all(|target| target.runtime_selection().unwrap() == RuntimeSelection::CliOnly)
     );
-    let selected = ordinary.clone().consumer_readiness().unwrap();
+    let selected = ordinary.clone().with_runtime_components().unwrap();
     assert_eq!(
         ordinary
             .targets

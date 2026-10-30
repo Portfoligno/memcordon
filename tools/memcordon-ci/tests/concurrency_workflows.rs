@@ -9,7 +9,7 @@ fn readiness_download_retry_is_terminal_and_stays_within_six_minutes() {
         .unwrap();
     let first = steps
         .iter()
-        .position(|step| step["id"].as_str() == Some("readiness-tools-download"))
+        .position(|step| step["id"].as_str() == Some("test-tools-download"))
         .unwrap();
     let initial = &steps[first];
     let retry = &steps[first + 1];
@@ -21,9 +21,9 @@ fn readiness_download_retry_is_terminal_and_stays_within_six_minutes() {
     assert!(retry["continue-on-error"].is_null());
     assert_eq!(
         retry["if"].as_str(),
-        Some("!cancelled() && steps.readiness-tools-download.outcome == 'failure'")
+        Some("!cancelled() && steps.test-tools-download.outcome == 'failure'")
     );
-    assert_eq!(extract["id"].as_str(), Some("readiness-tools-extract"));
+    assert_eq!(extract["id"].as_str(), Some("test-tools-extract"));
     assert!(extract["if"].is_null());
     // Model the emitted outcome guard and default success gate, including the
     // first step's masked conclusion. A log line or existing file is no input.
@@ -55,8 +55,7 @@ fn readiness_download_retry_is_terminal_and_stays_within_six_minutes() {
                 3 => steps[first + 1]["timeout-minutes"] = Value::from(4),
                 4 => {
                     steps[first + 1]["if"] = Value::String(
-                        "!cancelled() && steps.readiness-tools-download.conclusion == 'failure'"
-                            .into(),
+                        "!cancelled() && steps.test-tools-download.conclusion == 'failure'".into(),
                     )
                 }
                 5 => steps[first + 1]["with"]["artifact-ids"] = Value::String("other".into()),
@@ -177,7 +176,7 @@ fn actual_release_yaml_requires_same_host_helper_and_native_success() {
         "windows-x64",
         "windows-arm64",
     ] {
-        let prep = format!("readiness-tools-{host}");
+        let prep = format!("test-tools-{host}");
         let native = format!("native-{host}");
         rejects(workflow.clone(), |v| {
             v["jobs"]
@@ -194,7 +193,7 @@ fn actual_release_yaml_requires_same_host_helper_and_native_success() {
         let steps = workflow["jobs"][&native]["steps"].as_sequence().unwrap();
         let download = steps
             .iter()
-            .position(|step| step["id"].as_str() == Some("readiness-tools-download"))
+            .position(|step| step["id"].as_str() == Some("test-tools-download"))
             .unwrap();
         rejects(workflow.clone(), |v| {
             v["jobs"][&native]["steps"][download]["with"]["artifact-ids"] =
@@ -202,7 +201,7 @@ fn actual_release_yaml_requires_same_host_helper_and_native_success() {
         });
         let check = steps
             .iter()
-            .position(|step| step["id"].as_str() == Some("readiness-tools-check"))
+            .position(|step| step["id"].as_str() == Some("test-tools-check"))
             .unwrap();
         rejects(workflow.clone(), |v| {
             v["jobs"][&native]["steps"][check]["continue-on-error"] = Value::Bool(true);

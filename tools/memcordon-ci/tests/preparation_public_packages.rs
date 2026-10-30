@@ -24,7 +24,7 @@ fn fixture() -> &'static (cargo_metadata::Metadata, Distribution, semver::Versio
 fn actual_distribution_and_readiness_inventory_accept_independent_valid_orders() {
     let (metadata, distribution, version) = fixture();
     validate_public_package_inventory(metadata, version, &distribution.packages).unwrap();
-    let readiness = distribution.clone().consumer_readiness().unwrap();
+    let readiness = distribution.clone().with_runtime_components().unwrap();
     validate_public_package_inventory(metadata, version, &readiness.packages).unwrap();
     let derived = source::public_order(metadata, version).unwrap();
     validate_public_package_inventory(metadata, version, &derived).unwrap();

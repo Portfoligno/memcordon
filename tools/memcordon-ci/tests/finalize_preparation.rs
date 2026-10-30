@@ -109,7 +109,7 @@ fn fixture_profile(root: &Path, candidate: bool, readiness: bool) -> (PathBuf, P
     .unwrap();
     let distribution = Distribution::read(root).unwrap();
     let distribution = if readiness {
-        distribution.consumer_readiness().unwrap()
+        distribution.with_runtime_components().unwrap()
     } else {
         distribution
     };

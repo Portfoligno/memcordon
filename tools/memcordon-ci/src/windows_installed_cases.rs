@@ -278,53 +278,6 @@ pub struct SelectedArtifact {
     pub sha256: String,
 }
 
-/// Independently measured diagnostic code, never a production runtime component.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkloadDiagnosticInput {
-    pub source: crate::release::source::BuildSourceIdentity,
-    pub target: String,
-    pub executable: SelectedArtifact,
-    pub byte_len: u64,
-}
-
-impl WorkloadDiagnosticInput {
-    pub fn validate_for(
-        &self,
-        source: &crate::release::source::BuildSourceIdentity,
-        target: &str,
-    ) -> Result<()> {
-        use crate::release::{artifacts, target as native};
-        self.source.validate()?;
-        if &self.source != source
-            || self.target != target
-            || !target.ends_with("-pc-windows-msvc")
-            || !self.executable.path.is_absolute()
-            || self
-                .executable
-                .path
-                .file_name()
-                .is_none_or(|name| name != "memcordon-windows-loader-lab.exe")
-            || self.byte_len == 0
-            || self.byte_len > 128 * 1024 * 1024
-            || std::fs::metadata(&self.executable.path)?.len() != self.byte_len
-        {
-            return Err(CiError::Message(
-                "qualified workload diagnostic source, target, role or length differs".into(),
-            ));
-        }
-        let bytes = artifacts::read_file(&self.executable.path)?;
-        if bytes.len() as u64 != self.byte_len
-            || artifacts::checksum(&bytes) != self.executable.sha256
-        {
-            return Err(CiError::Message(
-                "qualified workload diagnostic bytes changed".into(),
-            ));
-        }
-        native::validate_executable(&bytes, target)
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledWindowsPayload {
@@ -338,8 +291,6 @@ pub struct InstalledWindowsPayload {
     pub components: Vec<SelectedArtifact>,
     pub installed_components: Vec<SelectedArtifact>,
     pub fixture: SelectedArtifact,
-    #[serde(default)]
-    pub workload_diagnostic: Option<WorkloadDiagnosticInput>,
     pub installed_agent: SelectedArtifact,
     pub installed_manifest: SelectedArtifact,
     pub provider: memcordon_core::PublicProviderBindingV1,
@@ -371,6 +322,31 @@ pub struct WindowsLeaseDeadlines {
 }
 
 impl WindowsLeaseDeadlines {
+    pub fn new(work: std::time::Instant, cleanup: std::time::Instant) -> Result<Self> {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| CiError::Message("Windows clock precedes Unix epoch".into()))?;
+        let sampled = std::time::Instant::now();
+        if work <= sampled || cleanup <= work {
+            return Err(CiError::Message(
+                "Windows operation requires remaining work and reserved cleanup time".into(),
+            ));
+        }
+        let wall = u64::try_from(wall.as_millis())
+            .map_err(|_| CiError::Message("Windows clock overflow".into()))?;
+        let project = |deadline: std::time::Instant| -> Result<u64> {
+            let remaining = u64::try_from(deadline.duration_since(sampled).as_millis())
+                .map_err(|_| CiError::Message("Windows remaining deadline overflow".into()))?;
+            wall.checked_add(remaining)
+                .ok_or_else(|| CiError::Message("Windows deadline overflow".into()))
+        };
+        Ok(Self {
+            work,
+            cleanup,
+            work_deadline_unix_millis: project(work)?,
+            cleanup_deadline_unix_millis: project(cleanup)?,
+        })
+    }
     /// Clamp a native work operation to the original cutoff. Exhaustion is an
     /// error before spawning; no retry receives a renewed operation budget.
     pub fn work_budget(self, maximum: std::time::Duration) -> Result<std::time::Duration> {
@@ -397,6 +373,7 @@ impl WindowsLeaseDeadlines {
         }
         Ok(remaining)
     }
+    #[cfg(windows)]
     pub(crate) fn finite_default() -> Self {
         let start = std::time::Instant::now();
         let unix = u64::try_from(
@@ -509,7 +486,6 @@ impl InstalledWindowsPayload {
         artifacts: Vec<SelectedArtifact>,
         payload_directory: &std::path::Path,
         fixture: SelectedArtifact,
-        workload_diagnostic: Option<WorkloadDiagnosticInput>,
         installed_directory: &std::path::Path,
         output_directory: PathBuf,
     ) -> Result<Self> {
@@ -517,9 +493,6 @@ impl InstalledWindowsPayload {
         use memcordon_core::runtime_components::RuntimeComponentRole;
         source.validate()?;
         distribution.validate()?;
-        if let Some(diagnostic) = &workload_diagnostic {
-            diagnostic.validate_for(source, &distribution.target)?;
-        }
         if !distribution.target.ends_with("-pc-windows-msvc")
             || !distribution
                 .features
@@ -675,27 +648,9 @@ impl InstalledWindowsPayload {
             components,
             installed_components,
             fixture,
-            workload_diagnostic,
             provider: manifest_provider,
             output_directory,
         })
-    }
-
-    pub fn require_workload_diagnostic(&self) -> Result<&WorkloadDiagnosticInput> {
-        let diagnostic = self.workload_diagnostic.as_ref().ok_or_else(|| {
-            CiError::Message(
-                "current Windows payload lacks its qualified workload diagnostic".into(),
-            )
-        })?;
-        if diagnostic.source.commit() != self.source_commit
-            || diagnostic.source.version().to_string() != self.version
-        {
-            return Err(CiError::Message(
-                "workload diagnostic differs from selected installed source".into(),
-            ));
-        }
-        diagnostic.validate_for(&diagnostic.source, &self.target)?;
-        Ok(diagnostic)
     }
 }
 
@@ -955,6 +910,163 @@ mod native {
             &config.installed_agent.sha256,
             &config.installed_manifest.sha256,
         )
+    }
+
+    #[allow(unsafe_code)] // Query fixed package service names; every SCM handle is scoped.
+    fn require_removed(config: &InstalledWindowsPayload) -> Result<()> {
+        use windows_sys::Win32::{
+            Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, GetLastError},
+            System::Services::{
+                CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT,
+                SERVICE_QUERY_STATUS,
+            },
+        };
+        struct ServiceHandle(SC_HANDLE);
+        impl Drop for ServiceHandle {
+            fn drop(&mut self) {
+                unsafe {
+                    CloseServiceHandle(self.0);
+                }
+            }
+        }
+        let raw = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let manager = ServiceHandle(raw);
+        let names = [
+            memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
+            memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
+            memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(crate::windows_owned_guardian::guardian_slot_names());
+        for name in names {
+            let encoded: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let raw = unsafe { OpenServiceW(manager.0, encoded.as_ptr(), SERVICE_QUERY_STATUS) };
+            if !raw.is_null() {
+                let _owned = ServiceHandle(raw);
+                return Err(CiError::Message(format!(
+                    "owned package service remains: {name}"
+                )));
+            }
+            let error = unsafe { GetLastError() };
+            if error != ERROR_SERVICE_DOES_NOT_EXIST {
+                return Err(std::io::Error::from_raw_os_error(error as i32).into());
+            }
+        }
+        for artifact in config
+            .installed_components
+            .iter()
+            .chain([&config.installed_manifest])
+        {
+            match fs::symlink_metadata(&artifact.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(CiError::Message(
+                        "owned package path remains or host is occupied".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn run_components_from_source_until(
+        root: &Path,
+        config: &InstalledWindowsPayload,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> Result<()> {
+        verify_selected(config)?;
+        require_removed(config)?;
+        let parent = config
+            .installed_agent
+            .path
+            .parent()
+            .ok_or_else(|| CiError::Message("installed package parent absent".into()))?;
+        if parent.try_exists()? && fs::read_dir(parent)?.next().transpose()?.is_some() {
+            return Err(CiError::Message(
+                "source component tests refuse an occupied installation directory".into(),
+            ));
+        }
+        fs::create_dir_all(&config.output_directory)?;
+        let mut started = false;
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            started = true;
+            package(config, "install", deadlines.work).map_err(CiError::Message)?;
+            package(config, "verify", deadlines.work).map_err(CiError::Message)?;
+            drop(quiescent(config)?);
+            crate::windows_consumer_readiness::provision_from_source_until(
+                root,
+                config,
+                deadlines.work,
+            )?;
+            crate::windows_readiness_components::run_installed_until(
+                config,
+                &config.output_directory.join("windows-readiness-input.json"),
+                deadlines,
+            )
+        }));
+        let _retirement = crate::cancellation::retirement_scope(deadlines.cleanup);
+        let mut cleanup_errors = Vec::new();
+        let mut processes = Vec::new();
+        if started {
+            for component in &config.installed_components {
+                match component.path.try_exists() {
+                    Ok(true) => match memcordon_testkit::windows_processes_for_image_until(
+                        &component.path,
+                        deadlines.cleanup,
+                    ) {
+                        Ok(held) => processes.extend(held),
+                        Err(error) => cleanup_errors.push(error.to_string()),
+                    },
+                    Ok(false) => {}
+                    Err(error) => cleanup_errors.push(error.to_string()),
+                }
+            }
+            if let Err(error) = crate::windows_consumer_readiness::cleanup_provider_probe(config) {
+                cleanup_errors.push(error.to_string());
+            }
+            if let Err(error) = recover_retained_state(config, deadlines) {
+                cleanup_errors.push(error);
+            }
+            if let Err(error) = package(config, "uninstall", deadlines.cleanup) {
+                cleanup_errors.push(error);
+            }
+            for process in processes {
+                match process.has_exited() {
+                    Ok(true) => {}
+                    Ok(false) => cleanup_errors
+                        .push("owned installed-image process remains live after removal".into()),
+                    Err(error) => cleanup_errors.push(error.to_string()),
+                }
+            }
+            if let Err(error) = require_removed(config) {
+                cleanup_errors.push(error.to_string());
+            }
+        }
+        let cleanup = if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CiError::Message(cleanup_errors.join("; ")))
+        };
+        match operation {
+            Err(payload) => {
+                if let Err(error) = cleanup {
+                    eprintln!("component panic cleanup also failed: {error}");
+                }
+                std::panic::resume_unwind(payload)
+            }
+            Ok(Err(primary)) => match cleanup {
+                Ok(()) => Err(primary),
+                Err(error) => Err(CiError::Message(format!(
+                    "{primary}; owned cleanup: {error}"
+                ))),
+            },
+            Ok(Ok(())) => cleanup,
+        }
     }
 
     fn public_command(
@@ -1563,141 +1675,151 @@ mod native {
         let mut fresh = config.clone();
         fresh.output_directory = config.output_directory.join("selected-fresh-lifetime");
         fs::create_dir(&fresh.output_directory)?;
-        let operation = (|| -> std::result::Result<(), String> {
-            observer(lease_event(
-                WindowsLeasePhase::BeforeFreshInstall,
-                &fresh,
-                Some("install"),
-                None,
-            ))
-            .map_err(|error| error.to_string())?;
-            fresh_install_started = true;
-            let installed = package(&fresh, "install", deadlines.work);
-            observer(lease_event(
-                WindowsLeasePhase::AfterFreshInstall,
-                &fresh,
-                Some("install"),
-                Some(&installed),
-            ))
-            .map_err(|error| error.to_string())?;
-            installed?;
-            let verified = package(&fresh, "verify", deadlines.work);
-            observer(lease_event(
-                WindowsLeasePhase::AfterFreshVerify,
-                &fresh,
-                Some("verify"),
-                Some(&verified),
-            ))
-            .map_err(|error| error.to_string())?;
-            verified?;
-            verify_file(&fresh.installed_manifest).map_err(|error| error.to_string())?;
-            for component in &fresh.installed_components {
-                verify_file(component).map_err(|error| error.to_string())?;
-            }
-            drop(quiescent(&fresh).map_err(|error| error.to_string())?);
-            observer(lease_event(
-                WindowsLeasePhase::BeforeCurrentUpgrade,
-                config,
-                Some("upgrade"),
-                None,
-            ))
-            .map_err(|error| error.to_string())?;
-            current_upgrade_started = true;
-            assessment.package_upgrade = package(config, "upgrade", deadlines.work);
-            observer(lease_event(
-                WindowsLeasePhase::AfterCurrentUpgrade,
-                config,
-                Some("upgrade"),
-                Some(&assessment.package_upgrade),
-            ))
-            .map_err(|error| error.to_string())?;
-            assessment.package_upgrade.clone()?;
-            let current_verify = package(config, "verify", deadlines.work);
-            observer(lease_event(
-                WindowsLeasePhase::AfterCurrentVerify,
-                config,
-                Some("verify"),
-                Some(&current_verify),
-            ))
-            .map_err(|error| error.to_string())?;
-            current_verify?;
-            current_controls::run(config, deadlines).map_err(|error| error.to_string())?;
-            verify_file(&config.installed_agent).map_err(|error| error.to_string())?;
-            verify_file(&config.installed_manifest).map_err(|error| error.to_string())?;
-            for component in &config.installed_components {
-                verify_file(component).map_err(|error| error.to_string())?;
-            }
-            drop(quiescent(config).map_err(|error| error.to_string())?);
-            if let Some(root) = source_root {
-                crate::windows_consumer_readiness::provision_from_source_until(
-                    root,
-                    config,
-                    deadlines.work,
-                )
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> std::result::Result<(), String> {
+                observer(lease_event(
+                    WindowsLeasePhase::BeforeFreshInstall,
+                    &fresh,
+                    Some("install"),
+                    None,
+                ))
                 .map_err(|error| error.to_string())?;
-            }
-            assessment.positive_suite =
-                crate::windows_consumer_readiness::run_installed_with_deadlines(
+                fresh_install_started = true;
+                let installed = package(&fresh, "install", deadlines.work);
+                observer(lease_event(
+                    WindowsLeasePhase::AfterFreshInstall,
+                    &fresh,
+                    Some("install"),
+                    Some(&installed),
+                ))
+                .map_err(|error| error.to_string())?;
+                installed?;
+                let verified = package(&fresh, "verify", deadlines.work);
+                observer(lease_event(
+                    WindowsLeasePhase::AfterFreshVerify,
+                    &fresh,
+                    Some("verify"),
+                    Some(&verified),
+                ))
+                .map_err(|error| error.to_string())?;
+                verified?;
+                verify_file(&fresh.installed_manifest).map_err(|error| error.to_string())?;
+                for component in &fresh.installed_components {
+                    verify_file(component).map_err(|error| error.to_string())?;
+                }
+                drop(quiescent(&fresh).map_err(|error| error.to_string())?);
+                observer(lease_event(
+                    WindowsLeasePhase::BeforeCurrentUpgrade,
+                    config,
+                    Some("upgrade"),
+                    None,
+                ))
+                .map_err(|error| error.to_string())?;
+                current_upgrade_started = true;
+                assessment.package_upgrade = package(config, "upgrade", deadlines.work);
+                observer(lease_event(
+                    WindowsLeasePhase::AfterCurrentUpgrade,
+                    config,
+                    Some("upgrade"),
+                    Some(&assessment.package_upgrade),
+                ))
+                .map_err(|error| error.to_string())?;
+                assessment.package_upgrade.clone()?;
+                let current_verify = package(config, "verify", deadlines.work);
+                observer(lease_event(
+                    WindowsLeasePhase::AfterCurrentVerify,
+                    config,
+                    Some("verify"),
+                    Some(&current_verify),
+                ))
+                .map_err(|error| error.to_string())?;
+                current_verify?;
+                current_controls::run(config, deadlines).map_err(|error| error.to_string())?;
+                verify_file(&config.installed_agent).map_err(|error| error.to_string())?;
+                verify_file(&config.installed_manifest).map_err(|error| error.to_string())?;
+                for component in &config.installed_components {
+                    verify_file(component).map_err(|error| error.to_string())?;
+                }
+                drop(quiescent(config).map_err(|error| error.to_string())?);
+                if let Some(root) = source_root {
+                    crate::windows_consumer_readiness::provision_from_source_until(
+                        root,
+                        config,
+                        deadlines.work,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                assessment.positive_suite =
+                    crate::windows_consumer_readiness::run_installed_with_deadlines(
+                        config,
+                        &config.output_directory.join("windows-readiness-input.json"),
+                        &mut assessment.positive_cases,
+                        deadlines,
+                    )
+                    .map_err(|error| error.to_string());
+                assessment.positive_suite.clone()?;
+                assessment.loss_suite = crate::windows_readiness_faults::run_until(
                     config,
                     &config.output_directory.join("windows-readiness-input.json"),
-                    &mut assessment.positive_cases,
+                    &mut assessment.loss_cases,
                     deadlines,
                 )
                 .map_err(|error| error.to_string());
-            assessment.positive_suite.clone()?;
-            assessment.loss_suite = crate::windows_readiness_faults::run_until(
-                config,
-                &config.output_directory.join("windows-readiness-input.json"),
-                &mut assessment.loss_cases,
-                deadlines,
-            )
-            .map_err(|error| error.to_string());
-            assessment.loss_suite.clone()?;
-            assessment.capacity_suite = crate::windows_readiness_capacity::run_until(
-                config,
-                &config.output_directory.join("windows-readiness-input.json"),
-                &mut assessment.capacity_cases,
-                deadlines.work,
-            )
-            .map_err(|error| error.to_string());
-            assessment.capacity_suite.clone()?;
-            assessment.refusal_suite = crate::windows_readiness_refusals::run_until(
-                config,
-                &config.output_directory.join("windows-readiness-input.json"),
-                &mut assessment.refusal_cases,
-                deadlines,
-            )
-            .map_err(|error| error.to_string());
-            assessment.refusal_suite.clone()?;
-            assessment.public_smoke_before = smoke(
-                config,
-                &config.output_directory.join("smoke-before.json"),
-                deadlines,
-            );
-            assessment.public_smoke_before.clone()?;
-            for case in [
-                InstalledCase::SamplingPopulation,
-                InstalledCase::GuardianLossAfterRelease,
-                InstalledCase::GuardianLossLifetime,
-            ] {
-                assessment.cases.push(run_case(config, case, deadlines));
-                let case = assessment.cases.last().expect("case was appended");
-                if case.workload_cleanup.is_err() {
-                    return Err("cannot establish fixture quiescence for later cases".to_owned());
+                assessment.loss_suite.clone()?;
+                assessment.capacity_suite = crate::windows_readiness_capacity::run_until(
+                    config,
+                    &config.output_directory.join("windows-readiness-input.json"),
+                    &mut assessment.capacity_cases,
+                    deadlines.work,
+                )
+                .map_err(|error| error.to_string());
+                assessment.capacity_suite.clone()?;
+                assessment.refusal_suite = crate::windows_readiness_refusals::run_until(
+                    config,
+                    &config.output_directory.join("windows-readiness-input.json"),
+                    &mut assessment.refusal_cases,
+                    deadlines,
+                )
+                .map_err(|error| error.to_string());
+                assessment.refusal_suite.clone()?;
+                assessment.public_smoke_before = smoke(
+                    config,
+                    &config.output_directory.join("smoke-before.json"),
+                    deadlines,
+                );
+                assessment.public_smoke_before.clone()?;
+                for case in [
+                    InstalledCase::SamplingPopulation,
+                    InstalledCase::GuardianLossAfterRelease,
+                    InstalledCase::GuardianLossLifetime,
+                ] {
+                    assessment.cases.push(run_case(config, case, deadlines));
+                    let case = assessment.cases.last().expect("case was appended");
+                    if case.workload_cleanup.is_err() {
+                        return Err(
+                            "cannot establish fixture quiescence for later cases".to_owned()
+                        );
+                    }
+                    drop(quiescent(config).map_err(|error| error.to_string())?);
+                    if case.behavior.is_err() || case.collection.is_err() {
+                        return Err(
+                            "required installed native case failed; stopping later cases"
+                                .to_owned(),
+                        );
+                    }
                 }
+                assessment.retained_state_recovery = recover_retained_state(config, deadlines);
+                assessment.retained_state_recovery.clone()?;
                 drop(quiescent(config).map_err(|error| error.to_string())?);
-            }
-            assessment.retained_state_recovery = recover_retained_state(config, deadlines);
-            assessment.retained_state_recovery.clone()?;
-            drop(quiescent(config).map_err(|error| error.to_string())?);
-            assessment.public_smoke_after = smoke(
-                config,
-                &config.output_directory.join("smoke-after.json"),
-                deadlines,
-            );
-            assessment.public_smoke_after.clone()?;
-            Ok(())
-        })();
+                assessment.public_smoke_after = smoke(
+                    config,
+                    &config.output_directory.join("smoke-after.json"),
+                    deadlines,
+                );
+                assessment.public_smoke_after.clone()?;
+                Ok(())
+            },
+        ));
         // Ordinary uninstall owns cleanup even if installation, collection or a
         // causal assertion failed; its success never rewrites the case behavior.
         let _retirement = crate::cancellation::retirement_scope(deadlines.cleanup);
@@ -1753,23 +1875,37 @@ mod native {
                 .clone()
                 .map_err(|reason| CleanupFailure { reason });
         }
+        let operation = match operation {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
         if let Err(error) = operation {
             if assessment.public_smoke_before.is_err() {
                 assessment.public_smoke_before = Err(error);
             }
         }
-        let bytes = serde_json::to_vec_pretty(&assessment)?;
-        if bytes.len() > acceptance::MAX_SUMMARY_BYTES {
-            return Err(CiError::Message(
-                "installed case assessment exceeds byte bound".to_owned(),
-            ));
+        match serde_json::to_vec_pretty(&assessment) {
+            Ok(bytes) if bytes.len() <= acceptance::MAX_SUMMARY_BYTES => {
+                if let Err(error) = fs::write(
+                    config.output_directory.join("installed-assessment.json"),
+                    bytes,
+                ) {
+                    eprintln!("optional installed-test diagnostics unavailable: {error}");
+                }
+            }
+            _ => eprintln!("optional installed-test diagnostics omitted: encoding or byte bound"),
         }
-        fs::write(
-            config.output_directory.join("installed-assessment.json"),
-            bytes,
-        )?;
         Ok(assessment)
     }
+}
+
+#[cfg(windows)]
+pub fn run_components_from_source_until(
+    root: &Path,
+    config: &InstalledWindowsPayload,
+    deadlines: WindowsLeaseDeadlines,
+) -> Result<()> {
+    native::run_components_from_source_until(root, config, deadlines)
 }
 
 #[cfg(windows)]

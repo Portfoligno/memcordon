@@ -19,7 +19,7 @@ fn selected(root: &Path) -> Result<TargetDistribution> {
         ));
     }
     distribution::Distribution::read(root)?
-        .consumer_readiness()?
+        .with_runtime_components()?
         .targets
         .into_iter()
         .find(|selection| selection.target == native)

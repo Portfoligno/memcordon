@@ -1,7 +1,15 @@
 //! The two original recovery owners must retire before orphan recovery starts.
-use memcordon_readiness_verifier::HeldProcessIdentity;
 use serde::Serialize;
 use std::time::Instant;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HeldProcessIdentity {
+    pub pid: u32,
+    pub birth: u64,
+    pub parent_pid: Option<u32>,
+    pub parent_birth: Option<u64>,
+    pub retirement_observed: bool,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Owners {

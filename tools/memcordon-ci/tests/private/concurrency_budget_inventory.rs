@@ -110,20 +110,6 @@ fn only_complete_static_matrix_rows_make_missing_properties_empty() {
 }
 
 #[test]
-fn installed_readiness_native_paths_share_the_actual_acquisition_clock() {
-    for executable in ["consumer-readiness", "consumer-readiness.exe"] {
-        let job: Value = serde_yaml::from_str(&format!("runs-on: windows-2025\nsteps:\n- run: ./target/{executable} acquire --identity selected\n  timeout-minutes: 160\n- run: ./target/{executable} cleanup --identity selected\n  timeout-minutes: 20\n")).unwrap();
-        assert_eq!(
-            job_budget_definition(&job)
-                .unwrap()
-                .timeout_minutes()
-                .unwrap(),
-            165
-        );
-    }
-}
-
-#[test]
 fn matrix_or_guards_and_unrecognized_conditions_never_omit_a_possible_step() {
     let job:Value=serde_yaml::from_str("runs-on: ubuntu-24.04\nstrategy:\n  matrix:\n    channel: [native, cargo]\nsteps:\n- run: native\n  if: matrix.channel == 'native'\n  timeout-minutes: 10\n- run: cargo\n  if: matrix.channel == 'cargo'\n  timeout-minutes: 30\n- run: either\n  if: matrix.channel == 'native' || matrix.channel == 'cargo'\n  timeout-minutes: 5\n- run: unknown\n  if: startsWith(github.ref, 'refs/heads/')\n  timeout-minutes: 1\n").unwrap();
     assert_eq!(
@@ -144,25 +130,4 @@ fn source_analysis_keeps_false_string_truthiness_and_unknown_statuses() {
     }
     let expression = crate::policy::cache_guard::parse("false").unwrap();
     assert!(budget_guard_value(&expression, &unknown).is_some_and(|value| !value.truthy()));
-}
-
-#[test]
-fn native_shared_clock_is_only_selected_for_real_split_and_actions_remain_additional() {
-    let job:Value=serde_yaml::from_str("runs-on: ubuntu-24.04\nsteps:\n- run: ./current release compile-target --build-source selected\n  timeout-minutes: 115\n- run: ./current release validate-package --build-source selected\n  timeout-minutes: 100\n- run: ./current consumer-readiness-native-components --identity selected\n  timeout-minutes: 155\n- uses: pinned-artifact-upload\n  timeout-minutes: 2\n").unwrap();
-    assert_eq!(
-        job_budget_definition(&job)
-            .unwrap()
-            .timeout_minutes()
-            .unwrap(),
-        172
-    );
-    let mut no_split = job.clone();
-    no_split["steps"].as_sequence_mut().unwrap().remove(0);
-    assert_eq!(
-        job_budget_definition(&no_split)
-            .unwrap()
-            .timeout_minutes()
-            .unwrap(),
-        262
-    );
 }

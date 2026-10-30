@@ -1,6 +1,6 @@
 //! Independent checks over actual YAML. No renderer equality or restored fact
 //! can supply a required work operation or native checkpoint here.
-use super::{adapters, text};
+use super::text;
 use crate::{CiError, Result};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -21,6 +21,349 @@ fn recipe(command: &str) -> Option<&str> {
     command.split_once(" ci segment ").map(|(_, recipe)| recipe)
 }
 
+fn dependencies(job: &Value) -> Vec<&str> {
+    match &job["needs"] {
+        Value::String(name) => vec![name],
+        Value::Sequence(names) => names.iter().filter_map(Value::as_str).collect(),
+        _ => vec![],
+    }
+}
+
+fn requires(document: &Value, owner: &str, predecessors: &[&str]) -> Result<()> {
+    let job = &document["jobs"][owner];
+    if !job.is_mapping()
+        || predecessors
+            .iter()
+            .any(|name| !dependencies(job).contains(name))
+    {
+        return Err(reject("required actual workflow dependency absent"));
+    }
+    Ok(())
+}
+
+fn operation<'a>(document: &'a Value, owner: &str, command: &str) -> Result<&'a Value> {
+    let steps = document["jobs"][owner]["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("required actual operation steps absent"))?;
+    let selected = steps
+        .iter()
+        .filter(|step| field(step, "run") == command)
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err(reject("required actual operation missing or duplicated"));
+    }
+    required(selected[0])?;
+    if !selected[0]["if"].is_null() {
+        return Err(reject(
+            "required direct test must execute unconditionally after setup",
+        ));
+    }
+    Ok(selected[0])
+}
+
+fn validate_current_graph(document: &Value) -> Result<()> {
+    let jobs = document["jobs"]
+        .as_mapping()
+        .ok_or_else(|| reject("workflow jobs absent"))?;
+    for (name, job) in jobs {
+        if job["strategy"]["matrix"].is_mapping()
+            && job["strategy"]["fail-fast"].as_bool() != Some(false)
+        {
+            return Err(reject("matrix peers must retain independent execution"));
+        }
+        for predecessor in dependencies(job) {
+            if !jobs.contains_key(text(predecessor)) || name.as_str() == Some(predecessor) {
+                return Err(reject("dangling workflow dependency"));
+            }
+        }
+        let steps = job["steps"]
+            .as_sequence()
+            .ok_or_else(|| reject("workflow steps absent"))?;
+        let ids = steps
+            .iter()
+            .filter_map(|step| step["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if ids.len() != steps.iter().filter(|step| step["id"].is_string()).count() {
+            return Err(reject("workflow step identifiers must be unique"));
+        }
+        for step in steps {
+            let run = field(step, "run");
+            if run.contains(" release compile-target ")
+                || run.contains(" release validate-package ")
+                || field(step, "id") == "test-tools-check"
+            {
+                required(step)?;
+                let expected_guard = if run.contains("memcordon-ci.exe") {
+                    "runner.os == 'Windows'"
+                } else {
+                    "runner.os != 'Windows'"
+                };
+                if if field(step, "id") == "test-tools-check" {
+                    !step["if"].is_null()
+                } else {
+                    !step["if"].is_null() && field(step, "if") != expected_guard
+                } {
+                    return Err(reject(
+                        "native validation must follow required setup success",
+                    ));
+                }
+            }
+        }
+        if let Some(index) = steps
+            .iter()
+            .position(|step| field(step, "id") == "test-tools-download")
+        {
+            let initial = &steps[index];
+            let retry = steps
+                .get(index + 1)
+                .ok_or_else(|| reject("native tools retry absent"))?;
+            let extract = steps
+                .get(index + 2)
+                .ok_or_else(|| reject("native tools extraction absent"))?;
+            if initial["timeout-minutes"].as_u64() != Some(3)
+                || retry["timeout-minutes"].as_u64() != Some(3)
+                || initial["continue-on-error"].as_bool() != Some(true)
+                || !retry["continue-on-error"].is_null()
+                || field(retry, "if")
+                    != "!cancelled() && steps.test-tools-download.outcome == 'failure'"
+                || initial["with"] != retry["with"]
+                || initial["uses"] != retry["uses"]
+                || field(extract, "id") != "test-tools-extract"
+                || !extract["if"].is_null()
+            {
+                return Err(reject(
+                    "native tools require one bounded terminal download retry",
+                ));
+            }
+            if let Some(host) = name.as_str().and_then(|name| name.strip_prefix("native-")) {
+                let host = host.split("-shard-").next().unwrap_or(host);
+                let expected = format!("${{{{ needs.test-tools-{host}.outputs.artifact-id }}}}");
+                if initial["with"]["artifact-ids"] != expected {
+                    return Err(reject(
+                        "native tools must come from the same-host preparation",
+                    ));
+                }
+            }
+        }
+        let serialized = serde_yaml::to_string(job)?;
+        for tail in serialized.split("steps.").skip(1) {
+            let reference = tail.split('.').next().unwrap_or_default();
+            if !ids.contains(reference) {
+                return Err(CiError::Message(format!(
+                    "dangling generated step reference in {}/{name:?}: steps.{reference}",
+                    field(document, "name")
+                )));
+            }
+        }
+        if serialized.contains("consumer-readiness")
+            || serialized.contains("readiness-upload")
+            || serialized.contains("native-coverage-plan")
+            || serialized.contains("native-coverage-shard")
+            || serialized.contains("producer-manifest.json")
+            || serialized.contains("aggregate-macos")
+        {
+            return Err(reject("retired CI evidence interface is forbidden"));
+        }
+        if job["timeout-minutes"]
+            .as_u64()
+            .is_none_or(|minutes| minutes == 0 || minutes > 360)
+        {
+            return Err(reject("job requires a finite hosted-runner timeout"));
+        }
+    }
+    if matches!(document["name"].as_str(), Some("CI" | "Release")) {
+        let release = document["name"] == "Release";
+        for leaf in [
+            if release {
+                "source-docs"
+            } else {
+                "quality-docs"
+            },
+            "supply-chain-audit",
+            "supply-chain-deny",
+        ] {
+            let job = &document["jobs"][leaf];
+            if !job.is_mapping()
+                || dependencies(job) != if release { vec!["select"] } else { vec![] }
+            {
+                return Err(reject(
+                    "quality and security leaves must remain independent",
+                ));
+            }
+        }
+        if jobs.contains_key(text("supply-chain")) {
+            return Err(reject(
+                "combined security cannot replace required independent leaves",
+            ));
+        }
+        if release {
+            requires(
+                document,
+                "assemble",
+                &["source-docs", "supply-chain-audit", "supply-chain-deny"],
+            )?;
+        }
+    }
+    if document["name"] != "Release" {
+        return Ok(());
+    }
+    for host in [
+        "linux-x64",
+        "linux-arm64",
+        "macos-x64",
+        "macos-arm64",
+        "windows-x64",
+        "windows-arm64",
+    ] {
+        let tools = format!("test-tools-{host}");
+        let native = format!("native-{host}");
+        requires(document, &tools, &["select"])?;
+        requires(document, &native, &["select", &tools])?;
+        if host != "macos-x64" {
+            let steps = document["jobs"][&native]["steps"]
+                .as_sequence()
+                .ok_or_else(|| reject("native steps absent"))?;
+            if steps
+                .iter()
+                .filter(|step| field(step, "run").contains(" release compile-target "))
+                .count()
+                != 1
+            {
+                return Err(reject("native target requires its actual compilation"));
+            }
+        }
+        requires(document, "assemble-payload", &[&native])?;
+        requires(document, "assemble", &[&native])?;
+        let driver = if host.starts_with("windows-") {
+            "./target/ci-runtime/current/memcordon-ci.exe"
+        } else {
+            "./target/ci-runtime/current/memcordon-ci"
+        };
+        operation(
+            document,
+            &tools,
+            &format!(
+                "{driver} release prepare-test-tools --build-source .release/build-source.json"
+            ),
+        )?;
+        if host.starts_with("linux-") || host.starts_with("windows-") {
+            operation(
+                document,
+                &native,
+                &format!(
+                    "{driver} release test-components --diagnostics target/ci/reports/components"
+                ),
+            )?;
+        }
+        for channel in ["native", "cargo"] {
+            let candidate = if host.starts_with("macos-") {
+                format!("installed-{host}-{channel}")
+            } else {
+                format!("candidate-{host}-{channel}")
+            };
+            requires(
+                document,
+                &candidate,
+                &["select", "packages", &native, &tools],
+            )?;
+            requires(document, "assemble", &[&candidate])?;
+            operation(
+                document,
+                &candidate,
+                &format!(
+                    "{driver} release test-installed --delivery candidate-{channel} --target .release/target --packages .release/packages --diagnostics target/ci/reports/installed"
+                ),
+            )?;
+            if !document["jobs"][&candidate]["outputs"].is_null() {
+                return Err(reject("installed tests do not export success artifacts"));
+            }
+            if !host.starts_with("macos-") {
+                let public = format!("public-{host}-{channel}");
+                requires(
+                    document,
+                    &public,
+                    &[
+                        "select",
+                        "assemble",
+                        "publish",
+                        "recovery-inputs",
+                        "recovery-publish",
+                        &tools,
+                    ],
+                )?;
+                if field(&document["jobs"][&public], "if")
+                    != "!cancelled() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged'"
+                {
+                    return Err(reject(
+                        "public delivery requires the successful selected writer",
+                    ));
+                }
+                operation(
+                    document,
+                    &public,
+                    &format!(
+                        "{driver} release test-installed --delivery public-{channel} --prepared .release/prepared --diagnostics target/ci/reports/installed"
+                    ),
+                )?;
+            }
+        }
+    }
+    for index in 0..4 {
+        let shard = format!("native-macos-x64-shard-{index}");
+        requires(document, &shard, &["select", "test-tools-macos-x64"])?;
+        requires(document, "assemble", &[&shard])?;
+        operation(
+            document,
+            &shard,
+            &format!(
+                "./target/ci-runtime/current/memcordon-ci suite native-shard --index {index} --count 4 --profile release"
+            ),
+        )?;
+        if dependencies(&document["jobs"]["assemble-payload"]).contains(&shard.as_str()) {
+            return Err(reject(
+                "early payload cannot wait for unrelated native shards",
+            ));
+        }
+    }
+    operation(
+        document,
+        "native-macos-x64",
+        "./target/ci-runtime/current/memcordon-ci release build-native-payload --build-source .release/build-source.json --runtime-components",
+    )?;
+    requires(
+        document,
+        "rehearse",
+        &["select", "assemble-payload", "rehearsal-tool"],
+    )?;
+    requires(document, "assemble", &["assemble-payload", "rehearse"])?;
+    requires(
+        document,
+        "recovery-rehearse",
+        &["select", "recovery-inputs", "rehearsal-tool"],
+    )?;
+    requires(document, "publish", &["select", "assemble", "rehearse"])?;
+    requires(
+        document,
+        "recovery-publish",
+        &["select", "recovery-inputs", "recovery-rehearse"],
+    )?;
+    for writer in ["publish", "recovery-publish"] {
+        let condition = field(&document["jobs"][writer], "if");
+        if condition.contains("always()")
+            || !condition.contains("startsWith(github.ref, 'refs/tags/')")
+            || !condition.contains("needs.select.outputs.preparation-kind == 'tagged'")
+        {
+            return Err(reject("publisher must retain successful tag-only routing"));
+        }
+        operation(
+            document,
+            writer,
+            "./.release/tool/memcordon-ci release publish",
+        )?;
+    }
+    Ok(())
+}
+
 pub fn validate(document: &Value) -> Result<()> {
     if document["name"] == "Release" {
         let needs = document["jobs"]["assemble"]["needs"]
@@ -38,15 +381,6 @@ pub fn validate(document: &Value) -> Result<()> {
         }
     }
     super::source_seed::validate(document)?;
-    super::concurrency::validate(document)?;
-    super::windows_fixture_native::validate(document)?;
-    if document["name"].as_str() == Some("Release") {
-        super::release_fuzz::validate(document)?;
-        super::host_preparation::validate(document)?;
-    }
-    if document["name"].as_str() == Some("Native backend tests") {
-        super::backend_private::validate(document)?;
-    }
     let jobs = document["jobs"]
         .as_mapping()
         .ok_or_else(|| reject("workflow jobs absent"))?;
@@ -151,14 +485,7 @@ pub fn validate(document: &Value) -> Result<()> {
     if jobs.contains_key(text("fuzz-setup")) && document["name"].as_str() == Some("Deep CI") {
         validate_fuzz_split(document)?;
     }
-    let file = match field(document, "name") {
-        "CI" => "ci.yml",
-        "Deep CI" => "deep-ci.yml",
-        "Native backend tests" => "backend-certification.yml",
-        "Release" => "release.yml",
-        _ => return Err(reject("unknown source-defined workflow name")),
-    };
-    adapters::validate_budget(document, file)?;
+    validate_current_graph(document)?;
     Ok(())
 }
 

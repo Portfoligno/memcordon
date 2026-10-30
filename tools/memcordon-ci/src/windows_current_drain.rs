@@ -75,7 +75,7 @@ pub(super) fn run(
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&config.installed_agent.path)?;
-    let image_identity = crate::windows_readiness_adapter::native_file_identity(
+    let image_identity = crate::windows_native_files::native_file_identity(
         &held,
         false,
         &config.installed_agent.path,
@@ -197,7 +197,7 @@ pub(super) fn run(
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&config.installed_agent.path)?;
-    if crate::windows_readiness_adapter::native_file_identity(
+    if crate::windows_native_files::native_file_identity(
         &named,
         false,
         &config.installed_agent.path,
@@ -222,7 +222,7 @@ pub(super) fn run(
         .chain(std::iter::once(&config.installed_manifest))
         .chain(config.installed_components.iter())
     {
-        let held = crate::windows_readiness_adapter::hold_artifact(
+        let held = crate::windows_native_files::hold_artifact(
             &selected.path,
             Some(&selected.sha256),
             512 * 1024 * 1024,

@@ -4,9 +4,6 @@ use memcordon_core::*;
 #[test]
 #[cfg(windows)]
 fn native_invalid_handle_capture_preserves_first_cause_across_phase_change() {
-    let evidence = crate::windows::readiness_receipt::begin(
-        "windows::diagnostics::causal_capture_tests::native_invalid_handle_capture_preserves_first_cause_across_phase_change",
-    );
     let _scope = AttemptDiagnosticScope::enter();
     set_phase(AttemptObservationPhaseV1::AuthorizedBeforeResume);
     let mut created = windows_sys::Win32::Foundation::FILETIME::default();
@@ -56,16 +53,6 @@ fn native_invalid_handle_capture_preserves_first_cause_across_phase_change() {
     assert_eq!(after.sequence, 2);
     assert_eq!(after.secondary.as_slice().len(), 1);
     assert!(after.is_consistent());
-    if let Some(evidence) = evidence {
-        let before_journal =
-            evidence.retain("before-journal.json", &serde_json::to_vec(&before).unwrap());
-        let after_journal =
-            evidence.retain("after-journal.json", &serde_json::to_vec(&after).unwrap());
-        evidence.finish_payload(serde_json::json!({"kind":"causal-capture","before_journal":before_journal,
-            "after_journal":after_journal,"first_api":"GetProcessTimes","first_return":first_return,
-            "first_win32_code":first_code,"second_api":"GetExitCodeProcess","second_return":second_return,
-            "second_win32_code":second_code,"invalid_handle_was_null":true}));
-    }
 }
 
 fn failure(code: u32) -> CausalEventV1 {

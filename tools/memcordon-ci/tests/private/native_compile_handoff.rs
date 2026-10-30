@@ -33,25 +33,3 @@ fn later_phase_requires_exact_selected_product_bytes_and_distribution() {
     fs::remove_file(&product).unwrap();
     assert!(verify_product_inputs(root, &selected, &distribution).is_err());
 }
-
-#[test]
-fn original_deadline_begin_and_resume_require_both_uncached_records() {
-    use crate::release::native_component_harness::{begin_original_deadline, original_deadline};
-    let root = tempfile::tempdir().unwrap();
-    let selected = BuildSourceIdentity::Working {
-        version: semver::Version::new(0, 1, 0),
-        commit: "abcdef".into(),
-    };
-    assert!(original_deadline(root.path(), &selected, "host").is_err());
-    begin_original_deadline(root.path(), &selected, "host").unwrap();
-    original_deadline(root.path(), &selected, "host").unwrap();
-    assert!(original_deadline(root.path(), &selected, "other-host").is_err());
-    fs::remove_file(root.path().join(".release/native-operation-deadline.json")).unwrap();
-    assert!(original_deadline(root.path(), &selected, "host").is_err());
-    assert!(
-        !root
-            .path()
-            .join(".release/native-operation-deadline.json")
-            .exists()
-    );
-}

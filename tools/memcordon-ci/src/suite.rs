@@ -2,6 +2,7 @@ use crate::{CiError, Result, failure_mode::FailureMode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum Suite {
+    NativeShard,
     WorkspaceFetch,
     FuzzFetch,
     PrepareTools,
@@ -11,7 +12,7 @@ pub enum Suite {
     ReleaseBuild,
     ReleaseCompile,
     ReleaseValidatePackage,
-    ReleaseReadiness,
+    ReleaseRuntime,
     WorkingWindowsPrepare,
     RehearsalToolBuild,
     Policy,
@@ -89,7 +90,8 @@ impl Suite {
     pub const fn failure_policy(self) -> SuiteFailurePolicy {
         use Suite::*;
         match self {
-            WorkspaceFetch
+            NativeShard
+            | WorkspaceFetch
             | FuzzFetch
             | PrepareMiriComponents
             | MiriSetup
@@ -115,7 +117,7 @@ impl Suite {
             | ReleaseBuild
             | ReleaseCompile
             | ReleaseValidatePackage
-            | ReleaseReadiness
+            | ReleaseRuntime
             | Quality
             | QualityCompile
             | QualityCompiler

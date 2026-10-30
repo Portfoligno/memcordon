@@ -285,7 +285,7 @@ pub fn assemble_build_profile(
     packages: &Path,
     target_directories: &[PathBuf],
     destination: &Path,
-    consumer_readiness: bool,
+    runtime_components: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let record = |state: &str, error: Option<&CiError>| {
@@ -309,7 +309,7 @@ pub fn assemble_build_profile(
         packages,
         target_directories,
         destination,
-        consumer_readiness,
+        runtime_components,
     );
     record(
         if result.is_ok() {
@@ -328,12 +328,12 @@ fn assemble_build_inner(
     packages: &Path,
     target_directories: &[PathBuf],
     destination: &Path,
-    consumer_readiness: bool,
+    runtime_components: bool,
 ) -> Result<()> {
     source.recheck(root)?;
     let distribution = Distribution::read(root)?;
-    let distribution = if consumer_readiness {
-        distribution.consumer_readiness()?
+    let distribution = if runtime_components {
+        distribution.with_runtime_components()?
     } else {
         distribution
     };

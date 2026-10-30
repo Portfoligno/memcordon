@@ -117,8 +117,11 @@ pub fn scopes(suite: Suite) -> Vec<CompiledScope<'static>> {
         Suite::SupplyAuditCheck | Suite::SupplyDenyCheck | Suite::ReleaseValidatePackage => vec![],
         Suite::Msrv => ordinary("msrv", "complete"),
         Suite::RehearsalToolBuild => ordinary("rehearsal-tool", "complete"),
-        Suite::ReleaseBuild | Suite::ReleaseReadiness | Suite::ReleaseCompile => {
-            let purpose = if matches!(suite, Suite::ReleaseReadiness) {
+        Suite::NativeShard
+        | Suite::ReleaseBuild
+        | Suite::ReleaseRuntime
+        | Suite::ReleaseCompile => {
+            let purpose = if matches!(suite, Suite::ReleaseRuntime | Suite::NativeShard) {
                 "native-readiness"
             } else {
                 "native-release"
@@ -127,7 +130,7 @@ pub fn scopes(suite: Suite) -> Vec<CompiledScope<'static>> {
                 scope(
                     "native-tests",
                     purpose,
-                    if matches!(suite, Suite::ReleaseReadiness) {
+                    if matches!(suite, Suite::ReleaseRuntime | Suite::NativeShard) {
                         coverage_cache_owner().map_or("complete", |(_, shard)| shard)
                     } else {
                         "complete"
@@ -350,7 +353,7 @@ pub fn operation(root: &Path, suite: Suite, mode: FailureMode) -> Result<()> {
             }
         }
         Suite::ReleaseBuild
-        | Suite::ReleaseReadiness
+        | Suite::ReleaseRuntime
         | Suite::ReleaseCompile
         | Suite::ReleaseValidatePackage
         | Suite::WorkingWindowsPrepare => Err(CiError::Message(

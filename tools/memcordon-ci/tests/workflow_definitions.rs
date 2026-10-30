@@ -143,11 +143,43 @@ fn compact_action_aliases_preserve_complete_workflow_data_and_consumer_guards() 
             for (name, job) in parsed["jobs"].as_mapping().unwrap() {
                 if name.as_str().unwrap().starts_with("installed-macos-") {
                     for row in job["strategy"]["matrix"]["include"].as_sequence().unwrap() {
-                        assert_eq!(row["producer-job"].as_str(), Some(""));
+                        assert!(row["producer-job"].is_null());
                     }
                 }
             }
         }
+    }
+}
+
+#[test]
+fn direct_release_tests_require_all_channels_shards_and_rehearsal() {
+    let baseline = workflow_definitions::definition("release.yml").unwrap();
+    for missing in [
+        "candidate-linux-x64-native",
+        "candidate-windows-arm64-cargo",
+        "installed-macos-arm64-cargo",
+        "native-macos-x64-shard-3",
+        "rehearse",
+    ] {
+        let mut changed = baseline.clone();
+        changed["jobs"]["assemble"]["needs"]
+            .as_sequence_mut()
+            .unwrap()
+            .retain(|name| name.as_str() != Some(missing));
+        assert!(
+            workflow_definitions::validate_semantics(&changed).is_err(),
+            "missing direct dependency {missing}"
+        );
+    }
+    let mut changed = baseline.clone();
+    changed["jobs"]["public-linux-x64-native"]["if"] = Value::String(
+        "needs.publish.result == 'success' && needs.recovery-publish.result == 'success'".into(),
+    );
+    assert!(workflow_definitions::validate_semantics(&changed).is_err());
+    for owner in ["publish", "recovery-publish"] {
+        let mut changed = baseline.clone();
+        changed["jobs"][owner]["if"] = Value::String("always()".into());
+        assert!(workflow_definitions::validate_semantics(&changed).is_err());
     }
 }
 

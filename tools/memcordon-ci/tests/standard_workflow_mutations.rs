@@ -60,7 +60,6 @@ fn selected_macos_forms_and_windows_channels_fail_closed_on_missing_work() {
         "macos-combined",
         "macos-native",
         "macos-acceptance",
-        "macos-assessment",
         "windows-payload-x64",
         "windows-payload-arm64",
         "windows-installed-x64",
@@ -87,9 +86,6 @@ fn selected_macos_forms_and_windows_channels_fail_closed_on_missing_work() {
         .unwrap()
         .pop();
     rejected(BACKEND, &changed, "missing Mac architecture");
-    let mut changed = original.clone();
-    changed["jobs"]["macos-assessment"]["if"] = Value::String("success()".into());
-    rejected(BACKEND, &changed, "skipped failed Mac phase assessment");
     let mut changed = original.clone();
     changed["jobs"]["windows-installed-arm64"]["strategy"]["matrix"]["include"][1]["channel"] =
         Value::String("native".into());

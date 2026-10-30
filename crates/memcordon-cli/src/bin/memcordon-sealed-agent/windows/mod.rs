@@ -8,15 +8,15 @@ pub mod job;
 mod job_diagnostics;
 pub mod launcher_service;
 pub(crate) mod loader_access;
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_native_process.rs"]
+pub(crate) mod native_process;
 pub mod package;
 pub mod pipe;
 pub mod process;
 mod process_impl;
 pub mod qualification;
 pub mod random;
-#[cfg(test)]
-#[path = "../../../../tests/sealed_agent/windows_readiness_receipt.rs"]
-pub(crate) mod readiness_receipt;
 pub mod record;
 pub mod security;
 pub mod service;

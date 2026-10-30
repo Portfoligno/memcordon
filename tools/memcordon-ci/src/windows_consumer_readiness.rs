@@ -32,14 +32,6 @@ mod start_gate_policy;
 #[cfg(windows)]
 #[path = "windows_toolchain_sampling.rs"]
 mod toolchain_sampling;
-#[cfg(windows)]
-#[path = "windows_toolchain_wait.rs"]
-mod toolchain_wait;
-
-#[cfg(windows)]
-pub fn observe_transferred_helper_wait_cleanup() -> std::io::Result<()> {
-    toolchain_wait::observe_transferred()
-}
 
 pub fn validate_toolchain_inventory(
     toolchain: &descriptor::Toolchain,
@@ -62,10 +54,6 @@ pub mod loader_event_diagnostics;
 #[cfg(windows)]
 #[path = "windows_workload_diagnostic.rs"]
 mod workload_diagnostic;
-
-#[cfg(any(windows, test))]
-#[path = "windows_installed_loader_diagnostic.rs"]
-pub(crate) mod installed_loader_diagnostic;
 
 #[cfg(windows)]
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/fixture_environment.rs"]
@@ -1323,7 +1311,6 @@ pub(crate) mod native {
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         work_deadline: Instant,
     ) -> Result<()> {
-        config.require_workload_diagnostic()?;
         use memcordon_core::workload_request::*;
         use std::num::NonZeroU64;
         let directory = std::path::absolute(&config.output_directory)?;
@@ -2715,6 +2702,19 @@ pub(crate) mod native {
         let root = &input.descriptor.output_root;
         let bytes: Vec<u8> = (0..=255).collect();
         match input.descriptor.case {
+            descriptor::Case::NativeArgv => {
+                let actual: serde_json::Value =
+                    serde_json::from_slice(&read(&root.join("native-argv.json"), 64 * 1024)?)?;
+                let expected = serde_json::json!({
+                    "encoding": "windows_utf16",
+                    "values": input.descriptor.arguments.iter().map(|argument| argument.encode_utf16().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                });
+                if actual != expected {
+                    return Err(CiError::Message(
+                        "independently observed native argv differs from selected arguments".into(),
+                    ));
+                }
+            }
             descriptor::Case::Joint | descriptor::Case::Churn | descriptor::Case::BinaryFiles => {
                 if !read(&root.join("nested").join("empty.bin"), 1)?.is_empty()
                     || read(&root.join("nested").join("all-bytes.bin"), 256)? != bytes
@@ -3043,7 +3043,6 @@ pub(crate) mod native {
     struct ToolchainObservationImages<'a> {
         images: &'a [descriptor::ToolchainImage],
         clock: (u64, u64),
-        wait: &'a Arc<Mutex<super::toolchain_wait::Observer>>,
     }
 
     struct PendingHelperSample {
@@ -3129,61 +3128,6 @@ pub(crate) mod native {
         super::toolchain_sampling::live(context.deadline)
     }
 
-    fn latest_wait_hint(
-        context: &HelperSampleContext<'_>,
-        admitted: &std::collections::BTreeMap<
-            super::toolchain_sampling::Identity,
-            ToolchainAdmission,
-        >,
-    ) -> io::Result<super::toolchain_sampling::Hint> {
-        let mut records = Vec::new();
-        for leaf in [
-            "toolchain-current-phase.json",
-            "toolchain-current-debug.json",
-        ] {
-            super::toolchain_sampling::live(context.deadline)?;
-            let bytes = read(
-                &context.output_root.join("compiled").join(leaf),
-                super::toolchain_sampling::RECORD_BOUND,
-            )
-            .map_err(io::Error::other)?;
-            super::toolchain_sampling::live(context.deadline)?;
-            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
-                .map_err(io::Error::other)?;
-            records.push(
-                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(io::Error::other)?,
-            );
-        }
-        let held = context
-            .family
-            .lock()
-            .map_err(|_| io::Error::other("compiler family ownership poisoned"))?;
-        let fixture = held
-            .iter()
-            .find(|owner| owner.identity.pid == context.root_pid)
-            .ok_or_else(|| {
-                io::Error::other("original fixture absent from later helper observation")
-            })?;
-        let images = context
-            .images
-            .iter()
-            .map(|image| image.sha256.clone())
-            .collect();
-        let hint = super::toolchain_sampling::hint(
-            &records[0],
-            &records[1],
-            context.challenge,
-            super::toolchain_sampling::Identity {
-                pid: fixture.identity.pid,
-                birth: fixture.identity.birth,
-            },
-            context.clock,
-            &images,
-        )?;
-        validate_helper_owners(context, &held, &hint, admitted)?;
-        Ok(hint)
-    }
-
     fn begin_helper_sample(
         context: &HelperSampleContext<'_>,
         seen: &mut BTreeSet<super::toolchain_sampling::Identity>,
@@ -3193,7 +3137,6 @@ pub(crate) mod native {
             ToolchainAdmission,
         >,
         owners: &mut Vec<std::fs::File>,
-        wait: &Arc<Mutex<super::toolchain_wait::Observer>>,
     ) -> io::Result<Option<PendingHelperSample>> {
         use super::toolchain_sampling as sampling;
         if Instant::now() >= context.deadline {
@@ -3287,9 +3230,6 @@ pub(crate) mod native {
             .expect("validated owner");
         seen.insert(hint.compiler);
         let sample = owner.begin_thread_activity_sample(context.deadline)?;
-        wait.lock()
-            .map_err(|_| io::Error::other("isolated observer ownership poisoned"))?
-            .arm(&hint, &sample, context.clock, context.deadline)?;
         let path = context.directory.join(format!(
             "native-toolchain-helper-activity-{}-{}.json",
             hint.compiler.pid, hint.compiler.birth
@@ -3532,7 +3472,6 @@ pub(crate) mod native {
                         &mut attempted,
                         &admitted,
                         &mut diagnostic_owners,
-                        selected.wait,
                     ) {
                         Ok(round) => pending = round,
                         Err(mut error) => {
@@ -3568,29 +3507,6 @@ pub(crate) mod native {
                             }
                         }
                     }
-                }
-                let later = (|| -> io::Result<()> {
-                    let due = selected
-                        .wait
-                        .lock()
-                        .map_err(|_| io::Error::other("isolated observer ownership poisoned"))?
-                        .due()?;
-                    if due {
-                        let latest = latest_wait_hint(&context, &admitted);
-                        selected
-                            .wait
-                            .lock()
-                            .map_err(|_| io::Error::other("isolated observer ownership poisoned"))?
-                            .launch(latest, challenge, selected.clock)?;
-                    }
-                    selected
-                        .wait
-                        .lock()
-                        .map_err(|_| io::Error::other("isolated observer ownership poisoned"))?
-                        .poll()
-                })();
-                if let Err(error) = later {
-                    diagnostic_error.get_or_insert(error);
                 }
                 if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
                     return Ok(());
@@ -3983,14 +3899,6 @@ pub(crate) mod native {
             descriptor::Case::Joint | descriptor::Case::Churn | descriptor::Case::EndpointMismatch
         );
         let native_started_utc = std::time::SystemTime::now();
-        let wait_observer = Arc::new(Mutex::new(super::toolchain_wait::Observer::prepare(
-            config,
-            &directory,
-            work_deadline,
-            clocks.cleanup,
-            input.descriptor.toolchain.is_some(),
-        )));
-        let callback_wait_observer = Arc::clone(&wait_observer);
         let work_budget = work_budget.min(work_deadline.saturating_duration_since(Instant::now()));
         if work_budget.is_zero() {
             return Err(CiError::Message(
@@ -4333,7 +4241,6 @@ pub(crate) mod native {
                         &held_family,
                         ToolchainObservationImages {
                             images: &toolchain_images,
-                            wait: &callback_wait_observer,
                             clock: toolchain_clock.ok_or_else(|| {
                                 io::Error::other("toolchain diagnostic original clock absent")
                             })?,
@@ -4915,20 +4822,6 @@ pub(crate) mod native {
         } else {
             None
         };
-        // Capture diagnostic settlement independently before any collection
-        // return. It must never skip original workload/guardian retirement.
-        let wait_settlement = match wait_observer.lock() {
-            Ok(mut observer) => observer.finish().map_err(CiError::Io),
-            Err(poisoned) => {
-                let cleanup = poisoned.into_inner().finish();
-                Err(CiError::Message(format!(
-                    "isolated observer ownership poisoned; settlement-error={:?}",
-                    cleanup
-                        .err()
-                        .map(|error| (error.kind(), error.raw_os_error()))
-                )))
-            }
-        };
         let gate_retention = (|| -> Result<()> {
             let Some(mut diagnostic) = gate_diagnostic else {
                 return Ok(());
@@ -5001,7 +4894,7 @@ pub(crate) mod native {
                     "controller-gate diagnostic exceeds bounded record".into(),
                 ));
             }
-            drop(crate::windows_readiness_adapter::publish_receipt(
+            drop(crate::windows_native_files::publish_owned_file(
                 &report.with_extension("controller-gate-security.json"),
                 &bytes,
             )?);
@@ -5032,7 +4925,7 @@ pub(crate) mod native {
                         "original guardian query retention cutoff exhausted".into(),
                     ));
                 }
-                drop(crate::windows_readiness_adapter::publish_receipt(
+                drop(crate::windows_native_files::publish_owned_file(
                     &report.with_extension(extension),
                     &bytes,
                 )?);
@@ -5123,7 +5016,7 @@ pub(crate) mod native {
                         }
                         if released_target {
                             let descriptor = super::workload_diagnostic::gate_sddl(gate.as_ref())?;
-                            drop(crate::windows_readiness_adapter::publish_receipt(
+                            drop(crate::windows_native_files::publish_owned_file(
                                 &report.with_extension("original-gate.sddl"),
                                 descriptor.as_bytes(),
                             )?);
@@ -5516,94 +5409,16 @@ pub(crate) mod native {
             (Err(original), _) => Err(original),
             (Ok(()), query) => query,
         };
-        let wait_settlement = match (wait_settlement, gate_retention) {
-            (Err(original), Err(gate)) => Err(CiError::Message(format!(
-                "{original}; secondary controller-gate retention={gate}"
-            ))),
-            (Err(original), _) => Err(original),
-            (Ok(()), gate) => gate,
-        };
-        match (collection, retirement, wait_settlement) {
-            (Err(original), _, Err(diagnostic)) => Err(CiError::Message(format!(
-                "{original}; secondary diagnostic settlement={diagnostic}"
-            ))),
-            (Err(original), _, _) => Err(original),
-            (Ok(()), Err(original), Err(diagnostic)) => Err(CiError::Message(format!(
-                "{original}; secondary diagnostic settlement={diagnostic}"
-            ))),
-            (Ok(()), Err(original), _) => Err(original),
-            (Ok(()), Ok(()), diagnostic) => diagnostic,
+        if let Err(error) = gate_retention {
+            eprintln!("optional native gate diagnostics unavailable: {error}");
         }
-    }
-
-    fn diagnose_installed_refusal(
-        config: &crate::windows_installed_cases::InstalledWindowsPayload,
-        input: &CaseInput,
-        deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
-    ) -> Result<()> {
-        let capture = read(
-            &config
-                .output_directory
-                .join(&input.key.family)
-                .join(&input.key.scenario)
-                .join("result.callback-failure.json"),
-            16 * 1024,
-        )?;
-        memcordon_core::canonical_json::reject_duplicate_json_keys(&capture)
-            .map_err(CiError::Message)?;
-        let capture: serde_json::Value = serde_json::from_slice(&capture)?;
-        if capture["format"] != "memcordon.windows-positive-callback-failure"
-            || capture["revision"] != 1
-            || capture["capture_complete"] != true
-            || capture["cleanup"] != serde_json::json!({"Ok":null})
-        {
-            return Err(CiError::Message(
-                "installed diagnostic original frontend is not settled".into(),
-            ));
+        match (collection, retirement) {
+            (Err(primary), Err(cleanup)) => Err(CiError::Message(format!(
+                "{primary}; owned retirement: {cleanup}"
+            ))),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), retirement) => retirement,
         }
-        deadlines.work_budget(Duration::from_secs(30))?;
-        let _quiescent = GuardianBaseline::quiescent(
-            &config.installed_agent.path,
-            &config.installed_manifest.path,
-            &config.installed_agent.sha256,
-            &config.installed_manifest.sha256,
-        )?;
-        let report = config
-            .output_directory
-            .join(&input.key.family)
-            .join(&input.key.scenario)
-            .join("result.json");
-        let original_path = report.with_extension("failed-frontend.json");
-        if original_path.try_exists()? {
-            let original = ResultV3::parse(&read(
-                &original_path,
-                crate::windows_causal_acceptance::MAX_REPORT_BYTES,
-            )?)
-            .map_err(CiError::Message)?;
-            if super::released_target_loader_event_candidate(&original) {
-                let gate = read(&report.with_extension("original-gate.sddl"), 16 * 1024)?;
-                let gate =
-                    String::from_utf8(gate).map_err(|error| CiError::Message(error.to_string()))?;
-                let observed = super::workload_diagnostic::observe(
-                    config,
-                    input,
-                    &report,
-                    &input.descriptor.output_root.join("frontend-result.json"),
-                    &gate,
-                    deadlines.work,
-                    deadlines.cleanup,
-                )
-                .map_err(|error| error.to_string());
-                drop(crate::windows_readiness_adapter::publish_receipt(
-                    &report.with_extension("workload-diagnostic.json"),
-                    &serde_json::to_vec(
-                        &serde_json::json!({"authority":"diagnostic-only", "original_failure_unchanged":true,"observation":observed}),
-                    )?,
-                )?);
-                return Ok(());
-            }
-        }
-        super::installed_loader_diagnostic::retain(config, input, deadlines)
     }
 
     pub fn run(
@@ -5669,14 +5484,6 @@ pub(crate) mod native {
                 work_deadline,
                 diagnostic_deadlines.map(|deadlines| deadlines.cleanup),
             ) {
-                if case.key.family == "W-ENVELOPE"
-                    && case.key.scenario == "restricted"
-                    && let Some(deadlines) = diagnostic_deadlines
-                    && let Err(diagnostic) =
-                        diagnose_installed_refusal(config, &execution, deadlines)
-                {
-                    eprintln!("secondary installed loader diagnostic unavailable: {diagnostic}");
-                }
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
