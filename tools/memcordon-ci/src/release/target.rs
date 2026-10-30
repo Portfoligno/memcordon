@@ -810,6 +810,11 @@ pub fn prepare_test_tools(root: &Path, source_path: &Path) -> Result<()> {
                 .run()?;
             }
             selected.recheck(root)?;
+            crate::preparation_tools::run(
+                root,
+                crate::preparation_tools::Operation::Package,
+                crate::preparation_tools::Kind::Test,
+            )?;
             if std::time::Instant::now() >= deadline {
                 return Err(CiError::Message(
                     "test-tool preparation deadline expired".into(),

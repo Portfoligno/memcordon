@@ -136,6 +136,7 @@ fn validate_current_graph(document: &Value) -> Result<()> {
                 ));
             }
             if let Some(host) = name.as_str().and_then(|name| name.strip_prefix("native-")) {
+                let host = host.strip_prefix("components-").unwrap_or(host);
                 let host = host.split("-shard-").next().unwrap_or(host);
                 let expected = format!("${{{{ needs.test-tools-{host}.outputs.artifact-id }}}}");
                 if initial["with"]["artifact-ids"] != expected {
@@ -247,13 +248,86 @@ fn validate_current_graph(document: &Value) -> Result<()> {
             ),
         )?;
         if host.starts_with("linux-") || host.starts_with("windows-") {
+            let components = format!("native-components-{host}");
+            requires(document, &components, &["select", &tools, &native])?;
+            let phase = &document["jobs"][&components];
+            let producer = &document["jobs"][&native];
+            if phase["strategy"] != producer["strategy"]
+                || phase["runs-on"] != producer["runs-on"]
+                || phase["if"] != producer["if"]
+            {
+                return Err(reject(
+                    "component phase must select its exact payload host and source",
+                ));
+            }
+            let steps = phase["steps"]
+                .as_sequence()
+                .ok_or_else(|| reject("component phase steps absent"))?;
+            let downloads = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| field(step, "id") == "native-payload-download")
+                .collect::<Vec<_>>();
+            if downloads.len() != 1 {
+                return Err(reject(
+                    "component native payload acquisition absent or duplicated",
+                ));
+            }
+            let (index, first) = downloads[0];
+            let retry = steps
+                .get(index + 1)
+                .ok_or_else(|| reject("component native payload retry absent"))?;
+            let execution = steps
+                .iter()
+                .position(|step| field(step, "id") == "native-components")
+                .ok_or_else(|| reject("component native execution absent"))?;
+            if first["with"]["artifact-ids"]
+                != format!("${{{{ needs.{native}.outputs.artifact-id }}}}")
+                || first["with"]["path"] != ".release/target"
+                || first["with"]["digest-mismatch"] != "error"
+                || first["with"]["merge-multiple"] != false
+                || first["timeout-minutes"].as_u64() != Some(3)
+                || first["continue-on-error"].as_bool() != Some(true)
+                || !first["if"].is_null()
+                || first["with"] != retry["with"]
+                || first["uses"] != retry["uses"]
+                || retry["timeout-minutes"].as_u64() != Some(3)
+                || !retry["continue-on-error"].is_null()
+                || field(retry, "id") != "native-payload-download-retry"
+                || field(retry, "if")
+                    != "!cancelled() && steps.native-payload-download.outcome == 'failure'"
+                || execution <= index + 1
+            {
+                return Err(reject(
+                    "component phase requires bounded exact native payload acquisition",
+                ));
+            }
+            for (owner, job) in jobs {
+                let Some(owner) = owner.as_str() else {
+                    continue;
+                };
+                if owner != components && dependencies(job).contains(&native.as_str()) {
+                    requires(document, owner, &[&components])?;
+                }
+            }
             operation(
                 document,
-                &native,
+                &components,
                 &format!(
                     "{driver} release test-components --diagnostics target/ci/reports/components"
                 ),
             )?;
+        } else if document["jobs"][&native]["steps"]
+            .as_sequence()
+            .is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| field(step, "run").contains(" release test-components "))
+            })
+        {
+            return Err(reject(
+                "macOS cannot select the Linux or Windows component operation",
+            ));
         }
         for channel in ["native", "cargo"] {
             let candidate = if host.starts_with("macos-") {

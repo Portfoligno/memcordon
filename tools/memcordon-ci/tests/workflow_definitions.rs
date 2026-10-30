@@ -159,6 +159,8 @@ fn direct_release_tests_require_all_channels_shards_and_rehearsal() {
         "candidate-windows-arm64-cargo",
         "installed-macos-arm64-cargo",
         "native-macos-x64-shard-3",
+        "native-components-linux-x64",
+        "native-components-windows-arm64",
         "rehearse",
     ] {
         let mut changed = baseline.clone();

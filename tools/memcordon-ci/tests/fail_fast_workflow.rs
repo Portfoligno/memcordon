@@ -125,6 +125,10 @@ fn validate(value: &Value) -> Result<(), String> {
         "native-macos-arm64",
         "native-windows-x64",
         "native-windows-arm64",
+        "native-components-linux-x64",
+        "native-components-linux-arm64",
+        "native-components-windows-x64",
+        "native-components-windows-arm64",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -157,6 +161,10 @@ fn validate(value: &Value) -> Result<(), String> {
         "test-tools-macos-arm64",
         "test-tools-windows-x64",
         "test-tools-windows-arm64",
+        "native-components-linux-x64",
+        "native-components-linux-arm64",
+        "native-components-windows-x64",
+        "native-components-windows-arm64",
         "native-macos-x64-shard-0",
         "native-macos-x64-shard-1",
         "native-macos-x64-shard-2",
@@ -311,6 +319,10 @@ fn every_required_final_dependency_is_individually_enforced() {
         "native-macos-arm64",
         "native-windows-x64",
         "native-windows-arm64",
+        "native-components-linux-x64",
+        "native-components-linux-arm64",
+        "native-components-windows-x64",
+        "native-components-windows-arm64",
         "candidate-linux-x64-native",
         "candidate-linux-x64-cargo",
         "candidate-linux-arm64-native",

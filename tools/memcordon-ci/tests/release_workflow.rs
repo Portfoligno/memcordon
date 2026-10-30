@@ -105,6 +105,7 @@ fn windows_release_jobs_configure_lf_before_checkout() {
     for (name, job) in workflow["jobs"].as_mapping().unwrap() {
         let name = name.as_str().unwrap();
         if !name.starts_with("native-windows-")
+            && !name.starts_with("native-components-windows-")
             && !name.starts_with("candidate-windows-")
             && !name.starts_with("public-windows-")
         {
@@ -183,14 +184,10 @@ fn source_component_failures_are_required_local_job_failures() {
     let baseline: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
     check(&baseline).unwrap();
-    for job in [
-        "native-linux-x64",
-        "native-linux-arm64",
-        "native-windows-x64",
-        "native-windows-arm64",
-    ] {
+    for host in ["linux-x64", "linux-arm64", "windows-x64", "windows-arm64"] {
+        let job = format!("native-components-{host}");
         let mut changed = baseline.clone();
-        let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+        let steps = changed["jobs"][&job]["steps"].as_sequence_mut().unwrap();
         let test = unique_step(steps, "native components", |step| {
             step["run"]
                 .as_str()
@@ -199,6 +196,28 @@ fn source_component_failures_are_required_local_job_failures() {
         assert!(steps[test]["continue-on-error"].is_null());
         steps[test]["continue-on-error"] = true.into();
         assert!(check(&changed).is_err());
+        let producer = format!("native-{host}");
+        assert!(
+            baseline["jobs"][&job]["needs"]
+                .as_sequence()
+                .unwrap()
+                .contains(&Value::String(producer))
+        );
+        for (consumer, definition) in baseline["jobs"].as_mapping().unwrap() {
+            if let Some(needs) = definition["needs"].as_sequence() {
+                if needs.contains(&Value::String(job.clone())) {
+                    let mut changed = baseline.clone();
+                    changed["jobs"][consumer]["needs"]
+                        .as_sequence_mut()
+                        .unwrap()
+                        .retain(|need| need.as_str() != Some(job.as_str()));
+                    assert!(
+                        check(&changed).is_err(),
+                        "{consumer:?} lost required component success for {host}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -263,6 +282,10 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
         "native-macos-arm64",
         "native-windows-x64",
         "native-windows-arm64",
+        "native-components-linux-x64",
+        "native-components-linux-arm64",
+        "native-components-windows-x64",
+        "native-components-windows-arm64",
         "candidate-linux-x64-native",
         "candidate-linux-x64-cargo",
         "candidate-linux-arm64-native",
