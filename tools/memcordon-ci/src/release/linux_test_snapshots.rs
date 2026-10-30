@@ -112,10 +112,10 @@ impl Drop for ProbeRun {
             if self.process.is_none() {
                 self.process = self.created.try_recv().ok();
             }
-            if let Some(process) = &self.process {
-                if let Err(error) = process.signal_kill() {
-                    eprintln!("original source probe unwind signal: {error}");
-                }
+            if let Some(process) = &self.process
+                && let Err(error) = process.signal_kill()
+            {
+                eprintln!("original source probe unwind signal: {error}");
             }
         }
     }
@@ -338,7 +338,7 @@ pub fn run_installed(
     work: Instant,
     cleanup: Instant,
 ) -> Result<()> {
-    let execution = (|| -> Result<()> {
+    (|| -> Result<()> {
         for scenario in ["caller-writable-source", "retained-writable-alias"] {
             let controller = controller_directory.join(format!("snapshot-{scenario}"));
             std::fs::create_dir(&controller)?;
@@ -499,8 +499,7 @@ pub fn run_installed(
             cleanup,
         )?;
         Ok(())
-    })();
-    execution
+    })()
 }
 
 #[allow(clippy::too_many_arguments)]

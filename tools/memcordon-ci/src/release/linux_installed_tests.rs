@@ -363,12 +363,11 @@ impl Actor {
             {
                 return Err(fail("refusing to remove a replacement actor account"));
             }
-            if let Some(session) = &self.session {
-                if fields[2].parse::<u32>().ok() != Some(session.uid)
-                    || fields[3].parse::<u32>().ok() != Some(session.gid)
-                {
-                    return Err(fail("owned actor native identity changed"));
-                }
+            if let Some(session) = &self.session
+                && (fields[2].parse::<u32>().ok() != Some(session.uid)
+                    || fields[3].parse::<u32>().ok() != Some(session.gid))
+            {
+                return Err(fail("owned actor native identity changed"));
             }
             operation(root, Path::new("/usr/sbin/userdel"), &[&self.name], cutoff)?;
         }

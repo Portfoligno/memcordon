@@ -219,7 +219,6 @@ fn negative(
     let mut runtime_root = images.runtime_source.clone();
     let mut input_root = images.input_source.clone();
     let mut mutation = Value::Null;
-    let mut probe = Vec::new();
     if scenario == "rpath-injection" {
         runtime_root = directory.join("runtime-source");
         copy_snapshot(
@@ -229,8 +228,7 @@ fn negative(
             caller,
             work,
         )?;
-        let (changed, details) = rpath_probe(&original_fixture, &images.runtime.target)?;
-        probe = changed;
+        let (probe, details) = rpath_probe(&original_fixture, &images.runtime.target)?;
         mutation = details;
         fs::write(runtime_root.join("bin/owned-readiness"), &probe)?;
         let mut value = serde_json::to_value(&runtime)?;
@@ -632,7 +630,7 @@ pub fn run_installed(
     cleanup: Instant,
 ) -> Result<()> {
     let images = images.minimal();
-    let operation = (|| -> Result<()> {
+    (|| -> Result<()> {
         for scenario in [
             "first-image",
             "interpreter",
@@ -933,6 +931,5 @@ pub fn run_installed(
             )?;
         }
         Ok(())
-    })();
-    operation
+    })()
 }

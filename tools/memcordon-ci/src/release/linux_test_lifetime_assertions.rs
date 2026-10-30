@@ -114,11 +114,11 @@ fn allocations(experiment: &Experiment, before: &Value) -> Result<()> {
             Some("footprint") => None,
             _ => return Err(fail("unknown actual native allocation")),
         };
-        if let Some(field) = field {
-            if item["device"] != before[field]["device"] || item["inode"] != before[field]["inode"]
-            {
-                return Err(fail("native allocation differs from actual durable owner"));
-            }
+        if let Some(field) = field
+            && (item["device"] != before[field]["device"]
+                || item["inode"] != before[field]["inode"])
+        {
+            return Err(fail("native allocation differs from actual durable owner"));
         }
     }
     Ok(())

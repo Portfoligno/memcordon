@@ -204,18 +204,18 @@ fn source_component_failures_are_required_local_job_failures() {
                 .contains(&Value::String(producer))
         );
         for (consumer, definition) in baseline["jobs"].as_mapping().unwrap() {
-            if let Some(needs) = definition["needs"].as_sequence() {
-                if needs.contains(&Value::String(job.clone())) {
-                    let mut changed = baseline.clone();
-                    changed["jobs"][consumer]["needs"]
-                        .as_sequence_mut()
-                        .unwrap()
-                        .retain(|need| need.as_str() != Some(job.as_str()));
-                    assert!(
-                        check(&changed).is_err(),
-                        "{consumer:?} lost required component success for {host}"
-                    );
-                }
+            if let Some(needs) = definition["needs"].as_sequence()
+                && needs.contains(&Value::String(job.clone()))
+            {
+                let mut changed = baseline.clone();
+                changed["jobs"][consumer]["needs"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .retain(|need| need.as_str() != Some(job.as_str()));
+                assert!(
+                    check(&changed).is_err(),
+                    "{consumer:?} lost required component success for {host}"
+                );
             }
         }
     }

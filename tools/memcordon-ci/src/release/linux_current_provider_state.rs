@@ -137,12 +137,13 @@ impl Fixture {
     }
     fn restore(&self) -> Result<()> {
         let current = open(&self.parent, NAME)?;
-        if let Some(current) = &current {
-            if !same(current, &self.original)? && !same(current, &self.bad)? {
-                return Err(fail(
-                    "refusing to replace another descriptor inode during test cleanup",
-                ));
-            }
+        if let Some(current) = &current
+            && !same(current, &self.original)?
+            && !same(current, &self.bad)?
+        {
+            return Err(fail(
+                "refusing to replace another descriptor inode during test cleanup",
+            ));
         }
         let original_named = current
             .as_ref()

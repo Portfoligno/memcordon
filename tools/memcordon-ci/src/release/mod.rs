@@ -58,15 +58,7 @@ pub mod linux_test_snapshots;
 #[cfg(target_os = "linux")]
 pub mod linux_test_socket_imports;
 pub mod linux_unit_diagnostics;
-#[cfg(target_os = "linux")]
-mod native_cargo_aliases;
 pub mod native_coverage_owner;
-#[cfg(target_os = "linux")]
-mod native_executable;
-#[cfg(target_os = "linux")]
-mod native_execution_association;
-#[cfg(target_os = "linux")]
-mod native_source_identity;
 #[cfg(target_os = "linux")]
 mod native_toolchain_search;
 pub mod ordinary_consumer_cache;

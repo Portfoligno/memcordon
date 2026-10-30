@@ -69,10 +69,9 @@ pub fn run(root: &Path, diagnostics: &Path) -> Result<()> {
             if record["reason"] == "compiler-artifact"
                 && record["target"]["name"] == "sealed_agent"
                 && record["profile"]["test"] == true
+                && let Some(path) = record["executable"].as_str()
             {
-                if let Some(path) = record["executable"].as_str() {
-                    executables.push(PathBuf::from(path));
-                }
+                executables.push(PathBuf::from(path));
             }
         }
         executables.sort();
