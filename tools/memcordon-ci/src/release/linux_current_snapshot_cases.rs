@@ -602,18 +602,18 @@ pub fn run_installed(
         ] {
             let directory = working_directory.join(leaf);
             let controller = controller_directory.join(controller_leaf);
-            if directory.is_dir() && controller.is_dir() {
-                if let Err(secondary) = super::linux_current_lease::retain_case_failure(
+            if directory.is_dir()
+                && controller.is_dir()
+                && let Err(secondary) = super::linux_current_lease::retain_case_failure(
                     &directory,
                     &controller,
                     artifact_root,
                     caller.uid,
                     &primary,
                     &mut observed.artifacts,
-                ) {
-                    primary =
-                        format!("{primary}; original snapshot capture retention: {secondary}");
-                }
+                )
+            {
+                primary = format!("{primary}; original snapshot capture retention: {secondary}");
             }
         }
         observed.primary_error = Some(primary);
@@ -987,11 +987,13 @@ fn run_substitution(
     persist_success(
         caller,
         &case,
-        &controller,
-        artifact_root,
-        &identity.source_commit,
+        SnapshotPersistenceContext {
+            controller: &controller,
+            artifact_root,
+            source_commit: &identity.source_commit,
+            cleanup,
+        },
         capture,
-        cleanup,
         observed,
     )
 }
@@ -1103,35 +1105,32 @@ fn run_corruptions(
         ];
         let mut actor = Some(actor);
         let (copy_tx, copy_rx) = mpsc::sync_channel(1);
-        let copy_observer: Option<Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>> =
-            if let Some(gate) = gate {
-                let bundle = bundle.try_clone()?;
-                let directory = directory.clone();
-                let original_actor = actor.take().expect("retained original source actor");
-                Some(Box::new(move |child| {
-                    let result = copy_boundary(
-                        child,
-                        gate,
-                        bundle,
-                        original_actor,
-                        &directory,
-                        work,
-                        cleanup,
-                    );
-                    let failure = result.as_ref().err().map(ToString::to_string);
-                    copy_tx
-                        .send(result.map_err(|error| error.to_string()))
-                        .map_err(|_| {
-                            CiError::Message("original copy observer receiver lost".into())
-                        })?;
-                    match failure {
-                        Some(error) => Err(CiError::Message(error)),
-                        None => Ok(()),
-                    }
-                }))
-            } else {
-                None
-            };
+        let copy_observer: Option<crate::command::AfterReleaseObserver> = if let Some(gate) = gate {
+            let bundle = bundle.try_clone()?;
+            let directory = directory.clone();
+            let original_actor = actor.take().expect("retained original source actor");
+            Some(Box::new(move |child| {
+                let result = copy_boundary(
+                    child,
+                    gate,
+                    bundle,
+                    original_actor,
+                    &directory,
+                    work,
+                    cleanup,
+                );
+                let failure = result.as_ref().err().map(ToString::to_string);
+                copy_tx
+                    .send(result.map_err(|error| error.to_string()))
+                    .map_err(|_| CiError::Message("original copy observer receiver lost".into()))?;
+                match failure {
+                    Some(error) => Err(CiError::Message(error)),
+                    None => Ok(()),
+                }
+            }))
+        } else {
+            None
+        };
         let launch_input = super::linux_request_launch::LaunchInput {
             extra_descriptor: None,
             lifetime: memcordon_core::Lifetime::Command,
@@ -1430,16 +1429,26 @@ fn copy_boundary(
     }
 }
 
+struct SnapshotPersistenceContext<'a> {
+    controller: &'a Path,
+    artifact_root: &'a Path,
+    source_commit: &'a str,
+    cleanup: Instant,
+}
+
 fn persist_success(
     caller: &CallerSession,
     case: &CurrentLinuxCase,
-    controller: &Path,
-    artifact_root: &Path,
-    source_commit: &str,
+    context: SnapshotPersistenceContext<'_>,
     capture: super::linux_current_case_capture::CapturedCase,
-    cleanup: Instant,
     observed: &mut InstalledSnapshotObservations,
 ) -> Result<()> {
+    let SnapshotPersistenceContext {
+        controller,
+        artifact_root,
+        source_commit,
+        cleanup,
+    } = context;
     let resolver = |path: &str| {
         capture
             .files

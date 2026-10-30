@@ -65,26 +65,42 @@ fn tools_command(windows: bool, package: bool) -> &'static str {
     }
 }
 fn transport(preparation: &str, windows: bool) -> Vec<Value> {
+    let mut download = object(&[
+        ("id", text("readiness-tools-download")),
+        ("name", text("Download readiness tools (attempt 1 of 2)")),
+        ("uses", text(DOWNLOAD)),
+        ("timeout-minutes", Value::from(3)),
+        (
+            "with",
+            object(&[
+                (
+                    "artifact-ids",
+                    text(&format!(
+                        "${{{{ needs.{preparation}.outputs.artifact-id }}}}"
+                    )),
+                ),
+                ("path", text(".release/readiness-tools")),
+                ("merge-multiple", Value::Bool(false)),
+                ("digest-mismatch", text("error")),
+            ]),
+        ),
+    ]);
+    let mut retry = download.clone();
+    put(&mut download, "continue-on-error", Value::Bool(true));
+    put(&mut retry, "id", text("readiness-tools-download-retry"));
+    put(
+        &mut retry,
+        "name",
+        text("Download readiness tools (attempt 2 of 2)"),
+    );
+    put(
+        &mut retry,
+        "if",
+        text("!cancelled() && steps.readiness-tools-download.outcome == 'failure'"),
+    );
     vec![
-        object(&[
-            ("id", text("readiness-tools-download")),
-            ("uses", text(DOWNLOAD)),
-            ("timeout-minutes", Value::from(6)),
-            (
-                "with",
-                object(&[
-                    (
-                        "artifact-ids",
-                        text(&format!(
-                            "${{{{ needs.{preparation}.outputs.artifact-id }}}}"
-                        )),
-                    ),
-                    ("path", text(".release/readiness-tools")),
-                    ("merge-multiple", Value::Bool(false)),
-                    ("digest-mismatch", text("error")),
-                ]),
-            ),
-        ]),
+        download,
+        retry,
         object(&[
             ("id", text("readiness-tools-extract")),
             ("timeout-minutes", Value::from(15)),
@@ -334,18 +350,25 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
             let steps = job["steps"]
                 .as_sequence()
                 .ok_or_else(|| CiError::Message("helper consumer steps absent".into()))?;
-            let download = steps
-                .iter()
-                .find(|step| field(step, "id") == "readiness-tools-download")
-                .ok_or_else(|| CiError::Message("helper artifact download absent".into()))?;
-            if field(&download["with"], "artifact-ids")
-                != format!("${{{{ needs.{prep}.outputs.artifact-id }}}}")
-                || field(download, "uses") != DOWNLOAD
-                || download["continue-on-error"].as_bool() == Some(true)
-            {
-                return Err(CiError::Message(
-                    "helper artifact must use exact required same-run producer".into(),
-                ));
+            let mut previous = None;
+            // The first failure is recoverable only through this required,
+            // identical-input terminal attempt. Extraction cannot consume a
+            // partial archive or a merely successful download log.
+            for expected in transport(&prep, host.starts_with("windows-")) {
+                let matches = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, step)| field(step, "id") == field(&expected, "id"))
+                    .collect::<Vec<_>>();
+                let [(index, actual)] = matches.as_slice() else {
+                    return Err(CiError::Message(
+                        "helper transport step must occur exactly once".into(),
+                    ));
+                };
+                if **actual != expected || previous.is_some_and(|last| *index != last + 1) {
+                    return Err(CiError::Message("helper transport must preserve the exact bounded retry and required extraction chain".into()));
+                }
+                previous = Some(*index);
             }
             let check = steps
                 .iter()

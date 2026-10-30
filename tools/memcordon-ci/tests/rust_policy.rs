@@ -400,6 +400,34 @@ fn unrelated_exec_method_is_not_rejected_by_name() {
 }
 
 #[test]
+fn workload_loader_environment_requires_the_linux_owned_field_branch() {
+    let boundary = Path::new("tools/memcordon-ci/src/command.rs");
+    let actual = include_str!("../src/command.rs");
+    validate_rust_policy_bytes(boundary, actual.as_bytes()).unwrap();
+    for (from, to) in [
+        (
+            "command.env(\"LD_LIBRARY_PATH\", path)",
+            "command.env(\"LD_LIBRARY_PATH\", arbitrary)",
+        ),
+        (
+            "if let Some(path) = &self.workload_loader_path",
+            "if let Some(path) = &self.arbitrary",
+        ),
+        (
+            "#[cfg(target_os = \"linux\")]\n        if let Some(path) = &self.workload_loader_path",
+            "if let Some(path) = &self.workload_loader_path",
+        ),
+    ] {
+        assert!(actual.contains(from));
+        assert!(validate_rust_policy_bytes(boundary, actual.replace(from, to).as_bytes()).is_err());
+    }
+    assert!(
+        validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), actual.as_bytes())
+            .is_err()
+    );
+}
+
+#[test]
 fn subprocess_environment_is_confined_to_the_sealed_exec_boundary() {
     let source = b"fn run(command: &mut std::process::Command) { command.env(\"A\", \"B\"); }";
     validate_rust_policy_bytes(

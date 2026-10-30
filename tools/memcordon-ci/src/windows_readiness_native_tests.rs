@@ -134,6 +134,42 @@ mod native {
             });
         Ok(())
     }
+
+    fn read_parser_input(
+        path: &std::path::Path,
+        bound: usize,
+        held: &std::cell::RefCell<Vec<fs::File>>,
+    ) -> Result<Vec<u8>> {
+        use std::{io::Read, os::windows::fs::OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        // Deny writes/deletion while the captured digest and inventory are
+        // established. The shared identity check rejects hard-link aliases.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        crate::windows_readiness_adapter::native_file_identity(&file, false, path)?;
+        let length = file.metadata()?.len();
+        if length > bound as u64 {
+            return Err(CiError::Message(
+                "parser input exceeds purpose-specific bound".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(bound as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != length || bytes.len() > bound {
+            return Err(CiError::Message(
+                "held parser input length changed or exceeded bound".into(),
+            ));
+        }
+        held.borrow_mut().push(file);
+        Ok(bytes)
+    }
     pub fn run(input: &NativeTestInput, records: &mut Vec<NativeTestAssessment>) -> Result<()> {
         run_one(
             input,
@@ -548,36 +584,132 @@ mod native {
                     path: receipt_path,
                     sha256: crate::windows_causal_acceptance::sha256(&bytes),
                 });
-            for entry in fs::read_dir(&artifact_root)? {
-                let path = entry?.path();
-                if path
-                    .file_name()
-                    .is_some_and(|name| name != "native-receipt.json")
+            if parser {
+                use memcordon_readiness_verifier::current::parsers::{
+                    ParserReceiptV2, capture_inputs,
+                };
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+                    FILE_SHARE_WRITE,
+                };
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
+                    .map_err(CiError::Message)?;
+                let receipt: ParserReceiptV2 = serde_json::from_slice(&bytes)?;
+                if receipt.recipe_id != input.recipe_id
+                    || receipt.native_target != input.native_target
+                    || receipt.challenge_sha256
+                        != crate::windows_causal_acceptance::sha256(&challenge)
                 {
-                    let bound = if test_name == INDEX_PARSER
-                        && path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                matches!(
-                                    name,
-                                    "base-index.json"
-                                        | "duplicate-case-index.json"
-                                        | "wrong-product-index.json"
-                                        | "omitted-case-index.json"
-                                )
-                            }) {
-                        memcordon_readiness_verifier::MAX_INDEX_BYTES
-                    } else {
-                        256 * 1024
-                    };
-                    let bytes = read(&path, bound)?;
+                    return Err(CiError::Message(
+                        "current parser selected invocation/challenge differs".into(),
+                    ));
+                }
+                let root = OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&artifact_root)?;
+                crate::windows_readiness_adapter::native_file_identity(
+                    &root,
+                    true,
+                    &artifact_root,
+                )?;
+                let prefix = input.artifact_prefix.join(directory_name).join("authority");
+                let prefix = prefix
+                    .components()
+                    .map(|part| match part {
+                        std::path::Component::Normal(name) => name.to_str().ok_or_else(|| {
+                            CiError::Message("parser prefix encoding differs".into())
+                        }),
+                        _ => Err(CiError::Message("parser prefix is not confined".into())),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join("/");
+                let held = std::cell::RefCell::new(Vec::new());
+                let captured = capture_inputs(
+                    &receipt,
+                    &prefix,
+                    env!("CARGO_PKG_VERSION"),
+                    &input.native_target,
+                    &|reference, bound| {
+                        let name = reference
+                            .strip_prefix(&format!("{prefix}/"))
+                            .filter(|name| {
+                                !name.is_empty()
+                                    && !name.contains(['/', '\\', ':', '\0'])
+                                    && !matches!(*name, "." | "..")
+                            })
+                            .ok_or_else(|| {
+                                "parser reference escaped owned authority directory".to_string()
+                            })?;
+                        read_parser_input(&artifact_root.join(name), bound, &held)
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .map_err(CiError::Message)?;
+                let mut actual = Vec::new();
+                for entry in fs::read_dir(&artifact_root)? {
+                    if actual.len()
+                        == memcordon_readiness_verifier::current::parsers::CAPTURE_FILE_COUNT
+                    {
+                        return Err(CiError::Message(
+                            "unexpected parser authority file exceeds closed inventory".into(),
+                        ));
+                    }
+                    let name = entry?
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| CiError::Message("unexpected parser file encoding".into()))?;
+                    actual.push(name);
+                }
+                memcordon_readiness_verifier::current::parsers::validate_capture_inventory(
+                    &prefix, &captured, &actual,
+                )
+                .map_err(CiError::Message)?;
+                for (reference, bytes) in captured {
+                    let name = reference
+                        .strip_prefix(&format!("{prefix}/"))
+                        .expect("capture validated prefix");
                     record
                         .artifacts
                         .push(crate::windows_installed_cases::SelectedArtifact {
-                            path,
+                            path: artifact_root.join(name),
                             sha256: crate::windows_causal_acceptance::sha256(&bytes),
                         });
+                }
+            } else {
+                for entry in fs::read_dir(&artifact_root)? {
+                    let path = entry?.path();
+                    if path
+                        .file_name()
+                        .is_some_and(|name| name != "native-receipt.json")
+                    {
+                        let bound = if test_name == INDEX_PARSER
+                            && path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| {
+                                    matches!(
+                                        name,
+                                        "base-index.json"
+                                            | "duplicate-case-index.json"
+                                            | "wrong-product-index.json"
+                                            | "omitted-case-index.json"
+                                    )
+                                }) {
+                            memcordon_readiness_verifier::MAX_INDEX_BYTES
+                        } else {
+                            256 * 1024
+                        };
+                        let bytes = read(&path, bound)?;
+                        record
+                            .artifacts
+                            .push(crate::windows_installed_cases::SelectedArtifact {
+                                path,
+                                sha256: crate::windows_causal_acceptance::sha256(&bytes),
+                            });
+                    }
                 }
             }
             record.behavior = Ok(());

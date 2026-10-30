@@ -2004,7 +2004,8 @@ pub(crate) fn expired_package_commit_with_backup_for_test(
 impl PackageDrainGuard<'_> {
     pub(crate) fn validate(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
-        for file in [self.current] {
+        {
+            let file = self.current;
             let metadata = file.metadata().map_err(|e| e.to_string())?;
             if !metadata.is_file()
                 || metadata.uid() != 0
@@ -2387,7 +2388,6 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
     transaction.commit().map_err(|error| {
         format!("package generation published and activated; backup cleanup failed: {error}")
     })?;
-    if operation == "upgrade" {}
     Ok(())
 }
 

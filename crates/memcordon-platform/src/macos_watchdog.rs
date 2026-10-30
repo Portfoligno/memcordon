@@ -506,6 +506,12 @@ pub(crate) fn run_attempt_in(
                         .into(),
                 });
             }
+            #[cfg(feature = "test-support")]
+            if !complete {
+                if let Some(observation) = &startup.settlement_diagnostic {
+                    errors.push(observation.clone());
+                }
+            }
             let cleanup = CleanupSummary {
                 direct_child_reaped: complete,
                 workload_empty: complete.then_some(true),

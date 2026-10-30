@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io;
 
-pub const REVISION: u32 = 2;
+pub const REVISION: u32 = 6;
+pub const API_SET_CONTRACT: &str = "api-ms-win-core-synch-l1-1-0.dll";
+pub const API_SET_SYMBOL: &str = "OpenEventW";
+pub const API_SET_METHOD: &str = "LoadLibraryExW/GetProcAddress";
 pub const FRAME_BOUND: usize = 16 * 1024;
 pub const NAME_UNITS_BOUND: usize = 128;
 const SID_SUBAUTHORITIES_BOUND: usize = 15;
@@ -57,13 +60,203 @@ pub struct Response {
     #[serde(deserialize_with = "required_option")]
     pub modify_denied: Option<bool>,
     pub diagnostics: DiagnosticState,
+    #[serde(deserialize_with = "required_option")]
+    pub native_open: Option<NativeOpen>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOpen {
+    pub cell: Cell,
+    pub name_utf16: Vec<u16>,
+    pub desired_access: u32,
+    pub inherit: bool,
+    pub probe_desired_access: u32,
+    pub namespace_held: bool,
+    pub probe: ZeroProbe,
+    #[serde(deserialize_with = "required_option")]
+    pub native_root: Option<NativeRoot>,
+    #[serde(deserialize_with = "required_option")]
+    pub module_provenance: Option<ModuleProvenance>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModuleRole {
+    #[serde(rename = "import-address-owner")]
+    ImportAddress,
+    #[serde(rename = "kernel32-export-table-owner")]
+    Kernel32ExportTable,
+    #[serde(rename = "resolved-export-owner")]
+    ResolvedExport,
+    #[serde(rename = "nt-open-event-owner")]
+    NtOpenEvent,
+    #[serde(rename = "api-set-open-event-owner")]
+    ApiSetOpenEvent,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiSetStage {
+    LoadContract,
+    ResolveExport,
+    ObserveOwner,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ApiSetObservation {
+    Resolved {
+        same_as_original_thunk: bool,
+    },
+    Unavailable {
+        stage: ApiSetStage,
+        raw_error: Option<i32>,
+        deadline: bool,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSetResolution {
+    pub contract: String,
+    pub symbol: String,
+    pub resolution_method: String,
+    pub observation: ApiSetObservation,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleLocation {
+    pub role: ModuleRole,
+    pub base: u64,
+    pub address: u64,
+    pub rva: u32,
+    pub path_utf16: Vec<u16>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ModuleProvenance {
+    Present {
+        started_qpc: u64,
+        finished_qpc: u64,
+        diagnostic_only: bool,
+        acceptance_authority: bool,
+        import_matches_resolved: bool,
+        api_set_resolution: ApiSetResolution,
+        modules: Vec<ModuleLocation>,
+    },
+    Unavailable {
+        reason: memcordon_core::BoundedText<128>,
+        raw_error: Option<i32>,
+        deadline: bool,
+    },
+}
+impl ModuleProvenance {
+    pub fn validate(&self) -> io::Result<()> {
+        if let Self::Present {
+            started_qpc,
+            finished_qpc,
+            diagnostic_only,
+            acceptance_authority,
+            import_matches_resolved,
+            api_set_resolution,
+            modules,
+        } = self
+        {
+            if !diagnostic_only
+                || *acceptance_authority
+                || started_qpc > finished_qpc
+                || api_set_resolution.contract != API_SET_CONTRACT
+                || api_set_resolution.symbol != API_SET_SYMBOL
+                || api_set_resolution.resolution_method != API_SET_METHOD
+                || modules.len()
+                    != if matches!(
+                        api_set_resolution.observation,
+                        ApiSetObservation::Resolved { .. }
+                    ) {
+                        5
+                    } else {
+                        4
+                    }
+            {
+                return Err(invalid());
+            }
+            for (index, module) in modules.iter().enumerate() {
+                if module.base == 0
+                    || module.address.checked_sub(module.base) != Some(u64::from(module.rva))
+                    || module.path_utf16.is_empty()
+                    || module.path_utf16.len() > 32768
+                    || module.path_utf16.contains(&0)
+                    || String::from_utf16(&module.path_utf16).is_err()
+                    || modules[..index]
+                        .iter()
+                        .any(|previous| previous.role == module.role)
+                    || (module.role == ModuleRole::Kernel32ExportTable && module.rva != 0)
+                    || modules[..index].iter().any(|previous| {
+                        previous.base == module.base && previous.path_utf16 != module.path_utf16
+                    })
+                {
+                    return Err(invalid());
+                }
+            }
+            let import = modules
+                .iter()
+                .find(|module| module.role == ModuleRole::ImportAddress)
+                .ok_or_else(invalid)?;
+            let resolved = modules
+                .iter()
+                .find(|module| module.role == ModuleRole::ResolvedExport)
+                .ok_or_else(invalid)?;
+            if *import_matches_resolved != (import.address == resolved.address) {
+                return Err(invalid());
+            }
+            let host = modules
+                .iter()
+                .find(|module| module.role == ModuleRole::ApiSetOpenEvent);
+            match (&api_set_resolution.observation, host) {
+                (
+                    ApiSetObservation::Resolved {
+                        same_as_original_thunk,
+                    },
+                    Some(host),
+                ) if *same_as_original_thunk == (import.address == host.address) => {}
+                (ApiSetObservation::Unavailable { .. }, None) => {}
+                _ => return Err(invalid()),
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRoot {
+    pub root_handle: u64,
+    pub type_status: Option<i32>,
+    pub basic_status: Option<i32>,
+    pub type_name: Option<String>,
+    pub granted_access: Option<u32>,
+    pub handle_attributes: Option<u32>,
+    pub leaf_utf16: Vec<u16>,
+    pub desired_access: u32,
+    pub object_attributes: u32,
+    pub open_status: Option<i32>,
+    pub handle: Option<u64>,
+    pub unavailable: Option<String>,
+    pub reason: Option<memcordon_core::BoundedText<512>>,
+    pub deadline: bool,
+    pub native_error: Option<i32>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ZeroProbe {
+    Unavailable { deadline: bool },
+    Failed { raw_error: i32 },
+    Held { handle: u64 },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceRole {
     BeforeOpen,
     AfterFailedOpen,
+    #[serde(rename = "after-replay-open")]
+    ReplayAfter,
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceObservation {
@@ -109,8 +302,8 @@ impl<'de> Deserialize<'de> for DiagnosticUnavailableReason {
 pub enum DiagnosticState {
     NotApplicable,
     Present {
-        before: SourceObservation,
-        after: SourceObservation,
+        before: Box<SourceObservation>,
+        after: Box<SourceObservation>,
     },
     Unavailable {
         reason: DiagnosticUnavailableReason,
@@ -123,8 +316,8 @@ impl<'de> Deserialize<'de> for DiagnosticState {
         enum Wire {
             NotApplicable {},
             Present {
-                before: SourceObservation,
-                after: SourceObservation,
+                before: Box<SourceObservation>,
+                after: Box<SourceObservation>,
             },
             Unavailable {
                 reason: DiagnosticUnavailableReason,
@@ -138,7 +331,7 @@ impl<'de> Deserialize<'de> for DiagnosticState {
     }
 }
 impl SourceObservation {
-    fn validate(&self) -> io::Result<()> {
+    pub(super) fn validate(&self) -> io::Result<()> {
         self.token.validate().map_err(|_| invalid())?;
         if self
             .default_acl_bytes
@@ -294,6 +487,62 @@ impl Request {
 }
 impl Response {
     fn validate_core(&self) -> io::Result<()> {
+        if let Some(call) = &self.native_open {
+            if let Some(modules) = &call.module_provenance {
+                modules.validate()?;
+            }
+            if let Some(root) = &call.native_root {
+                let queried = root.type_status.is_some_and(|status| status >= 0)
+                    && root.basic_status.is_some_and(|status| status >= 0)
+                    && root.type_name.as_deref() == Some("Directory")
+                    && root.granted_access.is_some()
+                    && root.handle_attributes.is_some();
+                if call.cell != Cell::Private
+                    || root.root_handle == 0
+                    || root.desired_access != 0x0010_0000
+                    || root.object_attributes != 0
+                    || root.leaf_utf16.is_empty()
+                    || root.leaf_utf16.len() > NAME_UNITS_BOUND
+                    || root
+                        .leaf_utf16
+                        .iter()
+                        .any(|unit| matches!(*unit, 0 | 47 | 92))
+                    || String::from_utf16(&root.leaf_utf16).is_err()
+                    || root
+                        .type_name
+                        .as_ref()
+                        .is_some_and(|name| name.encode_utf16().count() > NAME_UNITS_BOUND)
+                    || root
+                        .unavailable
+                        .as_ref()
+                        .is_some_and(|stage| stage.len() > NAME_UNITS_BOUND)
+                    || (root.open_status.is_some() && !queried)
+                    || (root.handle.is_some()
+                        && (!queried
+                            || root.open_status.is_none_or(|status| status < 0)
+                            || root.handle == Some(0)))
+                {
+                    return Err(invalid());
+                }
+            }
+            if self.success
+                || self.phase != Phase::Event
+                || self.event_handle.is_some()
+                || self.modify_denied.is_some()
+                || !matches!(call.cell, Cell::Local | Cell::Private)
+                || call.name_utf16.is_empty()
+                || call.name_utf16.len() > 2 * NAME_UNITS_BOUND + 1
+                || call.name_utf16.contains(&0)
+                || String::from_utf16(&call.name_utf16).is_err()
+                || call.desired_access != 0x0010_0000
+                || call.inherit
+                || call.probe_desired_access != 0
+                || call.namespace_held != (call.cell == Cell::Private)
+                || matches!(call.probe, ZeroProbe::Held { handle: 0 })
+            {
+                return Err(invalid());
+            }
+        }
         if self.revision != REVISION
             || !nonce(&self.nonce)
             || (self.phase == Phase::Held
@@ -372,7 +621,7 @@ pub fn encode_response(value: &Response) -> io::Result<Vec<u8>> {
     if value.success || value.phase != Phase::Event {
         return Err(invalid());
     }
-    let fallback = Response {
+    let mut fallback = Response {
         revision: value.revision,
         nonce: value.nonce.clone(),
         phase: value.phase,
@@ -380,10 +629,23 @@ pub fn encode_response(value: &Response) -> io::Result<Vec<u8>> {
         raw_error: value.raw_error,
         event_handle: value.event_handle,
         modify_denied: value.modify_denied,
+        native_open: value.native_open.clone(),
         diagnostics: DiagnosticState::Unavailable {
             reason: DiagnosticUnavailableReason::EncodingBoundOrRefused,
         },
     };
+    if let Some(call) = &mut fallback.native_open {
+        if matches!(
+            call.module_provenance,
+            Some(ModuleProvenance::Present { .. })
+        ) {
+            call.module_provenance = Some(ModuleProvenance::Unavailable {
+                reason: memcordon_core::BoundedText::new("record-bound").map_err(|_| invalid())?,
+                raw_error: None,
+                deadline: false,
+            });
+        }
+    }
     fallback.validate()?;
     encode(&fallback)
 }
@@ -405,6 +667,23 @@ pub fn encode_ack(value: &str) -> io::Result<Vec<u8>> {
     encode(&Ack {
         revision: REVISION,
         nonce: value,
+    })
+}
+
+pub fn encode_probe_ack(value: &str) -> io::Result<Vec<u8>> {
+    if !nonce(value) {
+        return Err(invalid());
+    }
+    #[derive(Serialize)]
+    struct Ack<'a> {
+        revision: u32,
+        nonce: &'a str,
+        kind: &'static str,
+    }
+    encode(&Ack {
+        revision: REVISION,
+        nonce: value,
+        kind: "diagnostic-release",
     })
 }
 
@@ -438,6 +717,8 @@ pub fn decode_failure_core(bytes: &[u8]) -> io::Result<FailureCore> {
         modify_denied: Option<bool>,
         #[serde(default)]
         diagnostics: Option<serde_json::Value>,
+        #[serde(default)]
+        native_open: Option<serde_json::Value>,
     }
     let wire: Wire = decode(bytes)?;
     if wire.revision != REVISION
@@ -451,6 +732,7 @@ pub fn decode_failure_core(bytes: &[u8]) -> io::Result<FailureCore> {
         return Err(invalid());
     }
     let _ = wire.diagnostics;
+    let _ = wire.native_open;
     let mut digest = String::new();
     use std::fmt::Write;
     for byte in Sha256::digest(bytes) {

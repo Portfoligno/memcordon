@@ -418,10 +418,10 @@ fn before_preparation_experiment(
                 ))
             })?;
         action["native_signal_result"] = json!(0);
-        if let Err(error) = permission.allow() {
-            if !frontend.exited().map_err(CiError::Message)? {
-                return Err(error);
-            }
+        if let Err(error) = permission.allow()
+            && !frontend.exited().map_err(CiError::Message)?
+        {
+            return Err(error);
         }
         action["released"] = permission.observation();
         launch.close_input();
@@ -1164,12 +1164,14 @@ pub fn run_installed(
                     caller,
                     images,
                     provider,
-                    &previous_controller,
-                    &old,
-                    scenario,
-                    "released-service-loss",
-                    work,
-                    cleanup,
+                    super::linux_current_component_lifetime::ExperimentContext {
+                        controller: &previous_controller,
+                        directory: &old,
+                        scenario,
+                        facet: "released-service-loss",
+                        work,
+                        cleanup,
+                    },
                 )?;
                 let restarted = crate::command::CommandSpec::new(
                     "/usr/bin/systemctl",

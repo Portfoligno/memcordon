@@ -59,12 +59,15 @@ pub(crate) fn retirement_deadline() -> Option<Instant> {
     RETIREMENT.get()
 }
 
+#[cfg(any(windows, test))]
 pub(crate) struct Retirement(Option<Instant>);
+#[cfg(any(windows, test))]
 impl Drop for Retirement {
     fn drop(&mut self) {
         RETIREMENT.set(self.0);
     }
 }
+#[cfg(any(windows, test))]
 pub(crate) fn retirement_scope(deadline: Instant) -> Retirement {
     let previous = RETIREMENT.get();
     RETIREMENT.set(Some(previous.map_or(deadline, |old| old.min(deadline))));

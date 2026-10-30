@@ -17,20 +17,24 @@ fn unprivileged_agent() -> Command {
 
 #[test]
 fn retired_recovery_routes_are_rejected_before_native_authorization() {
-    for arguments in [
-        vec!["package", "policy", "recover", "--json"],
-        vec!["package", "recover", "--json"],
+    for (arguments, expected_refusal) in [
+        (
+            vec!["package", "policy", "recover", "--json"],
+            "invalid arguments",
+        ),
+        (
+            vec!["package", "recover", "--json"],
+            "unknown package operation",
+        ),
     ] {
         let obsolete = unprivileged_agent()
             .args(arguments)
             .output()
             .expect("launch the actual native agent with a retired recovery route");
-        assert!(!obsolete.status.success());
+        assert_eq!(obsolete.status.code(), Some(125));
+        assert!(obsolete.stdout.is_empty());
         let refusal = String::from_utf8(obsolete.stderr).unwrap();
-        assert!(
-            refusal.contains("retired release command is unavailable"),
-            "{refusal}"
-        );
+        assert_eq!(refusal.lines().next(), Some(expected_refusal), "{refusal}");
         assert!(!refusal.contains("native recovery requires authenticated root administration"));
     }
 }

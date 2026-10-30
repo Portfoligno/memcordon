@@ -287,11 +287,11 @@ impl Pump<'_> {
                 "original workload return cutoff elapsed",
             ));
         }
-        if self.relay_error.is_none()
-            && let Err(error) = self.relay.step()
-        {
-            self.relay_error = Some(error.to_string());
-            self.relay.close_input();
+        if self.relay_error.is_none() {
+            if let Err(error) = self.relay.step() {
+                self.relay_error = Some(error.to_string());
+                self.relay.close_input();
+            }
         }
         if self.interruption.is_none() {
             self.interruption = self.signal.take();
@@ -302,9 +302,10 @@ impl Pump<'_> {
                 || self
                     .work_cutoff
                     .is_some_and(|cutoff| Instant::now() >= cutoff))
-            && let Some(binding) = self.assigned
         {
-            self.cancel(binding)?;
+            if let Some(binding) = self.assigned {
+                self.cancel(binding)?;
+            }
         }
         Ok(())
     }
@@ -838,22 +839,22 @@ pub(crate) fn run_workload_attempt(
                 if prepared_native.is_none() {
                     return Err("native output arrived without original prepared barrier".into());
                 }
-                if let Some(receiver) = &mut outputs
-                    && let Err(error) = receiver.inventory(&frame.payload)
-                {
-                    output_error.get_or_insert(error);
-                    outputs = None;
+                if let Some(receiver) = &mut outputs {
+                    if let Err(error) = receiver.inventory(&frame.payload) {
+                        output_error.get_or_insert(error);
+                        outputs = None;
+                    }
                 }
             }
             WorkloadFrameKind::OutputChunk => {
                 if prepared_native.is_none() {
                     return Err("native output arrived without original prepared barrier".into());
                 }
-                if let Some(receiver) = &mut outputs
-                    && let Err(error) = receiver.chunk(&frame.payload)
-                {
-                    output_error.get_or_insert(error);
-                    outputs = None;
+                if let Some(receiver) = &mut outputs {
+                    if let Err(error) = receiver.chunk(&frame.payload) {
+                        output_error.get_or_insert(error);
+                        outputs = None;
+                    }
                 }
             }
             WorkloadFrameKind::Terminal => {
@@ -866,8 +867,8 @@ pub(crate) fn run_workload_attempt(
                 {
                     return Err("released native workload omitted original prepared barrier".into());
                 }
-                if let (Some(prepared), Some(native)) = (&prepared_native, &terminal.native)
-                    && (prepared.entrypoint_sha256 != native.entrypoint_sha256
+                if let (Some(prepared), Some(native)) = (&prepared_native, &terminal.native) {
+                    if prepared.entrypoint_sha256 != native.entrypoint_sha256
                         || prepared.target != native.target
                         || prepared.namespace_init != native.namespace_init
                         || prepared.guardian != native.guardian
@@ -876,11 +877,13 @@ pub(crate) fn run_workload_attempt(
                         || prepared.target_uid != native.target_uid
                         || prepared.target_gid != native.target_gid
                         || prepared.caller_uid != native.caller_uid
-                        || prepared.caller_namespaces != native.caller_namespaces)
-                {
-                    return Err(
-                        "native terminal changed the exact held prepared attempt identities".into(),
-                    );
+                        || prepared.caller_namespaces != native.caller_namespaces
+                    {
+                        return Err(
+                            "native terminal changed the exact held prepared attempt identities"
+                                .into(),
+                        );
+                    }
                 }
                 if terminal.request.invocation_sha256
                     != memcordon_core::workload_request::invocation_digest(
@@ -907,11 +910,12 @@ pub(crate) fn run_workload_attempt(
             _ => return Err("unexpected provider workload frame".into()),
         }
     };
-    if terminal.release != memcordon_core::result_v3::ReleaseKnowledgeV3::NotReleased
-        && let Some(receiver) = outputs
-        && let Err(error) = receiver.finish()
-    {
-        output_error.get_or_insert(error);
+    if terminal.release != memcordon_core::result_v3::ReleaseKnowledgeV3::NotReleased {
+        if let Some(receiver) = outputs {
+            if let Err(error) = receiver.finish() {
+                output_error.get_or_insert(error);
+            }
+        }
     }
     pump.relay.close_input();
     let drain_cutoff = pump.cleanup_cutoff.or(return_cutoff).unwrap_or(
@@ -978,6 +982,10 @@ pub(crate) fn run_workload_attempt(
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the backend boundary preserves the public categorized Error contract"
+)]
 pub(crate) fn run_workload_backend(
     io: &mut WorkloadFrontendRequest,
     policy: &memcordon_core::Policy,

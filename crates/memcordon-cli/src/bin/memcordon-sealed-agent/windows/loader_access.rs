@@ -985,15 +985,25 @@ struct ObjectAttributes {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SectionBasicInformation {
     base_address: *mut c_void,
     allocation_attributes: u32,
     maximum_size: i64,
 }
 
+impl Default for SectionBasicInformation {
+    fn default() -> Self {
+        Self {
+            base_address: std::ptr::null_mut(),
+            allocation_attributes: 0,
+            maximum_size: 0,
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SectionImageInformation {
     transfer_address: *mut c_void,
     zero_bits: u32,
@@ -1010,6 +1020,28 @@ struct SectionImageInformation {
     loader_flags: u32,
     image_file_size: u32,
     checksum: u32,
+}
+
+impl Default for SectionImageInformation {
+    fn default() -> Self {
+        Self {
+            transfer_address: std::ptr::null_mut(),
+            zero_bits: 0,
+            maximum_stack_size: 0,
+            committed_stack_size: 0,
+            subsystem_type: 0,
+            subsystem_version: 0,
+            operating_system_version: 0,
+            image_characteristics: 0,
+            dll_characteristics: 0,
+            machine: 0,
+            image_contains_code: 0,
+            image_flags: 0,
+            loader_flags: 0,
+            image_file_size: 0,
+            checksum: 0,
+        }
+    }
 }
 
 type NtOpenDirectoryObjectFn =

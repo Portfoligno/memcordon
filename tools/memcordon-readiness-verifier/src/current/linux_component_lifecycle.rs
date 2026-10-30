@@ -326,7 +326,7 @@ pub(super) fn verify_observations(
     }
     let before = document("journal-before.json")?;
     let journal_fields = JOURNAL_FIELDS;
-    closed(&before, &journal_fields)?;
+    closed(&before, journal_fields)?;
     let attempt: Vec<u8> = serde_json::from_value(association["attempt"].clone())
         .map_err(|error| error.to_string())?;
     let attempt_name = hex::encode(attempt);
@@ -461,10 +461,10 @@ pub(super) fn verify_observations(
         {
             return Err("actual original held process identity/retirement differs".into());
         }
-        if ["guardian", "namespace_init", "target"].contains(&role) {
-            if native[role]["pid"] != pid || native[role]["birth"] != birth {
-                return Err("prepared native identity differs from held original process".into());
-            }
+        if ["guardian", "namespace_init", "target"].contains(&role)
+            && (native[role]["pid"] != pid || native[role]["birth"] != birth)
+        {
+            return Err("prepared native identity differs from held original process".into());
         }
     }
     let target = &processes[4];
@@ -558,7 +558,7 @@ pub(super) fn verify_observations(
         );
     }
     let after = document("journal-after.json")?;
-    closed(&after, &journal_fields)?;
+    closed(&after, journal_fields)?;
     if after["association"] != association || after["request"] != prepared["request"] {
         return Err("retained durable terminal selects another original attempt".into());
     }
@@ -608,7 +608,7 @@ pub(super) fn verify_observations(
             );
         }
         cleanup(&result["cleanup"])?;
-        super::linux::result_join(&result, &association, &digest, &source_commit, true)?;
+        super::linux::result_join(&result, &association, &digest, source_commit, true)?;
     } else {
         let expected_victim = match scenario {
             "lost-terminal-response" | "controlled-drain-cancel" => action["frontend"].clone(),
@@ -751,7 +751,7 @@ pub fn validate_snapshot_budget(
     configured: u64,
     headroom: u64,
 ) -> VerificationResult<()> {
-    if configured == 0 || configured % (1024 * 1024) != 0 || headroom == 0 {
+    if configured == 0 || !configured.is_multiple_of(1024 * 1024) || headroom == 0 {
         return Err("current snapshot memory operand is not a positive MiB value".into());
     }
     for page in [4096_u64, 16384, 65536] {

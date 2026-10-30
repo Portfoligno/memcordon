@@ -186,7 +186,32 @@ pub(crate) fn policy_projection(name: &str, actual: &Value) -> Result<Option<Map
         .and_then(Value::as_mapping_mut)
     {
         jobs.remove(text("source-seed")); // Independently validated above; no legacy equivalent.
-        for added in ["format", "source-policy"] {
+        for owner in [
+            "current-contracts",
+            "tooling-contracts",
+            "macos-administrative-contracts",
+            "macos-startup-deadline-feedback",
+            "windows-fixture-feedback",
+            "windows-sealed-agent-contracts",
+        ] {
+            if !expected["jobs"][owner].is_null()
+                && jobs.get(text(owner)) != Some(&expected["jobs"][owner])
+            {
+                return Err(CiError::Message(
+                    "independent current contracts owner differs from authoring".into(),
+                ));
+            }
+        }
+        for added in [
+            "format",
+            "source-policy",
+            "current-contracts",
+            "tooling-contracts",
+            "macos-administrative-contracts",
+            "macos-startup-deadline-feedback",
+            "windows-fixture-feedback",
+            "windows-sealed-agent-contracts",
+        ] {
             if let Some(job) = jobs.remove(text(added))
                 && job != expected["jobs"][added]
             {

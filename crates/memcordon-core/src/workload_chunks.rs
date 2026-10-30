@@ -82,7 +82,7 @@ impl<'a> WorkloadChunkV1<'a> {
         Ok(bytes)
     }
     pub fn decode(bytes: &'a [u8]) -> Result<Self, String> {
-        fn take<'b, const N: usize>(remaining: &mut &'b [u8]) -> Result<[u8; N], String> {
+        fn take<const N: usize>(remaining: &mut &[u8]) -> Result<[u8; N], String> {
             let (head, tail) = remaining
                 .split_at_checked(N)
                 .ok_or("truncated workload chunk")?;

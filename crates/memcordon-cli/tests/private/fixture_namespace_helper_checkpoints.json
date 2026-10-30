@@ -1,0 +1,2083 @@
+{
+  "source": "200b same-hash KernelBase",
+  "scope": "static checkpoint graph, not runtime evidence",
+  "max_checkpoint_stops": 93,
+  "nodes": [
+    {
+      "id": "0x86450",
+      "bytes": [
+        72,
+        139,
+        196
+      ],
+      "kind": "helper-entry",
+      "instruction": "movq %rsp, %rax",
+      "successors": [
+        "0x864de"
+      ]
+    },
+    {
+      "id": "0x864de",
+      "bytes": [
+        232,
+        174,
+        64,
+        10,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq 0x18012a591 <_invalid_parameter+0x231>",
+      "successors": [
+        "0x864e3"
+      ]
+    },
+    {
+      "id": "0x864e3",
+      "bytes": [
+        15,
+        87,
+        192
+      ],
+      "kind": "call-return",
+      "instruction": "xorps %xmm0, %xmm0",
+      "successors": [
+        "0x864fd"
+      ]
+    },
+    {
+      "id": "0x864fd",
+      "bytes": [
+        232,
+        143,
+        64,
+        10,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq 0x18012a591 <_invalid_parameter+0x231>",
+      "successors": [
+        "0x86502"
+      ]
+    },
+    {
+      "id": "0x86502",
+      "bytes": [
+        72,
+        141,
+        68,
+        36,
+        64
+      ],
+      "kind": "call-return",
+      "instruction": "leaq 0x40(%rsp), %rax",
+      "successors": [
+        "0x8653f"
+      ]
+    },
+    {
+      "id": "0x8653f",
+      "bytes": [
+        72,
+        255,
+        21,
+        18,
+        122,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207a12(%rip)         # 0x18028df58",
+      "successors": [
+        "0x86546"
+      ]
+    },
+    {
+      "id": "0x86546",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x8654f"
+      ]
+    },
+    {
+      "id": "0x8654f",
+      "bytes": [
+        15,
+        136,
+        241,
+        0,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x8656d",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x8656d",
+      "bytes": [
+        72,
+        255,
+        21,
+        228,
+        121,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x2079e4(%rip)         # 0x18028df58",
+      "successors": [
+        "0x86574"
+      ]
+    },
+    {
+      "id": "0x86574",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x8657d"
+      ]
+    },
+    {
+      "id": "0x8657d",
+      "bytes": [
+        15,
+        136,
+        195,
+        0,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x8659c",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x8659c",
+      "bytes": [
+        72,
+        255,
+        21,
+        181,
+        121,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x2079b5(%rip)         # 0x18028df58",
+      "successors": [
+        "0x865a3"
+      ]
+    },
+    {
+      "id": "0x865a3",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x865ac"
+      ]
+    },
+    {
+      "id": "0x865ac",
+      "bytes": [
+        15,
+        136,
+        148,
+        0,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x865b8",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x865b8",
+      "bytes": [
+        15,
+        133,
+        74,
+        54,
+        17,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180199c08 <TlsGetValue+0x9d88>",
+      "successors": [
+        "0x865c2",
+        "0x199c23"
+      ]
+    },
+    {
+      "id": "0x865c2",
+      "bytes": [
+        15,
+        133,
+        208,
+        2,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086898 <BaseGetNamedObjectDirectory+0x608>",
+      "successors": [
+        "0x865ca",
+        "0x8689d"
+      ]
+    },
+    {
+      "id": "0x865ca",
+      "bytes": [
+        15,
+        133,
+        112,
+        2,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086840 <BaseGetNamedObjectDirectory+0x5b0>",
+      "successors": [
+        "0x865d0",
+        "0x8685f"
+      ]
+    },
+    {
+      "id": "0x865d0",
+      "bytes": [
+        72,
+        255,
+        21,
+        153,
+        131,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x208399(%rip)         # 0x18028e970",
+      "successors": [
+        "0x865d7"
+      ]
+    },
+    {
+      "id": "0x865d7",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x865e2"
+      ]
+    },
+    {
+      "id": "0x865e2",
+      "bytes": [
+        15,
+        133,
+        92,
+        2,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086844 <BaseGetNamedObjectDirectory+0x5b4>",
+      "successors": [
+        "0x8663e",
+        "0x8685f"
+      ]
+    },
+    {
+      "id": "0x8663e",
+      "bytes": [
+        133,
+        219
+      ],
+      "kind": "copy-status",
+      "instruction": "testl %ebx, %ebx",
+      "successors": [
+        "0x86640"
+      ]
+    },
+    {
+      "id": "0x86640",
+      "bytes": [
+        15,
+        137,
+        167,
+        0,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jns 0x1800866ed <BaseGetNamedObjectDirectory+0x45d>",
+      "successors": [
+        "0x866ba",
+        "0x866f2"
+      ]
+    },
+    {
+      "id": "0x866ba",
+      "bytes": [
+        139,
+        195
+      ],
+      "kind": "selected-ebx",
+      "instruction": "movl %ebx, %eax",
+      "successors": [
+        "helper-return"
+      ]
+    },
+    {
+      "id": "0x866f2",
+      "bytes": [
+        15,
+        133,
+        94,
+        4,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086b56 <BaseGetNamedObjectDirectory+0x8c6>",
+      "successors": [
+        "0x866fa",
+        "0x86b58"
+      ]
+    },
+    {
+      "id": "0x866fa",
+      "bytes": [
+        15,
+        133,
+        197,
+        3,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086ac5 <BaseGetNamedObjectDirectory+0x835>",
+      "successors": [
+        "0x8671d",
+        "0x86ace"
+      ]
+    },
+    {
+      "id": "0x8671d",
+      "bytes": [
+        15,
+        132,
+        59,
+        5,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "je 0x180086c5e <BaseGetNamedObjectDirectory+0x9ce>",
+      "successors": [
+        "0x867cf"
+      ]
+    },
+    {
+      "id": "0x867cf",
+      "bytes": [
+        72,
+        255,
+        21,
+        162,
+        129,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x2081a2(%rip)         # 0x18028e978",
+      "successors": [
+        "0x867d6"
+      ]
+    },
+    {
+      "id": "0x867d6",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x867df"
+      ]
+    },
+    {
+      "id": "0x867df",
+      "bytes": [
+        15,
+        136,
+        134,
+        0,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "js 0x18008686b <BaseGetNamedObjectDirectory+0x5db>",
+      "successors": [
+        "0x867e7",
+        "0x8687a"
+      ]
+    },
+    {
+      "id": "0x867e7",
+      "bytes": [
+        116,
+        62
+      ],
+      "kind": "branch",
+      "instruction": "je 0x180086827 <BaseGetNamedObjectDirectory+0x597>",
+      "successors": [
+        "0x86808",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86808",
+      "bytes": [
+        72,
+        255,
+        21,
+        73,
+        119,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207749(%rip)         # 0x18028df58",
+      "successors": [
+        "0x8680f"
+      ]
+    },
+    {
+      "id": "0x8680f",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86818"
+      ]
+    },
+    {
+      "id": "0x86818",
+      "bytes": [
+        120,
+        118
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x86821",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86821",
+      "bytes": [
+        15,
+        133,
+        170,
+        3,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086bd1 <BaseGetNamedObjectDirectory+0x941>",
+      "successors": [
+        "0x866ba",
+        "0x86bdd"
+      ]
+    },
+    {
+      "id": "0x8685f",
+      "bytes": [
+        232,
+        24,
+        171,
+        252,
+        255
+      ],
+      "kind": "call-entry",
+      "instruction": "callq 0x18005137c <_OpenMuiStringCache+0x28c>",
+      "successors": [
+        "0x86864"
+      ]
+    },
+    {
+      "id": "0x86864",
+      "bytes": [
+        139,
+        216
+      ],
+      "kind": "call-return",
+      "instruction": "movl %eax, %ebx",
+      "successors": [
+        "0x8663e"
+      ]
+    },
+    {
+      "id": "0x8687a",
+      "bytes": [
+        72,
+        255,
+        21,
+        247,
+        128,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x2080f7(%rip)         # 0x18028e978",
+      "successors": [
+        "0x86881"
+      ]
+    },
+    {
+      "id": "0x86881",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x8688a"
+      ]
+    },
+    {
+      "id": "0x8688a",
+      "bytes": [
+        15,
+        137,
+        105,
+        2,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jns 0x180086af9 <BaseGetNamedObjectDirectory+0x869>",
+      "successors": [
+        "0x866ba",
+        "0x86b2d"
+      ]
+    },
+    {
+      "id": "0x8689d",
+      "bytes": [
+        72,
+        255,
+        21,
+        60,
+        113,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x20713c(%rip)         # 0x18028d9e0",
+      "successors": [
+        "0x868a4"
+      ]
+    },
+    {
+      "id": "0x868a4",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x868be"
+      ]
+    },
+    {
+      "id": "0x868be",
+      "bytes": [
+        72,
+        255,
+        21,
+        43,
+        135,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x20872b(%rip)         # 0x18028eff0",
+      "successors": [
+        "0x868c5"
+      ]
+    },
+    {
+      "id": "0x868c5",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x868d0"
+      ]
+    },
+    {
+      "id": "0x868d0",
+      "bytes": [
+        15,
+        132,
+        229,
+        3,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "je 0x180086cbb <BaseGetNamedObjectDirectory+0xa2b>",
+      "successors": [
+        "0x868f2",
+        "0x86cbb"
+      ]
+    },
+    {
+      "id": "0x868f2",
+      "bytes": [
+        72,
+        255,
+        21,
+        95,
+        118,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x20765f(%rip)         # 0x18028df58",
+      "successors": [
+        "0x868f9"
+      ]
+    },
+    {
+      "id": "0x868f9",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86902"
+      ]
+    },
+    {
+      "id": "0x86902",
+      "bytes": [
+        15,
+        136,
+        213,
+        51,
+        17,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180199cdd <TlsGetValue+0x9e5d>",
+      "successors": [
+        "0x86927",
+        "0x199ce2"
+      ]
+    },
+    {
+      "id": "0x86927",
+      "bytes": [
+        232,
+        80,
+        170,
+        252,
+        255
+      ],
+      "kind": "call-entry",
+      "instruction": "callq 0x18005137c <_OpenMuiStringCache+0x28c>",
+      "successors": [
+        "0x8692c"
+      ]
+    },
+    {
+      "id": "0x8692c",
+      "bytes": [
+        139,
+        216
+      ],
+      "kind": "call-return",
+      "instruction": "movl %eax, %ebx",
+      "successors": [
+        "0x86930"
+      ]
+    },
+    {
+      "id": "0x86930",
+      "bytes": [
+        15,
+        136,
+        16,
+        253,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x86938",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86938",
+      "bytes": [
+        15,
+        133,
+        161,
+        1,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086adf <BaseGetNamedObjectDirectory+0x84f>",
+      "successors": [
+        "0x8695e",
+        "0x86ae8"
+      ]
+    },
+    {
+      "id": "0x8695e",
+      "bytes": [
+        15,
+        132,
+        240,
+        2,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "je 0x180086c54 <BaseGetNamedObjectDirectory+0x9c4>",
+      "successors": [
+        "0x86a0f"
+      ]
+    },
+    {
+      "id": "0x86a0f",
+      "bytes": [
+        72,
+        255,
+        21,
+        98,
+        127,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207f62(%rip)         # 0x18028e978",
+      "successors": [
+        "0x86a16"
+      ]
+    },
+    {
+      "id": "0x86a16",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86a1f"
+      ]
+    },
+    {
+      "id": "0x86a1f",
+      "bytes": [
+        15,
+        136,
+        107,
+        254,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x86a2a",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86a2a",
+      "bytes": [
+        15,
+        133,
+        53,
+        51,
+        17,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180199d65 <TlsGetValue+0x9ee5>",
+      "successors": [
+        "0x86a38",
+        "0x199d96"
+      ]
+    },
+    {
+      "id": "0x86a38",
+      "bytes": [
+        72,
+        255,
+        21,
+        105,
+        121,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207969(%rip)         # 0x18028e3a8",
+      "successors": [
+        "0x86a3f"
+      ]
+    },
+    {
+      "id": "0x86a3f",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86a48"
+      ]
+    },
+    {
+      "id": "0x86a48",
+      "bytes": [
+        15,
+        136,
+        66,
+        254,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x86a52",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86a52",
+      "bytes": [
+        15,
+        133,
+        16,
+        2,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086c68 <BaseGetNamedObjectDirectory+0x9d8>",
+      "successors": [
+        "0x86a63",
+        "0x86c70"
+      ]
+    },
+    {
+      "id": "0x86a63",
+      "bytes": [
+        72,
+        255,
+        21,
+        22,
+        118,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207616(%rip)         # 0x18028e080",
+      "successors": [
+        "0x86a6a"
+      ]
+    },
+    {
+      "id": "0x86a6a",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86a73"
+      ]
+    },
+    {
+      "id": "0x86a73",
+      "bytes": [
+        15,
+        136,
+        23,
+        254,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x86aaa",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86aaa",
+      "bytes": [
+        72,
+        255,
+        21,
+        199,
+        126,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207ec7(%rip)         # 0x18028e978",
+      "successors": [
+        "0x86ab1"
+      ]
+    },
+    {
+      "id": "0x86ab1",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86aba"
+      ]
+    },
+    {
+      "id": "0x86aba",
+      "bytes": [
+        15,
+        137,
+        37,
+        253,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "jns 0x1800867e5 <BaseGetNamedObjectDirectory+0x555>",
+      "successors": [
+        "0x866ba",
+        "0x867e7"
+      ]
+    },
+    {
+      "id": "0x86ace",
+      "bytes": [
+        72,
+        255,
+        21,
+        243,
+        110,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x206ef3(%rip)         # 0x18028d9c8",
+      "successors": [
+        "0x86ad5"
+      ]
+    },
+    {
+      "id": "0x86ad5",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x867cf"
+      ]
+    },
+    {
+      "id": "0x86ae8",
+      "bytes": [
+        72,
+        255,
+        21,
+        217,
+        110,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x206ed9(%rip)         # 0x18028d9c8",
+      "successors": [
+        "0x86aef"
+      ]
+    },
+    {
+      "id": "0x86aef",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86a0f"
+      ]
+    },
+    {
+      "id": "0x86b2d",
+      "bytes": [
+        72,
+        255,
+        21,
+        68,
+        126,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207e44(%rip)         # 0x18028e978",
+      "successors": [
+        "0x86b34"
+      ]
+    },
+    {
+      "id": "0x86b34",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86b40"
+      ]
+    },
+    {
+      "id": "0x86b40",
+      "bytes": [
+        72,
+        255,
+        21,
+        217,
+        113,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x2071d9(%rip)         # 0x18028dd20",
+      "successors": [
+        "0x86b47"
+      ]
+    },
+    {
+      "id": "0x86b47",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86aba"
+      ]
+    },
+    {
+      "id": "0x86b58",
+      "bytes": [
+        15,
+        132,
+        45,
+        1,
+        0,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "je 0x180086c8b <BaseGetNamedObjectDirectory+0x9fb>",
+      "successors": [
+        "0x86b67",
+        "0x86cab"
+      ]
+    },
+    {
+      "id": "0x86b67",
+      "bytes": [
+        72,
+        255,
+        21,
+        90,
+        110,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x206e5a(%rip)         # 0x18028d9c8",
+      "successors": [
+        "0x86b6e"
+      ]
+    },
+    {
+      "id": "0x86b6e",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86ba9"
+      ]
+    },
+    {
+      "id": "0x86ba9",
+      "bytes": [
+        72,
+        255,
+        21,
+        200,
+        125,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207dc8(%rip)         # 0x18028e978",
+      "successors": [
+        "0x86bb0"
+      ]
+    },
+    {
+      "id": "0x86bb0",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86bb9"
+      ]
+    },
+    {
+      "id": "0x86bb9",
+      "bytes": [
+        15,
+        136,
+        209,
+        252,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x867cf",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86bdd",
+      "bytes": [
+        72,
+        255,
+        21,
+        228,
+        109,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x206de4(%rip)         # 0x18028d9c8",
+      "successors": [
+        "0x86be4"
+      ]
+    },
+    {
+      "id": "0x86be4",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86c1b"
+      ]
+    },
+    {
+      "id": "0x86c1b",
+      "bytes": [
+        72,
+        255,
+        21,
+        86,
+        125,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207d56(%rip)         # 0x18028e978",
+      "successors": [
+        "0x86c22"
+      ]
+    },
+    {
+      "id": "0x86c22",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86c2e"
+      ]
+    },
+    {
+      "id": "0x86c2e",
+      "bytes": [
+        15,
+        136,
+        18,
+        250,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x86c39",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86c39",
+      "bytes": [
+        72,
+        255,
+        21,
+        224,
+        112,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x2070e0(%rip)         # 0x18028dd20",
+      "successors": [
+        "0x86c40"
+      ]
+    },
+    {
+      "id": "0x86c40",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86c70",
+      "bytes": [
+        72,
+        255,
+        21,
+        73,
+        119,
+        32,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0x207749(%rip)         # 0x18028e3c0",
+      "successors": [
+        "0x86c77"
+      ]
+    },
+    {
+      "id": "0x86c77",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86c80"
+      ]
+    },
+    {
+      "id": "0x86c80",
+      "bytes": [
+        15,
+        136,
+        10,
+        252,
+        255,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x199ddd",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x86cab",
+      "bytes": [
+        15,
+        133,
+        178,
+        47,
+        17,
+        0
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180199c63 <TlsGetValue+0x9de3>",
+      "successors": [
+        "0x86ba9"
+      ]
+    },
+    {
+      "id": "0x86cbb",
+      "bytes": [
+        187,
+        154,
+        0,
+        0,
+        192
+      ],
+      "kind": "synthetic-status",
+      "instruction": "movl $0xc000009a, %ebx       # imm = 0xC000009A",
+      "successors": [
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199c23",
+      "bytes": [
+        72,
+        255,
+        21,
+        46,
+        67,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf432e(%rip)          # 0x18028df58",
+      "successors": [
+        "0x199c2a"
+      ]
+    },
+    {
+      "id": "0x199c2a",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199c33"
+      ]
+    },
+    {
+      "id": "0x199c33",
+      "bytes": [
+        15,
+        136,
+        13,
+        202,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x199c44",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199c44",
+      "bytes": [
+        72,
+        255,
+        21,
+        53,
+        68,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf4435(%rip)          # 0x18028e080",
+      "successors": [
+        "0x199c4b"
+      ]
+    },
+    {
+      "id": "0x199c4b",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199c54"
+      ]
+    },
+    {
+      "id": "0x199c54",
+      "bytes": [
+        15,
+        136,
+        236,
+        201,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x865c2",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199ce2",
+      "bytes": [
+        15,
+        133,
+        94,
+        201,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "jne 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x199cfa",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199cfa",
+      "bytes": [
+        72,
+        255,
+        21,
+        55,
+        68,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf4437(%rip)          # 0x18028e138",
+      "successors": [
+        "0x199d01"
+      ]
+    },
+    {
+      "id": "0x199d01",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199d1a"
+      ]
+    },
+    {
+      "id": "0x199d1a",
+      "bytes": [
+        72,
+        255,
+        21,
+        207,
+        82,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf52cf(%rip)          # 0x18028eff0",
+      "successors": [
+        "0x199d21"
+      ]
+    },
+    {
+      "id": "0x199d21",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199d2c"
+      ]
+    },
+    {
+      "id": "0x199d2c",
+      "bytes": [
+        15,
+        132,
+        137,
+        207,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "je 0x180086cbb <BaseGetNamedObjectDirectory+0xa2b>",
+      "successors": [
+        "0x199d4a",
+        "0x86cbb"
+      ]
+    },
+    {
+      "id": "0x199d4a",
+      "bytes": [
+        72,
+        255,
+        21,
+        7,
+        66,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf4207(%rip)          # 0x18028df58",
+      "successors": [
+        "0x199d51"
+      ]
+    },
+    {
+      "id": "0x199d51",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199d5a"
+      ]
+    },
+    {
+      "id": "0x199d5a",
+      "bytes": [
+        15,
+        136,
+        230,
+        200,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086646 <BaseGetNamedObjectDirectory+0x3b6>",
+      "successors": [
+        "0x86927",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199d96",
+      "bytes": [
+        72,
+        255,
+        21,
+        219,
+        75,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf4bdb(%rip)          # 0x18028e978",
+      "successors": [
+        "0x199d9d"
+      ]
+    },
+    {
+      "id": "0x199d9d",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199da6"
+      ]
+    },
+    {
+      "id": "0x199da6",
+      "bytes": [
+        15,
+        136,
+        228,
+        202,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x199db1",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199db1",
+      "bytes": [
+        72,
+        255,
+        21,
+        104,
+        63,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf3f68(%rip)          # 0x18028dd20",
+      "successors": [
+        "0x199db8"
+      ]
+    },
+    {
+      "id": "0x199db8",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86a38"
+      ]
+    },
+    {
+      "id": "0x199ddd",
+      "bytes": [
+        72,
+        255,
+        21,
+        156,
+        66,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf429c(%rip)          # 0x18028e080",
+      "successors": [
+        "0x199de4"
+      ]
+    },
+    {
+      "id": "0x199de4",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199ded"
+      ]
+    },
+    {
+      "id": "0x199ded",
+      "bytes": [
+        15,
+        136,
+        157,
+        202,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x199dfc",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199dfc",
+      "bytes": [
+        72,
+        255,
+        21,
+        173,
+        59,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf3bad(%rip)          # 0x18028d9b0",
+      "successors": [
+        "0x199e03"
+      ]
+    },
+    {
+      "id": "0x199e03",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199e13"
+      ]
+    },
+    {
+      "id": "0x199e13",
+      "bytes": [
+        72,
+        255,
+        21,
+        150,
+        59,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf3b96(%rip)          # 0x18028d9b0",
+      "successors": [
+        "0x199e1a"
+      ]
+    },
+    {
+      "id": "0x199e1a",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199e2a"
+      ]
+    },
+    {
+      "id": "0x199e2a",
+      "bytes": [
+        72,
+        255,
+        21,
+        127,
+        59,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf3b7f(%rip)          # 0x18028d9b0",
+      "successors": [
+        "0x199e31"
+      ]
+    },
+    {
+      "id": "0x199e31",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199e41"
+      ]
+    },
+    {
+      "id": "0x199e41",
+      "bytes": [
+        72,
+        255,
+        21,
+        104,
+        59,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf3b68(%rip)          # 0x18028d9b0",
+      "successors": [
+        "0x199e48"
+      ]
+    },
+    {
+      "id": "0x199e48",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199e76"
+      ]
+    },
+    {
+      "id": "0x199e76",
+      "bytes": [
+        232,
+        1,
+        117,
+        235,
+        255
+      ],
+      "kind": "call-entry",
+      "instruction": "callq 0x18005137c <_OpenMuiStringCache+0x28c>",
+      "successors": [
+        "0x199e7b"
+      ]
+    },
+    {
+      "id": "0x199e7b",
+      "bytes": [
+        139,
+        216
+      ],
+      "kind": "call-return",
+      "instruction": "movl %eax, %ebx",
+      "successors": [
+        "0x199e7f"
+      ]
+    },
+    {
+      "id": "0x199e7f",
+      "bytes": [
+        15,
+        136,
+        11,
+        202,
+        238,
+        255
+      ],
+      "kind": "branch",
+      "instruction": "js 0x180086890 <BaseGetNamedObjectDirectory+0x600>",
+      "successors": [
+        "0x199e90",
+        "0x866ba"
+      ]
+    },
+    {
+      "id": "0x199e90",
+      "bytes": [
+        72,
+        255,
+        21,
+        49,
+        59,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf3b31(%rip)          # 0x18028d9c8",
+      "successors": [
+        "0x199e97"
+      ]
+    },
+    {
+      "id": "0x199e97",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x199ecd"
+      ]
+    },
+    {
+      "id": "0x199ecd",
+      "bytes": [
+        72,
+        255,
+        21,
+        164,
+        74,
+        15,
+        0
+      ],
+      "kind": "call-entry",
+      "instruction": "callq *0xf4aa4(%rip)          # 0x18028e978",
+      "successors": [
+        "0x199ed4"
+      ]
+    },
+    {
+      "id": "0x199ed4",
+      "bytes": [
+        15,
+        31,
+        68,
+        0,
+        0
+      ],
+      "kind": "call-return",
+      "instruction": "nopl (%rax,%rax)",
+      "successors": [
+        "0x86aba"
+      ]
+    }
+  ]
+}

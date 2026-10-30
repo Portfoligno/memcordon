@@ -10,6 +10,7 @@ fn exec_association_uses_pinned_kernel_namespace_mapping() {
     )
     .unwrap();
     assert_eq!(identity.host_pid(), 30054);
+    assert_eq!(identity.namespace_pid(), 2);
     identity.require_exec_pid(30054, 2).unwrap();
     // Host and init-local numbers are not interchangeable. Both halves of
     // the originally pinned mapping remain part of the association check.

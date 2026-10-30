@@ -13,6 +13,10 @@ use crate::{CiError, Result};
 
 #[path = "cache_guard.rs"]
 pub(crate) mod cache_guard;
+#[path = "policy_native_descriptor.rs"]
+mod native_descriptor;
+#[path = "policy_native_environment.rs"]
+mod native_environment;
 
 pub const MAXIMUM_YAML_BYTES: usize = 1_048_576;
 pub const MAXIMUM_YAML_DEPTH: usize = 64;
@@ -3332,12 +3336,20 @@ fn validate_workflow_bytes_into(
                 .is_some_and(|env| env.len() == 1)
             && job_value["env"]["CARGO_HOME"].as_str()
                 == Some("${{ github.workspace }}/target/ci-cargo-home")
-            && (job_name == "source-seed"
-                || (relative == Path::new(".github/workflows/backend-certification.yml")
-                    && matches!(
-                        job_name,
-                        "private-linux-prepare-x64" | "private-linux-prepare-arm64"
-                    ))
+            && (matches!(
+                job_name,
+                "source-seed"
+                    | "current-contracts"
+                    | "tooling-contracts"
+                    | "macos-administrative-contracts"
+                    | "macos-startup-deadline-feedback"
+                    | "windows-fixture-feedback"
+                    | "windows-sealed-agent-contracts"
+            ) || (relative == Path::new(".github/workflows/backend-certification.yml")
+                && matches!(
+                    job_name,
+                    "private-linux-prepare-x64" | "private-linux-prepare-arm64"
+                ))
                 || job_value["steps"].as_sequence().is_some_and(|steps| {
                     steps.iter().any(|step| {
                         step["run"].as_str().is_some_and(|command| {
@@ -4196,6 +4208,7 @@ struct RustPolicy {
     cargo_home_mutations: usize,
     cargo_job_budget_mutations: usize,
     managed_miri_sysroot_mutations: usize,
+    workload_loader_mutations: usize,
     owned_compiler_protocols: usize,
     compiler_protocol_removals: usize,
     compiler_protocol_setters: usize,
@@ -4230,6 +4243,9 @@ impl<'ast> Visit<'ast> for RustPolicy {
                     let mut sanitation = RustPolicy::default();
                     sanitation.visit_block(&function.block);
                     self.command_sanitation_clears += sanitation.cleared_environments;
+                    self.workload_loader_mutations += function.block.stmts.iter().filter(|statement| {
+                        matches!(statement, syn::Stmt::Expr(syn::Expr::If(branch), _) if reviewed_workload_loader_branch(branch))
+                    }).count();
                 }
             }
         }
@@ -4434,12 +4450,50 @@ fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) ->
     relative == Path::new("tools/memcordon-ci/src/command.rs")
         && visitor.cargo_job_budget_mutations <= 1
         && visitor.managed_miri_sysroot_mutations <= 1
+        && visitor.workload_loader_mutations <= 1
         && reviewed_owned_compiler_protocol(relative, visitor)
         && visitor.subprocess_env_mutations
             == visitor.cargo_home_mutations
                 + visitor.cargo_job_budget_mutations
                 + visitor.managed_miri_sysroot_mutations
+                + visitor.workload_loader_mutations
                 + visitor.owned_compiler_protocols
+}
+
+fn reviewed_workload_loader_branch(branch: &syn::ExprIf) -> bool {
+    if branch.attrs.len() != 1
+        || branch.else_branch.is_some()
+        || branch.then_branch.stmts.len() != 1
+    {
+        return false;
+    }
+    let attribute = &branch.attrs[0];
+    if !attribute.path().is_ident("cfg")
+        || !matches!(attribute.parse_args::<syn::Meta>(), Ok(syn::Meta::NameValue(value))
+            if value.path.is_ident("target_os")
+                && matches!(&value.value, syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(os), .. }) if os.value() == "linux"))
+    {
+        return false;
+    }
+    let syn::Expr::Let(binding) = branch.cond.as_ref() else {
+        return false;
+    };
+    if !matches!(binding.pat.as_ref(), syn::Pat::TupleStruct(pattern)
+        if pattern.path.is_ident("Some") && pattern.elems.len() == 1
+            && matches!(pattern.elems.first(), Some(syn::Pat::Ident(name)) if name.ident == "path" && name.by_ref.is_none() && name.mutability.is_none() && name.subpat.is_none()))
+        || !matches!(binding.expr.as_ref(), syn::Expr::Reference(reference)
+            if reference.mutability.is_none()
+                && matches!(reference.expr.as_ref(), syn::Expr::Field(field)
+                    if matches!(&field.member, syn::Member::Named(name) if name == "workload_loader_path")
+                        && matches!(field.base.as_ref(), syn::Expr::Path(base) if base.path.is_ident("self"))))
+    {
+        return false;
+    }
+    matches!(&branch.then_branch.stmts[0], syn::Stmt::Expr(syn::Expr::MethodCall(call), Some(_))
+        if call.method == "env" && call.args.len() == 2
+            && matches!(call.receiver.as_ref(), syn::Expr::Path(receiver) if receiver.path.is_ident("command"))
+            && matches!(call.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "LD_LIBRARY_PATH")
+            && matches!(call.args.last(), Some(syn::Expr::Path(value)) if value.path.is_ident("path")))
 }
 
 /// Match the complete capability-consuming branch, not a variable-name allowlist.
@@ -4583,12 +4637,21 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
         && !reviewed_compiler_environment(relative, &visitor)
         && !reviewed_isolated_cargo_environment(relative, &visitor)
         && !reviewed_git_environment(relative)
+        && !native_environment::reviewed(
+            relative,
+            &syntax,
+            visitor.subprocess_env_mutations,
+            visitor.cleared_environments,
+        )
     {
         visitor
             .violations
             .push("subprocess environment mutation is forbidden".to_owned());
     }
-    if visitor.pre_exec_calls != 0 && relative != test_support {
+    if visitor.pre_exec_calls != 0
+        && relative != test_support
+        && !native_descriptor::reviewed(relative, &syntax, visitor.pre_exec_calls)
+    {
         visitor.violations.push(
             "pre_exec is allowed only at the exact reviewed process-test boundary".to_owned(),
         );
@@ -4684,12 +4747,21 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
             && !reviewed_compiler_environment(relative, &visitor)
             && !reviewed_isolated_cargo_environment(relative, &visitor)
             && !reviewed_git_environment(relative)
+            && !native_environment::reviewed(
+                relative,
+                &syntax,
+                visitor.subprocess_env_mutations,
+                visitor.cleared_environments,
+            )
         {
             visitor
                 .violations
                 .push("subprocess environment mutation is forbidden".to_owned());
         }
-        if visitor.pre_exec_calls != 0 && relative != test_support {
+        if visitor.pre_exec_calls != 0
+            && relative != test_support
+            && !native_descriptor::reviewed(relative, &syntax, visitor.pre_exec_calls)
+        {
             visitor
                 .violations
                 .push("pre_exec is allowed only at the reviewed process-test boundary".to_owned());

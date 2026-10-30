@@ -173,13 +173,13 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
     assert_serialized_response_limit(&cleanup, memcordon_core::WINDOWS_MAX_FRAME_BYTES);
     for (response, request, limit) in [
         (
-            br#"{"kind":"attempt-retained"}"#.as_slice(),
-            br#"{"message":"attempt-retained"}"#.as_slice(),
+            br#"{"kind":"attempt-retained-v2"}"#.as_slice(),
+            br#"{"message":"attempt-retained-v2"}"#.as_slice(),
             MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
         ),
         (
-            br#"{"kind":"replay-pending"}"#.as_slice(),
-            br#"{"message":"replay-pending"}"#.as_slice(),
+            br#"{"kind":"replay-pending-v2"}"#.as_slice(),
+            br#"{"message":"replay-pending-v2"}"#.as_slice(),
             MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
         ),
         (
@@ -351,7 +351,7 @@ fn fragmented_response_prefixes_keep_the_same_bounded_classification() {
         }
     }
 
-    let discriminator = b"{\"kind\":\"attempt-retained\"";
+    let discriminator = b"{\"kind\":\"attempt-retained-v2\"";
     let mut frame = discriminator.to_vec();
     frame.resize(WINDOWS_RESPONSE_PREFIX_BYTES, b' ');
     let unread_body = b",\"kind\":\"terminal\"}";
@@ -399,6 +399,22 @@ fn classified_duplicate_and_unknown_kinds_still_fail_full_decoding() {
     let private =
         br#"{"kind":"certification-machine-restart","schema_version":2,"recovered":true}"#;
     assert!(serde_json::from_slice::<WindowsProviderResponseV4>(deleted_public).is_err());
+    for retired in [
+        br#"{"kind":"attempt-retained"}"#.as_slice(),
+        br#"{"kind":"replay-pending"}"#.as_slice(),
+        br#"{"kind":"qualification-rejected"}"#.as_slice(),
+    ] {
+        assert_eq!(
+            windows_response_frame_limit(retired).unwrap(),
+            memcordon_core::WINDOWS_MAX_FRAME_BYTES
+        );
+        assert_eq!(
+            windows_launcher_response_frame_limit(retired).unwrap(),
+            memcordon_core::WINDOWS_MAX_FRAME_BYTES
+        );
+        assert!(serde_json::from_slice::<WindowsProviderResponseV4>(retired).is_err());
+        assert!(serde_json::from_slice::<WindowsLauncherResponseV4>(retired).is_err());
+    }
     assert!(serde_json::from_slice::<WindowsProviderResponseV4>(public).is_ok());
     assert!(serde_json::from_slice::<WindowsLauncherResponseV4>(private).is_ok());
     for invalid in [
@@ -578,8 +594,8 @@ fn diagnostic_expiry_does_not_change_terminal_authority_or_ack_bytes() {
 #[test]
 fn response_prefix_selects_diagnostic_budget_before_payload_allocation() {
     for prefix in [
-        b"{\"kind\":\"attempt-retained\",\"schema_version\":".as_slice(),
-        b"{\"kind\":\"replay-pending\",\"schema_version\":".as_slice(),
+        b"{\"kind\":\"attempt-retained-v2\",\"schema_version\":".as_slice(),
+        b"{\"kind\":\"replay-pending-v2\",\"schema_version\":".as_slice(),
     ] {
         assert_eq!(
             windows_response_frame_limit(prefix).unwrap(),

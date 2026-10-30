@@ -9,6 +9,7 @@ use memcordon::invocation::{
     BudgetToken, HELP_TOPIC_USAGE, HELP_USAGE, HelpKind, Invocation, LimitToken, route,
 };
 use memcordon::parse_duration;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION;
 use memcordon_core::{BoundaryRequirement, Lifetime};
 
@@ -18,7 +19,7 @@ fn native(values: &[&str]) -> Vec<OsString> {
 
 fn execution(values: &[&str]) -> memcordon::invocation::ExecutionArgs {
     match route(&native(values)).expect("invocation should parse") {
-        Invocation::Execute(args) => args,
+        Invocation::Execute(args) => *args,
         other => panic!("expected execution, received {other:?}"),
     }
 }
@@ -60,7 +61,7 @@ fn retired_qualification_frame_options_are_rejected() {
 
 fn plan(values: &[&str]) -> memcordon::invocation::PlanArgs {
     match route(&native(values)).expect("plan should parse") {
-        Invocation::Plan(args) => args,
+        Invocation::Plan(args) => *args,
         other => panic!("expected plan, received {other:?}"),
     }
 }
@@ -172,25 +173,38 @@ fn sealed_execution_plan_and_doctor_fail_closed() {
         "sealed target executed before authorization"
     );
     assert!(String::from_utf8_lossy(&execution.stderr).contains("MCBOUNDARY-UNSUPPORTED"));
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(report).expect("failure report should exist"))
-            .expect("failure report JSON");
-    assert_eq!(report["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
-    assert_eq!(report["policy"]["requested"]["boundary"], "sealed");
-    assert_eq!(report["policy"]["effective"]["boundary"], "unavailable");
-    assert_eq!(report["error"]["code"], "MCBOUNDARY-UNSUPPORTED");
+    let report = memcordon_core::result_v3::ResultV3::parse(
+        &std::fs::read(report).expect("failure report should exist"),
+    )
+    .expect("current failure result");
+    assert_eq!(report.format, "memcordon.result");
+    assert_eq!(report.revision, 3);
     assert_eq!(
-        report["error"]["boundary_setup_failure"]["requested"],
-        "sealed"
+        report.release,
+        memcordon_core::result_v3::ReleaseKnowledgeV3::NotReleased
     );
     assert_eq!(
-        report["error"]["boundary_setup_failure"]["target_created"],
-        false
+        report.outcome.kind,
+        memcordon_core::execution_facts::OutcomeKindV1::LaunchFailure
     );
-    assert_eq!(
-        report["error"]["boundary_setup_failure"]["target_released"],
-        false
+    assert_eq!(report.outcome.wrapper_status, 125);
+    assert!(
+        report
+            .diagnostics
+            .as_slice()
+            .iter()
+            .any(|diagnostic| { diagnostic.as_str().contains("MCBOUNDARY-UNSUPPORTED") })
     );
+    assert!(matches!(
+        &report.runtime,
+        memcordon_core::result_v3::RuntimeExecutionV3::PreparationFailed { .. }
+    ));
+    #[cfg(target_os = "macos")]
+    assert!(matches!(
+        &report.runtime,
+        memcordon_core::result_v3::RuntimeExecutionV3::PreparationFailed { profile }
+            if profile.as_str() == "unsupported-sealed-platform"
+    ));
 
     let plan = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["plan", "--sealed", "--json"])

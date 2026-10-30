@@ -25,7 +25,7 @@ pub struct DirectoryIdentity {
     pub device: u64,
     pub inode: u64,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllocationIntentsV1 {
     pub cgroup: bool,
@@ -35,19 +35,6 @@ pub struct AllocationIntentsV1 {
     pub guardian: bool,
     pub namespace_init: bool,
     pub target: bool,
-}
-impl Default for AllocationIntentsV1 {
-    fn default() -> Self {
-        Self {
-            cgroup: false,
-            input_staging: false,
-            root_staging: false,
-            footprint: false,
-            guardian: false,
-            namespace_init: false,
-            target: false,
-        }
-    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

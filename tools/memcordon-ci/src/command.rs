@@ -7,6 +7,9 @@ use memcordon_testkit::ObservedOutput;
 
 use crate::{CiError, Result};
 
+#[cfg(target_os = "linux")]
+pub(crate) type AfterReleaseObserver = Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>;
+
 /// Reject native command failure before decoding its successful-response schema.
 pub fn require_successful_output(operation: &str, output: &ObservedOutput) -> Result<()> {
     if output.status.success() {
@@ -581,7 +584,7 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, false, None)
+        self.output_quiet_with_creation_mode(observe_creation, false, None, None)
     }
 
     /// Keep the sole child wait owner and bounded capture while an installed
@@ -664,15 +667,17 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true, None)
+        self.output_quiet_with_creation_mode(observe_creation, true, None, None)
     }
+    /// Retain bounded original streams/status in this invocation's owned output.
     #[cfg(target_os = "linux")]
-    pub(crate) fn output_quiet_with_exec_release_observation(
+    pub(crate) fn output_quiet_with_retained_exec_observation(
         &self,
+        directory: &std::path::Path,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
-        after_release: Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>,
+        after_release: Option<AfterReleaseObserver>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true, Some(after_release))
+        self.output_quiet_with_creation_mode(observe_creation, true, after_release, Some(directory))
     }
 
     #[cfg(target_os = "linux")]
@@ -680,7 +685,8 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
         hold_exec: bool,
-        after_release: Option<Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>>,
+        after_release: Option<AfterReleaseObserver>,
+        evidence_directory: Option<&std::path::Path>,
     ) -> Result<ObservedOutput> {
         let command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
@@ -728,6 +734,26 @@ impl CommandSpec {
             |_| Ok(()),
         );
         let writers = crate::work_outcome::native_settlement(&output);
+        let custody = (|| -> Result<()> {
+            if let Some(directory) = evidence_directory {
+                match &output {
+                    Err(error) => crate::current_command_evidence::retain_failure(
+                        directory,
+                        error,
+                        self.output_limit,
+                    )?,
+                    Ok(output) if observation_error.is_some() => {
+                        crate::current_command_evidence::retain_output(
+                            directory,
+                            output,
+                            self.output_limit,
+                        )?;
+                    }
+                    Ok(_) => {}
+                }
+            }
+            Ok(())
+        })();
         let result = match (output, observation_error) {
             (Ok(output), None) => Ok(output),
             (Ok(_), Some(error)) => Err(error),
@@ -735,7 +761,9 @@ impl CommandSpec {
                 "native creation observation={original:?}; native settlement={error}"
             ))),
         };
-        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
+        crate::work_outcome::WorkOutcome::observed(result, writers)
+            .postcondition(custody)
+            .into_result()
     }
 
     /// Supply an already retained finite input without blocking a pipe before

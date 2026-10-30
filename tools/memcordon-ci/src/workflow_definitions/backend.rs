@@ -6816,7 +6816,10 @@ fn node_574() -> Value {
 fn node_575() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
-    values.insert(text("path"), text("target/ci/private-installed"));
+    values.insert(
+        text("path"),
+        text("target/ci/private-installed-diagnostics"),
+    );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
     Value::Mapping(values)

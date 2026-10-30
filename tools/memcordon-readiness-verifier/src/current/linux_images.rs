@@ -219,7 +219,7 @@ pub fn verify_relative_runpath_probe(
     if original.len() != probe.len()
         || at < dynamic.0
         || end > dynamic.0 + dynamic.1
-        || (at - dynamic.0) % 16 != 0
+        || !(at - dynamic.0).is_multiple_of(16)
         || original.get(..at) != probe.get(..at)
         || original.get(end..) != probe.get(end..)
         || original.get(at..end) != Some([0_u8; 16].as_slice())

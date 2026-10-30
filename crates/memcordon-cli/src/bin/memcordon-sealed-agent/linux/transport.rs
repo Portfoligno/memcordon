@@ -259,7 +259,7 @@ fn wait_ready_until(
             revents: 0,
         };
         let millis =
-            i32::try_from(remaining.as_millis().max(1).min(100)).expect("bounded poll duration");
+            i32::try_from(remaining.as_millis().clamp(1, 100)).expect("bounded poll duration");
         // SAFETY: one initialized live socket poll record.
         let observed = unsafe { libc::poll(&raw mut poll, 1, millis) };
         if observed < 0 {

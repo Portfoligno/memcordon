@@ -144,9 +144,11 @@ pub fn collect_parser(
     version: &str,
 ) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
     collect_operation(
-        identity,
-        build,
-        source,
+        ComponentSource {
+            identity,
+            build,
+            source,
+        },
         output,
         prefix,
         destination,
@@ -165,9 +167,11 @@ pub fn collect_filter(
     version: &str,
 ) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
     collect_operation(
-        identity,
-        build,
-        source,
+        ComponentSource {
+            identity,
+            build,
+            source,
+        },
         output,
         prefix,
         destination,
@@ -186,9 +190,11 @@ pub fn collect_versions(
     version: &str,
 ) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
     collect_operation(
-        identity,
-        build,
-        source,
+        ComponentSource {
+            identity,
+            build,
+            source,
+        },
         output,
         prefix,
         destination,
@@ -207,9 +213,11 @@ pub fn collect_wire_version(
     version: &str,
 ) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
     collect_operation(
-        identity,
-        build,
-        source,
+        ComponentSource {
+            identity,
+            build,
+            source,
+        },
         output,
         prefix,
         destination,
@@ -218,16 +226,25 @@ pub fn collect_wire_version(
     )
 }
 
+struct ComponentSource<'a> {
+    identity: &'a SourceIdentity,
+    build: &'a ComponentBuild,
+    source: &'a Artifact,
+}
+
 fn collect_operation(
-    identity: &SourceIdentity,
-    build: &ComponentBuild,
-    source: &Artifact,
+    component: ComponentSource<'_>,
     output: &Path,
     prefix: &str,
     destination: &Path,
     version: &str,
     operation: &str,
 ) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
+    let ComponentSource {
+        identity,
+        build,
+        source,
+    } = component;
     let wire = operation == "wire";
     let parser = operation != "filter" && !wire;
     let versions = operation == "versions";
@@ -482,7 +499,6 @@ fn collect_operation(
         );
         candidates.push((key, evidence, evidence_path, serde_json::to_value(input)?));
     }
-    drop(persist);
     let resolve = |path: &str| -> std::result::Result<Vec<u8>, String> {
         if let Some(bytes) = values.get(path) {
             return Ok(bytes.clone());

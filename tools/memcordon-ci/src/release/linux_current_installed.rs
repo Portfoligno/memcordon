@@ -403,22 +403,22 @@ pub fn current_recipes(
 }
 
 pub fn is_isolation_case(key: &CaseKey) -> bool {
-    match (key.family.as_str(), key.scenario.as_str()) {
+    matches!(
+        (key.family.as_str(), key.scenario.as_str()),
         ("L-MIX-04", "cross-attempt")
-        | ("L-ISO-01", "host-tcp" | "nonloopback")
-        | (
-            "L-ISO-02",
-            "host-temp-socket"
-            | "input-socket"
-            | "imported-socket"
-            | "host-tree-mount-import-rejected",
-        )
-        | ("L-ISO-03", "host-abstract" | "other-attempt-abstract")
-        | ("L-ISO-04", _)
-        | ("L-ISO-05", "stdio-host-socket" | "extra-host-fd")
-        | ("L-ISO-06", _) => true,
-        _ => false,
-    }
+            | ("L-ISO-01", "host-tcp" | "nonloopback")
+            | (
+                "L-ISO-02",
+                "host-temp-socket"
+                    | "input-socket"
+                    | "imported-socket"
+                    | "host-tree-mount-import-rejected",
+            )
+            | ("L-ISO-03", "host-abstract" | "other-attempt-abstract")
+            | ("L-ISO-04", _)
+            | ("L-ISO-05", "stdio-host-socket" | "extra-host-fd")
+            | ("L-ISO-06", _)
+    )
 }
 
 /// This returns actual bytes and observations. Independent behavior validation
@@ -455,17 +455,17 @@ pub fn run_recipe_with_descriptors(
     }
     run_recipe_inner(input, recipe, None, extra, stdin_socket, None, None)
 }
+type Intervention<'a> =
+    dyn FnMut(&mut RequestLaunch, &WorkloadAttemptAssociationV1) -> Result<serde_json::Value> + 'a;
+type BeforeRequest<'a> = dyn FnMut(&CallerRequestFixture) -> Result<()> + 'a;
+type OpenedRequest<'a> = dyn FnMut(&mut RequestLaunch, &CallerRequestFixture) -> Result<()> + 'a;
+
 pub fn run_recipe_with_source(
     input: CurrentLinuxInput<'_>,
     recipe: super::linux_current_inputs::CurrentRecipe,
-    before: &mut dyn FnMut(&CallerRequestFixture) -> Result<()>,
-    opened: &mut dyn FnMut(&mut RequestLaunch, &CallerRequestFixture) -> Result<()>,
-    intervention: Option<
-        &mut dyn FnMut(
-            &mut RequestLaunch,
-            &WorkloadAttemptAssociationV1,
-        ) -> Result<serde_json::Value>,
-    >,
+    before: &mut BeforeRequest<'_>,
+    opened: &mut OpenedRequest<'_>,
+    intervention: Option<&mut Intervention<'_>>,
 ) -> Result<CurrentLinuxCase> {
     run_recipe_inner(
         input,
@@ -480,16 +480,11 @@ pub fn run_recipe_with_source(
 fn run_recipe_inner(
     mut input: CurrentLinuxInput<'_>,
     mut recipe: super::linux_current_inputs::CurrentRecipe,
-    mut intervention: Option<
-        &mut dyn FnMut(
-            &mut RequestLaunch,
-            &WorkloadAttemptAssociationV1,
-        ) -> Result<serde_json::Value>,
-    >,
+    mut intervention: Option<&mut Intervention<'_>>,
     extra_descriptor: Option<&File>,
     stdin_socket: Option<&File>,
-    mut before: Option<&mut dyn FnMut(&CallerRequestFixture) -> Result<()>>,
-    mut opened: Option<&mut dyn FnMut(&mut RequestLaunch, &CallerRequestFixture) -> Result<()>>,
+    mut before: Option<&mut BeforeRequest<'_>>,
+    mut opened: Option<&mut OpenedRequest<'_>>,
 ) -> Result<CurrentLinuxCase> {
     if !recipe.mode.starts_with("joint") {
         input.images = input.images.minimal();

@@ -1460,7 +1460,7 @@ fn retire_idle_resource_metadata(cutoff: Instant) -> Result<(), String> {
         {
             return Err("current footprint charge or unknown resource remains".into());
         }
-        if held.len() >= super::workload_resources::SLOT_COUNT + 1 {
+        if held.len() > super::workload_resources::SLOT_COUNT {
             return Err("current resource metadata inventory exceeds ceiling".into());
         }
         let file = open_at(&directory, &name, libc::O_RDWR).map_err(|error| error.to_string())?;

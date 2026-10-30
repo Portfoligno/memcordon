@@ -4,6 +4,8 @@
 #![allow(clippy::vec_init_then_push)]
 use super::{LiteralRun, literal, number, text};
 use serde_yaml::Value;
+// Existing acquisition inputs, retained independently as unverified diagnostics.
+const ORIGINAL_NATIVE_DIAGNOSTICS: &str = "target/ci/reports/execution\ntarget/ci/deadline-evidence\ntarget/ci/reports/release-macos-native.json\ntarget/ci/reports/release-macos-acceptance.json\ntarget/ci/reports/backend-macos-watchdog.json\ntarget/ci/reports/memcordon-macos-acceptance-*\n.release/installed-results\n.release/native-components/measured-harnesses.json\n.release/native-components/acquisition-origin.json\n.release/native-components/native-host.json\n.release/native-operation-deadline.json\n.release/native-readiness-identity.json\n";
 pub(super) fn definition() -> Value {
     node_0()
 }
@@ -10083,7 +10085,7 @@ fn node_806() -> Value {
 fn node_807() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"),text("diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"));
-    values.insert(text("path"),text("target/ci/reports/execution\ntarget/ci/deadline-evidence\ntarget/ci/reports/release-macos-native.json\ntarget/ci/reports/release-macos-acceptance.json\ntarget/ci/reports/backend-macos-watchdog.json\ntarget/ci/reports/memcordon-macos-acceptance-*\n.release/installed-results\n"));
+    values.insert(text("path"), text(ORIGINAL_NATIVE_DIAGNOSTICS));
     values.insert(text("if-no-files-found"), text("warn"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
     values.insert(text("overwrite"), Value::Bool(false));
@@ -11333,7 +11335,7 @@ fn node_905() -> Value {
 fn node_906() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"),text("diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"));
-    values.insert(text("path"),text("target/ci/reports/execution\ntarget/ci/deadline-evidence\ntarget/ci/reports/release-macos-native.json\ntarget/ci/reports/release-macos-acceptance.json\ntarget/ci/reports/backend-macos-watchdog.json\ntarget/ci/reports/memcordon-macos-acceptance-*\n.release/installed-results\n"));
+    values.insert(text("path"), text(ORIGINAL_NATIVE_DIAGNOSTICS));
     values.insert(text("if-no-files-found"), text("warn"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
     values.insert(text("overwrite"), Value::Bool(false));
@@ -15079,7 +15081,7 @@ fn node_1202() -> Value {
 fn node_1203() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"),text("diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"));
-    values.insert(text("path"),text("target/ci/reports/execution\ntarget/ci/deadline-evidence\ntarget/ci/reports/release-macos-native.json\ntarget/ci/reports/release-macos-acceptance.json\ntarget/ci/reports/backend-macos-watchdog.json\ntarget/ci/reports/memcordon-macos-acceptance-*\n.release/installed-results\n"));
+    values.insert(text("path"), text(ORIGINAL_NATIVE_DIAGNOSTICS));
     values.insert(text("if-no-files-found"), text("warn"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
     values.insert(text("overwrite"), Value::Bool(false));
@@ -16329,7 +16331,7 @@ fn node_1301() -> Value {
 fn node_1302() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"),text("diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"));
-    values.insert(text("path"),text("target/ci/reports/execution\ntarget/ci/deadline-evidence\ntarget/ci/reports/release-macos-native.json\ntarget/ci/reports/release-macos-acceptance.json\ntarget/ci/reports/backend-macos-watchdog.json\ntarget/ci/reports/memcordon-macos-acceptance-*\n.release/installed-results\n"));
+    values.insert(text("path"), text(ORIGINAL_NATIVE_DIAGNOSTICS));
     values.insert(text("if-no-files-found"), text("warn"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
     values.insert(text("overwrite"), Value::Bool(false));

@@ -45,19 +45,10 @@ true observation bytes. It contains no reverse reference in the attempt.
 
 ## Reproducible fuzz seeds
 
-The ignored `write_portable_fuzz_seed_corpora` integration test emits bounded
-starting corpora for the six `workload-*` fuzz targets. Invoke it explicitly:
-
-```text
-cargo test --locked --package memcordon-core --test workload_independent_vectors -- --ignored --exact write_portable_fuzz_seed_corpora
-```
-
-It writes only under the ignored `fuzz/corpus/workload-*` directories. The
-normal tests validate its inputs without writing files. Baseline canonical
-bytes come from the independent fixture above. Additional JSON seeds are
-produced by public constructors so authenticated discovery and terminal
-receipt branches are reachable despite their nested digest dependencies.
-These generated starting points are not independent expected-value oracles.
+The predecessor seed generator was retired with its protocol. Current fuzz
+targets start from their managed corpus directories and accept empty corpora;
+CI does not regenerate predecessor seeds. The historical fixtures above remain
+available for independent regression coverage.
 
 TCP seeds describe a listener and a client referencing its logical endpoint,
 with kernel-assigned and range-selected ports. Parsing does not establish a

@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod bundle;
 pub mod compatibility;
 pub mod consumer_readiness_cell;
+pub mod consumer_success;
 pub mod distribution;
 pub mod finalize;
 pub mod git;
@@ -58,6 +59,8 @@ pub mod linux_recovery_owners;
 pub mod linux_request_fixture;
 #[cfg(target_os = "linux")]
 pub mod linux_request_launch;
+#[cfg(target_os = "linux")]
+pub mod linux_smoke_diagnostics;
 #[cfg(unix)]
 pub mod linux_snapshot_budget;
 pub mod linux_unit_diagnostics;
@@ -71,6 +74,7 @@ mod native_executable;
 mod native_execution_association;
 #[cfg(unix)]
 pub mod native_recipe_case;
+pub mod native_role_contract;
 #[cfg(target_os = "linux")]
 mod native_source_identity;
 #[cfg(target_os = "linux")]

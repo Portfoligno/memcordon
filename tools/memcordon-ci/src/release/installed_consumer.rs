@@ -168,6 +168,7 @@ struct CurrentSmokeSpec {
     output: PathBuf,
     operation_deadline_unix_millis: u64,
     workflow_run: Option<String>,
+    diagnostic_output: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -208,6 +209,51 @@ pub fn run_current_smoke_spec(root: &Path, path: &Path, cleanup_only: bool) -> R
     let cleanup = sampled
         .checked_add(Duration::from_millis(remaining))
         .ok_or_else(|| CiError::Message("current smoke deadline overflow".into()))?;
+    let operation = if cleanup_only { "cleanup" } else { "execute" };
+    let diagnostic_source = spec
+        .output
+        .parent()
+        .ok_or_else(|| CiError::Message("private smoke authority parent absent".into()))?
+        .to_path_buf();
+    if spec.output.file_name().and_then(|name| name.to_str()) != Some("linux-installed")
+        || !diagnostic_source.starts_with(std::path::absolute(root.join("target/ci"))?)
+        || spec.diagnostic_output
+            != std::path::absolute(root.join("target/ci/private-installed-diagnostics"))?
+    {
+        return Err(CiError::Message(
+            "private smoke diagnostic/authority namespace differs from selected CI output".into(),
+        ));
+    }
+    let diagnostic_output = spec
+        .diagnostic_output
+        .join(format!("{operation}-{}", std::process::id()));
+    let result = run_current_smoke_owned(root, spec, cleanup_only, cleanup);
+    let exported = super::linux_smoke_diagnostics::export(
+        &diagnostic_source,
+        &diagnostic_output,
+        cleanup,
+        operation,
+        &result,
+    );
+    if let Ok(crate::diagnostic_projection::Projection::Incomplete { limits, .. }) = &exported {
+        eprintln!(
+            "diagnostic projection incomplete: {limits:?}; original operation result retained"
+        );
+    }
+    crate::work_outcome::join_completed(
+        crate::work_outcome::WorkOutcome::from_result(result),
+        crate::work_outcome::WorkOutcome::from_result(exported.map(|_| ())),
+    )
+    .into_result()
+}
+
+#[cfg(target_os = "linux")]
+fn run_current_smoke_owned(
+    root: &Path,
+    spec: CurrentSmokeSpec,
+    cleanup_only: bool,
+    cleanup: std::time::Instant,
+) -> Result<()> {
     if cleanup_only {
         spec.payload.source.validate()?;
         spec.payload.distribution.validate()?;
@@ -1488,10 +1534,6 @@ fn retain_public_registry_graph(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Cargo install materialization retains independent source, package, target, toolchain, custody, and deadline"
-)]
 fn materialize_cargo_install(
     root: &Path,
     target_directory: &Path,
@@ -1598,6 +1640,21 @@ pub fn cli_case_command(
     ])
     .args(fixture_arguments);
     Ok((command, report_path))
+}
+
+/// Ordinary installed smoke success; unknown workload emptiness retains its
+/// existing acceptance policy, independently of the public-registry validator.
+pub fn public_success_retired(
+    outcome: Option<&memcordon_core::RunOutcome>,
+    wrapper: Option<i32>,
+) -> bool {
+    super::consumer_success::exited_zero(outcome)
+        && wrapper == Some(0)
+        && outcome.is_some_and(|outcome| {
+            outcome.cleanup().direct_child_reaped
+                && outcome.cleanup().errors.is_empty()
+                && outcome.cleanup().workload_empty != Some(false)
+        })
 }
 
 pub fn run_cli_case(
@@ -1713,22 +1770,13 @@ pub fn run_materialized_channel(
         .attempts
         .last()
         .and_then(|attempt| attempt.outcome.as_ref());
-    if !matches!(
+    if !public_success_retired(
         success_outcome,
-        Some(memcordon_core::RunOutcome::Exited {
-            child: memcordon_core::ChildTermination::ExitCode { code: 0 },
-            ..
-        })
-    ) || success
-        .supervision
-        .as_ref()
-        .is_none_or(|summary| summary.wrapper_exit_code != 0)
-        || success_outcome.is_none_or(|outcome| {
-            !outcome.cleanup().direct_child_reaped
-                || !outcome.cleanup().errors.is_empty()
-                || outcome.cleanup().workload_empty == Some(false)
-        })
-    {
+        success
+            .supervision
+            .as_ref()
+            .map(|summary| summary.wrapper_exit_code),
+    ) {
         return Err(CiError::Message(
             "actual selected CLI success/retirement failed".into(),
         ));
@@ -1750,7 +1798,7 @@ pub fn run_materialized_channel(
     ) || deadline
         .supervision
         .as_ref()
-        .is_none_or(|summary| summary.wrapper_exit_code != 124)
+        .is_none_or(|summary| summary.wrapper_exit_code != 123)
         || deadline_outcome.is_none_or(|outcome| {
             !outcome.cleanup().direct_child_reaped
                 || !outcome.cleanup().errors.is_empty()
@@ -1812,14 +1860,41 @@ pub fn run_materialized_channel(
     ) {
         #[cfg(target_os = "linux")]
         {
+            let preparation = crate::preparation_tools::checked_owner_preparation(
+                root,
+                crate::preparation_tools::Kind::Private,
+            )?;
+            let workflow_run = std::env::var("GITHUB_RUN_ID").ok();
+            let mut smoke_payload = SmokePayload::describe(payload);
+            smoke_payload.artifacts.extend(
+                super::original_native_components::retain_current_owner_probe(
+                    &preparation,
+                    &super::original_native_components::OwnerProbeOrigin {
+                        kind: crate::preparation_tools::Kind::Private,
+                        commit: payload.source.commit(),
+                        version: &payload.source.version().to_string(),
+                        target: &payload.distribution.target,
+                        run: workflow_run.as_deref().ok_or_else(|| {
+                            CiError::Message(
+                                "private smoke requires its original prepared workflow run".into(),
+                            )
+                        })?,
+                    },
+                    &output.join("owner-probe"),
+                )?,
+            );
             let spec = CurrentSmokeSpec {
                 format: "memcordon.current-materialized-smoke".into(),
                 revision: 1,
-                payload: SmokePayload::describe(payload),
+                payload: smoke_payload,
                 output: std::path::absolute(output.join("linux-installed"))?,
                 operation_deadline_unix_millis: original_cleanup_deadline,
-                workflow_run: std::env::var("GITHUB_RUN_ID").ok(),
+                workflow_run,
+                diagnostic_output: std::path::absolute(
+                    root.join("target/ci/private-installed-diagnostics"),
+                )?,
             };
+            fs::create_dir_all(&spec.diagnostic_output)?;
             let path = std::path::absolute(output.join("current-linux-smoke.json"))?;
             source::write_json(&path, &spec)?;
             if rustix::process::geteuid().is_root() {

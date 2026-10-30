@@ -16,6 +16,12 @@ pub type CaseVerifier = dyn Fn(
     &dyn Fn(&str) -> VerificationResult<Vec<u8>>,
 ) -> VerificationResult<()>;
 
+type LifecycleVerifier<'a> = dyn Fn(
+        &ProductObservationV2,
+        &dyn Fn(&str) -> VerificationResult<Vec<u8>>,
+    ) -> VerificationResult<()>
+    + 'a;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeComponent {
@@ -488,10 +494,7 @@ pub fn verify_scoped(
     artifact_root: &Path,
     scope: VerificationScope,
     case_verifier: &CaseVerifier,
-    lifecycle_verifier: &dyn Fn(
-        &ProductObservationV2,
-        &dyn Fn(&str) -> VerificationResult<Vec<u8>>,
-    ) -> VerificationResult<()>,
+    lifecycle_verifier: &LifecycleVerifier<'_>,
 ) -> VerificationResult<Verdict> {
     let manifest_bytes = crate::custody::read_external(manifest_path, 1024 * 1024)?;
     let index_bytes = crate::custody::read_external(report_path, crate::MAX_INDEX_BYTES as u64)?;
@@ -599,7 +602,19 @@ pub fn verify_scoped(
             .collect::<BTreeSet<_>>()
             != assessed
     {
-        return Err("current selected product matrix differs from scope".into());
+        let present: BTreeSet<_> = index
+            .products
+            .iter()
+            .map(|product| product.key.clone())
+            .collect();
+        let missing: Vec<_> = assessed.difference(&present).take(8).collect();
+        let unexpected: Vec<_> = present.difference(&assessed).take(8).collect();
+        return Err(format!(
+            "current selected product matrix differs from scope: expected={}, observed={}, missing(first 8)={missing:?}, unexpected(first 8)={unexpected:?}, producer failures(first 8)={:?}",
+            assessed.len(),
+            index.products.len(),
+            failures.iter().take(8).collect::<Vec<_>>()
+        ));
     }
     let mut products = BTreeMap::new();
     for value in &index.products {
@@ -765,17 +780,16 @@ pub fn verify_scoped(
             } else {
                 None
             };
-            if let Some(product) = product {
-                if evidence.lease_id.as_ref() != Some(&product.lifecycle.lease_id) {
-                    return Err("current case crossed original installed lease".into());
-                }
+            if let Some(product) = product
+                && evidence.lease_id.as_ref() != Some(&product.lifecycle.lease_id)
+            {
+                return Err("current case crossed original installed lease".into());
             }
-            if let Some(build) = build {
-                if evidence.component_recipe_id.as_ref() != Some(&build.recipe_id)
-                    || evidence.lease_id.is_some()
-                {
-                    return Err("current component recipe/source role differs".into());
-                }
+            if let Some(build) = build
+                && (evidence.component_recipe_id.as_ref() != Some(&build.recipe_id)
+                    || evidence.lease_id.is_some())
+            {
+                return Err("current component recipe/source role differs".into());
             }
             let input = crate::wire::decode(custody.bytes(&evidence.input)?)?;
             case_verifier(

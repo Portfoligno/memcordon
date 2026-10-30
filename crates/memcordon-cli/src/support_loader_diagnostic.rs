@@ -53,7 +53,7 @@ fn run(argv: &[OsString]) -> Result<i32, String> {
     let args = match memcordon::invocation::route(
         argv.get(3..).ok_or("diagnostic execution argv absent")?,
     ) {
-        Ok(memcordon::invocation::Invocation::Execute(args)) => args,
+        Ok(memcordon::invocation::Invocation::Execute(args)) => *args,
         _ => return Err("diagnostic requires typed execution argv".into()),
     };
     let status = crate::commands::execute(args, &crate::presentation::Presentation::automatic());

@@ -486,10 +486,8 @@ pub fn compile_mixed_seqpacket_filter(abi: NativeAbi) -> Vec<sock_filter> {
         program.push(instruction(BPF_JMP_JSET_K, 0, 1, 0x4000_0000));
         program.push(return_action(SECCOMP_RET_KILL_PROCESS));
     }
-    for (number, result) in [(numbers.clone3, errno(libc::ENOSYS))] {
-        program.push(jump_equal(number, 0, 1));
-        program.push(return_action(result));
-    }
+    program.push(jump_equal(numbers.clone3, 0, 1));
+    program.push(return_action(errno(libc::ENOSYS)));
 
     let clone_checks = clone_checks();
     program.push(jump_equal(numbers.clone, 1, 0));

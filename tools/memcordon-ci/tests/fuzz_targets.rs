@@ -2,11 +2,31 @@ use std::collections::BTreeSet;
 
 use memcordon_ci::fuzz_targets::{FuzzShard, RequiredFeature, plans_sharded, targets};
 
+fn manifest_inventory(manifest: &str) -> Vec<String> {
+    let parsed: toml::Value = toml::from_str(manifest).unwrap();
+    let mut names: Vec<_> = parsed["bin"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bin| bin["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(!names.is_empty());
+    assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), names.len());
+    names.sort();
+    names
+}
+
 #[test]
 fn typed_plans_preserve_all_targets_and_only_six_ci_dependency_requirements() {
     let manifest = include_str!("../../../fuzz/Cargo.toml");
     let plans = plans_sharded(manifest, None).unwrap();
-    assert_eq!(plans.len(), 52);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.name.clone())
+            .collect::<Vec<_>>(),
+        manifest_inventory(manifest)
+    );
     assert_eq!(
         plans
             .iter()
@@ -156,13 +176,30 @@ fn retained_probe_and_distribution_seeds_reach_valid_models_and_reject_substitut
 #[test]
 fn shards_cover_current_and_future_manifest_targets_exactly_once() {
     let manifest = include_str!("../../../fuzz/Cargo.toml");
-    for manifest in [
+    let original = manifest_inventory(manifest);
+    assert!(!original.iter().any(|name| name == "future_target"));
+    for (augmented, manifest) in [
         manifest.to_owned(),
         format!(
             "{manifest}\n[[bin]]\nname = 'future_target'\npath = 'fuzz_targets/future_target.rs'\n"
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let all = targets(&manifest, None).unwrap();
+        assert_eq!(all, manifest_inventory(&manifest));
+        if augmented == 1 {
+            assert_eq!(all.len(), original.len() + 1);
+            assert!(all.iter().any(|name| name == "future_target"));
+            assert_eq!(
+                all.iter()
+                    .filter(|name| name.as_str() != "future_target")
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                original
+            );
+        }
         let first = targets(&manifest, Some(FuzzShard::First)).unwrap();
         let second = targets(&manifest, Some(FuzzShard::Second)).unwrap();
         let first: BTreeSet<_> = first.into_iter().collect();
@@ -170,9 +207,11 @@ fn shards_cover_current_and_future_manifest_targets_exactly_once() {
         assert!(first.is_disjoint(&second));
         assert_eq!(first.union(&second).cloned().collect::<Vec<_>>(), all);
         assert!(first.len().abs_diff(second.len()) <= 1);
-        assert_ne!(first.contains("report_json"), first.contains("schema_four"));
+        for (ordinal, name) in all.iter().enumerate() {
+            assert_eq!(first.contains(name), ordinal % 2 == 0);
+            assert_eq!(second.contains(name), ordinal % 2 == 1);
+        }
     }
-    assert_eq!(targets(manifest, None).unwrap().len(), 52);
 }
 
 #[test]

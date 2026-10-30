@@ -82,16 +82,15 @@ pub fn verify_case(
             "current installed owner source, actual intervention or optional result differs".into(),
         );
     }
-    if let Some(product) = product {
-        if product.key.target != evidence.key.target
+    if let Some(product) = product
+        && (product.key.target != evidence.key.target
             || Some(&product.key.channel) != evidence.key.channel.as_ref()
             || product.source_commit != evidence.source_commit
             || product.source_tree_sha256 != evidence.source_tree_sha256
             || product.version != version
-            || evidence.lease_id.as_deref() != Some(product.lifecycle.lease_id.as_str())
-        {
-            return Err("owner intervention belongs to another selected product".into());
-        }
+            || evidence.lease_id.as_deref() != Some(product.lifecycle.lease_id.as_str()))
+    {
+        return Err("owner intervention belongs to another selected product".into());
     }
     if crate::sha256(&resolve(&evidence.fixture)?) != evidence.fixture_sha256
         || crate::sha256(&resolve(&evidence.fixture_source)?) != evidence.source_tree_sha256
@@ -152,7 +151,7 @@ pub fn verify_case(
         return verify_allocation(evidence, &receipt.captures, version, resolve);
     }
     if evidence.key.family == "C-OWNER" {
-        verify_peer(evidence, &receipt.captures, resolve)?;
+        verify_peer(evidence, &receipt.captures, version, resolve)?;
         for name in [
             "owner-intervention.json",
             "owner-input.json",
@@ -838,14 +837,13 @@ fn verify_allocation(
         {
             return Err("partial native resource path/inode was substituted or not retired".into());
         }
-        if let Some(field) = field {
-            if resource["device"] != original[field]["device"]
-                || resource["inode"] != original[field]["inode"]
-            {
-                return Err(
-                    "partial native resource differs from the held original journal inode".into(),
-                );
-            }
+        if let Some(field) = field
+            && (resource["device"] != original[field]["device"]
+                || resource["inode"] != original[field]["inode"])
+        {
+            return Err(
+                "partial native resource differs from the held original journal inode".into(),
+            );
         }
     }
     if let Some(result) = evidence.raw_result.as_deref() {
@@ -987,9 +985,57 @@ fn verify_restart(
     )
 }
 
+pub struct OwnerPreparationContext<'a> {
+    pub source_commit: &'a str,
+    pub version: &'a str,
+    pub run: &'a str,
+    pub target: &'a str,
+    pub image_sha256: &'a str,
+    pub image_size: u64,
+}
+
+/// Both origins are current preparation transports, never readiness certificates.
+pub fn verify_owner_preparation(
+    proof: &Value,
+    context: &OwnerPreparationContext<'_>,
+) -> VerificationResult<()> {
+    let producer = match (proof["inputs"]["kind"].as_str(), context.target) {
+        (Some("readiness"), "x86_64-unknown-linux-gnu") => "readiness-tools-linux-x64",
+        (Some("readiness"), "aarch64-unknown-linux-gnu") => "readiness-tools-linux-arm64",
+        (Some("private"), "x86_64-unknown-linux-gnu") => "private-linux-prepare-x64",
+        (Some("private"), "aarch64-unknown-linux-gnu") => "private-linux-prepare-arm64",
+        _ => return Err("unsupported current owner preparation origin/host".into()),
+    };
+    let controllers: Vec<_> = proof["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|file| file["path"] == "target/ci-runtime/current/memcordon-ci")
+        .collect();
+    if proof["format"] != 1
+        || proof["inputs"]["producer"] != producer
+        || proof["inputs"]["host"] != context.target
+        || proof["inputs"]["source"]["commit"] != context.source_commit
+        || proof["inputs"]["source"]["version"] != context.version
+        || proof["inputs"]["invocation"]["run"] != context.run
+        || controllers.len() != 1
+        || controllers.first().is_none_or(|file| {
+            file["sha256"] != context.image_sha256
+                || file["size"] != context.image_size
+                || file["executable"] != true
+        })
+    {
+        return Err(
+            "current owner preparation source/version/run/producer/controller differs".into(),
+        );
+    }
+    Ok(())
+}
+
 fn verify_peer(
     evidence: &CaseEvidenceV2,
     captures: &BTreeMap<String, String>,
+    version: &str,
     resolve: &dyn Fn(&str) -> VerificationResult<Vec<u8>>,
 ) -> VerificationResult<()> {
     let raw = |name: &str| -> VerificationResult<Vec<u8>> {
@@ -1062,22 +1108,22 @@ fn verify_peer(
         || action["probe_image"]["mode"] != 0o555
         || action["probe_image"]["links"] != 1
         || action["probe_image"]["sha256"] != image_sha
-        || proof["format"] != 1
-        || proof["inputs"]["kind"] != "readiness"
-        || proof["inputs"]["source"]["commit"] != evidence.source_commit
-        || proof["inputs"]["host"] != evidence.key.target
-        || !proof["files"].as_array().is_some_and(|files| {
-            files.iter().any(|file| {
-                file["sha256"] == image_sha
-                    && file["size"] == image.len() as u64
-                    && file["executable"] == true
-            })
-        })
     {
         return Err(
             "peer child is not the measured source-prepared readonly controller image".into(),
         );
     }
+    verify_owner_preparation(
+        &proof,
+        &OwnerPreparationContext {
+            source_commit: &evidence.source_commit,
+            version,
+            run: &evidence.run_id,
+            target: &evidence.key.target,
+            image_sha256: &image_sha,
+            image_size: image.len() as u64,
+        },
+    )?;
     let arguments: crate::NativeArguments =
         serde_json::from_value(action["command"]["arguments"].clone())
             .map_err(|error| error.to_string())?;

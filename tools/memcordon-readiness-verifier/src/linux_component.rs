@@ -204,7 +204,7 @@ pub fn validate_linux_filter_receipt(
             ("unix-positive", arch, socket, [1, 1, 0], 0x7fff0000),
             ("unix-pair-positive", arch, pair, [1, 1, 0], 0x7fff0000),
             (
-                "seqpacket-pair-positive-or-denied",
+                "seqpacket-pair-positive",
                 arch,
                 pair,
                 [1, 5 | 0x80000, 0],

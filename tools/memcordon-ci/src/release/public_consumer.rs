@@ -1,19 +1,29 @@
 //! Optional read-only consumer of the bytes actually exposed by the registry.
-use super::{artifacts, bundle::PreparedBundle, http};
+use super::{artifacts, bundle::PreparedBundle, consumer_success, http};
 use crate::{
     CiError, Result,
     command::{CommandSpec, rustup_cargo},
     public_reads::map_public_reads_ordered,
 };
-use memcordon_core::{
-    ChildTermination, MemcordonReport, RunOutcome, execution_facts::OutcomeKindV1,
-};
+use memcordon_core::{MemcordonReport, RunOutcome, execution_facts::OutcomeKindV1};
 use std::{
     fs,
     num::NonZeroUsize,
     path::Path,
     time::{Duration, Instant},
 };
+
+/// A generic published consumer requires an exact zero child result and its
+/// original stricter positive workload-empty retirement evidence.
+pub fn completed_success_retired(outcome: Option<&RunOutcome>, wrapper: Option<i32>) -> bool {
+    consumer_success::exited_zero(outcome)
+        && wrapper == Some(0)
+        && outcome.is_some_and(|outcome| {
+            outcome.cleanup().direct_child_reaped
+                && outcome.cleanup().errors.is_empty()
+                && outcome.cleanup().workload_empty == Some(true)
+        })
+}
 
 fn observe(
     command: CommandSpec,
@@ -280,14 +290,7 @@ pub fn run(directory: &Path, toolchain: &str) -> Result<()> {
             || !outcome.cleanup().direct_child_reaped
             || outcome.cleanup().workload_empty != Some(true)
             || (expected == OutcomeKindV1::Completed
-                && (wrapper != Some(0)
-                    || !matches!(
-                        outcome,
-                        RunOutcome::Exited {
-                            child: ChildTermination::ExitCode { code: 0 },
-                            ..
-                        }
-                    )))
+                && !completed_success_retired(Some(outcome), wrapper))
         {
             return Err(CiError::Message(format!(
                 "published installed consumer {name} execution or retirement differs"

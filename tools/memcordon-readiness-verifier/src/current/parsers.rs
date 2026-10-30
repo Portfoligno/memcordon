@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCENARIOS: &[&str] = &[
     "duplicate-key",
@@ -23,6 +23,36 @@ pub const SCENARIOS: &[&str] = &[
     "unsupported-result-format",
 ];
 pub const TEST_NAME: &str = "emit_current_parser_mutations";
+/// Intentional rejected payload, not a larger production result allowance.
+pub const RESULT_INPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const TERMINAL_INPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const OVERSIZED_DIAGNOSTIC_BYTES: usize = RESULT_INPUT_BYTES + 1;
+pub const CAPTURE_FILE_COUNT: usize = SCENARIOS.len() * 2 + 2;
+
+/// The authority directory contains only the closed receipt/vector inventory.
+pub fn validate_capture_inventory(
+    prefix: &str,
+    inputs: &BTreeMap<String, Vec<u8>>,
+    names: &[String],
+) -> VerificationResult<()> {
+    let mut expected = BTreeSet::from(["native-receipt.json".to_string()]);
+    for reference in inputs.keys() {
+        let name = reference
+            .strip_prefix(&format!("{prefix}/"))
+            .filter(|name| {
+                !name.is_empty()
+                    && !name.contains(['/', '\\', ':', '\0'])
+                    && !matches!(*name, "." | "..")
+            })
+            .ok_or("parser captured reference is not confined")?;
+        expected.insert(name.to_string());
+    }
+    let actual = names.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.len() != CAPTURE_FILE_COUNT || names.len() != expected.len() || actual != expected {
+        return Err("current parser authority directory missing/duplicate/unexpected input".into());
+    }
+    Ok(())
+}
 pub fn canonical_fixture_bytes(value: &Value) -> Vec<u8> {
     fn encode(value: &Value, out: &mut Vec<u8>) {
         match value {
@@ -80,6 +110,102 @@ pub struct ParserReceiptV2 {
     pub challenge_sha256: String,
     pub manifest: String,
     pub observations: Vec<ParserMutationV2>,
+}
+
+/// Capture malformed test vectors as data under purpose-specific transport
+/// bounds; production parser limits and independent mutation checks stay strict.
+pub fn capture_inputs(
+    receipt: &ParserReceiptV2,
+    prefix: &str,
+    version: &str,
+    target: &str,
+    read: &dyn Fn(&str, usize) -> VerificationResult<Vec<u8>>,
+) -> VerificationResult<BTreeMap<String, Vec<u8>>> {
+    if prefix.split('/').any(|part| {
+        part.is_empty() || matches!(part, "." | "..") || part.contains(['\\', '\0', ':'])
+    }) {
+        return Err("parser capture prefix is not confined".into());
+    }
+    let manifest = format!("{prefix}/current-manifest.toml");
+    if receipt.format != "memcordon.native-parser-mutation-receipt"
+        || receipt.revision != 2
+        || receipt.test_name != TEST_NAME
+        || receipt.native_target != target
+        || receipt.manifest != manifest
+        || receipt.observations.len() != SCENARIOS.len()
+    {
+        return Err("parser capture manifest/inventory differs".into());
+    }
+    let mut inputs = BTreeMap::new();
+    let mut oversized = None;
+    let manifest_bytes = read(&manifest, 256 * 1024)?;
+    if manifest_bytes.len() > 256 * 1024 {
+        return Err("parser capture manifest exceeds bound".into());
+    }
+    inputs.insert(manifest.clone(), manifest_bytes);
+    let mut seen = BTreeSet::new();
+    for row in &receipt.observations {
+        if !SCENARIOS.contains(&row.scenario.as_str()) || !seen.insert(&row.scenario) {
+            return Err("parser capture unknown/duplicate scenario".into());
+        }
+        let operation = if ["omitted-case", "duplicate-case", "wrong-product"]
+            .contains(&row.scenario.as_str())
+        {
+            "current-index-v2-inventory"
+        } else if ["stale-attempt", "forged-cleanup"].contains(&row.scenario.as_str()) {
+            "core-windows-terminal-v3-association"
+        } else {
+            "core-result-v3-parse"
+        };
+        if row.operation != operation
+            || row.base_input != format!("{prefix}/{}-base.json", row.scenario)
+            || row.mutated_input != format!("{prefix}/{}-mutated.json", row.scenario)
+        {
+            return Err("parser capture reference/operation mapping differs".into());
+        }
+        let bound = if operation == "current-index-v2-inventory" {
+            crate::MAX_INDEX_BYTES
+        } else if operation == "core-windows-terminal-v3-association" {
+            TERMINAL_INPUT_BYTES
+        } else {
+            RESULT_INPUT_BYTES
+        };
+        let base = read(&row.base_input, bound)?;
+        if base.len() > bound {
+            return Err("parser capture base exceeds purpose bound".into());
+        }
+        let changed_bound = if row.scenario == "oversized-record" {
+            let mut baseline = preparation(&base, version, target)?;
+            baseline["diagnostics"] = json!([""]);
+            let limit = canonical_fixture_bytes(&baseline)
+                .len()
+                .checked_add(OVERSIZED_DIAGNOSTIC_BYTES)
+                .ok_or("oversized parser transport bound overflow")?;
+            oversized = Some(row.mutated_input.clone());
+            limit
+        } else {
+            bound
+        };
+        let changed = read(&row.mutated_input, changed_bound)?;
+        if changed.len() > changed_bound {
+            return Err("parser capture mutation exceeds purpose bound".into());
+        }
+        if inputs.insert(row.base_input.clone(), base).is_some()
+            || inputs.insert(row.mutated_input.clone(), changed).is_some()
+        {
+            return Err("duplicate parser capture reference".into());
+        }
+    }
+    if oversized.is_none() {
+        return Err("oversized parser mutation absent".into());
+    }
+    validate_mutations(receipt, version, target, &|path| {
+        inputs
+            .get(path)
+            .cloned()
+            .ok_or_else(|| "parser input not captured".into())
+    })?;
+    Ok(inputs)
 }
 
 pub fn validate_index_inventory(
@@ -460,8 +586,9 @@ pub fn validate_mutations(
         }
         let mut expected = preparation(&base, version, target)?;
         if row.scenario == "oversized-record" {
-            expected["diagnostics"] = json!(["x".repeat(16 * 1024 * 1024 + 1)]);
-            if changed != canonical_fixture_bytes(&expected) || changed.len() <= 16 * 1024 * 1024 {
+            expected["diagnostics"] = json!(["x".repeat(OVERSIZED_DIAGNOSTIC_BYTES)]);
+            if changed != canonical_fixture_bytes(&expected) || changed.len() <= RESULT_INPUT_BYTES
+            {
                 return Err("current oversized raw parser vector was substituted".into());
             }
             continue;

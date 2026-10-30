@@ -200,10 +200,10 @@ fn run_pairs(
                         .filter(|line| line.ends_with(b"\n"))
                     {
                         let row: serde_json::Value = serde_json::from_slice(line)?;
-                        if row["operation"] == "isolation-listener-ready" {
-                            if ready.replace(row).is_some() {
-                                return Err(CiError::Message("listener ready duplicated".into()));
-                            }
+                        if row["operation"] == "isolation-listener-ready"
+                            && ready.replace(row).is_some()
+                        {
+                            return Err(CiError::Message("listener ready duplicated".into()));
                         }
                     }
                     if let Some(ready) = ready {
@@ -399,7 +399,6 @@ fn run_pairs(
             recipe,
             &mut callback,
         )?;
-        drop(callback);
         let peer =
             peer_case.ok_or_else(|| CiError::Message("original peer invocation absent".into()))?;
         let prefix = directory

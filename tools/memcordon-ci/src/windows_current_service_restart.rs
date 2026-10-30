@@ -1,7 +1,7 @@
 //! Actual current control-service restart followed by a fresh installed request.
 use super::{HeldProcess, fixture_environment, write_new};
 use crate::{
-    CiError, Result,
+    CiError, Result, current_command_evidence, windows_current_arguments as arguments,
     windows_installed_cases::{InstalledWindowsPayload, WindowsLeaseDeadlines},
 };
 use std::{
@@ -217,15 +217,14 @@ pub(super) fn run(
     }
     command
         .current_dir(&directory)
-        .args(["--boundary", "sealed", "--workload-request"])
-        .arg(&request)
-        .args(["--report-format", "result-v3", "--report"])
-        .arg(&report)
-        .arg("--windows-terminal-observation")
-        .arg(&terminal)
-        .arg("--")
-        .arg(&config.fixture.path)
-        .args(["exit", "--code", "0"])
+        .args(arguments::service_restart(
+            &arguments::Paths {
+                request: &request,
+                report: &report,
+                fixture: &config.fixture.path,
+            },
+            &terminal,
+        ))
         .stdin(std::process::Stdio::null());
     let budget = deadlines.work_budget(Duration::from_secs(90))?;
     write_new(
@@ -236,7 +235,9 @@ pub(super) fn run(
     )?;
     let output =
         memcordon_testkit::run_with_deadline_output_limit(&mut command, budget, 4 * 1024 * 1024)
-            .map_err(|error| CiError::Message(error.to_string()))?;
+            .map_err(|error| {
+                current_command_evidence::into_ci_error(&directory, error, 4 * 1024 * 1024)
+            })?;
     write_new(&directory.join("stdout.bin"), &output.stdout)?;
     write_new(&directory.join("stderr.bin"), &output.stderr)?;
     write_new(

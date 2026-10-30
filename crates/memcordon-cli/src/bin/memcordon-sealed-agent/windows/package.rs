@@ -1329,18 +1329,19 @@ fn recover_interrupted_upgrade() -> Result<(), String> {
         cleanup_upgrade_rollback(&rollback)?;
         return remove_empty_install_root();
     }
-    if let Some(replacement) = replacement
-        && let Ok(current) = validate_existing_installed_artifacts()
-    {
-        if current.digests == rollback.replacement_artifact_digests
-            && captured_installed_manifest(&current)?.as_deref()
-                == Some(rollback.replacement_manifest.as_slice())
-        {
-            validate_current_runtime_snapshot(&replacement, &current)?;
-            reconcile_services_from_installed()?;
-            service_owned_cleanup_barrier()?;
-            verify_live_installed_state()?;
-            return cleanup_upgrade_rollback(&rollback);
+    #[allow(clippy::collapsible_if)] // Let chains exceed the product's Rust 1.85 MSRV.
+    if let Some(replacement) = replacement {
+        if let Ok(current) = validate_existing_installed_artifacts() {
+            if current.digests == rollback.replacement_artifact_digests
+                && captured_installed_manifest(&current)?.as_deref()
+                    == Some(rollback.replacement_manifest.as_slice())
+            {
+                validate_current_runtime_snapshot(&replacement, &current)?;
+                reconcile_services_from_installed()?;
+                service_owned_cleanup_barrier()?;
+                verify_live_installed_state()?;
+                return cleanup_upgrade_rollback(&rollback);
+            }
         }
     }
     // An incomplete replacement cannot be adopted. Validate every exact old

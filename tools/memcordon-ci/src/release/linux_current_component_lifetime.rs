@@ -87,20 +87,36 @@ fn wait_until(cutoff: Instant, mut observed: impl FnMut() -> Result<bool>) -> Re
     }
 }
 
-pub fn run(
-    root: &Path,
-    payload: &MaterializedPayload,
-    identity: &SourceIdentity,
-    key: &ProductKey,
-    scope: &Path,
-    prefix: &str,
-    destination: &Path,
-    build: &ComponentBuild,
-    source_artifact: &Artifact,
-    work: Instant,
-    cleanup: Instant,
-    cleanup_unix: u64,
-) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
+pub struct ComponentLifetimeInputs<'a> {
+    pub root: &'a Path,
+    pub payload: &'a MaterializedPayload,
+    pub identity: &'a SourceIdentity,
+    pub key: &'a ProductKey,
+    pub scope: &'a Path,
+    pub prefix: &'a str,
+    pub destination: &'a Path,
+    pub build: &'a ComponentBuild,
+    pub source_artifact: &'a Artifact,
+    pub work: Instant,
+    pub cleanup: Instant,
+    pub cleanup_unix: u64,
+}
+
+pub fn run(inputs: ComponentLifetimeInputs<'_>) -> Result<(Vec<CaseRecord>, Vec<Artifact>)> {
+    let ComponentLifetimeInputs {
+        root,
+        payload,
+        identity,
+        key,
+        scope,
+        prefix,
+        destination,
+        build,
+        source_artifact,
+        work,
+        cleanup,
+        cleanup_unix,
+    } = inputs;
     if !rustix::process::geteuid().is_root() || Instant::now() >= work || work >= cleanup {
         return Err(CiError::Message(
             "current native lifetime requires original privileged controller and cutoffs".into(),
@@ -323,12 +339,14 @@ pub fn run(
                 &caller,
                 &images,
                 &provider,
-                &controller,
-                &directory,
-                scenario,
-                scenario,
-                work,
-                cleanup,
+                ExperimentContext {
+                    controller: &controller,
+                    directory: &directory,
+                    scenario,
+                    facet: scenario,
+                    work,
+                    cleanup,
+                },
             )?;
             let observed = super::linux_current_components::collect_lifecycle(
                 identity,
@@ -360,10 +378,11 @@ pub fn run(
         owner["uninstall_required"] = json!(false);
         private(&scope.join("current-owner.json"), &owner)?;
     }
-    if caller_issued && package_settled {
-        if let Err(error) = super::linux_current_lease::retire_caller(root, &owner, cleanup) {
-            failures.push(error.to_string());
-        }
+    if caller_issued
+        && package_settled
+        && let Err(error) = super::linux_current_lease::retire_caller(root, &owner, cleanup)
+    {
+        failures.push(error.to_string());
     }
     if failures.is_empty() {
         super::linux_current_lease::observe_paths()?;
@@ -445,17 +464,29 @@ pub struct Experiment {
     pub files: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
+pub(super) struct ExperimentContext<'a> {
+    pub controller: &'a Path,
+    pub directory: &'a Path,
+    pub scenario: &'a str,
+    pub facet: &'a str,
+    pub work: Instant,
+    pub cleanup: Instant,
+}
+
 pub(super) fn experiment(
     caller: &CallerSession,
     images: &CallerImages,
     provider: &memcordon_core::PublicProviderBindingV1,
-    controller: &Path,
-    directory: &Path,
-    scenario: &str,
-    facet: &str,
-    work: Instant,
-    cleanup: Instant,
+    context: ExperimentContext<'_>,
 ) -> Result<Experiment> {
+    let ExperimentContext {
+        controller,
+        directory,
+        scenario,
+        facet,
+        work,
+        cleanup,
+    } = context;
     experiment_with_intervention(
         caller, images, provider, controller, directory, scenario, facet, work, cleanup, None,
     )

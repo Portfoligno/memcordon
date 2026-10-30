@@ -79,7 +79,8 @@ fn partial_initial_request_uses_the_fixed_whole_frame_cutoff() {
         started + Duration::from_millis(40),
     )
     .unwrap_err();
-    assert!(error.contains("phase=Length"));
+    assert!(error.contains("MCSEALED-WINDOWS-PIPE-READ"));
+    assert!(error.contains("phase=length-read"));
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 

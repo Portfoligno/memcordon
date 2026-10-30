@@ -51,6 +51,7 @@ fn response() -> Response {
         event_handle: None,
         modify_denied: None,
         diagnostics: DiagnosticState::NotApplicable,
+        native_open: None,
     }
 }
 
@@ -59,6 +60,142 @@ fn acl_digest(bytes: &Option<Vec<u8>>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[test]
+fn authz_calculation_never_substitutes_for_the_actual_open() {
+    assert_ne!(
+        encode_probe_ack(&request().nonce).unwrap(),
+        encode_ack(&request().nonce).unwrap()
+    );
+    for (correlated, api, error, granted, expected) in [
+        (true, true, 0, 0x0010_0000, "supplied-data-allow"),
+        (true, true, 5, 0, "supplied-data-denial"),
+        (true, false, 0, 0, "api-failure"),
+        (false, true, 0, 0x0010_0000, "uncorrelated"),
+        (true, true, 0, 0, "inconsistent"),
+        (true, true, 5, 0x0010_0000, "inconsistent"),
+    ] {
+        assert_eq!(
+            AuthzObservation::conclusion(correlated, api, error, granted),
+            expected
+        );
+        let snapshot = Snapshot::new(vec![1, 0, 4, 128], 4).unwrap();
+        let record = AuthzObservation::Evaluated {
+            engine: "AuthzAccessCheck",
+            scope: "controller-descriptor-and-token-derived-context",
+            diagnostic_only: true,
+            acceptance_authority: false,
+            sampling: "sequential-non-atomic",
+            descriptor_sha256: snapshot.sha256().into(),
+            desired_access: 0x0010_0000,
+            source_token_id: 7,
+            source_modified_id: 9,
+            context_matches: correlated,
+            user_matches: correlated,
+            groups_match: correlated,
+            restricted_match: correlated,
+            privileges_match: correlated,
+            source_unchanged: correlated,
+            api_success: api,
+            native_error: (!api).then_some(5),
+            reply_error: api.then_some(error),
+            granted: api.then_some(granted),
+            conclusion: expected,
+        };
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["acceptance_authority"], false);
+        assert_eq!(value["api_success"], api);
+        assert_eq!(
+            value["reply_error"].as_u64(),
+            api.then_some(u64::from(error))
+        );
+        assert_eq!(value["conclusion"], expected);
+    }
+    for stage in [
+        "descriptor",
+        "source-token",
+        "context-identities",
+        "access-check",
+    ] {
+        let record = AuthzObservation::unavailable(stage, &std::io::Error::from_raw_os_error(5));
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["state"], "unavailable");
+        assert_eq!(value["stage"], stage);
+        assert_eq!(value["raw_error"], 5);
+        assert!(value.get("conclusion").is_none());
+        assert!(serde_json::to_vec(&value).unwrap().len() < RECORD_BOUND);
+    }
+}
+
+#[test]
+fn post_failure_readback_distinguishes_same_bytes_changes_and_unavailability_without_authority() {
+    let request = request();
+    let response = response();
+    let name: Vec<u16> = "owned-alias\\self".encode_utf16().collect();
+    let parent = Err(memcordon_windows_launch_core::ObservationUnavailable::NotRequested);
+    let acl = None;
+    let label = LabelObservation::Unavailable(LabelUnavailable::Native {
+        stage: LabelStage::Size,
+        raw_error: Some(5),
+    });
+    let original = Snapshot::new(vec![1, 0, 4, 128], 4).unwrap();
+    for (post_failure, present, equal) in [
+        (
+            ReadbackObservation::Present(Snapshot::new(vec![1, 0, 4, 128], 4).unwrap()),
+            true,
+            Some(true),
+        ),
+        (
+            ReadbackObservation::Present(Snapshot::new(vec![1, 0, 0, 128], 4).unwrap()),
+            true,
+            Some(false),
+        ),
+        (
+            ReadbackObservation::Unavailable {
+                raw_error: Some(5),
+                deadline: false,
+            },
+            false,
+            None,
+        ),
+        (
+            ReadbackObservation::Unavailable {
+                raw_error: None,
+                deadline: true,
+            },
+            false,
+            None,
+        ),
+    ] {
+        let association = Association {
+            request: &request,
+            response: &response,
+            original_name: &name,
+            controller_handle: 7,
+            child_pid: 9,
+            child_birth: 11,
+            parent_prelaunch_token: &parent,
+            parent_default_acl_bytes: &acl,
+            label: &label,
+            post_failure: &post_failure,
+        };
+        let value = failure(&association, &original).unwrap();
+        assert_eq!(value["post_failure_security_readback_observed"], present);
+        assert_eq!(
+            value["post_failure_security_readback"]["bytes_equal_prelaunch"].as_bool(),
+            equal
+        );
+        assert_eq!(
+            value["post_failure_security_readback"]["hash_equal_prelaunch"].as_bool(),
+            equal
+        );
+        assert_eq!(value["original_response"]["raw_error"], 5);
+        assert_eq!(value["acceptance_authority"], false);
+        assert_eq!(value["cross_process_event_identity_observed"], false);
+        assert_eq!(value["cleanup_observed"], false);
+        assert!(serde_json::to_vec_pretty(&value).unwrap().len() <= RECORD_BOUND);
+    }
 }
 
 #[test]
@@ -93,6 +230,7 @@ fn retained_native_bytes_are_lossless_and_explicitly_prelaunch_not_completed_pro
         parent_prelaunch_token: &parent,
         parent_default_acl_bytes: &acl,
         label: &label,
+        post_failure: &ReadbackObservation::NotRequested,
     };
     for bytes in [
         vec![
@@ -192,6 +330,7 @@ fn projection_refuses_cross_association_and_never_relabels_success_as_failure() 
                 parent_prelaunch_token: &parent,
                 parent_default_acl_bytes: &acl,
                 label: &label,
+                post_failure: &ReadbackObservation::NotRequested,
             },
             &snapshot,
         )
@@ -247,6 +386,7 @@ fn label_bytes_are_separate_from_info7_and_optional_bounds_never_replace_native_
                 parent_prelaunch_token: &parent,
                 parent_default_acl_bytes: acl,
                 label,
+                post_failure: &ReadbackObservation::NotRequested,
             },
             snapshot,
         )
@@ -343,7 +483,8 @@ fn label_bytes_are_separate_from_info7_and_optional_bounds_never_replace_native_
                 child_birth: 11,
                 parent_prelaunch_token: &parent,
                 parent_default_acl_bytes: &acl,
-                label: &wrong
+                label: &wrong,
+                post_failure: &ReadbackObservation::NotRequested,
             },
             &small
         )

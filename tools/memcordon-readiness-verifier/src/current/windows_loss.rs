@@ -672,12 +672,13 @@ pub(crate) fn validate_windows_loss(
                 &terminal,
                 &recovery,
                 association,
-                evidence,
-                loss,
-                provider_request_path,
-                native,
-                key,
-                custody,
+                LossTerminalContext {
+                    evidence,
+                    loss,
+                    provider_request_path,
+                    native,
+                    custody,
+                },
             )
         }
         "reject" => {
@@ -705,12 +706,13 @@ pub(crate) fn validate_windows_loss(
                     .ok_or("loss recovered receipt absent")?,
                 &recovery,
                 association,
-                evidence,
-                loss,
-                provider_request_path,
-                native,
-                key,
-                custody,
+                LossTerminalContext {
+                    evidence,
+                    loss,
+                    provider_request_path,
+                    native,
+                    custody,
+                },
             )
         }
         "terminal-retired-v2" => {
@@ -941,17 +943,27 @@ pub(crate) fn validate_windows_request(
     Ok(())
 }
 
+struct LossTerminalContext<'a> {
+    evidence: &'a CaseEvidenceV2,
+    loss: &'a WindowsLossEvidence,
+    provider_request_path: &'a str,
+    native: &'a NativeObservation,
+    custody: &'a custody::Custody,
+}
+
 fn validate_loss_terminal(
     terminal: &Value,
     recovery: &Value,
     association: &Value,
-    evidence: &CaseEvidenceV2,
-    loss: &WindowsLossEvidence,
-    provider_request_path: &str,
-    native: &NativeObservation,
-    _key: &CaseKey,
-    custody: &custody::Custody,
+    context: LossTerminalContext<'_>,
 ) -> VerificationResult<()> {
+    let LossTerminalContext {
+        evidence,
+        loss,
+        provider_request_path,
+        native,
+        custody,
+    } = context;
     super::windows_actors::validate_terminal_shapes(terminal)?;
     super::windows_proof::validate_windows_proof_matrix(terminal)?;
     super::windows::validate_terminal_authority(

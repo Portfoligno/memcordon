@@ -17,6 +17,28 @@ use windows_sys::Win32::System::Threading::{
 #[path = "../../../tests/private/fixture_namespace_primary_protocol.rs"]
 pub(super) mod protocol;
 use protocol::{Cell, Phase, Request, Response};
+#[cfg(target_arch = "x86_64")]
+#[path = "../../../tests/private/fixture_namespace_call_packet.rs"]
+mod call_packet;
+#[path = "../../../tests/private/fixture_namespace_ack.rs"]
+mod diagnostic_ack;
+#[path = "namespace_primary_modules.rs"]
+mod module_readback;
+#[path = "../../../tests/private/fixture_namespace_replay_protocol.rs"]
+mod replay_wire;
+#[cfg(target_arch = "x86_64")]
+fn replay_marker(parameters: [u64; call_packet::PARAMETERS]) {
+    let parameters = parameters.map(|value| value as usize);
+    // SAFETY: public continuable application exception; bounded inline words.
+    unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::RaiseException(
+            call_packet::CODE,
+            0,
+            parameters.len() as u32,
+            parameters.as_ptr(),
+        )
+    };
+}
 #[path = "namespace_primary_token.rs"]
 mod token_readback;
 
@@ -102,7 +124,14 @@ fn publish(
         event_handle: handle,
         modify_denied: modify,
         diagnostics,
+        native_open: None,
     };
+    publish_response(request, &mut response)
+}
+
+fn publish_response(request: &Request, response: &mut Response) -> io::Result<()> {
+    let success = response.success;
+    let phase = response.phase;
     if response
         .diagnostics
         .validate_correspondence(request)
@@ -118,14 +147,17 @@ fn publish(
     // Optional diagnostics may be replaced by a bounded explicit-unavailable
     // state, but the original native result must survive byte-for-byte in core.
     response.diagnostics = offered.diagnostics.clone();
-    if offered != response {
+    if offered != *response {
         return Err(io::Error::other("experiment response encoding changed"));
     }
     if !success && matches!(phase, Phase::Namespace | Phase::Event) {
         // Independently retain/check the original failed core even when the
         // optional complete observation was replaced by an unavailable state.
         let core = protocol::decode_failure_core(&bytes)?;
-        if Some(core.raw_error) != error || core.nonce != request.nonce || core.phase != phase {
+        if Some(core.raw_error) != response.raw_error
+            || core.nonce != request.nonce
+            || core.phase != phase
+        {
             return Err(io::Error::other("original failed core encoding changed"));
         }
     }
@@ -203,26 +235,129 @@ pub(super) fn run() -> io::Result<i32> {
     if protocol::encode_request(&request)? != bytes {
         return Err(io::Error::other("experiment request is not canonical"));
     }
+    run_request(request, None, &mut input)
+}
+
+pub(super) fn run_replay(encoded: &str) -> io::Result<i32> {
+    let replay = replay_wire::decode_replay(encoded)?;
+    use std::os::windows::ffi::OsStrExt;
+    let argv = std::env::args_os()
+        .map(|arg| arg.encode_wide().collect())
+        .collect::<Vec<Vec<u16>>>();
+    let mut command = memcordon_core::encode_windows_command_line(&argv);
+    command.push(0);
+    replay_wire::check_replay_command_line(&command)?;
+    let request = replay.request.clone();
+    run_request(request, Some(replay), &mut io::BufReader::new(io::empty()))
+}
+
+fn replay_result(
+    replay: &replay_wire::ReplayEnvelope,
+    outcome: replay_wire::ReplayOutcome,
+) -> io::Result<i32> {
+    let record = replay_wire::ReplayResult {
+        format: "memcordon.namespace-debug-replay-result".into(),
+        revision: 2,
+        original_nonce: replay.original_nonce.clone(),
+        replay_nonce: replay.replay_nonce.clone(),
+        diagnostic_stop_qpc: replay.diagnostic_stop_qpc,
+        request_sha256: replay.request_sha256.clone(),
+        outcome,
+        cleanup: replay_wire::ReplayCleanup::Closed,
+        diagnostic_only: true,
+        acceptance_authority: false,
+    };
+    let bytes = replay_wire::encode_replay_result(&record, replay)?;
+    let _ = replay_wire::decode_replay_result(&bytes, replay)?;
+    io::stdout().lock().write_all(&bytes)?;
+    Ok(0)
+}
+fn close_replay(
+    namespace: &mut Option<Namespace>,
+    boundary: &mut Option<Boundary>,
+) -> io::Result<()> {
+    if let Some(namespace) = namespace {
+        namespace.close()?;
+    }
+    drop(namespace.take());
+    drop(boundary.take());
+    Ok(())
+}
+fn replay_expired(
+    replay: Option<&replay_wire::ReplayEnvelope>,
+    request: &Request,
+) -> io::Result<Option<u64>> {
+    match replay {
+        Some(replay) => {
+            let now = clock(request)?.0;
+            Ok((now >= replay.diagnostic_stop_qpc).then_some(now))
+        }
+        None => Ok(None),
+    }
+}
+fn captured_before(before: Option<&SourceCapture>, stop: u64) -> Option<SourceCapture> {
+    before
+        .filter(|capture| match capture {
+            Ok(source) => source.finished_qpc < stop,
+            Err(_) => true,
+        })
+        .cloned()
+}
+fn replay_after_capture(capture: SourceCapture) -> replay_wire::ReplayAfter {
+    match capture {
+        Ok(observation) => replay_wire::ReplayAfter::Observed {
+            observation: Box::new(observation),
+        },
+        Err(reason) => replay_wire::ReplayAfter::Unavailable { reason },
+    }
+}
+
+fn run_request(
+    request: Request,
+    replay: Option<replay_wire::ReplayEnvelope>,
+    mut input: &mut impl BufRead,
+) -> io::Result<i32> {
     remaining(&request)?;
+    let mut boundary = None;
+    let mut namespace = None;
+    macro_rules! before_pre_stop {
+        ($before:expr) => {
+            if let Some(now) = replay_expired(replay.as_ref(), &request)? {
+                close_replay(&mut namespace, &mut boundary)?;
+                let replay = replay.as_ref().expect("replay cutoff");
+                return replay_result(
+                    replay,
+                    replay_wire::ReplayOutcome::CallNotAttempted {
+                        reason: replay_wire::NotAttemptedReason::DiagnosticStopBeforePre,
+                        observed_qpc: now,
+                        before: captured_before($before, replay.diagnostic_stop_qpc),
+                    },
+                );
+            }
+        };
+    }
+    before_pre_stop!(None);
     let mut token = std::ptr::null_mut();
     // SAFETY: actual process token is queried, never changed.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let token = owner(token)?;
+    before_pre_stop!(None);
     let before = source(&request, &token, Some(protocol::SourceRole::BeforeOpen))?;
-    let mut boundary = None;
-    let mut namespace = None;
+    before_pre_stop!(Some(&before));
     if request.cell != Cell::Local {
         let boundary_name: Vec<u16> = request.boundary.encode_utf16().chain(Some(0)).collect();
         let alias: Vec<u16> = request.alias.encode_utf16().chain(Some(0)).collect();
         remaining(&request)?;
+        before_pre_stop!(Some(&before));
         // SAFETY: bounded terminated boundary name and documented flags zero.
         let raw = unsafe { CreateBoundaryDescriptorW(boundary_name.as_ptr(), 0) };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let mut held = Boundary(raw);
+        boundary = Some(Boundary(raw));
+        before_pre_stop!(Some(&before));
         let sid_text: Vec<u16> = request.user_sid.encode_utf16().chain(Some(0)).collect();
         let mut sid = std::ptr::null_mut();
         // SAFETY: bounded canonical SID text; LocalFree owns the returned allocation.
@@ -230,7 +365,8 @@ pub(super) fn run() -> io::Result<i32> {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: SID lives through this synchronous boundary update.
-        let added = unsafe { AddSIDToBoundaryDescriptor(&mut held.0, sid) };
+        let added =
+            unsafe { AddSIDToBoundaryDescriptor(&mut boundary.as_mut().expect("boundary").0, sid) };
         let error = io::Error::last_os_error();
         // SAFETY: release only the ConvertStringSid allocation.
         unsafe { LocalFree(sid) };
@@ -238,11 +374,24 @@ pub(super) fn run() -> io::Result<i32> {
             return Err(error);
         }
         remaining(&request)?;
+        before_pre_stop!(Some(&before));
         // FIRST namespace registration in this fresh restricted-primary worker.
         // SAFETY: exact bounded alias and retained boundary; no inherited namespace.
-        let raw = unsafe { OpenPrivateNamespaceW(held.0, alias.as_ptr()) };
+        let raw = unsafe {
+            OpenPrivateNamespaceW(boundary.as_ref().expect("boundary").0, alias.as_ptr())
+        };
         let error = io::Error::last_os_error();
         if raw.is_null() {
+            if let Some(replay) = &replay {
+                close_replay(&mut namespace, &mut boundary)?;
+                return replay_result(
+                    replay,
+                    replay_wire::ReplayOutcome::NamespaceFailed {
+                        raw_error: error.raw_os_error().expect("native namespace error"),
+                        before,
+                    },
+                );
+            }
             let _ = source(&request, &token, None)?;
             publish(
                 &request,
@@ -256,22 +405,89 @@ pub(super) fn run() -> io::Result<i32> {
             return Ok(0);
         }
         namespace = Some(Namespace(raw));
-        boundary = Some(held);
         remaining(&request)?;
     }
-    let mut name: Vec<u16> = if request.cell == Cell::Local {
-        "Local\\".encode_utf16().collect()
-    } else {
-        request
-            .alias
-            .encode_utf16()
-            .chain(Some(u16::from(b'\\')))
-            .collect()
-    };
-    name.extend(request.event.encode_utf16());
-    name.push(0);
+    before_pre_stop!(Some(&before));
+    let name = replay_wire::event_name(&request)?;
     remaining(&request)?;
-    // SAFETY: exact terminated name, synchronization only, noninheriting.
+    let captured_name = name
+        .strip_suffix(&[0])
+        .expect("one owned terminator")
+        .to_vec();
+    let namespace_held = namespace.is_some() && boundary.is_some();
+    if let Some(replay) = &replay {
+        let measured: unsafe extern "system" fn(u32, i32, *const u16) -> HANDLE = OpenEventW;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let packet = call_packet::Packet::pre(&replay.replay_nonce, measured as usize as u64)?;
+            before_pre_stop!(Some(&before));
+            replay_marker(packet);
+        }
+        if let Some(now) = replay_expired(Some(replay), &request)? {
+            close_replay(&mut namespace, &mut boundary)?;
+            #[cfg(target_arch = "x86_64")]
+            let reason = replay_wire::NotAttemptedReason::DiagnosticStopAfterPre;
+            #[cfg(not(target_arch = "x86_64"))]
+            let reason = replay_wire::NotAttemptedReason::DiagnosticStopBeforePre;
+            return replay_result(
+                replay,
+                replay_wire::ReplayOutcome::CallNotAttempted {
+                    reason,
+                    observed_qpc: now,
+                    before: Some(before),
+                },
+            );
+        }
+        // SAFETY: this is the same typed imported function whose address PRE reports.
+        let raw = unsafe { measured(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+        let error = io::Error::last_os_error();
+        let event = if raw.is_null() {
+            None
+        } else {
+            Some(owner(raw)?)
+        };
+        let after = if replay_expired(Some(replay), &request)?.is_some() {
+            replay_wire::ReplayAfter::SkippedDiagnosticStop
+        } else {
+            #[cfg(target_arch = "x86_64")]
+            replay_marker(call_packet::Packet::post(
+                &replay.replay_nonce,
+                measured as usize as u64,
+                !raw.is_null(),
+                if raw.is_null() {
+                    error.raw_os_error().expect("saved native last error") as u32
+                } else {
+                    0
+                },
+            )?);
+            if replay_expired(Some(replay), &request)?.is_some() {
+                replay_wire::ReplayAfter::SkippedDiagnosticStop
+            } else {
+                let captured = source(&request, &token, Some(protocol::SourceRole::ReplayAfter))?;
+                if replay_expired(Some(replay), &request)?.is_some() {
+                    replay_wire::ReplayAfter::SkippedDiagnosticStop
+                } else {
+                    replay_after_capture(captured)
+                }
+            }
+        };
+        drop(event);
+        close_replay(&mut namespace, &mut boundary)?;
+        return replay_result(
+            replay,
+            replay_wire::ReplayOutcome::EventReturned {
+                event_open: !raw.is_null(),
+                raw_error: if raw.is_null() {
+                    error.raw_os_error()
+                } else {
+                    None
+                },
+                before,
+                after,
+            },
+        );
+    }
+    // SAFETY: original uninstrumented path, synchronization only, noninheriting.
     let raw = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
     let error = io::Error::last_os_error();
     if raw.is_null() {
@@ -281,7 +497,10 @@ pub(super) fn run() -> io::Result<i32> {
             Some(protocol::SourceRole::AfterFailedOpen),
         )?;
         let diagnostics = match (before, after) {
-            (Ok(before), Ok(after)) => protocol::DiagnosticState::Present { before, after },
+            (Ok(before), Ok(after)) => protocol::DiagnosticState::Present {
+                before: Box::new(before),
+                after: Box::new(after),
+            },
             (Err(reason), _) => protocol::DiagnosticState::Unavailable {
                 reason: protocol::DiagnosticUnavailableReason::Observation {
                     role: protocol::SourceRole::BeforeOpen,
@@ -295,15 +514,99 @@ pub(super) fn run() -> io::Result<i32> {
                 },
             },
         };
-        publish(
-            &request,
-            Phase::Event,
-            false,
-            error.raw_os_error(),
-            None,
-            None,
+        let module_provenance = matches!(request.cell, Cell::Local | Cell::Private)
+            .then(|| module_readback::observe(&request));
+        let mut probe_owner = None;
+        let mut root_owner = None;
+        let native_open = if matches!(request.cell, Cell::Local | Cell::Private) {
+            let probe = if remaining(&request).is_err() {
+                protocol::ZeroProbe::Unavailable { deadline: true }
+            } else {
+                // SAFETY: exact same original terminated buffer, no rights, noninheriting.
+                let probe = unsafe { OpenEventW(0, 0, name.as_ptr()) };
+                let probe_error = io::Error::last_os_error();
+                if probe.is_null() {
+                    protocol::ZeroProbe::Failed {
+                        raw_error: probe_error.raw_os_error().unwrap_or(0),
+                    }
+                } else {
+                    probe_owner = Some(owner(probe)?);
+                    protocol::ZeroProbe::Held {
+                        handle: probe as usize as u64,
+                    }
+                }
+            };
+            let native_root = if request.cell == Cell::Private {
+                if let Some(namespace) = namespace.as_ref() {
+                    let (record, owner) =
+                        super::namespace_primary_root::observe(namespace.0, &request);
+                    root_owner = owner;
+                    Some(record)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Some(protocol::NativeOpen {
+                cell: request.cell,
+                name_utf16: captured_name,
+                desired_access: SYNCHRONIZATION_SYNCHRONIZE,
+                inherit: false,
+                probe_desired_access: 0,
+                namespace_held,
+                probe,
+                native_root,
+                module_provenance,
+            })
+        } else {
+            None
+        };
+        let mut response = Response {
+            revision: protocol::REVISION,
+            nonce: request.nonce.clone(),
+            phase: Phase::Event,
+            success: false,
+            raw_error: error.raw_os_error(),
+            event_handle: None,
+            modify_denied: None,
             diagnostics,
-        )?;
+            native_open,
+        };
+        publish_response(&request, &mut response)?;
+        if probe_owner.is_some() || root_owner.is_some() {
+            // The controller cannot send this ACK until it receives the above
+            // response, so request decoding cannot have prefetched ACK bytes.
+            diagnostic_ack::read_ack(
+                &mut input,
+                &protocol::encode_probe_ack(&request.nonce)?,
+                || {
+                    let mut available = 0;
+                    // SAFETY: original stdio pipe; read only after bytes are observed.
+                    if unsafe {
+                        windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                            io::stdin().as_raw_handle(),
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            &mut available,
+                            std::ptr::null_mut(),
+                        )
+                    } == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if available == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(available != 0)
+                },
+                || remaining(&request).map(|_| ()),
+            )?;
+            remaining(&request)?;
+        }
+        drop(probe_owner);
+        drop(root_owner);
         return Ok(0);
     }
     let event = owner(raw)?;

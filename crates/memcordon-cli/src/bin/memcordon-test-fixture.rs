@@ -1197,6 +1197,18 @@ fn main() {
                 .unwrap_or_else(|error| fail(error.to_string()))
         }
         #[cfg(windows)]
+        "namespace-primary-debug-replay" => {
+            let encoded = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .unwrap_or_else(|| fail("one encoded replay envelope required"));
+            if args.next().is_some() {
+                fail("one replay envelope only");
+            }
+            consumer_readiness_windows::namespace_primary_replay(&encoded)
+                .unwrap_or_else(|error| fail(error.to_string()))
+        }
+        #[cfg(windows)]
         "consumer-readiness-windows" => {
             consumer_readiness_windows::run(args).unwrap_or_else(|error| fail(error.to_string()))
         }

@@ -17,12 +17,23 @@ use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Pipes::*;
 use windows_sys::Win32::System::Threading::*;
 
+#[path = "private/fixture_namespace_authz.rs"]
+mod authz_diagnostic;
+#[path = "private/fixture_namespace_debug_replay.rs"]
+mod debug_replay;
+#[path = "private/fixture_namespace_experiment.rs"]
+mod experiment;
 #[path = "../src/bin/consumer_readiness_windows/fixture_default_dacl.rs"]
 mod fixture_default_dacl;
+#[path = "private/fixture_namespace_module_bundle.rs"]
+mod module_bundle;
 #[path = "../src/bin/consumer_readiness_windows/native_fixture_default_dacl.rs"]
 mod native_fixture_default_dacl;
 #[path = "private/fixture_namespace_primary_protocol.rs"]
 mod protocol;
+#[cfg(target_arch = "x86_64")]
+#[path = "private/fixture_namespace_replay_protocol.rs"]
+mod replay_wire;
 #[path = "private/fixture_namespace_security_evidence.rs"]
 mod security_evidence;
 #[path = "../src/bin/consumer_readiness_windows/namespace_primary_token.rs"]
@@ -220,8 +231,12 @@ fn pipe(parent_reads: bool) -> io::Result<(File, OwnedHandle)> {
     Ok((File::from(parent), child))
 }
 struct Child {
-    process: OwnedHandle,
+    process: std::sync::Arc<OwnedHandle>,
     thread: Option<OwnedHandle>,
+    #[cfg(target_arch = "x86_64")]
+    pid: u32,
+    #[cfg(target_arch = "x86_64")]
+    tid: u32,
     deadline: Instant,
     settled: bool,
 }
@@ -247,6 +262,13 @@ impl Drop for Attributes {
     }
 }
 fn launch(token: HANDLE, deadline: Instant) -> io::Result<(Child, File, File)> {
+    launch_mode(token, deadline, None)
+}
+fn launch_mode(
+    token: HANDLE,
+    deadline: Instant,
+    replay: Option<&str>,
+) -> io::Result<(Child, File, File)> {
     let (input, child_input) = pipe(false)?;
     let (output, child_output) = pipe(true)?;
     let handles = [child_input.as_raw_handle(), child_output.as_raw_handle()];
@@ -284,12 +306,26 @@ fn launch(token: HANDLE, deadline: Instant) -> io::Result<(Child, File, File)> {
     startup.lpAttributeList = attributes.0;
     let image = OsStr::new(env!("CARGO_BIN_EXE_memcordon-test-fixture"));
     let application: Vec<u16> = image.encode_wide().chain(Some(0)).collect();
-    let argv = [
+    let mut argv = vec![
         image.encode_wide().collect(),
-        "namespace-primary-experiment".encode_utf16().collect(),
+        if replay.is_some() {
+            "namespace-primary-debug-replay"
+        } else {
+            "namespace-primary-experiment"
+        }
+        .encode_utf16()
+        .collect(),
     ];
+    if let Some(replay) = replay {
+        argv.push(replay.encode_utf16().collect());
+    }
     let mut command = memcordon_core::encode_windows_command_line(&argv);
     command.push(0);
+    #[cfg(target_arch = "x86_64")]
+    if replay.is_some() {
+        replay_wire::check_replay_command_line(&command)
+            .map_err(|_| io::Error::other("unavailable-command-line-bound"))?;
+    }
     let mut info = PROCESS_INFORMATION::default();
     live(deadline)?;
     // SAFETY: exact compiled fixture image, structured argv, original restricted PRIMARY,
@@ -302,7 +338,13 @@ fn launch(token: HANDLE, deadline: Instant) -> io::Result<(Child, File, File)> {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_SUSPENDED
+                | EXTENDED_STARTUPINFO_PRESENT
+                | if replay.is_some() {
+                    DEBUG_ONLY_THIS_PROCESS
+                } else {
+                    0
+                },
             std::ptr::null(),
             std::ptr::null(),
             &startup.StartupInfo,
@@ -312,16 +354,40 @@ fn launch(token: HANDLE, deadline: Instant) -> io::Result<(Child, File, File)> {
     {
         return Err(io::Error::last_os_error());
     }
+    // A successful debug creation must transfer both documented owners before
+    // any fallible postcreation work. An impossible partial transfer is fatal;
+    // the precreation watchdog/default debugger-death policy owns containment.
+    if replay.is_some()
+        && (info.hProcess.is_null()
+            || info.hProcess == INVALID_HANDLE_VALUE
+            || info.hThread.is_null()
+            || info.hThread == INVALID_HANDLE_VALUE)
+    {
+        std::process::abort();
+    }
     let mut child = Child {
-        process: owned(info.hProcess)?,
+        process: std::sync::Arc::new(owned(info.hProcess)?),
         thread: None,
+        #[cfg(target_arch = "x86_64")]
+        pid: info.dwProcessId,
+        #[cfg(target_arch = "x86_64")]
+        tid: info.dwThreadId,
         deadline,
         settled: false,
     };
-    child.thread = Some(owned(info.hThread)?);
-    live(deadline)?;
+    child.thread = Some(if replay.is_some() {
+        // SAFETY: successful creation transferred this checked unique owner.
+        unsafe { OwnedHandle::from_raw_handle(info.hThread) }
+    } else {
+        owned(info.hThread)?
+    });
+    if replay.is_none() {
+        live(deadline)?;
+    }
     // SAFETY: original creation-held thread, no thread/process reopen.
-    if unsafe { ResumeThread(child.thread.as_ref().unwrap().as_raw_handle()) } == u32::MAX {
+    if replay.is_none()
+        && unsafe { ResumeThread(child.thread.as_ref().unwrap().as_raw_handle()) } == u32::MAX
+    {
         return Err(io::Error::last_os_error());
     }
     drop(attributes);
@@ -461,6 +527,132 @@ fn child_source(child: &Child, request: &Request) -> io::Result<()> {
         request.expected_default_acl_sha256
     );
     live(child.deadline)
+}
+
+fn native_open_probe(
+    child: &mut Child,
+    input: &mut File,
+    request: &Request,
+    call: &protocol::NativeOpen,
+    original: &OwnedHandle,
+    wrong: &OwnedHandle,
+) -> serde_json::Value {
+    let expected: Vec<u16> = if request.cell == Cell::Local {
+        "Local\\"
+            .encode_utf16()
+            .chain(request.event.encode_utf16())
+            .collect()
+    } else {
+        request
+            .alias
+            .encode_utf16()
+            .chain(Some(u16::from(b'\\')))
+            .chain(request.event.encode_utf16())
+            .collect()
+    };
+    let mut value = serde_json::json!({"diagnostic_only":true,"acceptance_authority":false,
+        "sampling":"sequential-non-atomic","worker_call":call,
+        "call_matches_request":call.cell==request.cell && call.name_utf16==expected,
+        "identity_observed":false,"cleanup_observed":false});
+    let zero = match call.probe {
+        protocol::ZeroProbe::Held { handle } => Some(handle),
+        _ => None,
+    };
+    let native = call.native_root.as_ref().and_then(|root| root.handle);
+    value["identities"] = serde_json::json!({});
+    for (source, handle) in [("zero-win32", zero), ("native-relative", native)] {
+        let Some(handle) = handle else {
+            continue;
+        };
+        let comparison = (|| -> io::Result<(bool, bool)> {
+            live(child.deadline)?;
+            let mut duplicate = std::ptr::null_mut();
+            // SAFETY: value is owned by this original live child until the distinct ack;
+            // existing creation-held PROCESS_DUP_HANDLE authority, outward SAME_ACCESS only.
+            if unsafe {
+                DuplicateHandle(
+                    child.process.as_raw_handle(),
+                    handle as usize as HANDLE,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let duplicate = owned(duplicate)?;
+            live(child.deadline)?;
+            // SAFETY: all three handles remain owned and live; no access rights required.
+            let same = unsafe {
+                CompareObjectHandles(original.as_raw_handle(), duplicate.as_raw_handle())
+            } != 0;
+            let different =
+                unsafe { CompareObjectHandles(wrong.as_raw_handle(), duplicate.as_raw_handle()) }
+                    != 0;
+            live(child.deadline)?;
+            Ok((same, different))
+        })();
+        match comparison {
+            Ok((same, wrong)) => {
+                value["identity_observed"] = true.into();
+                value["identities"][source] =
+                    serde_json::json!({"state":"observed","same_original":same,"same_wrong":wrong});
+            }
+            Err(error) => {
+                value["identities"][source] = serde_json::json!({"state":"unavailable","raw_error":error.raw_os_error(),"deadline":error.kind()==io::ErrorKind::TimedOut});
+            }
+        }
+    }
+    if zero.is_some() || native.is_some() {
+        let ack = (|| -> io::Result<()> {
+            live(child.deadline)?;
+            input.write_all(&protocol::encode_probe_ack(&request.nonce)?)?;
+            input.flush()?;
+            live(child.deadline)
+        })();
+        value["acknowledged"] = ack.is_ok().into();
+        if ack.is_err() {
+            // SAFETY: retire only the same original owned child; never reopen a PID.
+            unsafe {
+                TerminateProcess(child.process.as_raw_handle(), 125);
+            }
+        }
+    }
+    let waited = wait_millis(child.deadline).ok().map(|millis| {
+        // SAFETY: exact original creation owner and unchanged absolute deadline.
+        unsafe { WaitForSingleObject(child.process.as_raw_handle(), millis) }
+    });
+    value["wait_result"] = serde_json::json!(waited);
+    value["wait_deadline_unavailable"] = waited.is_none().into();
+    if waited == Some(WAIT_OBJECT_0) {
+        child.settled = true;
+        value["cleanup_observed"] = true.into();
+    }
+    value
+}
+
+// Optional diagnostic custody is acquired while the exact original child is
+// live. It never substitutes for child_source's mandatory query-only checks.
+fn child_diagnostic_token(child: &Child, request: &Request) -> io::Result<OwnedHandle> {
+    live(child.deadline)?;
+    let mut token = std::ptr::null_mut();
+    // SAFETY: only the retained creation process is queried; no numeric PID lookup.
+    if unsafe { OpenProcessToken(child.process.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned(token)?;
+    let envelope = memcordon_windows_launch_core::query_token_envelope(token.as_raw_handle())
+        .map_err(io::Error::other)?;
+    if envelope != request.expected_token {
+        return Err(io::Error::other(
+            "diagnostic child token source binding differs",
+        ));
+    }
+    live(child.deadline)?;
+    Ok(token)
 }
 
 fn default_acl_sha256(token: HANDLE) -> io::Result<String> {
@@ -679,7 +871,7 @@ fn original_event_label_query_uses_only_each_retained_handles_read_control() -> 
 }
 
 #[test]
-fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabilities()
+fn fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities()
 -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut counter = 0;
@@ -759,6 +951,7 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
         .map_err(io::Error::other)?;
     let parent_prelaunch_default_acl = token_readback::collect(restricted.as_raw_handle())?;
     let expected_acl = parent_prelaunch_default_acl.sha256.clone();
+    let mut summaries = Vec::with_capacity(5);
     for cell in [
         Cell::Local,
         Cell::Private,
@@ -839,12 +1032,66 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
         let identity = child_identity(&child)?;
         assert!(identity.0 != 0 && identity.1 != 0);
         child_source(&child, &request)?;
+        let diagnostic_token = child_diagnostic_token(&child, &request);
         let frame = protocol::encode_request(&request)?;
         assert_eq!(protocol::decode_request(&frame)?, request);
         input.write_all(&frame)?;
         input.flush()?;
         let observed = response(&child, &mut output, &request)?;
+        // The mandatory pre-request child_source readback established both
+        // bindings; the worker also validates them before its original API.
+        // Optional replay/diagnostic evidence never classifies this outcome.
+        let outcome = experiment::classify_original(
+            &request,
+            &observed,
+            experiment::Binding {
+                initial_identity: identity,
+                current_identity: child_identity(&child)?,
+                token_matches: true,
+                default_acl_matches: true,
+            },
+        )?;
         if !observed.success {
+            // Read only the original READ_CONTROL owner after the unchanged
+            // failed native open. Never reopen by name or replace its outcome.
+            let post_failure = if observed.phase == Phase::Event {
+                match event_security(&original, deadline) {
+                    Ok(snapshot) => security_evidence::ReadbackObservation::Present(snapshot),
+                    Err(error) => security_evidence::ReadbackObservation::Unavailable {
+                        raw_error: error.raw_os_error(),
+                        deadline: error.kind() == io::ErrorKind::TimedOut,
+                    },
+                }
+            } else {
+                security_evidence::ReadbackObservation::NotRequested
+            };
+            let native_probe = observed.native_open.as_ref().map(|call| {
+                native_open_probe(&mut child, &mut input, &request, call, &original, &wrong)
+            });
+            // Passive disk provenance is optional and starts only after the
+            // original child has released its diagnostic handles and settled.
+            if child.settled {
+                if let Some(provenance) = observed
+                    .native_open
+                    .as_ref()
+                    .and_then(|call| call.module_provenance.as_ref())
+                {
+                    match module_bundle::capture(
+                        provenance,
+                        &request,
+                        &observed,
+                        std::path::Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+                        deadline,
+                    ) {
+                        Ok(path) => eprintln!("passive module evidence: {}", path.display()),
+                        Err(error) => eprintln!(
+                            "passive module evidence unavailable: kind={:?}; raw={:?}",
+                            error.kind(),
+                            error.raw_os_error()
+                        ),
+                    }
+                }
+            }
             let retained = (|| -> io::Result<()> {
                 live(deadline)?;
                 let original_name: Vec<u16> = name.encode_utf16().collect();
@@ -858,8 +1105,27 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
                     parent_prelaunch_token: &parent_prelaunch_token,
                     parent_default_acl_bytes: &parent_prelaunch_default_acl.bytes,
                     label: &original_label,
+                    post_failure: &post_failure,
                 };
-                let record = security_evidence::failure(&association, &original_security)?;
+                let mut record = security_evidence::failure(&association, &original_security)?;
+                record["native_open_probe"] =
+                    serde_json::to_value(&native_probe).map_err(io::Error::other)?;
+                if observed.phase == Phase::Event {
+                    let access = match (&diagnostic_token, &post_failure) {
+                        (Ok(token), security_evidence::ReadbackObservation::Present(snapshot)) => {
+                            authz_diagnostic::observe(token, &request, snapshot, deadline)
+                        }
+                        (Err(error), _) => {
+                            security_evidence::AuthzObservation::unavailable("source-token", error)
+                        }
+                        _ => security_evidence::AuthzObservation::unavailable(
+                            "descriptor-readback",
+                            &io::Error::other("same-handle descriptor unavailable"),
+                        ),
+                    };
+                    record["authz_descriptor_context"] =
+                        serde_json::to_value(access).map_err(io::Error::other)?;
+                }
                 // Pretty framing preserves one typed record while keeping each
                 // bounded hex chunk below the existing progress-line limit.
                 let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
@@ -877,12 +1143,45 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
             if let Err(error) = retained {
                 // Diagnostic custody/render/sink failures never replace the
                 // original response or bypass its unchanged strict assertions.
+                // This result was already collected before rendering. Retain it
+                // without a fresh live snapshot or another native call.
+                if let Some(probe) = &native_probe {
+                    #[derive(serde::Serialize)]
+                    struct RetainedProbe<'a> {
+                        format: &'static str,
+                        revision: u32,
+                        diagnostic_only: bool,
+                        acceptance_authority: bool,
+                        nonce: &'a str,
+                        original_error: Option<i32>,
+                        probe: &'a serde_json::Value,
+                    }
+                    let record = RetainedProbe {
+                        format: "memcordon.native-probe-settlement",
+                        revision: 1,
+                        diagnostic_only: true,
+                        acceptance_authority: false,
+                        nonce: &request.nonce,
+                        original_error: observed.raw_error,
+                        probe,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&record) {
+                        if bytes.len() <= protocol::FRAME_BOUND {
+                            let mut sink = io::stderr().lock();
+                            let _ = sink.write_all(&bytes);
+                            let _ = sink.write_all(b"\n");
+                        }
+                    }
+                }
                 let _ = writeln!(
                     io::stderr().lock(),
                     "fresh-primary security evidence unavailable: kind={:?}; raw={:?}",
                     error.kind(),
                     error.raw_os_error()
                 );
+            }
+            if child.settled && matches!(cell, Cell::Private) {
+                debug_replay::capture(restricted.as_raw_handle(), &request, &observed, deadline);
             }
         }
         let _ = writeln!(
@@ -894,7 +1193,8 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
             observed.success,
             observed.raw_error
         );
-        if observed.phase == Phase::Held {
+        let mut held_verified = false;
+        if outcome == experiment::OriginalOutcome::HeldAwaitingIdentity {
             assert!(
                 matches!(cell, Cell::Local | Cell::Private),
                 "negative cell admitted original namespace/event"
@@ -941,26 +1241,15 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
             let completed = response(&child, &mut output, &request)?;
             assert_eq!(completed.phase, Phase::Completed);
             assert!(completed.success);
+            held_verified = true;
         } else {
             assert!(!observed.success);
-            match cell {
-                Cell::Local => assert_eq!(observed.phase, Phase::Event),
-                Cell::NamespaceDenied | Cell::WrongBoundary => {
-                    assert_eq!(observed.phase, Phase::Namespace)
-                }
-                Cell::EventDenied => assert_eq!(observed.phase, Phase::Event),
-                Cell::Private => panic!(
-                    "fresh restricted-primary positive failed: operation={}; response={observed:?}",
-                    match observed.phase {
-                        Phase::Namespace => "OpenPrivateNamespaceW",
-                        Phase::Event => "OpenEventW(SYNCHRONIZE)",
-                        _ => "unexpected-worker-phase",
-                    }
-                ),
-            }
-            if matches!(cell, Cell::NamespaceDenied | Cell::EventDenied) {
-                assert_eq!(observed.raw_error, Some(ERROR_ACCESS_DENIED as i32));
-            }
+            // Classification accepts only the exact named negative outcomes.
+            // Event denial does not prove the target event DACL was reached.
+            assert!(!matches!(
+                outcome,
+                experiment::OriginalOutcome::HeldAwaitingIdentity
+            ));
         }
         // SAFETY: settle original owned process under the same absolute cutoff.
         assert_eq!(
@@ -982,9 +1271,11 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
         drop(output);
         drop(wrong);
         drop(original);
+        drop(diagnostic_token);
         if let Some(namespace) = &mut namespace {
             namespace.close()?;
         }
+        drop(namespace);
         assert_eq!(
             memcordon_windows_launch_core::query_token_envelope(primary.as_raw_handle())
                 .map_err(io::Error::other)?,
@@ -999,8 +1290,51 @@ fn fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabil
                 .map_err(io::Error::other)?,
             expected
         );
+        assert_eq!(
+            default_acl_sha256(restricted.as_raw_handle())?,
+            expected_acl
+        );
+        temporary.close()?;
         live(deadline)?;
+        let settlement = experiment::Settlement {
+            process_settled: true,
+            exit_zero: true,
+            identity_stable: true,
+            token_and_acl_stable: true,
+            event_sd_stable: true,
+            thread_stable: true,
+            resources_released: true,
+            held_identity_and_release_verified: held_verified,
+        };
+        let final_outcome = experiment::complete_cell(outcome, &settlement)?;
+        summaries.push(serde_json::json!({
+            "cell":cell,"original_nonce":nonce,"original_pid":identity.0,"original_birth":identity.1,
+            "original_phase":observed.phase,"original_success":observed.success,"original_error":observed.raw_error,
+            "original_api":if observed.phase==Phase::Namespace {"OpenPrivateNamespaceW"}else{"OpenEventW"},
+            "event_desired_access":if observed.phase==Phase::Namespace {None}else{Some(SYNCHRONIZATION_SYNCHRONIZE)},
+            "outcome":final_outcome,"scenario_success":final_outcome.scenario_success(),
+            "original_event_identity":if held_verified {"same-original-object-verified"}else{"not-reached"},
+            "wrong_object_comparison":if held_verified {"distinct-original-object-verified"}else{"not-reached"},
+            "event_modify_denied":observed.modify_denied,"held_release_completed":held_verified,
+            "target_event_dacl_denial_cause":"unobserved","settlement":settlement
+        }));
+        assert!(summaries.len() <= 5);
     }
+    assert_eq!(summaries.len(), 5);
+    drop(restricted);
+    drop(primary);
+    let summary = serde_json::json!({"format":"memcordon.namespace-primary-experiment-summary","revision":1,"diagnostic_only":true,"acceptance_authority":false,"harness_integrity_verified":true,"shared_token_handles_released":true,"deadline_qpc":cutoff,"scenario_success_scope":"original event acquisition and live identity verified; every denial remains false","source_binding_scope":"creation-process token/default ACL before request; worker original-call validation; source/derived invariance at settlement","cells":summaries});
+    // Keep each progress line short while retaining one bounded typed record.
+    let bytes = serde_json::to_vec_pretty(&summary).map_err(io::Error::other)?;
+    if bytes.len() > 8 * 1024 {
+        return Err(io::Error::other(
+            "five-cell experiment summary exceeds bound",
+        ));
+    }
+    live(deadline)?;
+    let mut sink = io::stderr().lock();
+    sink.write_all(&bytes)?;
+    sink.write_all(b"\n")?;
     live(deadline)
 }
 fn namespace_collision(alias: &str, user: &str, deadline: Instant) -> bool {

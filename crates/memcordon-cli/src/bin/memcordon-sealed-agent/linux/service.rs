@@ -140,10 +140,12 @@ fn handle(
                 stream,
                 &request,
                 descriptors,
-                credentials.pid,
-                credentials.uid,
-                credentials.gid,
-                &groups,
+                super::workload_runtime::PublicCallerIdentity {
+                    pid: credentials.pid,
+                    uid: credentials.uid,
+                    gid: credentials.gid,
+                    groups: &groups,
+                },
                 setup_cutoff_nanos,
             );
         }
@@ -311,7 +313,7 @@ pub(crate) fn terminal_payload(facts: &super::launch::TerminalFacts) -> Vec<u8> 
             (class.receipt_name(), os_code.to_string())
         }
     };
-    let payload = format!(
+    format!(
         "schema-version=2\nmechanism=linux-pid-namespace-cgroup-v2\nstatus={}\nexec-status={}\nexec-os-code={}\nspawn-error-reported={}\ntarget-pid={}\nauthorization-offset-millis={}\nmemory-limit-exceeded={}\ndeadline-exceeded={}\nassignment-verified={}\nnamespaces-verified={}\ntarget-initial-credentials-verified={}\ninitial-provider-capabilities-absent={}\ncaller-envelope-digest={}\ncaller-no-new-privs={}\ntarget-no-new-privs-matched={}\ncaller-capability-bounding-set-digest={}\ntarget-capability-bounding-set-matched={}\ncaller-mount-namespace-digest={}\ntarget-mount-context-derived-from-caller={}\ncredential-transition-disposition=preserve-caller-envelope\nboundary-independent-of-credentials={}\ndescriptors-verified={}\nwritable-ancestor-cgroup-denied={}\nparent-namespace-handles-denied={}\nrecursive-provider-request-denied={}\nguardian-ready-before-authorization={}\nfrontend-loss-authority-verified={}\ncgroup-kill-invoked={}\ncgroup-empty={}\ninit-reaped={}\nguardian-reaped={}\nboundary-retired={}\n",
         facts.child_status.map_or_else(|| "none".to_owned(), |status| status.to_string()),
         exec_status,
@@ -345,8 +347,7 @@ pub(crate) fn terminal_payload(facts: &super::launch::TerminalFacts) -> Vec<u8> 
         facts.guardian_reaped,
         facts.boundary_retired
     )
-    .into_bytes();
-    payload
+    .into_bytes()
 }
 
 #[cfg(feature = "test-support")]

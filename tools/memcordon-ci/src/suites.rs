@@ -932,22 +932,6 @@ fn fuzz_phase(
         name,
         &serde_json::json!({"planner_version": 2, "shard_index": shard.map(|s| s.index()), "shard_count": shard.map(|s| s.count()), "targets": targets,"target_plans":target_plans}),
     )?;
-    cargo(
-        root,
-        stable,
-        "test",
-        [
-            "--locked",
-            "--package",
-            "memcordon-core",
-            "--test",
-            "workload_independent_vectors",
-            "--",
-            "--ignored",
-            "--exact",
-            "write_portable_fuzz_seed_corpora",
-        ],
-    )?;
     let tools = config::tools(root)?;
     install_tool(root, stable, "cargo-fuzz", &tools.cargo_fuzz)?;
     CommandSpec::new("rustup", root, Duration::from_secs(10 * 60))
@@ -1558,17 +1542,7 @@ pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
         .args(["doctor", "--probe-execution", "--json"])
         .run()?;
     let probe: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if probe["kind"] != "doctor-execution-probe"
-        || probe["schema_version"] != 1
-        || probe["execution"]["helper_ready"] != true
-        || probe["execution"]["target_exec_confirmed"] != true
-        || probe["execution"]["target_exit"] != 0
-        || probe["execution"]["cleanup_complete"] != true
-    {
-        return Err(CiError::Message(
-            "installed macOS execution probe lacks complete native lifecycle evidence".into(),
-        ));
-    }
+    memcordon_ci::macos_probe_contract::validate(&probe)?;
     let deadline = CommandSpec::new(&installed, root, Duration::from_secs(5))
         .args(["+100ms", "--"])
         .arg(root.join("target/ci/backend-macos/debug/memcordon-test-fixture"))

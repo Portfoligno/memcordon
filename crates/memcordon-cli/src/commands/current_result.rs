@@ -194,6 +194,8 @@ fn base(
                         ..
                     }) => "windows-sealed-current-token-v1",
                     None if cfg!(target_os = "linux") => "linux-pid-namespace-cgroup-v2",
+                    // Sealed preparation failed before selecting a native backend.
+                    None if cfg!(target_os = "macos") => "unsupported-sealed-platform",
                     None => "windows-sealed-current-token-v1",
                 },
             )
@@ -202,6 +204,7 @@ fn base(
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(super) fn success(
     args: &ExecutionArgs,
     command: &CommandSpec,
@@ -237,26 +240,29 @@ pub(super) fn success(
     {
         return preallocation_cancelled(args, command, &resolution.report, cancellation);
     }
-    if let Some(failure) = &attempt.operational_failure
-        && (failure.workload_attempt.is_some() || failure.workload_rejection.is_some())
-    {
-        let message = attempt
-            .error
-            .as_ref()
-            .map_or("current workload transport failed".to_owned(), |error| {
-                format!("{}: {}", error.code, error.message)
-            });
-        return workload_failure(
-            args,
-            command,
-            &resolution.report,
-            failure.workload_attempt.clone(),
-            failure.workload_binding.clone(),
-            failure.workload_rejection.clone(),
-            failure.workload_input_complete,
-            &message,
-            execution.wrapper_exit_code(),
-        );
+    #[allow(clippy::collapsible_if)] // Preserve Rust 1.85 compatibility.
+    if let Some(failure) = &attempt.operational_failure {
+        if failure.workload_attempt.is_some() || failure.workload_rejection.is_some() {
+            let message = attempt
+                .error
+                .as_ref()
+                .map_or("current workload transport failed".to_owned(), |error| {
+                    format!("{}: {}", error.code, error.message)
+                });
+            return workload_failure(
+                args,
+                command,
+                &resolution.report,
+                WorkloadFailureContext {
+                    association: failure.workload_attempt.clone(),
+                    binding: failure.workload_binding.clone(),
+                    rejection: failure.workload_rejection.clone(),
+                    input_complete: failure.workload_input_complete,
+                    message: &message,
+                    exit_code: execution.wrapper_exit_code(),
+                },
+            );
+        }
     }
     if let BoundaryMechanismEvidence::LinuxPrivateWorkloadV1 { terminal, frontend } =
         &attempt.boundary_detail
@@ -436,25 +442,28 @@ pub(super) fn success(
             args,
             command,
             &resolution.report,
-            None,
-            None,
-            None,
-            false,
-            &message,
-            execution.wrapper_exit_code(),
+            WorkloadFailureContext {
+                association: None,
+                binding: None,
+                rejection: None,
+                input_complete: false,
+                message: &message,
+                exit_code: execution.wrapper_exit_code(),
+            },
         );
     }
-    if let Some(failure) = &attempt.operational_failure
-        && let Some(rejection) = &failure.windows_current_rejection
-    {
-        return rejected(
-            args,
-            command,
-            &resolution.report,
-            rejection,
-            failure.provider_association.clone(),
-            execution.wrapper_exit_code(),
-        );
+    #[allow(clippy::collapsible_if)] // Preserve Rust 1.85 compatibility.
+    if let Some(failure) = &attempt.operational_failure {
+        if let Some(rejection) = &failure.windows_current_rejection {
+            return rejected(
+                args,
+                command,
+                &resolution.report,
+                rejection,
+                failure.provider_association.clone(),
+                execution.wrapper_exit_code(),
+            );
+        }
     }
     let BoundaryMechanismEvidence::WindowsJobObjectV3(native) = &attempt.boundary_detail else {
         return Err("sealed provider supplied no current native observation".into());
@@ -680,12 +689,14 @@ pub(super) fn failure(
             args,
             command,
             policy,
-            error.workload_attempt.clone(),
-            error.workload_binding.clone(),
-            error.workload_rejection.clone(),
-            error.workload_input_complete,
-            &error.message,
-            exit_code,
+            WorkloadFailureContext {
+                association: error.workload_attempt.clone(),
+                binding: error.workload_binding.clone(),
+                rejection: error.workload_rejection.clone(),
+                input_complete: error.workload_input_complete,
+                message: &error.message,
+                exit_code,
+            },
         );
     }
     if let Some(rejection) = &error.windows_provider_rejection_v3 {
@@ -733,17 +744,29 @@ pub(super) fn failure(
     Ok(report)
 }
 
-fn workload_failure(
-    args: &ExecutionArgs,
-    command: &CommandSpec,
-    policy: &PolicyEnvelopeReport,
+struct WorkloadFailureContext<'a> {
     association: Option<memcordon_core::workload_request::WorkloadAttemptAssociationV1>,
     binding: Option<WorkloadRequestAssociationV1>,
     rejection: Option<memcordon_core::workload_request::WorkloadRejectionV1>,
     input_complete: bool,
-    message: &str,
+    message: &'a str,
     exit_code: i32,
+}
+
+fn workload_failure(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    policy: &PolicyEnvelopeReport,
+    context: WorkloadFailureContext<'_>,
 ) -> Result<ResultV3, String> {
+    let WorkloadFailureContext {
+        association,
+        binding,
+        rejection,
+        input_complete,
+        message,
+        exit_code,
+    } = context;
     let mut report = base(
         args,
         command,
@@ -775,6 +798,7 @@ fn workload_failure(
     Ok(report)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(super) fn write(path: &Path, report: ResultV3) -> Result<(), String> {
     let mut report = memcordon_core::ResultReport::Current(Box::new(report));
     report

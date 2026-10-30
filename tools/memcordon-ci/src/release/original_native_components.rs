@@ -18,6 +18,8 @@ use crate::readiness_identity::SourceIdentity;
 use crate::{CiError, Result};
 #[path = "original_loader_diagnostic.rs"]
 pub mod loader_diagnostic;
+#[path = "original_windows_recovery_receipt.rs"]
+pub mod windows_recovery_receipt;
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct Args {
@@ -158,51 +160,7 @@ struct WindowsPackageCapture {
 }
 
 #[cfg(windows)]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WindowsRecoveryInvocation {
-    format: String,
-    revision: u32,
-    cli: crate::windows_installed_cases::SelectedArtifact,
-    provider: memcordon_core::PublicProviderBindingV1,
-    cwd: PathBuf,
-    argv_utf16: Vec<Vec<u16>>,
-    environment_cleared: bool,
-    command_budget_millis: u64,
-}
-
-#[cfg(windows)]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WindowsRemovalReceipt {
-    format: String,
-    revision: u32,
-    provider_generation: String,
-    absent_services: Vec<String>,
-    absent_paths: Vec<PathBuf>,
-    fixture_processes_absent: bool,
-    installed_image_processes_absent: bool,
-    native_component_census: String,
-    service_observations: Vec<WindowsServiceAbsence>,
-    path_observations: Vec<WindowsPathAbsence>,
-}
-#[cfg(windows)]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WindowsServiceAbsence {
-    service_name: String,
-    api: String,
-    native_domain: String,
-    native_code: u32,
-}
-#[cfg(windows)]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WindowsPathAbsence {
-    path: PathBuf,
-    native_domain: String,
-    native_code: i32,
-}
+type WindowsRemovalReceipt = crate::windows_native_removal::RemovalReceipt;
 struct Selection {
     identity: SourceIdentity,
     target: String,
@@ -399,39 +357,18 @@ fn select_with_diagnostic_deadline(
             "original measured roles/source/deadline association differs".into(),
         ));
     }
-    let features = if target.contains("windows") {
-        "windows-sealed-runtime,test-support"
-    } else {
-        "private-tcp,test-support"
-    };
-    if roles.roles.len() != 2
-        || roles
+    super::native_role_contract::validate_original_roles(
+        target,
+        roles
             .roles
             .iter()
-            .filter(|role| {
-                role.role == "operational"
-                    && role.package == "memcordon"
-                    && role.test == "sealed_agent"
-                    && role.features.as_deref() == Some(features)
-            })
-            .count()
-            != 1
-        || roles
-            .roles
-            .iter()
-            .filter(|role| {
-                role.role == "parser"
-                    && role.package == "memcordon-readiness-verifier"
-                    && role.test == "contract"
-                    && role.features.is_none()
-            })
-            .count()
-            != 1
-    {
-        return Err(CiError::Message(
-            "original native executable roles differ".into(),
-        ));
-    }
+            .map(|role| super::native_role_contract::NativeRole {
+                role: &role.role,
+                package: &role.package,
+                test: &role.test,
+                features: role.features.as_deref(),
+            }),
+    )?;
     roles.source.recheck(root)?;
     let origin_record =
         OwnedRecord::read(&root.join(".release/native-components/acquisition-origin.json"))?;
@@ -680,36 +617,35 @@ fn persist_unix(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) struct OwnerProbeOrigin<'a> {
+    pub kind: crate::preparation_tools::Kind,
+    pub commit: &'a str,
+    pub version: &'a str,
+    pub target: &'a str,
+    pub run: &'a str,
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn retain_current_owner_probe(
-    root: &Path,
-    identity: &SourceIdentity,
-    target: &str,
+    preparation: &[u8],
+    origin: &OwnerProbeOrigin<'_>,
     destination: &Path,
 ) -> Result<Vec<crate::windows_installed_cases::SelectedArtifact>> {
     let executable = std::env::current_exe()?;
     let bytes = artifacts::read_file(&executable)?;
-    super::target::validate_executable(&bytes, target)?;
-    let preparation = artifacts::read_file(&root.join("target/ci-preparation/readiness.json"))?;
-    memcordon_core::canonical_json::reject_duplicate_json_keys(&preparation)
-        .map_err(CiError::Message)?;
-    let record: serde_json::Value = serde_json::from_slice(&preparation)?;
-    if record["format"] != 1
-        || record["inputs"]["kind"] != "readiness"
-        || record["inputs"]["source"]["commit"] != identity.source_commit
-        || record["inputs"]["source"]["version"] != identity.version
-        || record["inputs"]["host"] != target
-        || !record["files"].as_array().is_some_and(|files| {
-            files.iter().any(|file| {
-                file["sha256"] == artifacts::checksum(&bytes)
-                    && file["size"] == bytes.len() as u64
-                    && file["executable"] == true
-            })
-        })
-    {
-        return Err(CiError::Message(
-            "current owner probe is not the original source-prepared controller image".into(),
-        ));
-    }
+    super::target::validate_executable(&bytes, origin.target)?;
+    crate::preparation_tools::validate_owner_probe_preparation(
+        preparation,
+        &crate::preparation_tools::OwnerProbeBinding {
+            kind: origin.kind,
+            source_commit: origin.commit,
+            version: origin.version,
+            host: origin.target,
+            run: origin.run,
+            image_sha256: &artifacts::checksum(&bytes),
+            image_size: bytes.len() as u64,
+        },
+    )?;
     std::fs::create_dir(destination)?;
     let artifact = retain_file(
         &executable,
@@ -720,7 +656,7 @@ pub(super) fn retain_current_owner_probe(
     )?;
     persist(
         &destination.join("current-linux-owner.preparation.json"),
-        &preparation,
+        preparation,
     )?;
     Ok(vec![
         crate::windows_installed_cases::SelectedArtifact {
@@ -729,7 +665,7 @@ pub(super) fn retain_current_owner_probe(
         },
         crate::windows_installed_cases::SelectedArtifact {
             path: destination.join("current-linux-owner.preparation.json"),
-            sha256: artifacts::checksum(&preparation),
+            sha256: artifacts::checksum(preparation),
         },
     ])
 }
@@ -1160,18 +1096,20 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
             scope.outputs(),
         )?;
         match super::linux_current_component_lifetime::run(
-            &root,
-            &payload,
-            &selection.identity,
-            &native_key,
-            scope.outputs(),
-            prefix_text,
-            &destination,
-            &build,
-            &source,
-            selection.work,
-            selection.cleanup,
-            selection.deadline.cleanup_deadline_unix_millis,
+            super::linux_current_component_lifetime::ComponentLifetimeInputs {
+                root: &root,
+                payload: &payload,
+                identity: &selection.identity,
+                key: &native_key,
+                scope: scope.outputs(),
+                prefix: prefix_text,
+                destination: &destination,
+                build: &build,
+                source_artifact: &source,
+                work: selection.work,
+                cleanup: selection.cleanup,
+                cleanup_unix: selection.deadline.cleanup_deadline_unix_millis,
+            },
         ) {
             Ok((records, artifacts)) => merge_rows(&mut cell, records, artifacts)?,
             Err(primary) => {
@@ -1984,97 +1922,23 @@ fn validate_windows_settlement(
         records.push(record);
     }
     let recovery: crate::windows_readiness_adapter::RecoveryCleanup = records[0].parse()?;
-    if recovery.output_directory != settled.cleanup_directory.join("recovery")
-        || recovery.deadline_exhausted
-        || recovery.native_status != Some(0)
-        || recovery.recovery.is_err()
-        || recovery.native_quiescence.is_err()
-        || recovery.artifacts.len() != 3
-    {
-        return Err(CiError::Message(
-            "original successful recovery summary differs".into(),
-        ));
-    }
-    let mut paths = std::collections::BTreeSet::new();
-    for receipt in &recovery.artifacts {
-        if receipt.path.parent() != Some(recovery.output_directory.as_path())
-            || !paths.insert(receipt.path.clone())
-        {
-            return Err(CiError::Message(
-                "raw recovery artifact destination duplicated or escaped".into(),
-            ));
-        }
-        let record = OwnedRecord::read(&receipt.path)?;
-        if artifacts::checksum(&record.bytes) != receipt.sha256 {
-            return Err(CiError::Message(
-                "raw recovery artifact bytes differ".into(),
-            ));
-        }
-        records.push(record);
-    }
-    let invocation_path = recovery.output_directory.join("recovery-invocation.json");
-    let stdout_path = recovery.output_directory.join("recovery.stdout.bin");
-    let stderr_path = recovery.output_directory.join("recovery.stderr.bin");
-    if paths
-        != [invocation_path.clone(), stdout_path.clone(), stderr_path]
-            .into_iter()
-            .collect()
-    {
-        return Err(CiError::Message(
-            "successful recovery raw artifact stems differ".into(),
-        ));
-    }
-    let invocation: WindowsRecoveryInvocation = records
-        .iter()
-        .find(|record| record.path == invocation_path)
-        .expect("checked invocation")
-        .parse()?;
-    let argv = invocation
-        .argv_utf16
-        .iter()
-        .map(|argument| {
-            String::from_utf16(argument).map_err(|error| CiError::Message(error.to_string()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if invocation.format != "memcordon.windows-native-recovery-invocation"
-        || invocation.revision != 1
-        || serde_json::to_vec(&invocation.cli)? != serde_json::to_vec(&owner.config.cli)?
-        || serde_json::to_vec(&invocation.provider)? != serde_json::to_vec(&owner.config.provider)?
-        || invocation.cwd != recovery.output_directory
-        || !invocation.environment_cleared
-        || !(100..=60000).contains(&invocation.command_budget_millis)
-        || argv.len() != 3
-        || argv[0] != "windows-recover"
-        || argv[1] != "converge"
-        || argv[2]
-            != invocation
-                .command_budget_millis
-                .saturating_sub(100)
-                .min(30000)
-                .to_string()
-    {
-        return Err(CiError::Message(
-            "actual recovery invocation differs from original selected CLI/provider".into(),
-        ));
-    }
-    let inventory: memcordon_core::WindowsRecoveryInventoryV1 = records
-        .iter()
-        .find(|record| record.path == stdout_path)
-        .expect("checked stdout")
-        .parse()?;
-    if !inventory.is_consistent()
-        || inventory.provider_generation != owner.config.provider.generation.as_str()
-        || inventory.executing != 0
-        || inventory.incomplete_proof != 0
-        || inventory.unacknowledged_outboxes != 0
-        || inventory.ack_retirement_in_progress != 0
-        || inventory.active_admissions != 0
-        || inventory.quarantined != 0
-    {
-        return Err(CiError::Message(
-            "actual original recovery inventory retains selected authority".into(),
-        ));
-    }
+    let recovery_directory = settled.cleanup_directory.join("recovery");
+    windows_recovery_receipt::validate(
+        &recovery,
+        &windows_recovery_receipt::ExpectedRecovery {
+            directory: &recovery_directory,
+            cli: &owner.config.cli,
+            provider: &owner.config.provider,
+            agent_sha256: &owner.config.installed_agent.sha256,
+            manifest_sha256: &owner.config.installed_manifest.sha256,
+        },
+        |path| {
+            let record = OwnedRecord::read(path)?;
+            let bytes = record.bytes.clone();
+            records.push(record);
+            Ok(bytes)
+        },
+    )?;
     let uninstall: WindowsPackageCapture = records[1].parse()?;
     if uninstall.operation != "uninstall"
         || uninstall.status != Some(0)
@@ -2129,40 +1993,23 @@ fn validate_windows_settlement(
         ]
         .map(str::to_owned),
     );
-    if removal.format != "memcordon.windows-native-removal"
-        || removal.revision != 1
-        || removal.provider_generation != owner.config.provider.generation.as_str()
-        || removal.absent_paths != expected_paths
-        || removal.absent_services != services
-        || !removal.fixture_processes_absent
-        || !removal.installed_image_processes_absent
-        || removal.native_component_census != "owned-package-image-names-no-live-candidate"
-        || removal.service_observations.len() != services.len()
-        || removal.path_observations.len() != expected_paths.len()
-        || removal
-            .service_observations
+    let images = crate::windows_native_removal::image_names(
+        owner
+            .config
+            .installed_components
             .iter()
-            .zip(&services)
-            .any(|(observation, name)| {
-                observation.service_name != *name
-                    || observation.api != "OpenServiceW"
-                    || observation.native_domain != "win32"
-                    || observation.native_code != 1060
-            })
-        || removal
-            .path_observations
-            .iter()
-            .zip(&expected_paths)
-            .any(|(observation, path)| {
-                observation.path != *path
-                    || observation.native_domain != "win32"
-                    || ![2, 3].contains(&observation.native_code)
-            })
-    {
-        return Err(CiError::Message(
-            "original native removal receipt layout/SCM/file observations differ".into(),
-        ));
-    }
+            .chain(std::iter::once(&owner.config.installed_agent))
+            .map(|artifact| artifact.path.as_path()),
+    )
+    .map_err(CiError::Message)?;
+    removal
+        .validate(
+            owner.config.provider.generation.as_str(),
+            &expected_paths,
+            &services,
+            &images,
+        )
+        .map_err(CiError::Message)?;
     Ok(records)
 }
 

@@ -213,7 +213,245 @@ pub fn apply(document: &mut Value, workflow: &str) -> Result<()> {
                 .push(text("format"));
         }
     }
+    if matches!(
+        workflow,
+        "ci.yml" | "release.yml" | "deep-ci.yml" | "backend-certification.yml"
+    ) {
+        jobs.insert(text("current-contracts"), current_contracts_job(workflow));
+        jobs.insert(text("tooling-contracts"), tooling_contracts_job(workflow));
+        jobs.insert(
+            text("macos-administrative-contracts"),
+            platform_contracts_job(workflow, PlatformFeedback::MacosAdministration),
+        );
+        if workflow == "ci.yml" {
+            jobs.insert(
+                text("macos-startup-deadline-feedback"),
+                platform_contracts_job(workflow, PlatformFeedback::MacosStartupDeadline),
+            );
+            jobs.insert(
+                text("windows-fixture-feedback"),
+                platform_contracts_job(workflow, PlatformFeedback::WindowsFixture),
+            );
+            jobs.insert(
+                text("windows-sealed-agent-contracts"),
+                platform_contracts_job(workflow, PlatformFeedback::WindowsNativeContracts),
+            );
+        }
+    }
     Ok(())
+}
+
+/// Portable wire/help feedback owns its own target directory and never waits
+/// for selection, a CI driver, or the complete native test inventory.
+fn current_contracts_job(workflow: &str) -> Value {
+    let mut job = producer_job("ci.yml");
+    let mapping = job.as_mapping_mut().expect("contract job");
+    for key in ["strategy", "continue-on-error"] {
+        mapping.remove(text(key));
+    }
+    job["name"] = text("Current portable contracts");
+    job["if"] = text(if workflow == "release.yml" {
+        "github.event.deleted != true && (github.event_name != 'workflow_dispatch' || inputs.recovery-mode == 'reprepare')"
+    } else {
+        "github.event.deleted != true"
+    });
+    job["runs-on"] = text("ubuntu-24.04");
+    job["timeout-minutes"] = number("40");
+    let steps = job["steps"].as_sequence_mut().expect("contract steps");
+    steps.retain(|step| {
+        field(step, "id") != "public-source-fetch" && field(step, "id") != "public-source-seed-save"
+    });
+    let key = "mc-current-contracts-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}";
+    let prefix = "mc-current-contracts-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-";
+    steps.push(object(&[
+        ("id", text("current-contracts-restore")),
+        ("uses", text(RESTORE)),
+        ("continue-on-error", Value::Bool(true)),
+        ("timeout-minutes", number("3")),
+        (
+            "with",
+            object(&[
+                ("path", text("target/ci-current-contracts")),
+                ("key", text(key)),
+                ("restore-keys", text(prefix)),
+            ]),
+        ),
+    ]));
+    for (name, command) in [
+        (
+            "Current core wire contracts",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon-core --test diagnostics --test current_formats --test windows_guardian_observation",
+        ),
+        (
+            "Current public help",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test documentation",
+        ),
+        (
+            "Retired native package routes refuse before authorization",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test native_package_recovery_dispatch",
+        ),
+        (
+            "Current Linux package inspection",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent_distribution",
+        ),
+        (
+            "Current fail-closed CLI reports",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test cli sealed_execution_plan_and_doctor_fail_closed -- --exact",
+        ),
+        (
+            "Current doctor presentation",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test cli doctor_text_and_json_have_distinct_complete_shapes -- --exact",
+        ),
+    ] {
+        steps.push(invocation(name, command, "10"));
+    }
+    steps.push(object(&[
+        ("id", text("current-contracts-save")), ("uses", text(SAVE)),
+        ("if", text("always() && steps.current-contracts-restore.outcome != 'skipped' && steps.current-contracts-restore.outputs.cache-hit != 'true'")),
+        ("continue-on-error", Value::Bool(true)), ("timeout-minutes", number("3")),
+        ("with", object(&[("path", text("target/ci-current-contracts")), ("key", text(key))])),
+    ]));
+    steps.push(object(&[
+        ("id", text("current-contracts-source-save")), ("uses", text(SAVE)),
+        ("if", text("always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'")),
+        ("continue-on-error", Value::Bool(true)), ("timeout-minutes", number("2")),
+        ("with", object(&[("path", text(PATHS)), ("key", text("${{ steps.public-source-seed-restore.outputs.cache-primary-key }}"))])),
+    ]));
+    job
+}
+
+/// Tooling contracts compile only their package and never bootstrap a CI driver.
+fn tooling_contracts_job(workflow: &str) -> Value {
+    let mut job = current_contracts_job(workflow);
+    job["name"] = text("Current tooling contracts");
+    let steps = job["steps"]
+        .as_sequence_mut()
+        .expect("tooling contract steps");
+    steps.retain(|step| {
+        !matches!(
+            field(step, "id"),
+            "current-contracts-restore" | "current-contracts-save"
+        ) && step["run"]
+            .as_str()
+            .is_none_or(|run| !run.starts_with("rustup run 1.97.1 cargo test "))
+    });
+    let key = "mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('tools/memcordon-ci/**/*.rs', 'crates/**/*.rs', 'fuzz/Cargo.toml', 'fuzz/corpus/**', '.github/workflows/deep-ci.yml') }}";
+    let prefix = "mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-";
+    let source_save = steps.pop().expect("independent source save");
+    steps.push(object(&[
+        ("id", text("tooling-contracts-restore")),
+        ("uses", text(RESTORE)),
+        ("continue-on-error", Value::Bool(true)),
+        ("timeout-minutes", number("3")),
+        (
+            "with",
+            object(&[
+                ("path", text("target/ci-tooling-contracts")),
+                ("key", text(key)),
+                ("restore-keys", text(prefix)),
+            ]),
+        ),
+    ]));
+    steps.push(invocation("Current external consumer contracts", "rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test original_native_roles --test workflow_policy", "10"));
+    steps.push(object(&[
+        ("id", text("tooling-contracts-save")), ("uses", text(SAVE)),
+        ("if", text("always() && steps.tooling-contracts-restore.outcome != 'skipped' && steps.tooling-contracts-restore.outputs.cache-hit != 'true'")),
+        ("continue-on-error", Value::Bool(true)), ("timeout-minutes", number("3")),
+        ("with", object(&[("path", text("target/ci-tooling-contracts")), ("key", text(key))])),
+    ]));
+    steps.push(source_save);
+    job
+}
+
+enum PlatformFeedback {
+    MacosAdministration,
+    MacosStartupDeadline,
+    WindowsFixture,
+    WindowsNativeContracts,
+}
+
+/// Feedback starts with the actual selected Cargo prerequisites. Windows
+/// acceptance still requires the existing exact one-test verified native lane.
+fn platform_contracts_job(workflow: &str, feedback: PlatformFeedback) -> Value {
+    let mut job = current_contracts_job(workflow);
+    let (name, runner, command, key, prefix) = match feedback {
+        PlatformFeedback::MacosAdministration => (
+            "macOS administrative contracts",
+            "macos-15",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent_distribution",
+            "mc-macos-administrative-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}",
+            "mc-macos-administrative-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-",
+        ),
+        PlatformFeedback::MacosStartupDeadline => (
+            "macOS x64 startup deadline feedback",
+            "macos-15-intel",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test macos_remediation requested_deadline_expires_during_unacknowledged_startup -- --exact --nocapture",
+            "mc-macos-startup-deadline-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}",
+            "mc-macos-startup-deadline-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-",
+        ),
+        PlatformFeedback::WindowsFixture => (
+            "Windows fixture feedback / ${{ matrix.id }}",
+            "${{ matrix.runner }}",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test windows_namespace_primary fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities -- --exact --nocapture",
+            "mc-windows-fixture-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}",
+            "mc-windows-fixture-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-",
+        ),
+        PlatformFeedback::WindowsNativeContracts => (
+            "Windows sealed-agent contracts / ${{ matrix.id }}",
+            "${{ matrix.runner }}",
+            "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent -- --exact --nocapture windows_security::exact_predecessor_delete_child_grant_is_refused_unchanged_and_current_policy_denies windows_security::certification_marker_security_accepts_only_current_policy_and_preserves_refused_descriptors windows_security::server_response_completion_waits_for_small_and_large_frames_to_be_consumed windows_security::support_control_release_reads_only_complete_bounded_frames_before_original_cutoff windows_guardian_startup::structured_bootstrap_rejection_is_preserved_while_guardian_is_live windows_security::frame_read_diagnostics_distinguish_length_payload_decode_and_peer_close windows_terminal_transport::partial_initial_request_uses_the_fixed_whole_frame_cutoff",
+            "mc-windows-sealed-agent-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}",
+            "mc-windows-sealed-agent-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-",
+        ),
+    };
+    job["name"] = text(name);
+    job["runs-on"] = text(runner);
+    if matches!(
+        feedback,
+        PlatformFeedback::WindowsFixture | PlatformFeedback::WindowsNativeContracts
+    ) {
+        job["strategy"] = object(&[
+            ("fail-fast", Value::Bool(false)),
+            (
+                "matrix",
+                object(&[(
+                    "include",
+                    Value::Sequence(vec![
+                        object(&[
+                            ("id", text("windows-x64")),
+                            ("runner", text("windows-2025")),
+                        ]),
+                        object(&[
+                            ("id", text("windows-arm64")),
+                            ("runner", text("windows-11-arm")),
+                        ]),
+                    ]),
+                )]),
+            ),
+        ]);
+    }
+    let steps = job["steps"]
+        .as_sequence_mut()
+        .expect("platform feedback steps");
+    let first = steps
+        .iter()
+        .position(|step| field(step, "run").starts_with("rustup run 1.97.1 cargo test "))
+        .expect("portable contract boundary");
+    steps.retain(|step| !field(step, "run").starts_with("rustup run 1.97.1 cargo test "));
+    steps.insert(first, invocation(name, command, "10"));
+    for step in steps {
+        match field(step, "id") {
+            "current-contracts-restore" => {
+                step["with"]["key"] = text(key);
+                step["with"]["restore-keys"] = text(prefix);
+            }
+            "current-contracts-save" => {
+                step["with"]["key"] = text(key);
+            }
+            _ => {}
+        }
+    }
+    job
 }
 
 pub fn validate(document: &Value) -> Result<()> {

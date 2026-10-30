@@ -64,16 +64,26 @@ fn rejection(
     })
 }
 
+pub(super) struct PublicCallerIdentity<'a> {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: &'a [u32],
+}
+
 pub(super) fn forward_public(
     frontend: &mut UnixStream,
     request: &Frame,
     descriptors: Vec<OwnedFd>,
-    pid: i32,
-    uid: u32,
-    gid: u32,
-    groups: &[u32],
+    identity: PublicCallerIdentity<'_>,
     mut setup_cutoff_nanos: u64,
 ) -> Result<(), String> {
+    let PublicCallerIdentity {
+        pid,
+        uid,
+        gid,
+        groups,
+    } = identity;
     let setup = (|| -> Result<_, (WorkloadRejectionCodeV1, String)> {
         let malformed = |e: String| (WorkloadRejectionCodeV1::MalformedRequest, e);
         if !cfg!(feature = "private-tcp")
@@ -832,16 +842,18 @@ pub(super) fn execute_brokered(
     let owner = super::private_lifecycle::PrivateAttemptOwner::new(journal)?;
     let terminal = owner.execute_workload(
         stream,
-        start,
-        launch,
-        caller,
-        account,
-        worker_fd,
-        frontend,
-        streams,
-        association,
-        inputs,
-        cutoff,
+        super::private_lifecycle::WorkloadExecutionInputs {
+            start,
+            launch,
+            caller,
+            account,
+            worker: worker_fd,
+            frontend,
+            streams,
+            association,
+            inputs,
+            setup_cutoff: cutoff,
+        },
     )?;
     Ok(Frame {
         kind: MessageKind::WorkloadTerminal,

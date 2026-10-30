@@ -19,6 +19,7 @@ fn execution_and_cleanup_preserve_only_the_same_selected_toolchain_and_owner_arg
         identity: PathBuf::from("selected identity/source.json"),
         destination: PathBuf::from("selected destination/cell"),
         operation_deadline_unix_millis: 1792324633463,
+        owner_preparation_sha256: None,
     };
     let selected_environment = toolchain_environment(
         OsString::from("/selected toolchain/bin:/usr/bin:/bin"),

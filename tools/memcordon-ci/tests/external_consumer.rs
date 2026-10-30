@@ -7,13 +7,13 @@ use serde_json::json;
 fn spec() -> serde_json::Value {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path();
-    json!({"format":"memcordon.external-consumer","revision":1,
+    json!({"format":"memcordon.external-consumer","revision":2,
         "target":"x86_64-unknown-linux-gnu","version":"1.2.3","runtime_features":[],
         "selection":"measured-cli","selected_inputs":[],
         "cli":{"path":directory.join("memcordon"),"sha256":artifacts::checksum(b"cli")},
         "workload":{"path":directory.join("consumer"),"sha256":artifacts::checksum(b"consumer")},
-        "working_directory":directory,"arguments":[],"requested_contract":{"kind":"standard"},
-        "report_format":"result-v1","report_revision":1,"expected_outcome":"completed",
+        "working_directory":directory,"arguments":[],
+        "report_format":"standard","report_revision":10,"expected_outcome":"completed",
         "expected_native_termination":{"kind":"exit-code","code":0},"expected_wrapper_status":0,
         "coverage":{"kind":"libtest","tests":["first","second"]},"outer_deadline_millis":10000})
 }
@@ -37,7 +37,8 @@ fn expected_inventory_is_trusted_explicit_nonempty_and_named() {
             "format" => json!("memcordon.result"),
             "report_format" => json!("schema-11"),
             "target" => json!("unknown-target"),
-            "revision" | "report_revision" => json!(2),
+            "revision" => json!(1),
+            "report_revision" => json!(2),
             "outer_deadline_millis" => json!(0),
             "runtime_features" => json!(["private-tcp", "private-tcp"]),
             _ => json!([{"display":"a\u{0000}b","raw":null}]),
@@ -57,10 +58,14 @@ fn expected_inventory_is_trusted_explicit_nonempty_and_named() {
         invalid["selection"] = json!(selection);
         assert!(ExternalConsumerSpec::parse(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
-    let duplicate = String::from_utf8(bytes).unwrap().replacen(
-        "\"revision\":1",
-        "\"revision\":1,\"revision\":1",
-        1,
+    let mut removed_field = spec();
+    removed_field["requested_contract"] = json!({"kind":"standard"});
+    assert!(ExternalConsumerSpec::parse(&serde_json::to_vec(&removed_field).unwrap()).is_err());
+    let valid = String::from_utf8(bytes).unwrap();
+    let duplicate = valid.replacen("\"revision\":2", "\"revision\":2,\"revision\":2", 1);
+    assert_ne!(
+        duplicate, valid,
+        "duplicate-field mutation did not alter current input"
     );
     assert!(ExternalConsumerSpec::parse(duplicate.as_bytes()).is_err());
 }

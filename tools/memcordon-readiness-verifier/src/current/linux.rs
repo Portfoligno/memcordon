@@ -8,6 +8,8 @@ pub(super) fn unix_absolute(path: &str) -> bool {
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+type ExecutionSemantic<'a> = dyn Fn(&[Value], &Value, &Value) -> VerificationResult<()> + 'a;
+
 pub(super) fn closed(value: &Value, fields: &[&str]) -> VerificationResult<()> {
     let object = value.as_object().ok_or("expected closed current object")?;
     if object.len() != fields.len() || object.keys().any(|key| !fields.contains(&key.as_str())) {
@@ -744,7 +746,7 @@ pub(super) fn verify_execution(
     input: &Value,
     source_commit: &str,
     resolver: &dyn Fn(&str) -> VerificationResult<Vec<u8>>,
-    semantic: &dyn Fn(&[Value], &Value, &Value) -> VerificationResult<()>,
+    semantic: &ExecutionSemantic<'_>,
 ) -> VerificationResult<()> {
     verify_execution_inner(evidence, input, source_commit, resolver, Some(semantic))
 }
@@ -753,7 +755,7 @@ fn verify_execution_inner(
     input: &Value,
     source_commit: &str,
     resolver: &dyn Fn(&str) -> VerificationResult<Vec<u8>>,
-    current_semantic: Option<&dyn Fn(&[Value], &Value, &Value) -> VerificationResult<()>>,
+    current_semantic: Option<&ExecutionSemantic<'_>>,
 ) -> VerificationResult<()> {
     if evidence.key.family == "L-LIFE-05" && evidence.key.scenario == "report-persistence-failure" {
         return verify_report_failure(evidence, input, source_commit, resolver);

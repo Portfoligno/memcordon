@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub const TARGET_DIR: &str = "target/ci/windows-fixture-native";
 pub const TEST_SELECTOR: &str =
-    "fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabilities";
+    "fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities";
 
 pub struct Command {
     pub arguments: Vec<&'static str>,

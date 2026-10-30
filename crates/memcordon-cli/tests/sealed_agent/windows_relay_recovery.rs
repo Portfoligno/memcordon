@@ -219,20 +219,25 @@ fn partial_acknowledgment_peer_loss_is_not_a_bound_acknowledgment() {
 #[test]
 fn complete_wrong_binding_acknowledgment_remains_a_refusal() {
     let (read, write) = anonymous_control_pipe();
-    pipe::write_frame(
-        write.raw(),
-        &WindowsLauncherRequestV4::RelaysRetired {
-            schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
-            attempt_id: "wrong".into(),
-            nonce: "nonce".into(),
-            request_sha256: "request".into(),
-        },
-    )
-    .unwrap();
+    let writer = std::thread::spawn(move || {
+        pipe::write_frame(
+            write.raw(),
+            &WindowsLauncherRequestV4::RelaysRetired {
+                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+                attempt_id: "wrong".into(),
+                nonce: "nonce".into(),
+                request_sha256: "request".into(),
+            },
+        )
+    });
     // SAFETY: current process is a live synchronization handle.
     let result = wait_for_relays_retired(read.raw(), "attempt", "nonce", "request", unsafe {
         GetCurrentProcess()
     });
+    if !matches!(&result, Err(detail) if detail == "invalid relay-retirement message") {
+        drop(read);
+    }
+    writer.join().expect("writer settled").unwrap();
     assert!(matches!(result, Err(detail) if detail == "invalid relay-retirement message"));
 }
 

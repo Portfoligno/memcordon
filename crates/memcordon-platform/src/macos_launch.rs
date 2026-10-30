@@ -1681,6 +1681,8 @@ pub(crate) struct Launch {
 }
 pub(crate) struct StartupError {
     #[cfg(feature = "test-support")]
+    pub(crate) settlement_diagnostic: Option<memcordon_core::CleanupErrorRecord>,
+    #[cfg(feature = "test-support")]
     pub(crate) configuration_written: bool,
     #[cfg(feature = "test-support")]
     pub(crate) fault_phase_reached: bool,
@@ -1897,6 +1899,8 @@ fn launch_configured(
     if Instant::now() >= deadline {
         diagnostic.cleanup.state = CleanupState::Complete;
         return Err(Box::new(StartupError {
+            #[cfg(feature = "test-support")]
+            settlement_diagnostic: None,
             #[cfg(feature = "test-support")]
             configuration_written,
             #[cfg(feature = "test-support")]
@@ -2214,6 +2218,8 @@ fn launch_configured(
             // Observe the failed admission before native retirement can consume
             // the cleanup reserve. This receipt must never be sampled afterwards.
             let terminal_observed = crate::macos_deadline::continuous_nanos().ok();
+            #[cfg(feature = "test-support")]
+            let mut creation_settlement = None;
             let mut retirement_observed = None;
             let mut retirement_within_reserve = false;
             let cancellation_observed = signal
@@ -2378,15 +2384,47 @@ fn launch_configured(
                         detail: error.to_string(),
                     }),
                 }
-            } else if pending_creation
-                .as_ref()
-                .is_none_or(|observation| observation.settled_until(cleanup_deadline))
-            {
-                // No native operation was enqueued, or this exact creation's
-                // ticket proves no-child completion or actual native retirement.
-                diagnostic.cleanup.state = CleanupState::Complete;
-                retirement_observed = crate::macos_deadline::continuous_nanos().ok();
-                retirement_within_reserve = Instant::now() <= cleanup_deadline;
+            } else {
+                #[cfg(feature = "test-support")]
+                let before = pending_creation.as_ref().map(|observation| {
+                    let now = Instant::now();
+                    let tick = crate::macos_deadline::continuous_nanos().ok();
+                    (
+                        observation.diagnostic(),
+                        tick,
+                        tick.and_then(|tick| {
+                            crate::startup_cleanup_observation::cutoff_nanos(
+                                tick,
+                                now,
+                                cleanup_deadline,
+                            )
+                        }),
+                    )
+                });
+                let settled = pending_creation
+                    .as_ref()
+                    .is_none_or(|observation| observation.settled_until(cleanup_deadline));
+                if settled {
+                    // No native operation was enqueued, or this exact creation's
+                    // ticket proves no-child completion or actual native retirement.
+                    diagnostic.cleanup.state = CleanupState::Complete;
+                    retirement_observed = crate::macos_deadline::continuous_nanos().ok();
+                    retirement_within_reserve = Instant::now() <= cleanup_deadline;
+                }
+                #[cfg(feature = "test-support")]
+                if let (Some((before, observed_before, original_cutoff)), Some(observation)) =
+                    (before, pending_creation.as_ref())
+                {
+                    creation_settlement =
+                        Some(crate::startup_cleanup_observation::CreationSettlement {
+                            before,
+                            after: observation.diagnostic(),
+                            observed_before,
+                            observed_after: crate::macos_deadline::continuous_nanos().ok(),
+                            original_cutoff,
+                            settled,
+                        });
+                }
             }
             if !diagnostic.cleanup.errors.is_empty() {
                 diagnostic.cleanup.state = CleanupState::Incomplete;
@@ -2404,6 +2442,19 @@ fn launch_configured(
                 });
             }
             Err(Box::new(StartupError {
+                #[cfg(feature = "test-support")]
+                settlement_diagnostic: (diagnostic.cleanup.state != CleanupState::Complete).then(
+                    || {
+                        crate::startup_cleanup_observation::error_record(
+                            phase,
+                            &error,
+                            guardian_owner.is_some(),
+                            configured,
+                            &release,
+                            creation_settlement.as_ref(),
+                        )
+                    },
+                ),
                 #[cfg(feature = "test-support")]
                 configuration_written,
                 #[cfg(feature = "test-support")]

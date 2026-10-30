@@ -8,46 +8,44 @@ use memcordon::invocation::{
 };
 use presentation::Presentation;
 
+#[allow(clippy::collapsible_if)] // Let chains require Rust newer than the 1.85 MSRV.
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    if let [workload, acknowledge, arguments @ ..] = argv.as_slice()
-        && workload == "workload"
-        && acknowledge == "acknowledge"
-    {
-        let code = match memcordon::workload_recovery::acknowledge(arguments) {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("MCWORKLOAD-ACKNOWLEDGMENT: {error}");
-                125
-            }
-        };
-        std::process::exit(code);
+    if let [workload, acknowledge, arguments @ ..] = argv.as_slice() {
+        if workload == "workload" && acknowledge == "acknowledge" {
+            let code = match memcordon::workload_recovery::acknowledge(arguments) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("MCWORKLOAD-ACKNOWLEDGMENT: {error}");
+                    125
+                }
+            };
+            std::process::exit(code);
+        }
     }
-    if let [workload, recover, arguments @ ..] = argv.as_slice()
-        && workload == "workload"
-        && recover == "recover"
-    {
-        let code = match memcordon::workload_recovery::run(arguments) {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("MCWORKLOAD-RECOVERY: {error}");
-                125
-            }
-        };
-        std::process::exit(code);
+    if let [workload, recover, arguments @ ..] = argv.as_slice() {
+        if workload == "workload" && recover == "recover" {
+            let code = match memcordon::workload_recovery::run(arguments) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("MCWORKLOAD-RECOVERY: {error}");
+                    125
+                }
+            };
+            std::process::exit(code);
+        }
     }
-    if let [workload, pack, arguments @ ..] = argv.as_slice()
-        && workload == "workload"
-        && pack == "pack"
-    {
-        let code = match memcordon::workload_pack::run(arguments) {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("MCWORKLOAD-PACK: {error}");
-                2
-            }
-        };
-        std::process::exit(code);
+    if let [workload, pack, arguments @ ..] = argv.as_slice() {
+        if workload == "workload" && pack == "pack" {
+            let code = match memcordon::workload_pack::run(arguments) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("MCWORKLOAD-PACK: {error}");
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
     }
     #[cfg(all(target_os = "windows", feature = "test-support"))]
     if argv
@@ -100,10 +98,10 @@ fn main() {
     }
     let presentation = Presentation::automatic();
     let code = match route(&argv) {
-        Ok(Invocation::Execute(args)) => execute_with_terminal_observation(args, &presentation),
+        Ok(Invocation::Execute(args)) => execute_with_terminal_observation(*args, &presentation),
         Ok(Invocation::WindowsRecovery(args)) => commands::windows_recovery(args),
         Ok(Invocation::Doctor(args)) => commands::doctor(args, &presentation),
-        Ok(Invocation::Plan(args)) => commands::plan(args, &presentation),
+        Ok(Invocation::Plan(args)) => commands::plan(*args, &presentation),
         Ok(Invocation::Clean(args)) => commands::clean(args, &presentation),
         Ok(Invocation::Version) => {
             let mut out = presentation.stdout();
@@ -206,7 +204,7 @@ fn execute_windows_certification(argv: &[std::ffi::OsString]) -> i32 {
         };
         let presentation = Presentation::automatic();
         let code = match route(execution) {
-            Ok(Invocation::Execute(args)) => commands::execute(args, &presentation),
+            Ok(Invocation::Execute(args)) => commands::execute(*args, &presentation),
             _ => return Err("certification requires typed execution argv".into()),
         };
         let observation = scope.finish()?;

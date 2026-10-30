@@ -96,7 +96,7 @@ fn canonical_digests_match_original_length_prefixed_le_records_and_preserve_dupl
     );
     for flags in [0, 16, u32::MAX] {
         assert_ne!(
-            sid_attributes_digest(&[first.clone()]),
+            sid_attributes_digest(std::slice::from_ref(&first)),
             sid_attributes_digest(&[pair("S-1-5-18", flags)])
         );
     }

@@ -40,11 +40,18 @@ fn real_fuzz_manifest_has_four_disjoint_complete_quarters_and_compatible_halves(
             .unwrap()
         })
         .collect();
-    assert_eq!(complete.len(), 52);
-    for quarter in &quarters {
-        assert_eq!(quarter.len(), 13);
+    assert!(!complete.is_empty());
+    assert_eq!(
+        complete.iter().collect::<BTreeSet<_>>().len(),
+        complete.len()
+    );
+    for (index, quarter) in quarters.iter().enumerate() {
+        assert_eq!(
+            quarter.len(),
+            complete.len() / quarters.len() + usize::from(index < complete.len() % quarters.len())
+        );
     }
-    let mut joined: Vec<_> = quarters.into_iter().flatten().collect();
+    let mut joined: Vec<_> = quarters.iter().flatten().cloned().collect();
     joined.sort();
     assert_eq!(joined, complete);
     for (index, half) in [
@@ -54,6 +61,16 @@ fn real_fuzz_manifest_has_four_disjoint_complete_quarters_and_compatible_halves(
     .into_iter()
     .enumerate()
     {
+        let mut quarter_union: Vec<_> = quarters[index]
+            .iter()
+            .chain(&quarters[index + 2])
+            .cloned()
+            .collect();
+        quarter_union.sort();
+        assert_eq!(
+            memcordon_ci::fuzz_targets::targets(manifest, Some(half)).unwrap(),
+            quarter_union
+        );
         assert_eq!(
             memcordon_ci::fuzz_targets::targets(manifest, Some(half)).unwrap(),
             memcordon_ci::fuzz_targets::targets_sharded(

@@ -55,7 +55,15 @@ fn authenticated_owner_query_roundtrip_keeps_public_facts_and_private_frame_boun
         serde_json::from_slice::<WindowsLauncherRequestV4>(&bytes).unwrap(),
         request
     );
-    assert!(serde_json::from_slice::<memcordon_core::WindowsLauncherRequestV4>(&bytes).is_err());
+    let mut wrong_kind = serde_json::to_value(&request).unwrap();
+    wrong_kind["kind"] = serde_json::json!("unknown-current-request");
+    assert!(serde_json::from_value::<WindowsLauncherRequestV4>(wrong_kind).is_err());
+    let mut missing_identity = serde_json::to_value(&request).unwrap();
+    missing_identity
+        .as_object_mut()
+        .unwrap()
+        .remove("guardian_identity");
+    assert!(serde_json::from_value::<WindowsLauncherRequestV4>(missing_identity).is_err());
     let mut oversized = serde_json::to_value(&request).unwrap();
     fn above_bound<const N: usize>(_: &BoundedText<N>) -> String {
         "x".repeat(N + 1)

@@ -26,7 +26,6 @@ use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe};
 
 use crate::presentation::{self, ExecutionSummary, Presentation, SummaryTone};
 
-#[cfg(not(target_os = "macos"))]
 #[path = "current_result.rs"]
 mod current_result;
 
@@ -612,6 +611,32 @@ fn finish_error(
     }
     presentation::write_runtime_error(&mut diagnostics, &error)
         .expect("memory error serialization");
+    if report_path.is_some() && args.output.report_format == memcordon_core::ReportFormat::ResultV3
+    {
+        let policy = resolution
+            .map(|value| value.report.clone())
+            .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
+        let report = match current_result::failure(&args, command, &policy, &error, exit_code) {
+            Ok(report) => memcordon_core::ResultReport::Current(Box::new(report)),
+            Err(error) => {
+                presentation::write_runtime_error(&mut diagnostics, error)
+                    .expect("memory error serialization");
+                super::result_delivery::deliver(delivery, diagnostics, None, None, return_deadline);
+                return 125;
+            }
+        };
+        return if super::result_delivery::deliver(
+            delivery,
+            diagnostics,
+            report_path,
+            Some(report),
+            return_deadline,
+        ) {
+            exit_code
+        } else {
+            125
+        };
+    }
     let report = if report_path.is_some() {
         let policy = resolution
             .map(|value| value.report.clone())
@@ -1422,9 +1447,12 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
         return doctor_execution_probe(value, args.json, presentation);
     }
     if args.json {
-        return print_json(&value, "capabilities-v3", presentation);
+        let status = print_json(&value, "capabilities-v3", presentation);
+        return if status != 0 || met { status } else { 125 };
     }
     let mut out = presentation.stdout();
+    presentation::write_version(&mut out, env!("CARGO_PKG_VERSION"))
+        .expect("doctor output writable");
     if let Some(backend) = value.selected {
         presentation::write_selected_backend(&mut out, &backend.name)
             .expect("doctor output writable");

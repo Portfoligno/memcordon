@@ -80,6 +80,10 @@ pub struct BackendCleanupFacts {
     pub errors: Vec<String>,
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the backend boundary preserves the public categorized Error contract"
+)]
 pub(crate) fn validate_current_workload_policy(policy: &Policy) -> Result<(), Error> {
     if let Some(request) = policy.workload_request() {
         request.validate().map_err(|error| {

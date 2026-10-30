@@ -1519,7 +1519,7 @@ jobs:
           - id: windows-arm64
             runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 270
+    timeout-minutes: 276
     steps:
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -2397,6 +2397,15 @@ jobs:
         if: always() && (steps.native-run-windows.outcome == 'success' || steps.native-run-windows.outcome == 'failure')
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers native-execute
+      - name: Retain passive Win32 module evidence
+        if: '!cancelled() && runner.os == ''Windows'''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/namespace-win32
+          if-no-files-found: ignore
+          retention-days: 7
+        timeout-minutes: 6
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   macos-deadline:
@@ -3852,7 +3861,7 @@ jobs:
           - macos-15
           - windows-2025
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 56
+    timeout-minutes: 62
     continue-on-error: true
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
@@ -3895,6 +3904,15 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+      - name: Retain passive Win32 module evidence
+        if: '!cancelled() && runner.os == ''Windows'''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/namespace-win32
+          if-no-files-found: ignore
+          retention-days: 7
+        timeout-minutes: 6
   format:
     name: CI source formatting
     if: github.event_name != 'push'
@@ -3917,6 +3935,433 @@ jobs:
       - name: Check formatting
         run: rustup run 1.97.1 cargo fmt --all -- --check
         timeout-minutes: 15
+  current-contracts:
+    name: Current portable contracts
+    if: github.event.deleted != true
+    permissions:
+      contents: read
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: current-contracts-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-current-contracts-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+          restore-keys: mc-current-contracts-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-
+      - name: Current core wire contracts
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon-core --test diagnostics --test current_formats --test windows_guardian_observation
+        timeout-minutes: 10
+      - name: Current public help
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test documentation
+        timeout-minutes: 10
+      - name: Retired native package routes refuse before authorization
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test native_package_recovery_dispatch
+        timeout-minutes: 10
+      - name: Current Linux package inspection
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent_distribution
+        timeout-minutes: 10
+      - name: Current fail-closed CLI reports
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test cli sealed_execution_plan_and_doctor_fail_closed -- --exact
+        timeout-minutes: 10
+      - name: Current doctor presentation
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test cli doctor_text_and_json_have_distinct_complete_shapes -- --exact
+        timeout-minutes: 10
+      - id: current-contracts-save
+        uses: *action_2
+        if: always() && steps.current-contracts-restore.outcome != 'skipped' && steps.current-contracts-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-current-contracts-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+      - id: current-contracts-source-save
+        uses: *action_2
+        if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 97
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  tooling-contracts:
+    name: Current tooling contracts
+    if: github.event.deleted != true
+    permissions:
+      contents: read
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: tooling-contracts-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-tooling-contracts
+          key: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('tools/memcordon-ci/**/*.rs', 'crates/**/*.rs', 'fuzz/Cargo.toml', 'fuzz/corpus/**', '.github/workflows/deep-ci.yml') }}
+          restore-keys: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-
+      - name: Current external consumer contracts
+        run: rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test original_native_roles --test workflow_policy
+        timeout-minutes: 10
+      - id: tooling-contracts-save
+        uses: *action_2
+        if: always() && steps.tooling-contracts-restore.outcome != 'skipped' && steps.tooling-contracts-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-tooling-contracts
+          key: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('tools/memcordon-ci/**/*.rs', 'crates/**/*.rs', 'fuzz/Cargo.toml', 'fuzz/corpus/**', '.github/workflows/deep-ci.yml') }}
+      - id: current-contracts-source-save
+        uses: *action_2
+        if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 47
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  macos-administrative-contracts:
+    name: macOS administrative contracts
+    if: github.event.deleted != true
+    permissions:
+      contents: read
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: current-contracts-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-macos-administrative-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+          restore-keys: mc-macos-administrative-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-
+      - name: macOS administrative contracts
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent_distribution
+        timeout-minutes: 10
+      - id: current-contracts-save
+        uses: *action_2
+        if: always() && steps.current-contracts-restore.outcome != 'skipped' && steps.current-contracts-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-macos-administrative-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+      - id: current-contracts-source-save
+        uses: *action_2
+        if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+    runs-on: macos-15
+    timeout-minutes: 47
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  macos-startup-deadline-feedback:
+    name: macOS x64 startup deadline feedback
+    if: github.event.deleted != true
+    permissions:
+      contents: read
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: current-contracts-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-macos-startup-deadline-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+          restore-keys: mc-macos-startup-deadline-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-
+      - name: macOS x64 startup deadline feedback
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test macos_remediation requested_deadline_expires_during_unacknowledged_startup -- --exact --nocapture
+        timeout-minutes: 10
+      - id: current-contracts-save
+        uses: *action_2
+        if: always() && steps.current-contracts-restore.outcome != 'skipped' && steps.current-contracts-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-macos-startup-deadline-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+      - id: current-contracts-source-save
+        uses: *action_2
+        if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+    runs-on: macos-15-intel
+    timeout-minutes: 47
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  windows-fixture-feedback:
+    name: Windows fixture feedback / ${{ matrix.id }}
+    if: github.event.deleted != true
+    permissions:
+      contents: read
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: current-contracts-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-windows-fixture-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+          restore-keys: mc-windows-fixture-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-
+      - name: Windows fixture feedback / ${{ matrix.id }}
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test windows_namespace_primary fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities -- --exact --nocapture
+        timeout-minutes: 10
+      - id: current-contracts-save
+        uses: *action_2
+        if: always() && steps.current-contracts-restore.outcome != 'skipped' && steps.current-contracts-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-windows-fixture-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+      - id: current-contracts-source-save
+        uses: *action_2
+        if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+      - name: Retain passive Win32 module evidence
+        if: '!cancelled() && runner.os == ''Windows'''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/namespace-win32
+          if-no-files-found: ignore
+          retention-days: 7
+        timeout-minutes: 6
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 53
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            runner: windows-2025
+          - id: windows-arm64
+            runner: windows-11-arm
+  windows-sealed-agent-contracts:
+    name: Windows sealed-agent contracts / ${{ matrix.id }}
+    if: github.event.deleted != true
+    permissions:
+      contents: read
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: current-contracts-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-windows-sealed-agent-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+          restore-keys: mc-windows-sealed-agent-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-
+      - name: Windows sealed-agent contracts / ${{ matrix.id }}
+        run: rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent -- --exact --nocapture windows_security::exact_predecessor_delete_child_grant_is_refused_unchanged_and_current_policy_denies windows_security::certification_marker_security_accepts_only_current_policy_and_preserves_refused_descriptors windows_security::server_response_completion_waits_for_small_and_large_frames_to_be_consumed windows_security::support_control_release_reads_only_complete_bounded_frames_before_original_cutoff windows_guardian_startup::structured_bootstrap_rejection_is_preserved_while_guardian_is_live windows_security::frame_read_diagnostics_distinguish_length_payload_decode_and_peer_close windows_terminal_transport::partial_initial_request_uses_the_fixed_whole_frame_cutoff
+        timeout-minutes: 10
+      - id: current-contracts-save
+        uses: *action_2
+        if: always() && steps.current-contracts-restore.outcome != 'skipped' && steps.current-contracts-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          path: target/ci-current-contracts
+          key: mc-windows-sealed-agent-feedback-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs') }}
+      - id: current-contracts-source-save
+        uses: *action_2
+        if: always() && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+      - name: Retain passive Win32 module evidence
+        if: '!cancelled() && runner.os == ''Windows'''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/namespace-win32
+          if-no-files-found: ignore
+          retention-days: 7
+        timeout-minutes: 6
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 53
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            runner: windows-2025
+          - id: windows-arm64
+            runner: windows-11-arm
   windows-fixture-native:
     if: github.event.deleted != true
     name: Windows fixture native / ${{ matrix.id }}

@@ -84,7 +84,7 @@ impl RequestLaunch {
     }
     pub fn start_with_copy_observer(
         input: LaunchInput<'_>,
-        observer: Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>,
+        observer: crate::command::AfterReleaseObserver,
     ) -> Result<Self> {
         if input.interactive || input.stdin.is_some() || input.extra_descriptor.is_some() {
             return Err(CiError::Message(
@@ -96,7 +96,7 @@ impl RequestLaunch {
     fn start_inner(
         input: LaunchInput<'_>,
         loader_path: Option<&Path>,
-        copy_observer: Option<Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>>,
+        copy_observer: Option<crate::command::AfterReleaseObserver>,
     ) -> Result<Self> {
         let bundle_identity = input.fixture.bundle_identity()?;
         let extra = input.extra_descriptor.map(File::try_clone).transpose()?;
@@ -162,11 +162,9 @@ impl RequestLaunch {
             .command(input.directory, input.work_cutoff)?
             .arg(input.memory)
             .arg(input.deadline)
-            .arg("--lifetime")
-            .arg(match input.lifetime {
-                memcordon_core::Lifetime::Command => "command",
-                memcordon_core::Lifetime::Workload => "workload",
-            })
+            .args(crate::linux_request_arguments::wait_arguments(
+                input.lifetime,
+            ))
             .arg("--sealed")
             .arg("--workload-request")
             .arg(&input.fixture.request)
@@ -212,6 +210,7 @@ impl RequestLaunch {
         let (snapshot_sender, snapshots) = std::sync::mpsc::sync_channel(1);
         let interactive = input.interactive;
         let work_cutoff = input.work_cutoff;
+        let capture_directory = input.directory.to_path_buf();
         let (sender, observer) = std::sync::mpsc::sync_channel(1);
         let capture = std::thread::spawn(move || {
             let observe = |child: &std::process::Child| {
@@ -381,12 +380,11 @@ impl RequestLaunch {
                             observe,
                             |_, _, _| Ok(()),
                         ),
-                    None => match copy_observer {
-                        Some(observer) => {
-                            command.output_quiet_with_exec_release_observation(observe, observer)
-                        }
-                        None => command.output_quiet_with_exec_observation(observe),
-                    },
+                    None => command.output_quiet_with_retained_exec_observation(
+                        &capture_directory,
+                        observe,
+                        copy_observer,
+                    ),
                 }
             }
         });

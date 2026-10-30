@@ -4089,7 +4089,10 @@ pub struct WindowsRemovalObservation {
 #[allow(unsafe_code)]
 pub(crate) fn absent_owned_services(
     deadline: std::time::Instant,
-) -> crate::Result<(Vec<String>, Vec<serde_json::Value>)> {
+) -> crate::Result<(
+    Vec<String>,
+    Vec<crate::windows_native_removal::ServiceAbsence>,
+)> {
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, GetLastError};
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
@@ -4139,7 +4142,12 @@ pub(crate) fn absent_owned_services(
         if code != ERROR_SERVICE_DOES_NOT_EXIST {
             return Err(std::io::Error::from_raw_os_error(code as i32).into());
         }
-        observed.push(serde_json::json!({"service_name":name,"api":"OpenServiceW","native_domain":"win32","native_code":code}));
+        observed.push(crate::windows_native_removal::ServiceAbsence {
+            service_name: name.clone(),
+            api: "OpenServiceW".into(),
+            native_domain: "win32".into(),
+            native_code: code,
+        });
     }
     Ok((names, observed))
 }
@@ -4149,8 +4157,8 @@ pub(crate) fn absent_owned_services(
 fn absent_component_processes(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
     deadline: std::time::Instant,
-) -> crate::Result<serde_json::Value> {
-    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+) -> crate::Result<crate::windows_native_removal::ComponentCensus> {
+    use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -4159,36 +4167,14 @@ fn absent_component_processes(
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
-    let fold = |units: &[u16]| {
-        units
+    let names = crate::windows_native_removal::image_names(
+        config
+            .installed_components
             .iter()
-            .map(|unit| {
-                if (65..=90).contains(unit) {
-                    unit + 32
-                } else {
-                    *unit
-                }
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut names = std::collections::BTreeSet::new();
-    for artifact in config
-        .installed_components
-        .iter()
-        .chain(std::iter::once(&config.installed_agent))
-    {
-        let name = artifact
-            .path
-            .file_name()
-            .ok_or_else(|| crate::CiError::Message("installed image name missing".into()))?;
-        let units: Vec<u16> = name.encode_wide().collect();
-        if units.iter().any(|unit| *unit > 127) {
-            return Err(crate::CiError::Message(
-                "installed component census requires exact ASCII package image names".into(),
-            ));
-        }
-        names.insert(fold(&units));
-    }
+            .chain(std::iter::once(&config.installed_agent))
+            .map(|artifact| artifact.path.as_path()),
+    )
+    .map_err(crate::CiError::Message)?;
     // SAFETY: read-only local process snapshot; ownership closes its handle on
     // every exit. Only package image-name candidates are queried below.
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -4207,7 +4193,7 @@ fn absent_component_processes(
             ));
         }
         count += 1;
-        if count > 32768 {
+        if count > crate::windows_native_removal::MAX_PROCESS_ENTRIES {
             return Err(crate::CiError::Message(
                 "native removal process census exceeded finite bound".into(),
             ));
@@ -4217,7 +4203,9 @@ fn absent_component_processes(
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(entry.szExeFile.len());
-        if names.contains(&fold(&entry.szExeFile[..length])) {
+        if names.contains(&crate::windows_native_removal::fold_name(
+            &entry.szExeFile[..length],
+        )) {
             // Fail closed even for another local process using a package image
             // name; it cannot silently substitute for absent owned processes.
             let process =
@@ -4243,9 +4231,13 @@ fn absent_component_processes(
     if code != ERROR_NO_MORE_FILES {
         return Err(std::io::Error::from_raw_os_error(code as i32).into());
     }
-    Ok(
-        serde_json::json!({"api":"CreateToolhelp32Snapshot/Process32FirstW/Process32NextW","entries_observed":count,"terminal_native_code":code,"required_image_names_utf16":names,"matching_processes":[]}),
-    )
+    Ok(crate::windows_native_removal::ComponentCensus {
+        api: crate::windows_native_removal::CENSUS_API.into(),
+        entries_observed: count,
+        terminal_native_code: code,
+        required_image_names_utf16: names,
+        matching_processes: Vec::new(),
+    })
 }
 
 /// Distinct from installed-generation recovery: missing services are checked as
@@ -4316,9 +4308,11 @@ pub fn observe_removed(
                 if ![2, 3].contains(&code) {
                     return Err(error.into());
                 }
-                path_observations.push(
-                    serde_json::json!({"path":path,"native_domain":"win32","native_code":code}),
-                );
+                path_observations.push(crate::windows_native_removal::PathAbsence {
+                    path: path.clone(),
+                    native_domain: "win32".into(),
+                    native_code: code,
+                });
             }
             Err(error) => return Err(error.into()),
             Ok(_) => {
@@ -4354,13 +4348,18 @@ pub fn observe_removed(
             }
         }
     }
-    let bytes = serde_json::to_vec(
-        &serde_json::json!({"format":"memcordon.windows-native-removal","revision":2,
-        "provider_generation":config.provider.generation.as_str(),"absent_services":absent_services,
-        "absent_paths":paths,"fixture_processes_absent":true,"installed_image_processes_absent":true,
-        "native_component_census":component_census,
-        "service_observations":service_observations,"path_observations":path_observations}),
-    )?;
+    let bytes = serde_json::to_vec(&crate::windows_native_removal::RemovalReceipt {
+        format: "memcordon.windows-native-removal".into(),
+        revision: 2,
+        provider_generation: config.provider.generation.as_str().into(),
+        absent_services: absent_services.clone(),
+        absent_paths: paths.clone(),
+        fixture_processes_absent: true,
+        installed_image_processes_absent: true,
+        native_component_census: component_census,
+        service_observations,
+        path_observations,
+    })?;
     if !output_directory.starts_with(&config.output_directory)
         || output_directory == config.output_directory
         || output_directory.try_exists()?

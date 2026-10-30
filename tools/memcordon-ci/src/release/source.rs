@@ -206,17 +206,27 @@ pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    write_json_record(path, value, false)
+    write_json_record(path, value, false, false)
+}
+
+/// Private authority publication must never replace a previous owner receipt.
+pub fn write_json_new(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_record(path, value, false, true)
 }
 
 /// Diagnostic snapshots are retained by the ordinary runner even when the
 /// measured operation runs as administrator. Private authority records continue
 /// to use `write_json`; only this explicit diagnostic publication is readable.
 pub fn write_diagnostic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    write_json_record(path, value, true)
+    write_json_record(path, value, true, false)
 }
 
-fn write_json_record(path: &Path, value: &impl Serialize, readable_diagnostic: bool) -> Result<()> {
+fn write_json_record(
+    path: &Path,
+    value: &impl Serialize,
+    readable_diagnostic: bool,
+    exclusive: bool,
+) -> Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -240,9 +250,15 @@ fn write_json_record(path: &Path, value: &impl Serialize, readable_diagnostic: b
     #[cfg(not(unix))]
     let _ = readable_diagnostic;
     temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| CiError::Io(error.error))?;
+    if exclusive {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| CiError::Io(error.error))?;
+    } else {
+        temporary
+            .persist(path)
+            .map_err(|error| CiError::Io(error.error))?;
+    }
     #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(())

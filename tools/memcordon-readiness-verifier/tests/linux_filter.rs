@@ -42,7 +42,7 @@ fn vector(abi: &str, arch: u32, socket: u32, pair: u32) -> FilterVector {
     });
     for (case, syscall, arguments, actual_bpf_return) in [
         (
-            "seqpacket-pair-positive-or-denied",
+            "seqpacket-pair-positive",
             pair,
             [1, 5 | 0x80000, 0],
             0x7fff0000,
@@ -92,6 +92,29 @@ fn structural_filter_decoder_rejects_rehashed_decision_and_inventory_mutations()
         ],
     };
     validate_linux_filter_receipt(&receipt, &key).unwrap();
+    for abi in 0..2 {
+        for mutation in 0..4 {
+            let mut changed = receipt.clone();
+            let index = changed.vectors[abi]
+                .observations
+                .iter()
+                .position(|item| item.case == "seqpacket-pair-positive")
+                .unwrap();
+            match mutation {
+                0 => {
+                    changed.vectors[abi].observations[index].case =
+                        "seqpacket-pair-positive-or-denied".into()
+                }
+                1 => changed.vectors[abi].observations[index].case = "unknown-positive".into(),
+                2 => changed.vectors[abi].observations[index].actual_bpf_return = 0x5005d,
+                _ => {
+                    changed.vectors[abi].observations[index] =
+                        changed.vectors[abi].observations[0].clone()
+                }
+            }
+            assert!(validate_linux_filter_receipt(&changed, &key).is_err());
+        }
+    }
     let mut changed = receipt.clone();
     changed.vectors[0].profile = "unsupported-profile".into();
     assert!(

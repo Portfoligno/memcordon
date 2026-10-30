@@ -624,7 +624,7 @@ fn protect_manifest_components(
             after.ctime(),
             after.ctime_nsec(),
         ) || bytes.len() as u64 != component.size
-            || artifacts::checksum(&bytes) != String::from(component.sha256.clone())
+            || artifacts::checksum(&bytes) != component.sha256
         {
             return Err(CiError::Message(
                 "selected source image bytes changed during protected copy".into(),
@@ -634,12 +634,11 @@ fn protect_manifest_components(
             .artifacts
             .iter()
             .find(|artifact| artifact.path == path)
+            && selected.sha256 != artifacts::checksum(&bytes)
         {
-            if selected.sha256 != artifacts::checksum(&bytes) {
-                return Err(CiError::Message(
-                    "copied image differs from original selected artifact digest".into(),
-                ));
-            }
+            return Err(CiError::Message(
+                "copied image differs from original selected artifact digest".into(),
+            ));
         }
         let destination = directory.join(&component.path);
         let mut output = fs::OpenOptions::new()
@@ -665,7 +664,7 @@ fn protect_manifest_components(
         .mode(0o444)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(directory.join("runtime-manifest.json"))?;
-    output.write_all(&manifest_bytes)?;
+    output.write_all(manifest_bytes)?;
     output.sync_all()?;
     drop(output);
     held.push(
@@ -1586,11 +1585,11 @@ pub fn run_current_cell(
             Err(error) => failures.push(error.to_string()),
         }
     }
-    if !owner["foreign_caller"].is_null() {
-        if let Err(error) = retire_caller(root, &owner["foreign_caller"], cleanup) {
-            caller_retired = false;
-            failures.push(format!("foreign caller retirement: {error}"));
-        }
+    if !owner["foreign_caller"].is_null()
+        && let Err(error) = retire_caller(root, &owner["foreign_caller"], cleanup)
+    {
+        caller_retired = false;
+        failures.push(format!("foreign caller retirement: {error}"));
     }
     let absence = (|| -> Result<serde_json::Value> {
         Ok(
@@ -1714,12 +1713,14 @@ pub fn run_current_cell(
             vec!["actual current installed lifetime retains failure evidence".into()]
         },
     };
-    persist(
-        artifact_root,
-        &lifetime.join("installed-retirement.json"),
-        &serde_json::to_vec(&receipt)?,
-        &mut inventory,
-    )?;
+    let receipt_path = lifetime.join("installed-retirement.json");
+    source::write_json_new(&receipt_path, &receipt)?;
+    let receipt_bytes = fs::read(&receipt_path)?;
+    inventory.push(Artifact {
+        path: relative(artifact_root, &receipt_path)?,
+        length: receipt_bytes.len() as u64,
+        sha256: artifacts::checksum(&receipt_bytes),
+    });
     let observations = lifetime.join("current-cell-observations.json");
     source::write_json(
         &observations,
@@ -1749,9 +1750,14 @@ fn protected_json(path: &Path, limit: u64) -> Result<serde_json::Value> {
         || metadata.nlink() != 1
         || metadata.len() > limit
     {
-        return Err(CiError::Message(
-            "current original recovery record custody differs".into(),
-        ));
+        return Err(CiError::Message(format!(
+            "current original recovery record custody differs: path={:?}; uid={}; mode={:#o}; links={}; length={}; limit={limit}",
+            path,
+            metadata.uid(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.len(),
+        )));
     }
     let mut bytes = Vec::new();
     (&mut file).take(limit + 1).read_to_end(&mut bytes)?;

@@ -548,7 +548,7 @@ Example:
   memcordon plan +8GiB --wait-for workload +10m
 
 Text prints the selected backend and "launch proof: false"; --json prints the
-full policy resolution.
+full policy resolution as memcordon.plan revision 3.
 
 Budgets:
   +MEMORY    Memory ceiling; bytes, KB..EB, or KiB..EiB
@@ -912,10 +912,10 @@ pub enum HelpKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invocation {
-    Execute(ExecutionArgs),
+    Execute(Box<ExecutionArgs>),
     WindowsRecovery(WindowsRecoveryArgs),
     Doctor(DoctorArgs),
-    Plan(PlanArgs),
+    Plan(Box<PlanArgs>),
     Clean(CleanArgs),
     Help(HelpKind),
     Version,
@@ -989,7 +989,7 @@ pub fn route(argv: &[OsString]) -> Result<Invocation, CliError> {
             ),
         ));
     }
-    parse_execution(argv).map(Invocation::Execute)
+    parse_execution(argv).map(|args| Invocation::Execute(Box::new(args)))
 }
 
 fn parse_windows_recovery(argv: &[OsString]) -> Result<WindowsRecoveryArgs, CliError> {
@@ -1509,11 +1509,11 @@ fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
         index += 1;
     }
     validate_policy_dependencies(&mut policy, &budgets)?;
-    Ok(Invocation::Plan(PlanArgs {
+    Ok(Invocation::Plan(Box::new(PlanArgs {
         json,
         budgets,
         policy,
-    }))
+    })))
 }
 
 fn validate_policy_dependencies(

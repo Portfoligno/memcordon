@@ -7,7 +7,7 @@ fn main() {
         "+120s",
         "--sealed",
         "--report-format",
-        "result-v1",
+        "result-v3",
         "--report",
     ] {
         assert_eq!(arguments.next().unwrap(), expected);

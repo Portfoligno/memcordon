@@ -33,6 +33,9 @@ mod macos_launch;
 mod macos_result_delivery;
 #[cfg(target_os = "macos")]
 mod macos_result_frame;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod startup_cleanup_observation;
 #[cfg(target_os = "macos")]
 pub use macos_launch::LaunchRuntime as MacosLaunchRuntime;
 #[cfg(target_os = "macos")]

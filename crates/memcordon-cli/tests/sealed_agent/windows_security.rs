@@ -5907,7 +5907,7 @@ fn cleanup_create_once_publication_withholds_delete_child_from_restricted_produc
 }
 
 #[test]
-fn exact_predecessor_grants_write_restricted_delete_child_and_migrates_to_denial() {
+fn exact_predecessor_delete_child_grant_is_refused_unchanged_and_current_policy_denies() {
     const FILE_DELETE_CHILD: u32 = 0x0000_0040;
     const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
 
@@ -5947,9 +5947,16 @@ fn exact_predecessor_grants_write_restricted_delete_child_and_migrates_to_denial
         token.revert().unwrap();
     }
 
-    crate::windows::package::reconcile_certification_marker_security(&marker_root).unwrap();
+    assert!(
+        crate::windows::package::reconcile_certification_marker_security(&marker_root).is_err()
+    );
+    predecessor.verify_path(&marker_root).unwrap();
+    let marker_root = temporary.path().join("current-certification-markers");
+    std::fs::create_dir(&marker_root).unwrap();
     let current =
         SecurityDescriptor::from_sddl(&certification_marker_state_sddl().unwrap()).unwrap();
+    current.apply_to_path(&marker_root).unwrap();
+    let marker_root_security = open_retained_directory(&marker_root, READ_CONTROL_ACCESS).unwrap();
     current.verify_path(&marker_root).unwrap();
     {
         let token = crate::windows::token::impersonate_write_restricted_current_thread().unwrap();
@@ -6012,7 +6019,7 @@ fn retired_workspace_cleanup_uses_the_complete_cleanup_protocol_inventory() {
 }
 
 #[test]
-fn certification_marker_security_migrates_only_exact_legacy_policies() {
+fn certification_marker_security_accepts_only_current_policy_and_preserves_refused_descriptors() {
     let temporary = tempfile::tempdir().unwrap();
     let expected_sddl = certification_marker_state_sddl().unwrap();
     let expected = SecurityDescriptor::from_sddl(&expected_sddl).unwrap();
@@ -6025,12 +6032,16 @@ fn certification_marker_security_migrates_only_exact_legacy_policies() {
     for (index, policy) in policies.into_iter().enumerate() {
         let path = temporary.path().join(format!("recognized-{index}"));
         std::fs::create_dir(&path).unwrap();
-        SecurityDescriptor::from_sddl(&policy)
-            .unwrap()
-            .apply_to_path(&path)
-            .unwrap();
-        crate::windows::package::reconcile_certification_marker_security(&path).unwrap();
-        expected.verify_path(&path).unwrap();
+        let original = SecurityDescriptor::from_sddl(&policy).unwrap();
+        original.apply_to_path(&path).unwrap();
+        let result = crate::windows::package::reconcile_certification_marker_security(&path);
+        if policy == expected_sddl {
+            result.unwrap();
+            expected.verify_path(&path).unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+        original.verify_path(&path).unwrap();
     }
 
     let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
@@ -6537,19 +6548,19 @@ fn assert_server_response_is_drained_before_disconnect(payload: String) {
         &pipe_name,
         SecurityDescriptor::from_sddl(&test_public_pipe_sddl()).unwrap(),
     );
-    let (written_sender, written_receiver) = mpsc::channel();
+    let (started_sender, started_receiver) = mpsc::channel();
     let (finished_sender, finished_receiver) = mpsc::channel();
     let expected = payload.clone();
     let server = std::thread::spawn(move || {
         let connection = listener.accept().unwrap();
+        started_sender.send(()).unwrap();
         crate::windows::pipe::write_frame(connection.raw(), &payload).unwrap();
-        written_sender.send(()).unwrap();
         let result = crate::windows::pipe::finish_server_response(connection.raw());
         finished_sender.send(result).unwrap();
     });
 
     let client = crate::windows::pipe::connect(&pipe_name).unwrap();
-    written_receiver.recv().unwrap();
+    started_receiver.recv().unwrap();
     assert!(matches!(
         finished_receiver.recv_timeout(Duration::from_millis(100)),
         Err(RecvTimeoutError::Timeout)
@@ -6604,6 +6615,18 @@ fn assert_abrupt_frame_read_phase(
                 0
             );
             assert_eq!(written, 4);
+            let transport = crate::windows::pipe::SynchronousIoDeadline::start(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+            // SAFETY: this live owned pipe is drained under its own-thread cancellation guard.
+            let drained = unsafe {
+                windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(connection.raw())
+            };
+            let error = (drained == 0).then(std::io::Error::last_os_error);
+            let settled = transport.finish();
+            assert!(error.is_none(), "raw header drain failed: {error:?}");
+            settled.unwrap();
             crate::windows::pipe::finish_server_response(connection.raw()).unwrap();
         } else {
             crate::windows::pipe::disconnect(connection.raw());
@@ -6991,9 +7014,12 @@ fn support_control_release_reads_only_complete_bounded_frames_before_original_cu
     let message = memcordon_core::WindowsProviderRequestV4::Probe {
         schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
     };
-    crate::windows::pipe::write_frame(write.raw(), &message).unwrap();
-    assert_eq!(
-        read_control_release(read.raw(), peer, Instant::now() + Duration::from_secs(1)).unwrap(),
-        message
-    );
+    let sent = message.clone();
+    let writer = std::thread::spawn(move || crate::windows::pipe::write_frame(write.raw(), &sent));
+    let received = read_control_release(read.raw(), peer, Instant::now() + Duration::from_secs(1));
+    if received.is_err() {
+        drop(read);
+    }
+    writer.join().expect("writer settled").unwrap();
+    assert_eq!(received.unwrap(), message);
 }

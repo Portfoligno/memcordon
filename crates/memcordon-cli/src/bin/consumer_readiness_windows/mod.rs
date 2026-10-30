@@ -9,6 +9,7 @@ mod controller_gate_token;
 pub mod descriptor;
 mod fixture_default_dacl;
 mod fixture_environment;
+mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;
 mod native_fixture_default_dacl;
@@ -29,6 +30,9 @@ use std::time::Duration;
 
 pub(super) fn namespace_primary_experiment() -> io::Result<i32> {
     namespace_primary_worker::run()
+}
+pub(super) fn namespace_primary_replay(encoded: &str) -> io::Result<i32> {
+    namespace_primary_worker::run_replay(encoded)
 }
 
 #[derive(Debug, Deserialize, Serialize)]

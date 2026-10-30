@@ -174,8 +174,13 @@ fn pumped_frame_pipe_pair() -> (OwnedHandle, OwnedHandle) {
 #[test]
 fn pumped_pending_read_makes_progress_without_losing_frame_or_owner() {
     let (server, client) = pumped_frame_pipe_pair();
+    let (start, ready) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        ready.recv().unwrap();
+        write_frame(client.raw(), &"authenticated ready")
+    });
     let mut calls = 0;
-    let value: String = read_frame_bounded_pumped(
+    let value = read_frame_bounded_pumped::<String>(
         server.raw(),
         None,
         std::time::Instant::now() + Duration::from_secs(2),
@@ -183,12 +188,17 @@ fn pumped_pending_read_makes_progress_without_losing_frame_or_owner() {
         &mut || {
             calls += 1;
             if calls == 1 {
-                write_frame(client.raw(), &"authenticated ready")?;
+                start.send(()).map_err(|error| error.to_string())?;
             }
             Ok(())
         },
-    )
-    .unwrap();
+    );
+    if value.is_err() {
+        drop(server);
+    }
+    drop(start);
+    writer.join().expect("writer settled").unwrap();
+    let value = value.unwrap();
     assert_eq!(value, "authenticated ready");
     assert_ne!(calls, 0);
 }
@@ -210,14 +220,18 @@ fn failed_pump_cancels_pending_read_before_next_frame() {
             .to_string()
             .contains("actual diagnostic pump failure")
     );
-    write_frame(client.raw(), &"next intact frame").unwrap();
-    let next: String = read_frame_bounded(
+    let writer = std::thread::spawn(move || write_frame(client.raw(), &"next intact frame"));
+    let next = read_frame_bounded::<String>(
         server.raw(),
         None,
         std::time::Instant::now() + Duration::from_secs(2),
         TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
-    )
-    .unwrap();
+    );
+    if next.is_err() {
+        drop(server);
+    }
+    writer.join().expect("writer settled").unwrap();
+    let next = next.unwrap();
     assert_eq!(next, "next intact frame");
 }
 

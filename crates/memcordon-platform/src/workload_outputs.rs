@@ -94,7 +94,12 @@ impl Destination {
         }
         // SAFETY: the preceding successful fstatat initialized named.
         let named = unsafe { named.assume_init() };
-        if (held.dev(), held.ino()) != (named.st_dev as u64, named.st_ino as u64) {
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "native stat device and inode types differ across Unix platforms"
+        )]
+        let named_identity = (named.st_dev as u64, named.st_ino as u64);
+        if (held.dev(), held.ino()) != named_identity {
             return Err("partial output name no longer identifies its held object".into());
         }
         // SAFETY: only this exact newly created caller-owned leaf is removed.
@@ -221,10 +226,10 @@ impl WorkloadOutputReceiver {
                     destination.committed = true;
                 }
             }
-            if !destination.committed
-                && let Err(error) = destination.abort()
-            {
-                self.failure.get_or_insert(error);
+            if !destination.committed {
+                if let Err(error) = destination.abort() {
+                    self.failure.get_or_insert(error);
+                }
             }
         }
         self.index += 1;
@@ -253,11 +258,12 @@ impl WorkloadOutputReceiver {
             .offset
             .checked_add(chunk.bytes.len() as u64)
             .ok_or("output offset overflow")?;
-        if let Some(destination) = &mut self.destination
-            && self.failure.is_none()
-            && let Err(error) = destination.file.write_all(chunk.bytes)
-        {
-            self.failure = Some(error.to_string());
+        if let Some(destination) = &mut self.destination {
+            if self.failure.is_none() {
+                if let Err(error) = destination.file.write_all(chunk.bytes) {
+                    self.failure = Some(error.to_string());
+                }
+            }
         }
         if self.offset == file.size {
             self.complete_current()?;

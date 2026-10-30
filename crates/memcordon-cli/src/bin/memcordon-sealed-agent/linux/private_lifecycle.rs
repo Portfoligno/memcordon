@@ -46,6 +46,35 @@ use super::private_wait_status::{
 };
 use crate::request::NamespaceIdentity;
 
+pub(super) struct MixedNamespaceContext {
+    pub caller_namespace: NamespaceIdentity,
+    pub provider_namespace: NamespaceIdentity,
+    pub lifetime: crate::request::Lifetime,
+}
+
+pub(super) struct WorkloadExecutionInputs {
+    pub start: memcordon_core::workload_request::WorkloadStartV1,
+    pub launch: crate::request::LaunchRequestV2,
+    pub caller: super::envelope::CapturedCallerEnvelopeV2,
+    pub account: super::workload_account::VerifiedPackageAccount,
+    pub worker: OwnedFd,
+    pub frontend: OwnedFd,
+    pub streams: [OwnedFd; 3],
+    pub association: memcordon_core::workload_request::WorkloadAttemptAssociationV1,
+    pub inputs: super::workload_inputs::HeldWorkloadInputs,
+    pub setup_cutoff: Instant,
+}
+
+pub(super) struct WorkloadLaunchInputs {
+    pub identity: ResolvedTargetIdentity,
+    pub runtime: super::workload_snapshot::HeldSnapshot,
+    pub input: super::workload_snapshot::HeldSnapshot,
+    pub working_directory: Option<memcordon_core::workload_request::RootRelativePath>,
+    pub attempt: [u8; 16],
+    pub challenge: [u8; 16],
+    pub cutoff: Instant,
+}
+
 pub struct PrivateObservedTarget {
     native: PrivateGatedReadback,
     network: PrivateNetworkSetup,
@@ -374,11 +403,14 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         prelaunch: PrivateGatedPrelaunch,
         preparation: super::private_namespace_init::MixedNamespacePreparation,
         provider_root_channel: std::os::unix::net::UnixStream,
-        caller_namespace: NamespaceIdentity,
-        provider_namespace: NamespaceIdentity,
-        lifetime: crate::request::Lifetime,
+        context: MixedNamespaceContext,
         deadline: Instant,
     ) -> Result<(), String> {
+        let MixedNamespaceContext {
+            caller_namespace,
+            provider_namespace,
+            lifetime,
+        } = context;
         if self.record_mut().phase() != PrivateAttemptPhase::BoundaryCreated
             || self.namespace_init.is_some()
             || self.mixed_staging.is_none()
@@ -1114,19 +1146,22 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
     pub(super) fn execute_workload(
         mut self,
         stream: &mut std::os::unix::net::UnixStream,
-        start: memcordon_core::workload_request::WorkloadStartV1,
-        launch: crate::request::LaunchRequestV2,
-        caller: super::envelope::CapturedCallerEnvelopeV2,
-        account: super::workload_account::VerifiedPackageAccount,
-        worker: OwnedFd,
-        frontend: OwnedFd,
-        streams: [OwnedFd; 3],
-        association: memcordon_core::workload_request::WorkloadAttemptAssociationV1,
-        inputs: super::workload_inputs::HeldWorkloadInputs,
-        setup_cutoff: Instant,
+        execution: WorkloadExecutionInputs,
     ) -> Result<memcordon_core::result_v3::LinuxWorkloadTerminalV1, String> {
         use memcordon_core::execution_facts::CleanupStateV1;
         use memcordon_core::result_v3::*;
+        let WorkloadExecutionInputs {
+            start,
+            launch,
+            caller,
+            account,
+            worker,
+            frontend,
+            streams,
+            association,
+            inputs,
+            setup_cutoff,
+        } = execution;
         self.drop_cutoff = Some(setup_cutoff);
         let identity = ResolvedTargetIdentity::package_account(&account, caller.envelope.uid)?;
         let super::workload_inputs::HeldWorkloadInputs {
@@ -1153,13 +1188,15 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
             let prepared = self.prepare_workload_launch(
                 &start.request,
                 &launch,
-                identity.clone(),
-                runtime,
-                input,
-                start.working_directory.clone(),
-                association.attempt,
-                association.challenge,
-                setup_cutoff,
+                WorkloadLaunchInputs {
+                    identity: identity.clone(),
+                    runtime,
+                    input,
+                    working_directory: start.working_directory.clone(),
+                    attempt: association.attempt,
+                    challenge: association.challenge,
+                    cutoff: setup_cutoff,
+                },
             )?;
             let metadata = std::fs::metadata("/proc/self/ns/net").map_err(|e| e.to_string())?;
             let provider_namespace = NamespaceIdentity {
@@ -1170,9 +1207,11 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
                 prepared.prelaunch,
                 prepared.preparation,
                 prepared.provider_root_channel,
-                caller.envelope.network_namespace_identity,
-                provider_namespace,
-                launch.policy.lifetime,
+                MixedNamespaceContext {
+                    caller_namespace: caller.envelope.network_namespace_identity,
+                    provider_namespace,
+                    lifetime: launch.policy.lifetime,
+                },
                 setup_cutoff,
             )?;
             self.start_guardian(
@@ -1602,16 +1641,19 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
         &mut self,
         request: &memcordon_core::workload_request::WorkloadRequestV1,
         launch: &crate::request::LaunchRequestV2,
-        identity: ResolvedTargetIdentity,
-        runtime: super::workload_snapshot::HeldSnapshot,
-        input: super::workload_snapshot::HeldSnapshot,
-        working_directory: Option<memcordon_core::workload_request::RootRelativePath>,
-        attempt: [u8; 16],
-        challenge: [u8; 16],
-        cutoff: Instant,
+        inputs: WorkloadLaunchInputs,
     ) -> Result<PreparedPrivateLaunch, String> {
         use memcordon_core::workload_request::RuntimeRequestV1;
         use std::os::unix::fs::MetadataExt;
+        let WorkloadLaunchInputs {
+            identity,
+            runtime,
+            input,
+            working_directory,
+            attempt,
+            challenge,
+            cutoff,
+        } = inputs;
         request.validate().map_err(|e| e.to_string())?;
         let RuntimeRequestV1::LinuxPrivate { inputs, layout, .. } = &request.runtime else {
             return Err("unsupported Linux workload profile".into());

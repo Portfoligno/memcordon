@@ -317,8 +317,10 @@ fn installed_layout_probe_works_with_spaces_minimal_path_and_closed_stdio() {
     let output = run_with_deadline(&mut probe, Duration::from_secs(10)).unwrap();
     assert_eq!(output.status.code(), Some(0));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["kind"], "doctor-execution-probe");
-    assert_eq!(value["doctor"]["schema_version"], 6);
+    assert_eq!(value["format"], "memcordon.capabilities-probe");
+    assert_eq!(value["revision"], 2);
+    assert_eq!(value["capabilities"]["format"], "memcordon.capabilities");
+    assert_eq!(value["capabilities"]["revision"], 3);
     assert_eq!(value["execution"]["helper_ready"], true);
     assert_eq!(value["execution"]["target_exec_confirmed"], true);
     assert_eq!(value["execution"]["cleanup_complete"], true);

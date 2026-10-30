@@ -103,7 +103,6 @@ pub fn observe(
                 let available = rustix::io::ioctl_fionread(file).map_err(std::io::Error::from)?;
                 let capacity = u64::try_from(*capacity)
                     .map_err(|error| CiError::Message(error.to_string()))?;
-                let available = u64::from(available);
                 let syscall =
                     std::fs::read_to_string(format!("/proc/{}/syscall", target.process_id))?;
                 let fields: Vec<_> = syscall.split_whitespace().collect();

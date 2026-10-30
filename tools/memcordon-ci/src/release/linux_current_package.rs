@@ -291,12 +291,12 @@ pub fn emit(
         let Some(operation) = value["arguments"][1].as_str() else {
             continue;
         };
-        if value["completed"]["status"] == 0 {
-            if operations.insert(operation.to_owned(), relative).is_some() {
-                return Err(CiError::Message(
-                    "duplicate successful package phase in original lifetime".into(),
-                ));
-            }
+        if value["completed"]["status"] == 0
+            && operations.insert(operation.to_owned(), relative).is_some()
+        {
+            return Err(CiError::Message(
+                "duplicate successful package phase in original lifetime".into(),
+            ));
         }
     }
     let mut records = Vec::new();

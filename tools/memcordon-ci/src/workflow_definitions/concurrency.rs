@@ -564,7 +564,12 @@ pub(super) fn project(
                     "cache-producing matrices must preserve peer runners".into(),
                 ));
             }
-            job["strategy"]["fail-fast"] = original["jobs"][name]["strategy"]["fail-fast"].clone();
+            // Independently authored feedback matrices have no legacy job to
+            // project. Keep their exact value for their owner validation.
+            if !original["jobs"][name].is_null() {
+                job["strategy"]["fail-fast"] =
+                    original["jobs"][name]["strategy"]["fail-fast"].clone();
+            }
         }
     }
     Ok(())

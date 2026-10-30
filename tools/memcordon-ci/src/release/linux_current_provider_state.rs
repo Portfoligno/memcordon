@@ -206,12 +206,12 @@ pub fn restore(owner: &mut serde_json::Value, lifetime: &Path) -> Result<()> {
                 "original descriptor backup custody differs; retained".into(),
             ));
         }
-        if let Some(named) = named {
-            if fixture["bad"].is_null() || !same(&named, &fixture["bad"])? {
-                return Err(CiError::Message(
-                    "occupied descriptor is not owned fixture; retained".into(),
-                ));
-            }
+        if let Some(named) = named
+            && (fixture["bad"].is_null() || !same(&named, &fixture["bad"])?)
+        {
+            return Err(CiError::Message(
+                "occupied descriptor is not owned fixture; retained".into(),
+            ));
         }
         rustix::fs::renameat(&parent, backup.as_str(), &parent, NAME)
             .map_err(std::io::Error::from)?;

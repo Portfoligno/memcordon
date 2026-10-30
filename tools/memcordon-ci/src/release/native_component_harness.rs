@@ -169,32 +169,24 @@ pub fn build_original_roles(
         assembly.observe(crate::work_outcome::WorkOutcome::from_result(
             retain_original_host(root, selected, target, destination, deadline),
         ))?;
-        let features = if target.ends_with("-unknown-linux-gnu") {
-            "private-tcp,test-support"
-        } else if target.ends_with("-pc-windows-msvc") {
-            "windows-sealed-runtime,test-support"
-        } else {
-            return Err(CiError::Message(
-                "native component roles require a supported readiness target".into(),
-            ));
-        };
+        let [operational_role, parser_role] = super::native_role_contract::original_roles(target)?;
         let operational =
             assembly.observe(crate::work_outcome::WorkOutcome::from_result(build(
                 root,
                 target,
-                "memcordon",
-                "sealed_agent",
-                Some(features),
-                &destination.join("operational"),
+                operational_role.package,
+                operational_role.test,
+                operational_role.features,
+                &destination.join(operational_role.role),
                 deadline,
             )))?;
         let parser = assembly.observe(crate::work_outcome::WorkOutcome::from_result(build(
             root,
             target,
-            "memcordon-readiness-verifier",
-            "current_parser_receipts",
-            None,
-            &destination.join("parser"),
+            parser_role.package,
+            parser_role.test,
+            parser_role.features,
+            &destination.join(parser_role.role),
             deadline,
         )))?;
         #[cfg(windows)]
@@ -210,10 +202,10 @@ pub fn build_original_roles(
             "format":"memcordon.consumer-readiness.native-harnesses","revision":1,
             "source":selected,"native_target":target,
             "roles":[
-                {"role":"operational","package":"memcordon","test":"sealed_agent","features":features,
+                {"role":operational_role.role,"package":operational_role.package,"test":operational_role.test,"features":operational_role.features,
                     "executable":operational.executable,"sha256":operational.sha256,
                     "compiler_output":operational.compiler_output,"compiler_errors":operational.compiler_errors},
-                {"role":"parser","package":"memcordon-readiness-verifier","test":"current_parser_receipts","features":null,
+                {"role":parser_role.role,"package":parser_role.package,"test":parser_role.test,"features":parser_role.features,
                     "executable":parser.executable,"sha256":parser.sha256,
                     "compiler_output":parser.compiler_output,"compiler_errors":parser.compiler_errors}
             ]}))?,
@@ -528,17 +520,13 @@ pub fn build(
             "component harness must be built on its actual native target".into(),
         ));
     }
-    match (package, test, features) {
-        ("memcordon", "sealed_agent", Some("private-tcp,test-support"))
-            if target.ends_with("-unknown-linux-gnu") => {}
-        ("memcordon", "sealed_agent", Some("windows-sealed-runtime,test-support"))
-            if target.ends_with("-pc-windows-msvc") => {}
-        ("memcordon-readiness-verifier", "current_parser_receipts", None) => (),
-        _ => {
-            return Err(CiError::Message(
-                "component harness recipe is not a frozen native role".into(),
-            ));
-        }
+    if !super::native_role_contract::original_roles(target)?
+        .iter()
+        .any(|role| (role.package, role.test, role.features) == (package, test, features))
+    {
+        return Err(CiError::Message(
+            "component harness recipe is not a frozen native role".into(),
+        ));
     }
     fs::create_dir(destination)?;
     let build_root = root.join("target/ci/native-readiness-components");

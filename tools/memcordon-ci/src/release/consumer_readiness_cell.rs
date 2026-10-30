@@ -24,6 +24,8 @@ pub struct CellArguments {
     pub destination: PathBuf,
     #[arg(long)]
     pub operation_deadline_unix_millis: u64,
+    #[arg(long)]
+    pub owner_preparation_sha256: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,7 +83,7 @@ fn privileged_cell_command(
         CellOperation::Cleanup => ("consumer-readiness-cleanup", 15),
     };
     let [native_path, rustup_environment] = toolchain;
-    Ok(
+    let mut command =
         crate::command::CommandSpec::new("sudo", root, Duration::from_secs(minutes * 60))
             .arg("-n")
             .arg("--")
@@ -100,8 +102,11 @@ fn privileged_cell_command(
             .arg(std::path::absolute(&arguments.destination)?)
             .arg("--operation-deadline-unix-millis")
             .arg(arguments.operation_deadline_unix_millis.to_string())
-            .bounded_until(deadline),
-    )
+            .bounded_until(deadline);
+    if let Some(digest) = &arguments.owner_preparation_sha256 {
+        command = command.args(["--owner-preparation-sha256", digest]);
+    }
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -200,9 +205,15 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
     let (identity, key, bundle) = select(root, arguments)?;
     #[cfg(target_os = "linux")]
     if !rustix::process::geteuid().is_root() {
+        let proof = crate::preparation_tools::checked_owner_preparation(
+            root,
+            crate::preparation_tools::Kind::Readiness,
+        )?;
+        let mut arguments = arguments.clone();
+        arguments.owner_preparation_sha256 = Some(super::artifacts::checksum(&proof));
         return privileged_cell_command(
             root,
-            arguments,
+            &arguments,
             CellOperation::Execute,
             selected_toolchain_environment()?,
             &std::env::current_exe()?,
@@ -327,11 +338,34 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
         };
         super::installed_consumer::require_current_runtime(&payload)?;
         #[cfg(target_os = "linux")]
+        let owner_preparation = {
+            let kind = crate::preparation_tools::Kind::Readiness;
+            let proof =
+                super::artifacts::read_file(&root.join(crate::preparation_tools::manifest(kind)))?;
+            let expected = match &arguments.owner_preparation_sha256 {
+                Some(digest) => digest.clone(),
+                None => super::artifacts::checksum(
+                    &crate::preparation_tools::checked_owner_preparation(root, kind)?,
+                ),
+            };
+            if super::artifacts::checksum(&proof) != expected {
+                return Err(CiError::Message(
+                    "readiness owner preparation changed after full transport validation".into(),
+                ));
+            }
+            proof
+        };
+        #[cfg(target_os = "linux")]
         payload.artifacts.extend(
             super::original_native_components::retain_current_owner_probe(
-                root,
-                &identity,
-                &key.target,
+                &owner_preparation,
+                &super::original_native_components::OwnerProbeOrigin {
+                    kind: crate::preparation_tools::Kind::Readiness,
+                    commit: &identity.source_commit,
+                    version: &identity.version,
+                    target: &key.target,
+                    run: &identity.run_id,
+                },
                 &prefix.join("owner-probe"),
             )?,
         );

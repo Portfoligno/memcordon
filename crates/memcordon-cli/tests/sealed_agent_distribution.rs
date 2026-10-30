@@ -76,8 +76,8 @@ fn package_inspection_is_unavailable_without_a_native_provider_package() {
     assert_eq!(output.status.code(), Some(125));
     assert!(output.stdout.is_empty());
     assert_eq!(
-        String::from_utf8(output.stderr).unwrap().trim(),
-        "retired release command is unavailable"
+        String::from_utf8(output.stderr).unwrap().lines().next(),
+        Some("invalid arguments")
     );
 }
 
@@ -180,7 +180,7 @@ fn bare_inspection_does_not_infer_package_custody_from_a_hard_linked_build() {
     );
     let inspection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inspection["format"], "memcordon.agent-package-inspection");
-    assert_eq!(inspection["revision"], 1);
+    assert_eq!(inspection["revision"], 2);
     assert_eq!(inspection["compiled_metadata_valid"], true);
 
     let manifest = directory.path().join("runtime-manifest.json");

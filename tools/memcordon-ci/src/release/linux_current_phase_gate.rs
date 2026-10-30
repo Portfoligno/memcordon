@@ -69,7 +69,7 @@ impl PermissionStop {
         }
         let mut response = Vec::with_capacity(8);
         response.extend(self.file.as_raw_fd().to_ne_bytes());
-        response.extend((libc::FAN_ALLOW as u32).to_ne_bytes());
+        response.extend(libc::FAN_ALLOW.to_ne_bytes());
         let mut group = &*self.group;
         if let Err(error) = group.write_all(&response) {
             self.release_errno = error.raw_os_error();
@@ -372,13 +372,13 @@ impl NativeReadGate {
             {
                 Ok(event) => return event,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(process) = process {
-                        if process.exited().map_err(CiError::Message)? {
-                            return Err(CiError::Message(
-                                "original frontend retired before the required native phase event"
-                                    .into(),
-                            ));
-                        }
+                    if let Some(process) = process
+                        && process.exited().map_err(CiError::Message)?
+                    {
+                        return Err(CiError::Message(
+                            "original frontend retired before the required native phase event"
+                                .into(),
+                        ));
                     }
                 }
                 Err(error) => {

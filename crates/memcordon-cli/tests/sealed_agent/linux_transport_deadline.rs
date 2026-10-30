@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use std::io;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -17,6 +18,82 @@ fn pipe() -> (OwnedFd, OwnedFd) {
             OwnedFd::from_raw_fd(descriptors[0]),
             OwnedFd::from_raw_fd(descriptors[1]),
         )
+    }
+}
+
+#[allow(unsafe_code)] // Reads/polls one owned nonblocking pipe against its original absolute cutoff.
+fn require_eof(read: &OwnedFd, cutoff: Instant) -> io::Result<()> {
+    let mut last_errno = None;
+    loop {
+        let remaining = cutoff
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("pipe EOF cutoff expired; last errno {last_errno:?}"),
+                )
+            })?;
+        let mut byte = 0u8;
+        let result = unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) };
+        if result == 0 {
+            return Ok(());
+        }
+        if result > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected pipe payload while requiring EOF",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        last_errno = error.raw_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("pipe read errno {last_errno:?}: {error}"),
+            ));
+        }
+        let _ = remaining; // Recompute after read; progress never renews the cutoff.
+        let remaining = cutoff
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("pipe EOF cutoff expired; last errno {last_errno:?}"),
+                )
+            })?;
+        let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: read.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            last_errno = error.raw_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "pipe poll errno {last_errno:?}, revents {}: {error}",
+                    descriptor.revents
+                ),
+            ));
+        }
+        if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+            return Err(io::Error::other(format!(
+                "pipe poll invalid/error revents {}",
+                descriptor.revents
+            )));
+        }
+        // HUP/readability only requests another read; only read0 proves EOF.
     }
 }
 
@@ -66,6 +143,7 @@ fn frame(payload: Vec<u8>) -> (crate::protocol::Frame, Vec<u8>) {
 #[allow(unsafe_code)] // EOF of the original native pipe proves every transferred writer was closed, without process-global fd counts.
 fn malformed_or_partial_frames_close_every_received_right() {
     for scenario in 0..4 {
+        let cutoff = Instant::now() + Duration::from_secs(1);
         let (writer, reader) = UnixStream::pair().unwrap();
         let (read, write) = pipe();
         let (_, mut bytes) = frame(vec![9; 8]);
@@ -83,19 +161,10 @@ fn malformed_or_partial_frames_close_every_received_right() {
         send_raw(&writer, &bytes[..count], &rights);
         drop(write);
         writer.shutdown(std::net::Shutdown::Write).unwrap();
-        assert!(
-            crate::linux::transport::receive_public_until(
-                &reader,
-                Instant::now() + Duration::from_secs(1)
-            )
-            .is_err()
-        );
-        let mut byte = 0;
-        assert_eq!(
-            unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) },
-            0,
-            "scenario {scenario} leaked a received pipe writer"
-        );
+        assert!(crate::linux::transport::receive_public_until(&reader, cutoff).is_err());
+        require_eof(&read, cutoff).unwrap_or_else(|error| {
+            panic!("scenario {scenario} did not close every received writer: {error}")
+        });
     }
 }
 
@@ -140,27 +209,55 @@ fn short_send_continues_bytes_without_repeating_descriptor_authority() {
         0
     );
     let (expected, bytes) = frame(vec![7; 512 * 1024]);
+    let cutoff = Instant::now() + Duration::from_secs(2);
     let sender = std::thread::spawn(move || {
-        crate::linux::transport::send_until(
-            &writer,
-            &bytes,
-            &[write.as_raw_fd()],
-            Instant::now() + Duration::from_secs(2),
-        )
-        .unwrap()
+        crate::linux::transport::send_until(&writer, &bytes, &[write.as_raw_fd()], cutoff).unwrap()
     });
-    let (actual, rights, _) = crate::linux::transport::receive_public_until(
-        &reader,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap();
+    let (actual, rights, _) =
+        crate::linux::transport::receive_public_until(&reader, cutoff).unwrap();
     sender.join().unwrap();
     assert_eq!(actual, expected);
     assert_eq!(rights.len(), 1);
     drop(rights);
-    let mut byte = 0;
+    require_eof(&read, cutoff).unwrap();
+}
+
+#[test]
+fn eof_wait_accepts_closed_writer_and_rejects_a_persistent_writer() {
+    let (read, write) = pipe();
+    drop(write);
+    require_eof(&read, Instant::now() + Duration::from_secs(1)).unwrap();
+    let (read, _write) = pipe();
     assert_eq!(
-        unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) },
-        0
+        require_eof(&read, Instant::now() + Duration::from_millis(10))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn eof_wait_observes_synchronized_thread_closure_before_original_cutoff() {
+    let (read, write) = pipe();
+    let (send, receive) = std::sync::mpsc::sync_channel(0);
+    let closer = std::thread::spawn(move || {
+        receive.recv().unwrap();
+        drop(write);
+    });
+    let cutoff = Instant::now() + Duration::from_secs(1);
+    send.send(()).unwrap();
+    require_eof(&read, cutoff).unwrap();
+    closer.join().unwrap();
+}
+
+#[test]
+fn eof_wait_rejects_unexpected_payload() {
+    let (read, write) = pipe();
+    std::fs::File::from(write).write_all(&[1]).unwrap();
+    assert_eq!(
+        require_eof(&read, Instant::now() + Duration::from_secs(1))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
     );
 }

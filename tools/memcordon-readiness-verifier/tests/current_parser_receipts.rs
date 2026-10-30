@@ -74,7 +74,9 @@ fn index() -> EvidenceIndexV2 {
         assessment_failures: Vec::new(),
     }
 }
-fn vectors() -> Vec<(&'static str, &'static str, Vec<u8>, Vec<u8>, String)> {
+type ParserVector = (&'static str, &'static str, Vec<u8>, Vec<u8>, String);
+
+fn vectors() -> Vec<ParserVector> {
     let baseline = preparation();
     let base: Value = serde_json::from_slice(&baseline).unwrap();
     let mut rows = Vec::new();
@@ -93,7 +95,7 @@ fn vectors() -> Vec<(&'static str, &'static str, Vec<u8>, Vec<u8>, String)> {
             "unknown-variant" => changed["runtime"]["kind"] = json!("qualified-by-readiness"),
             "oversized-record" => {
                 changed["diagnostics"] =
-                    json!(["x".repeat(memcordon_core::execution_facts::RESULT_MAX_BYTES + 1)])
+                    json!(["x".repeat(current::parsers::OVERSIZED_DIAGNOSTIC_BYTES)])
             }
             "unsupported-result-format" => {
                 changed = json!({"format":"unsupported-result","revision":99});
@@ -255,6 +257,167 @@ struct Input {
     artifact_root: PathBuf,
     artifact_prefix: String,
     challenge: Vec<u8>,
+}
+
+#[test]
+fn current_capture_retains_exact_large_rejection_inputs_under_closed_purpose_bounds() {
+    use current::parsers::{
+        CAPTURE_FILE_COUNT, RESULT_INPUT_BYTES, TERMINAL_INPUT_BYTES, capture_inputs,
+        validate_capture_inventory,
+    };
+    use std::collections::BTreeMap;
+    assert_eq!(
+        RESULT_INPUT_BYTES,
+        memcordon_core::execution_facts::RESULT_MAX_BYTES
+    );
+    assert_eq!(
+        TERMINAL_INPUT_BYTES,
+        memcordon_core::WINDOWS_MAX_FRAME_BYTES
+    );
+    let prefix = "owned/current-parser/authority";
+    let manifest = format!("{prefix}/current-manifest.toml");
+    let mut files = BTreeMap::from([(manifest.clone(), MANIFEST.to_vec())]);
+    let observations = vectors()
+        .into_iter()
+        .map(|(scenario, operation, base, changed, refusal)| {
+            let base_input = format!("{prefix}/{scenario}-base.json");
+            let mutated_input = format!("{prefix}/{scenario}-mutated.json");
+            files.insert(base_input.clone(), base);
+            files.insert(mutated_input.clone(), changed);
+            ParserMutationV2 {
+                scenario: scenario.into(),
+                operation: operation.into(),
+                base_input,
+                mutated_input,
+                actual_refusal: refusal,
+                baseline_accepted: true,
+                data_only: true,
+                baseline_profile_ready: false,
+            }
+        })
+        .collect();
+    let target = match (std::env::consts::ARCH, cfg!(windows)) {
+        ("aarch64", true) => "aarch64-pc-windows-msvc",
+        ("x86_64", true) => "x86_64-pc-windows-msvc",
+        ("aarch64", false) => "aarch64-unknown-linux-gnu",
+        _ => "x86_64-unknown-linux-gnu",
+    };
+    let receipt = ParserReceiptV2 {
+        format: "memcordon.native-parser-mutation-receipt".into(),
+        revision: 2,
+        run_id: "data-only".into(),
+        recipe_id: "data-only".into(),
+        test_name: current::parsers::TEST_NAME.into(),
+        native_target: target.into(),
+        executable_sha256: "1".repeat(64),
+        challenge_sha256: "2".repeat(64),
+        manifest,
+        observations,
+    };
+    let reads = std::cell::RefCell::new(Vec::new());
+    let read = |path: &str, bound: usize| {
+        reads.borrow_mut().push((path.to_string(), bound));
+        let bytes = files.get(path).ok_or("input absent")?;
+        if bytes.len() > bound {
+            return Err("purpose bound exceeded".into());
+        }
+        Ok(bytes.clone())
+    };
+    let captured =
+        capture_inputs(&receipt, prefix, env!("CARGO_PKG_VERSION"), target, &read).unwrap();
+    assert_eq!(captured.len() + 1, CAPTURE_FILE_COUNT);
+    let index = format!("{prefix}/duplicate-case-base.json");
+    assert!(captured[&index].len() > 256 * 1024);
+    let oversized = format!("{prefix}/oversized-record-mutated.json");
+    assert!(captured[&oversized].len() > RESULT_INPUT_BYTES);
+    assert!(memcordon_core::result_v3::ResultV3::parse(&captured[&oversized]).is_err());
+    let reads = reads.borrow();
+    assert_eq!(
+        reads.iter().find(|(path, _)| path == &index).unwrap().1,
+        memcordon_readiness_verifier::MAX_INDEX_BYTES
+    );
+    assert_eq!(
+        reads.iter().find(|(path, _)| path == &oversized).unwrap().1,
+        captured[&oversized].len()
+    );
+    let mut names = captured
+        .keys()
+        .map(|path| {
+            path.strip_prefix(&format!("{prefix}/"))
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    names.push("native-receipt.json".into());
+    validate_capture_inventory(prefix, &captured, &names).unwrap();
+    let mut wrong = names.clone();
+    wrong.pop();
+    assert!(validate_capture_inventory(prefix, &captured, &wrong).is_err());
+    wrong = names.clone();
+    wrong.push("unlisted-large.bin".into());
+    assert!(validate_capture_inventory(prefix, &captured, &wrong).is_err());
+    wrong = names.clone();
+    wrong[0] = wrong[1].clone();
+    assert!(validate_capture_inventory(prefix, &captured, &wrong).is_err());
+    drop(reads);
+    drop(captured);
+    for (kind, replacement) in [
+        ("alias", format!("{prefix}/duplicate-key-base.json")),
+        ("escape", "../outside.json".into()),
+        ("unexpected", format!("{prefix}/unlisted-large.bin")),
+    ] {
+        let mut changed = receipt.clone();
+        changed.observations[1].base_input = replacement;
+        assert!(
+            capture_inputs(&changed, prefix, env!("CARGO_PKG_VERSION"), target, &read).is_err(),
+            "{kind}"
+        );
+    }
+    let mut incomplete = receipt.clone();
+    incomplete.observations.pop();
+    assert!(
+        capture_inputs(
+            &incomplete,
+            prefix,
+            env!("CARGO_PKG_VERSION"),
+            target,
+            &read
+        )
+        .is_err()
+    );
+    let oversized_limit = files[&oversized].len();
+    assert!(
+        capture_inputs(
+            &receipt,
+            prefix,
+            env!("CARGO_PKG_VERSION"),
+            target,
+            &|path, bound| {
+                if path == oversized {
+                    Ok(vec![b'x'; oversized_limit + 1])
+                } else {
+                    read(path, bound)
+                }
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        capture_inputs(
+            &receipt,
+            prefix,
+            env!("CARGO_PKG_VERSION"),
+            target,
+            &|path, bound| {
+                if path == oversized {
+                    Ok(vec![b'x'; oversized_limit])
+                } else {
+                    read(path, bound)
+                }
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]

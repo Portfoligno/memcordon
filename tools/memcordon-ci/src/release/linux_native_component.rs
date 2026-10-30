@@ -727,23 +727,10 @@ impl NativeAdminScope {
                 "held original native retirement bytes differ from named readback".into(),
             ));
         }
-        memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
-            .map_err(CiError::Message)?;
-        let receipt: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let visited = receipt["visited_entries"]
-            .as_u64()
-            .filter(|count| *count <= 131072)
-            .ok_or_else(|| {
-                CiError::Message("retired native entry observation exceeds bound".into())
-            })?;
-        if receipt
-            != serde_json::json!({"format":"memcordon.owned-readiness-admin-retirement","revision":1,
-            "path":path,"device":device,"inode":inode,"native_root_links":0,"named_absent":true,"parent_synced":true,"visited_entries":visited})
-        {
-            return Err(CiError::Message(
-                "prior native retirement receipt association differs".into(),
-            ));
-        }
+        crate::native_retirement::NativeSourceRetirement::decode_bound(
+            &bytes, &path, device, inode,
+        )
+        .map_err(CiError::Message)?;
         let named = fs::symlink_metadata(receipt_path)?;
         if (named.dev(), named.ino()) != (metadata.dev(), metadata.ino())
             || held.metadata()?.nlink() != 1
@@ -1081,10 +1068,13 @@ impl NativeAdminScope {
             &serde_json::json!({"device":metadata.dev(),"inode":metadata.ino()}),
             deadline,
         )?;
-        Ok(
-            serde_json::json!({"format":"memcordon.native-source-retirement","revision":1,
-            "path":self.path,"device":metadata.dev(),"inode":metadata.ino(),"absent":true}),
-        )
+        Ok(serde_json::to_value(
+            crate::native_retirement::NativeSourceRetirement::observed(
+                self.path.clone(),
+                metadata.dev(),
+                metadata.ino(),
+            ),
+        )?)
     }
 }
 

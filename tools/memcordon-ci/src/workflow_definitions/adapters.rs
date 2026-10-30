@@ -1249,7 +1249,49 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
     early_source_checks(workflow, name)?;
     apply_feedback(workflow, name)?;
     super::source_seed::apply(workflow, name)?;
+    retain_namespace_modules(workflow)?;
     apply_budgets(workflow, name)?;
+    Ok(())
+}
+
+/// Passive failed-call evidence is independent of cache/build success. Keep it
+/// after execution in every Windows-capable job, including early feedback.
+fn retain_namespace_modules(workflow: &mut Value) -> Result<()> {
+    for (_, job) in workflow["jobs"].as_mapping_mut().expect("source jobs") {
+        if !selected_hosts(job).unwrap_or_default().contains(&true) {
+            continue;
+        }
+        let Some(steps) = job["steps"].as_sequence_mut() else {
+            continue;
+        };
+        let covered = steps.iter().any(|step| {
+            (field(step, "uses") == "./.github/actions/upload-artifact"
+                || field(step, "uses").starts_with("actions/upload-artifact@"))
+                && ["always()", "!cancelled()", "failure()"]
+                    .iter()
+                    .any(|guard| field(step, "if").contains(guard))
+                && field(&step["with"], "path").lines().any(|path| {
+                    matches!(
+                        path.trim_end_matches('/'),
+                        "target/ci/reports" | "target/ci/reports/namespace-win32"
+                    )
+                })
+        });
+        if covered {
+            continue;
+        }
+        steps.push(object(&[
+            ("name", text("Retain passive Win32 module evidence")),
+            ("if", text("always() && runner.os == 'Windows'")),
+            ("uses", text("./.github/actions/upload-artifact")),
+            ("with", object(&[
+                ("name", text("namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}")),
+                ("path", text("target/ci/reports/namespace-win32")),
+                ("if-no-files-found", text("ignore")),
+                ("retention-days", Value::Number(7.into())),
+            ])),
+        ]));
+    }
     Ok(())
 }
 

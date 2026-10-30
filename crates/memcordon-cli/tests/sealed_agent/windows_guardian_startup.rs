@@ -295,23 +295,29 @@ fn structured_bootstrap_rejection_is_preserved_while_guardian_is_live() {
     // SAFETY: the current process pseudo-handle remains live throughout the test.
     let process = unsafe { GetCurrentProcess() };
     let identity = crate::windows::process::process_identity(process).unwrap();
-    crate::windows::pipe::write_frame(
-        writer.raw(),
-        &crate::windows::guardian::GuardianBootstrapMessageV1::Rejected {
-            binding: None,
-            subphase: GuardianStartupSubphase::ProcessPolicyReadback,
-            role: None,
-            native_code: Some(5),
-            detail_class: "policy-attestation".to_owned(),
-        },
-    )
-    .unwrap();
-    let error = crate::windows::process::guardian_bootstrap_frame_for_test(
+    let writer = std::thread::spawn(move || {
+        crate::windows::pipe::write_frame(
+            writer.raw(),
+            &crate::windows::guardian::GuardianBootstrapMessageV1::Rejected {
+                binding: None,
+                subphase: GuardianStartupSubphase::ProcessPolicyReadback,
+                role: None,
+                native_code: Some(5),
+                detail_class: "policy-attestation".to_owned(),
+            },
+        )
+    });
+    let result = crate::windows::process::guardian_bootstrap_frame_for_test(
         reader.raw(),
         process,
         &identity,
-    )
-    .unwrap_err();
+    );
+    if !matches!(&result, Err(error) if error.outcome == crate::windows::process::GuardianBootstrapOutcome::ChildRejected)
+    {
+        drop(reader);
+    }
+    writer.join().expect("writer settled").unwrap();
+    let error = result.unwrap_err();
     assert_eq!(
         error.outcome,
         crate::windows::process::GuardianBootstrapOutcome::ChildRejected

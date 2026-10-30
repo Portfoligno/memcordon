@@ -7,6 +7,12 @@ use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Resolver<'a> = &'a dyn Fn(&str) -> VerificationResult<Vec<u8>>;
+
+struct CaseArtifacts<'a> {
+    directory: &'a str,
+    evidence: &'a CaseEvidenceV2,
+    resolve: Resolver<'a>,
+}
 #[path = "windows_resources.rs"]
 mod resources;
 pub use resources::special_resource_digest;
@@ -196,6 +202,20 @@ pub(super) fn request(bytes: &[u8]) -> VerificationResult<(Value, String)> {
         value,
         crate::sha256(&serde_json::to_vec(&request).map_err(|error| error.to_string())?),
     ))
+}
+
+/// Validate the same selected-runtime guardian receipt used by current readiness.
+/// This is supplied receipt validation, not a replacement native observation.
+pub fn validate_guardian_quiescence(
+    value: &Value,
+    agent_hash: &str,
+    manifest_hash: &str,
+) -> VerificationResult<()> {
+    guardian(
+        value,
+        &json!({"runtime_manifest_sha256":manifest_hash}),
+        agent_hash,
+    )
 }
 
 fn guardian(value: &Value, expected: &Value, agent_hash: &str) -> VerificationResult<()> {
@@ -1545,7 +1565,7 @@ fn special_case(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if positions.len() != 1
-        || argv.get(0) != Some(&"+4GiB".encode_utf16().collect::<Vec<_>>())
+        || argv.first() != Some(&"+4GiB".encode_utf16().collect::<Vec<_>>())
         || argv.get(1) != Some(&"+120s".encode_utf16().collect::<Vec<_>>())
         || argv.get(2) != Some(&"--sealed".encode_utf16().collect::<Vec<_>>())
         || positions[0] + 3 != argv.len()
@@ -2787,10 +2807,13 @@ fn validate_drain_case(
     prepared: &Value,
     native: &Value,
     cancel: &Value,
-    directory: &str,
-    evidence: &CaseEvidenceV2,
-    resolve: Resolver<'_>,
+    case: CaseArtifacts<'_>,
 ) -> VerificationResult<()> {
+    let CaseArtifacts {
+        directory,
+        evidence,
+        resolve,
+    } = case;
     let mut required = [
         "drain.json",
         "drain-recovery.json",
@@ -3840,9 +3863,11 @@ fn current_held_cancel(
             &prepared,
             &native,
             &cancel,
-            &directory,
-            evidence,
-            resolve,
+            CaseArtifacts {
+                directory: &directory,
+                evidence,
+                resolve,
+            },
         )?;
     } else if input["drain_artifacts"] != json!({}) {
         return Err("non-drain case invents current package operation".into());
@@ -4024,10 +4049,13 @@ fn validate_interrupted_current(
     provider: &Value,
     product: &ProductObservationV2,
     recovery: &Value,
-    directory: &str,
-    evidence: &CaseEvidenceV2,
-    resolve: Resolver<'_>,
+    case: CaseArtifacts<'_>,
 ) -> VerificationResult<()> {
+    let CaseArtifacts {
+        directory,
+        evidence,
+        resolve,
+    } = case;
     let current = &owner["current"];
     let value = &phase["interrupted"];
     fields(
@@ -4640,9 +4668,11 @@ fn package_case(
             &provider(product, resolve)?,
             product,
             &input["recovery_artifacts"],
-            &directory,
-            evidence,
-            resolve,
+            CaseArtifacts {
+                directory: &directory,
+                evidence,
+                resolve,
+            },
         )?;
         if !String::from_utf8_lossy(&resolve(&evidence.stderr)?)
             .contains("MCSEALED-WINDOWS-UPGRADE-ROLLBACK-FAILED")

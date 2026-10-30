@@ -29,6 +29,9 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 impl Snapshot {
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
     pub fn new(bytes: Vec<u8>, native_length: u32) -> io::Result<Self> {
         Self::capture(bytes, native_length, 7)
     }
@@ -90,6 +93,98 @@ pub enum LabelObservation {
     Unavailable(LabelUnavailable),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadbackObservation {
+    NotRequested,
+    Present(Snapshot),
+    Unavailable {
+        raw_error: Option<i32>,
+        deadline: bool,
+    },
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum AuthzObservation {
+    Unavailable {
+        stage: &'static str,
+        reason: memcordon_core::BoundedText<512>,
+        raw_error: Option<i32>,
+        deadline: bool,
+    },
+    Evaluated {
+        engine: &'static str,
+        scope: &'static str,
+        diagnostic_only: bool,
+        acceptance_authority: bool,
+        sampling: &'static str,
+        descriptor_sha256: String,
+        desired_access: u32,
+        source_token_id: u64,
+        source_modified_id: u64,
+        context_matches: bool,
+        user_matches: bool,
+        groups_match: bool,
+        restricted_match: bool,
+        privileges_match: bool,
+        source_unchanged: bool,
+        api_success: bool,
+        native_error: Option<i32>,
+        reply_error: Option<u32>,
+        granted: Option<u32>,
+        conclusion: &'static str,
+    },
+}
+impl AuthzObservation {
+    pub fn unavailable(stage: &'static str, error: &io::Error) -> Self {
+        Self::Unavailable {
+            stage,
+            reason: memcordon_core::BoundedText::new(&error.to_string()).unwrap_or_else(|_| {
+                memcordon_core::BoundedText::new("diagnostic reason exceeds bound")
+                    .expect("fixed reason fits")
+            }),
+            raw_error: error.raw_os_error(),
+            deadline: error.kind() == io::ErrorKind::TimedOut,
+        }
+    }
+    pub fn conclusion(correlated: bool, api: bool, error: u32, granted: u32) -> &'static str {
+        if !correlated {
+            "uncorrelated"
+        } else if !api {
+            "api-failure"
+        } else if error == 0 && granted == 0x0010_0000 {
+            "supplied-data-allow"
+        } else if error == 5 && granted == 0 {
+            "supplied-data-denial"
+        } else {
+            "inconsistent"
+        }
+    }
+}
+
+fn readback_value(readback: &ReadbackObservation, original: &Snapshot) -> io::Result<Value> {
+    Ok(match readback {
+        ReadbackObservation::NotRequested => {
+            json!({"state":"not-requested","reason":"no-original-event-open-failure"})
+        }
+        ReadbackObservation::Present(snapshot) => {
+            if snapshot.information != 7 {
+                return Err(refused());
+            }
+            json!({"state":"present","phase":"post-failure","source":"same-retained-controller-event-handle",
+                "sampling":"sequential-non-atomic","security_information":snapshot.information,
+                "native_length":snapshot.native_length,"sha256":snapshot.sha256,
+                "bytes_equal_prelaunch":snapshot.bytes == original.bytes,
+                "hash_equal_prelaunch":snapshot.sha256 == original.sha256,
+                "native_bytes_retained":false})
+        }
+        ReadbackObservation::Unavailable {
+            raw_error,
+            deadline,
+        } => json!({"state":"unavailable","raw_error":raw_error,"deadline":deadline}),
+    })
+}
+
 fn snapshot_value(snapshot: &Snapshot) -> Value {
     json!({"phase":"prelaunch","security_information":snapshot.information,
         "native_length":snapshot.native_length(),"sha256":snapshot.sha256,
@@ -110,6 +205,7 @@ pub struct Association<'a> {
     >,
     pub parent_default_acl_bytes: &'a Option<Vec<u8>>,
     pub label: &'a LabelObservation,
+    pub post_failure: &'a ReadbackObservation,
 }
 pub fn failure(association: &Association<'_>, snapshot: &Snapshot) -> io::Result<Value> {
     protocol::encode_request(association.request)?;
@@ -180,6 +276,12 @@ pub fn failure(association: &Association<'_>, snapshot: &Snapshot) -> io::Result
             json!({"state":"unavailable","requested_information":16,"reason":reason})
         }
     };
+    if !matches!(association.post_failure, ReadbackObservation::NotRequested)
+        && association.response.phase != protocol::Phase::Event
+    {
+        return Err(refused());
+    }
+    let post_failure = readback_value(association.post_failure, snapshot)?;
     // Keep the exact original native core separate from independently bounded
     // optional observations. These are not a normalized replacement wire frame.
     let mut core = serde_json::to_value(association.response).map_err(|_| refused())?;
@@ -201,10 +303,11 @@ pub fn failure(association: &Association<'_>, snapshot: &Snapshot) -> io::Result
             "default_acl_bytes":association.parent_default_acl_bytes},
         "security_snapshot":snapshot_value(snapshot),
         "label_snapshot":label,
-        "post_failure_security_readback_observed":false,
+        "post_failure_security_readback":post_failure,
+        "post_failure_security_readback_observed":matches!(association.post_failure, ReadbackObservation::Present(_)),
         "cross_process_event_identity_observed":false,
         "cleanup_observed":false,
-        "interpretation":"already-read original controller event bytes; no native security verdict or completed identity/cleanup proof"
+        "interpretation":"original retained controller event snapshots; no named-open access verdict or completed cross-process identity/cleanup proof"
     });
     // Optional observations are all-or-unavailable; never truncate the existing
     // authoritative original descriptor or change a native result to fit.

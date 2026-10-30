@@ -3,6 +3,7 @@
 #![cfg(windows)]
 use crate::windows_installed_cases::{InstalledWindowsPayload, WindowsLeaseDeadlines};
 use crate::{CiError, Result};
+use crate::{current_command_evidence, windows_current_arguments as arguments};
 use memcordon_core::{
     WindowsProcessIdentityV1, WindowsProviderRequestV4, WindowsWorkloadPreparedV1,
 };
@@ -140,15 +141,14 @@ fn run_preallocation(
         );
     }
     command
-        .args(["--boundary", "sealed", "--workload-request"])
-        .arg(&request)
-        .arg("--workload-observation-directory")
-        .arg(&observations)
-        .args(["--report-format", "result-v3", "--report"])
-        .arg(&report)
-        .arg("--")
-        .arg(&config.fixture.path)
-        .args(["exit", "--code", "0"])
+        .args(arguments::preallocation(
+            &arguments::Paths {
+                request: &request,
+                report: &report,
+                fixture: &config.fixture.path,
+            },
+            &observations,
+        ))
         .stdin(std::process::Stdio::null());
     let invocation = serde_json::json!({"format":"memcordon.windows-current-control-invocation","revision":1,"scenario":"before-preparation","program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),"argv_utf16":command.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),"cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"cli_sha256":config.cli.sha256,"fixture_sha256":config.fixture.sha256,"work_deadline_unix_millis":deadlines.work_deadline_unix_millis,"cleanup_deadline_unix_millis":deadlines.cleanup_deadline_unix_millis,"environment_cleared":true,"frontend_environment":frontend_environment});
     write_new(
@@ -172,7 +172,7 @@ fn run_preallocation(
                 if accepted.frontend!=identity{return Err(io::Error::other("preallocation frontend identity differs from original child handle"));}
                 write_new(&callback_directory.join("accepted.json"),&bytes).map_err(io::Error::other)?;break accepted;
             }
-            if Instant::now()>=original_cutoff||frontend.wait()?!=windows_sys::Win32::Foundation::WAIT_TIMEOUT{return Err(io::Error::other("original preallocation/frontend cutoff exhausted"));}
+            current_command_evidence::require_frontend_pending("preallocation association",Instant::now()>=original_cutoff,||frontend.wait())?;
             std::thread::sleep(Duration::from_millis(5));
         };
         let native_request=fs::read(observations.join(format!("{}.request.json",accepted.attempt_id)))?;
@@ -195,7 +195,7 @@ fn run_preallocation(
         write_new(&callback_directory.join("native-cancellation.json"),&raw).map_err(io::Error::other)?;
         write_new(&callback_directory.join("native.json"),&serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-current-preallocation-native","revision":1,"frontend":identity,"accepted_sha256":accepted.canonical_sha256().map_err(io::Error::other)?,"cancel_sha256":crate::windows_causal_acceptance::sha256(&cancel),"cancellation_sha256":crate::windows_causal_acceptance::sha256(&raw)})).map_err(io::Error::other)?).map_err(io::Error::other)?;
         Ok(())
-    }).map_err(|error|CiError::Message(error.to_string()))?;
+    }).map_err(|error|current_command_evidence::into_ci_error(&directory,error,4*1024*1024))?;
     write_new(&directory.join("stdout.bin"), &output.stdout)?;
     write_new(&directory.join("stderr.bin"), &output.stderr)?;
     let native_status = output
@@ -274,28 +274,20 @@ fn run_held(
             std::ffi::OsString::from_wide(&entry.value),
         );
     }
+    let pid_file = directory.join("target-started.json");
     command
         .current_dir(&directory)
-        .args(["--boundary", "sealed", "--workload-request"])
-        .arg(&request)
-        .arg("--workload-observation-directory")
-        .arg(&observation_directory)
-        .arg("--report-format")
-        .arg("result-v3")
-        .arg("--report")
-        .arg(&report)
-        .arg("--windows-terminal-observation")
-        .arg(&terminal)
-        .arg("--")
-        .arg(&config.fixture.path)
+        .args(arguments::held(
+            &arguments::Paths {
+                request: &request,
+                report: &report,
+                fixture: &config.fixture.path,
+            },
+            &observation_directory,
+            &terminal,
+            after_release.then_some(pid_file.as_path()),
+        ))
         .stdin(std::process::Stdio::null());
-    if after_release {
-        command
-            .args(["hold", "--duration", "240s", "--pid-file"])
-            .arg(directory.join("target-started.json"));
-    } else {
-        command.args(["exit", "--code", "0"]);
-    }
     let invocation = serde_json::json!({"format":"memcordon.windows-current-control-invocation","revision":1,"scenario":if during_drain {"during-drain"} else if after_release {"after-release"} else {"held-before-release"},"program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),"argv_utf16":command.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),"cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"cli_sha256":config.cli.sha256,"fixture_sha256":config.fixture.sha256,"work_deadline_unix_millis":deadlines.work_deadline_unix_millis,"cleanup_deadline_unix_millis":deadlines.cleanup_deadline_unix_millis,"environment_cleared":true,"frontend_environment":frontend_environment});
     write_new(
         &directory.join("invocation.json"),
@@ -327,7 +319,7 @@ fn run_held(
                 write_new(&callback_directory.join("accepted.json"),&bytes).map_err(io::Error::other)?;
                 break accepted;
             }
-            if Instant::now()>=original_cutoff || frontend.wait()?!=windows_sys::Win32::Foundation::WAIT_TIMEOUT { return Err(io::Error::other("original preallocation/frontend cutoff exhausted")); }
+            current_command_evidence::require_frontend_pending("preallocation association",Instant::now()>=original_cutoff,||frontend.wait())?;
             std::thread::sleep(Duration::from_millis(5));
         };
         let preparation_ack=WindowsProviderRequestV4::PreparationAcknowledged { schema_version:memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,attempt_id:accepted.attempt_id.clone(),nonce:accepted.nonce.clone(),request_sha256:accepted.request_sha256.clone(),accepted_sha256:accepted.canonical_sha256().map_err(io::Error::other)? };
@@ -348,7 +340,7 @@ fn run_held(
                 write_new(&callback_directory.join("prepared.json"), &bytes).map_err(io::Error::other)?;
                 break prepared;
             }
-            if Instant::now() >= original_cutoff || frontend.wait()? != windows_sys::Win32::Foundation::WAIT_TIMEOUT { return Err(io::Error::other("original frontend/preparation cutoff exhausted")); }
+            current_command_evidence::require_frontend_pending("workload preparation",Instant::now()>=original_cutoff,||frontend.wait())?;
             std::thread::sleep(Duration::from_millis(5));
         };
         let target = HeldProcess::open(prepared.target.process_id)?;
@@ -459,7 +451,7 @@ fn run_held(
         }
         write_new(&callback_directory.join("native.json"), &serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-current-control-native","revision":1,"frontend":frontend_identity,"target":target_identity,"target_wait_before_cancel":before_cancel,"target_wait_after_cancel":target_wait,"prepared_sha256":prepared.canonical_sha256().map_err(io::Error::other)?,"cancel_sha256":crate::windows_causal_acceptance::sha256(&cancellation_bytes)})).map_err(io::Error::other)?).map_err(io::Error::other)?;
         Ok(())
-    }).map_err(|error|CiError::Message(error.to_string()))?;
+    }).map_err(|error|current_command_evidence::into_ci_error(&directory,error,4*1024*1024))?;
     write_new(&directory.join("stdout.bin"), &output.stdout)?;
     write_new(&directory.join("stderr.bin"), &output.stderr)?;
     let native_status = output

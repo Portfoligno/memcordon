@@ -148,13 +148,75 @@ fn inputs(root: &Path, kind: Kind) -> Result<Inputs> {
     })
 }
 
-fn manifest(kind: Kind) -> &'static str {
+pub(crate) fn manifest(kind: Kind) -> &'static str {
     match kind {
         Kind::Readiness => "target/ci-preparation/readiness.json",
         Kind::Private => "target/ci-preparation/private.json",
         Kind::PrivateDriver => "target/ci-preparation/private-driver.json",
         Kind::ReleaseFuzz => "target/ci-preparation/release-fuzz.json",
     }
+}
+
+pub struct OwnerProbeBinding<'a> {
+    pub kind: Kind,
+    pub source_commit: &'a str,
+    pub version: &'a str,
+    pub host: &'a str,
+    pub run: &'a str,
+    pub image_sha256: &'a str,
+    pub image_size: u64,
+}
+
+/// Capture the exact checked transport before privilege reentry can drop CI context.
+pub fn checked_owner_preparation(root: &Path, kind: Kind) -> Result<Vec<u8>> {
+    if !matches!(kind, Kind::Readiness | Kind::Private) {
+        return Err(invalid("unsupported owner preparation origin"));
+    }
+    let expected = inputs(root, kind)?;
+    let bytes = read(root, Path::new(manifest(kind)), RECORD_LIMIT)?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes).map_err(CiError::Message)?;
+    let record: Record = serde_json::from_slice(&bytes)?;
+    validate(root, &record, &expected)?;
+    Ok(bytes)
+}
+
+/// The owning route selects the origin; transported bytes never select it.
+pub fn validate_owner_probe_preparation(
+    bytes: &[u8],
+    expected: &OwnerProbeBinding<'_>,
+) -> Result<()> {
+    if !matches!(expected.kind, Kind::Readiness | Kind::Private)
+        || bytes.len() as u64 > RECORD_LIMIT
+    {
+        return Err(invalid("unsupported owner preparation origin/extent"));
+    }
+    memcordon_core::canonical_json::reject_duplicate_json_keys(bytes).map_err(CiError::Message)?;
+    let record: Record = serde_json::from_slice(bytes)?;
+    record.inputs.source.validate()?;
+    let mut controllers = record
+        .files
+        .iter()
+        .filter(|file| file.path == "target/ci-runtime/current/memcordon-ci");
+    let controller = controllers.next();
+    if record.format != FORMAT
+        || record.inputs.kind != expected.kind
+        || record.inputs.source.commit() != expected.source_commit
+        || record.inputs.source.version().to_string() != expected.version
+        || record.inputs.host != expected.host
+        || record.inputs.producer != producer(expected.kind, expected.host)?
+        || record.inputs.invocation.run != expected.run
+        || controllers.next().is_some()
+        || controller.is_none_or(|file| {
+            !file.executable
+                || file.size != expected.image_size
+                || file.sha256 != expected.image_sha256
+        })
+    {
+        return Err(invalid(
+            "owner controller preparation origin/source/host/run/bytes differ",
+        ));
+    }
+    Ok(())
 }
 
 fn read(root: &Path, relative: &Path, limit: u64) -> Result<Vec<u8>> {

@@ -21,7 +21,7 @@ fn narrow_commands_select_only_the_actual_fixture_binary_and_exact_native_test()
     assert_eq!(plan::TARGET_DIR, "target/ci/windows-fixture-native");
     assert_eq!(
         plan::TEST_SELECTOR,
-        "fresh_restricted_primary_opens_owned_namespace_without_inherited_gate_capabilities"
+        "fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities"
     );
     assert_eq!(compile.arguments, [base.as_slice(), &["--no-run"]].concat());
     assert_eq!(

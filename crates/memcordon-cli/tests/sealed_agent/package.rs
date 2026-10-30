@@ -189,16 +189,15 @@ fn optional_network_launcher_is_package_owned_but_not_an_active_profile() {
         cfg!(feature = "private-tcp"),
     )
     .unwrap();
-    match manifest.sealed {
+    let included = match manifest.sealed {
         SealedRuntimeV2::Included { profile, .. } => {
-            assert!(cfg!(feature = "private-tcp"));
             assert_eq!(profile, "linux-private-workload-v1");
+            true
         }
-        SealedRuntimeV2::CredentialPreservingLinux { .. } => {
-            assert!(!cfg!(feature = "private-tcp"))
-        }
+        SealedRuntimeV2::CredentialPreservingLinux { .. } => false,
         SealedRuntimeV2::NotIncluded => panic!("Linux runtime omitted"),
-    }
+    };
+    assert_eq!(included, cfg!(feature = "private-tcp"));
 }
 
 #[test]
