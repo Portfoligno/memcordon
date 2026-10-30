@@ -8,7 +8,6 @@ use memcordon_core::{BoundedVec, identifiers::LogicalId, workload_request::Priva
 use std::{
     fs,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
 };
 pub(super) fn allocations() -> Result<serde_json::Value> {
     let mut observations = Vec::new();

@@ -340,7 +340,7 @@ fn before_preparation_experiment(
         challenge.into(),
     ];
     use std::os::unix::ffi::OsStrExt;
-    let invocation = json!({"format":"memcordon.current-preparation-invocation","revision":1,"installed_cli":caller.installed_cli,"caller_uid":caller.uid,"caller_gid":caller.gid,"memory_token":memory.as_bytes(),"memory_bytes":memory_bytes,"deadline_token":"+30s","lifetime":"command","request_path":fixture.request,"input_path":fixture.bundle,"entrypoint":"owned-readiness","arguments":NativeArguments::UnixBytes(arguments.iter().map(|value|value.as_bytes().to_vec()).collect()),"report_format":"result-v3","request_sha256":fixture.request_sha256,"provider":provider});
+    let invocation = json!({"format":"memcordon.current-preparation-invocation","revision":1,"installed_cli":caller.installed_cli,"caller_uid":caller.uid,"caller_gid":caller.gid,"memory_token":memory.as_bytes(),"memory_bytes":memory_bytes,"deadline_token":"+30s","lifetime":"command","request_path":fixture.request,"input_path":fixture.bundle,"entrypoint":"owned-readiness","arguments":arguments.iter().map(|value|value.as_bytes().to_vec()).collect::<Vec<_>>(),"report_format":"result-v3","request_sha256":fixture.request_sha256,"provider":provider});
     let mut launch = RequestLaunch::start(LaunchInput {
         extra_descriptor: None,
         lifetime: memcordon_core::Lifetime::Command,
@@ -880,7 +880,7 @@ fn allocation_experiment(
                 ("provider-manifest.json".into(), manifest_bytes),
             ]);
             use std::os::unix::ffi::OsStrExt;
-            files.insert("operands.json".into(),serde_json::to_vec(&json!({"working_directory":null,"memory_bytes":memory_bytes,"deadline_millis":30000,"lifetime":"command","target_argv":NativeArguments::UnixBytes(arguments.iter().map(|argument|argument.as_bytes().to_vec()).collect())}))?);
+            files.insert("operands.json".into(),serde_json::to_vec(&json!({"working_directory":null,"memory_bytes":memory_bytes,"deadline_millis":30000,"lifetime":"command","target_argv":arguments.iter().map(|argument|argument.as_bytes().to_vec()).collect::<Vec<_>>()}))?);
             let blocked = permission.observation();
             super::source::write_json(
                 &controller.join(format!("current-attempt-{attempt}.json")),

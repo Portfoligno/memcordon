@@ -46,7 +46,7 @@ struct Inputs {
     components_only: bool,
 }
 
-fn fail(message: &str) -> CiError {
+fn fail(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
 }
 
@@ -820,7 +820,7 @@ fn execute(
         require_successful_output("completed workload acknowledgment", &acknowledged)?;
         let acknowledgment =
             memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&acknowledged.stdout)
-                .map_err(CiError::Message)?;
+                .map_err(|error| CiError::Message(error.to_string()))?;
         if acknowledgment.association != case.locator {
             return Err(fail(
                 "current acknowledgment refers to another actual workload",

@@ -12,6 +12,28 @@ fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+fn ordinary_policy_fixture() -> Value {
+    let generated: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/ci.yml")).unwrap();
+    let checkout = generated["jobs"]
+        .as_mapping()
+        .unwrap()
+        .values()
+        .flat_map(|job| job["steps"].as_sequence().unwrap())
+        .find_map(|step| {
+            step["uses"]
+                .as_str()
+                .filter(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("generated workflow pins checkout");
+    let mut fixture: Value = serde_yaml::from_str(
+        "name: Policy fixture\non: [push]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    steps:\n      - uses: checkout\n        with:\n          persist-credentials: false\n",
+    )
+    .unwrap();
+    fixture["jobs"]["check"]["steps"][0]["uses"] = Value::String(checkout.into());
+    fixture
+}
+
 #[test]
 fn workflow_mutation_fixture_is_checkout_eol_independent() {
     let lf = text_fixture::canonical_lf_utf8(
@@ -120,7 +142,7 @@ fn workflow_with_job_timeout(fixture: &str, job_id: &str, timeout_minutes: u64) 
 }
 
 #[test]
-fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
+fn deep_ci_fuzz_timeout_preserves_the_authored_bound() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
@@ -142,16 +164,16 @@ fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
         )
         .expect_err("a changed fuzz shard deadline must fail");
         assert!(
-            error.to_string().contains(&format!(
-                "job budget {timeout_minutes} does not cover emitted branch"
-            )),
+            error
+                .to_string()
+                .contains("workflow differs from current Rust authoring graph"),
             "unexpected workflow policy error: {error}"
         );
     }
 }
 
 #[test]
-fn deep_ci_miri_job_bound_includes_audit_and_cleanup_headroom() {
+fn deep_ci_miri_job_preserves_the_authored_bound() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
@@ -173,16 +195,16 @@ fn deep_ci_miri_job_bound_includes_audit_and_cleanup_headroom() {
         )
         .expect_err("a changed Miri job bound must fail");
         assert!(
-            error.to_string().contains(&format!(
-                "job budget {timeout_minutes} does not cover emitted branch"
-            )),
+            error
+                .to_string()
+                .contains("workflow differs from current Rust authoring graph"),
             "unexpected workflow policy error: {error}"
         );
     }
 }
 
 #[test]
-fn deep_ci_stress_job_bound_covers_cold_packages_lifecycle_and_audit() {
+fn deep_ci_stress_jobs_preserve_the_authored_bounds() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
@@ -216,9 +238,9 @@ fn deep_ci_stress_job_bound_covers_cold_packages_lifecycle_and_audit() {
         )
         .expect_err("a changed stress job bound must fail");
         assert!(
-            error.to_string().contains(&format!(
-                "job budget {timeout_minutes} does not cover emitted branch"
-            )),
+            error
+                .to_string()
+                .contains("workflow differs from current Rust authoring graph"),
             "unexpected workflow policy error: {error}"
         );
     }
@@ -288,7 +310,7 @@ fn windows_arm_native_matrix_entries_are_structurally_required() {
             assert!(
                 error
                     .to_string()
-                    .contains(&format!("{job} matrix entries differ")),
+                    .contains("workflow differs from current Rust authoring graph"),
                 "unexpected {job} policy error: {error}"
             );
         }
@@ -309,7 +331,7 @@ fn windows_arm_native_matrix_entries_are_structurally_required() {
         assert!(
             planted_error
                 .to_string()
-                .contains(&format!("{job} matrix entries differ")),
+                .contains("workflow differs from current Rust authoring graph"),
             "unexpected planted {job} policy error: {planted_error}"
         );
         let direct_runner = exact.replacen(
@@ -327,7 +349,7 @@ fn windows_arm_native_matrix_entries_are_structurally_required() {
         assert!(
             runner_error
                 .to_string()
-                .contains(&format!("{job} runner selection differs")),
+                .contains("workflow differs from current Rust authoring graph"),
             "unexpected {job} runner policy error: {runner_error}"
         );
     }
@@ -406,7 +428,31 @@ fn action_input_boolean_value_selection_is_rejected() {
     assert!(
         error
             .to_string()
-            .contains("workflow differs from its Rust step adapters"),
+            .contains("workflow differs from current Rust authoring graph"),
+        "unexpected policy error: {error}"
+    );
+    let mut ordinary = ordinary_policy_fixture();
+    let path = Path::new(".github/workflows/policy-fixture.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        path,
+        serde_yaml::to_string(&ordinary).unwrap().as_bytes(),
+        &repository_policy,
+    )
+    .expect("ordinary policy baseline must pass");
+    ordinary["jobs"]["check"]["steps"][0]["with"]["ref"] =
+        Value::String("${{ inputs.tag || github.ref }}".into());
+    let error = policy::validate_workflow_bytes(
+        &root,
+        path,
+        serde_yaml::to_string(&ordinary).unwrap().as_bytes(),
+        &repository_policy,
+    )
+    .expect_err("ordinary action inputs must reject Boolean value selection");
+    assert!(
+        error
+            .to_string()
+            .contains("workflow action input may not select values with Boolean operators"),
         "unexpected policy error: {error}"
     );
 }
@@ -429,6 +475,29 @@ fn named_github_environments_are_rejected() {
         &repository_policy,
     )
     .expect_err("named GitHub environments must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("workflow differs from current Rust authoring graph"),
+        "unexpected policy error: {error}"
+    );
+    let mut ordinary = ordinary_policy_fixture();
+    let path = Path::new(".github/workflows/policy-fixture.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        path,
+        serde_yaml::to_string(&ordinary).unwrap().as_bytes(),
+        &repository_policy,
+    )
+    .expect("ordinary policy baseline must pass");
+    ordinary["jobs"]["check"]["environment"] = Value::String("release".into());
+    let error = policy::validate_workflow_bytes(
+        &root,
+        path,
+        serde_yaml::to_string(&ordinary).unwrap().as_bytes(),
+        &repository_policy,
+    )
+    .expect_err("ordinary named environments must be rejected");
     assert!(
         error
             .to_string()

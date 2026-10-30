@@ -1,5 +1,4 @@
 //! Installed caller-byte workloads. No policy registry or image installation enters this driver.
-use super::installed_consumer::MaterializedPayload;
 use super::linux_request_fixture::{CallerRequestFixture, CallerSession, CallerSnapshot};
 use super::linux_request_launch::{LaunchInput, RequestLaunch};
 use crate::linux_consumer_readiness::HeldLinuxProcess;
@@ -8,7 +7,6 @@ use memcordon_core::workload_bundle::SnapshotManifestV1;
 use memcordon_core::workload_request::WorkloadAttemptAssociationV1;
 use memcordon_core::workload_request::{PrivateRootLayoutV1, RootRelativePath};
 use memcordon_core::{BoundedVec, PublicProviderBindingV1};
-use sha2::Digest;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};

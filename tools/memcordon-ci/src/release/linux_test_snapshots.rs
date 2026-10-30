@@ -1031,7 +1031,7 @@ fn run_corruptions(
         let terminal: Value = serde_json::from_slice(&recovery)?;
         let request_bytes = std::fs::read(&fixture.request)?;
         let request = memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
-            .map_err(CiError::Message)?;
+            .map_err(|error| CiError::Message(error.to_string()))?;
         if raw["release"] != "not-released"
             || raw["runtime"]["kind"] != "preparation-failed"
             || raw["outcome"]["kind"] != "launch-failure"
@@ -1039,7 +1039,11 @@ fn run_corruptions(
             || raw["delivery"] != "complete"
             || raw["cleanup"]["state"] != "complete"
             || raw["request"]["request_sha256"]
-                != serde_json::to_value(request.digest().map_err(CiError::Message)?)?
+                != serde_json::to_value(
+                    request
+                        .digest()
+                        .map_err(|error| CiError::Message(error.to_string()))?,
+                )?
             || raw["provider"] != serde_json::to_value(provider)?
             || raw["workload_attempt"] != serde_json::to_value(&association)?
             || terminal["association"] != serde_json::to_value(&association)?
@@ -1249,7 +1253,7 @@ fn acknowledge(caller: &CallerSession, case: &ExecutedCase, cleanup: Instant) ->
     crate::command::require_successful_output("current snapshot acknowledgment", &output)?;
     let response =
         memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&output.stdout)
-            .map_err(CiError::Message)?;
+            .map_err(|error| CiError::Message(error.to_string()))?;
     if response.association != case.locator {
         return Err(CiError::Message(
             "snapshot acknowledgment names a different attempt".into(),

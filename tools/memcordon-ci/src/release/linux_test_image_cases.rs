@@ -378,7 +378,7 @@ fn negative(
         let raw = serde_json::to_value(&result)?;
         let request_bytes = fs::read(&fixture.request)?;
         let request = memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
-            .map_err(fail)?;
+            .map_err(|error| fail(error.to_string()))?;
         if raw["release"] != "not-released"
             || raw["runtime"]["kind"] != "preparation-failed"
             || raw["outcome"]["kind"] != "launch-failure"
@@ -386,7 +386,7 @@ fn negative(
             || raw["delivery"] != "complete"
             || raw["cleanup"]["state"] != "complete"
             || raw["request"]["request_sha256"]
-                != serde_json::to_value(request.digest().map_err(fail)?)?
+                != serde_json::to_value(request.digest().map_err(|error| fail(error.to_string()))?)?
             || wait["status"] != 125
             || wait["raw_wait_status"] != 125 * 256
             || !stdout.is_empty()
@@ -449,7 +449,7 @@ fn negative(
         }
         if let (Some(association), Some(ack)) = (&association, ack) {
             let response = memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&ack)
-                .map_err(fail)?;
+                .map_err(|error| fail(error.to_string()))?;
             if response.association != *association {
                 return Err(fail(
                     "loader refusal acknowledgment names another actual attempt",
