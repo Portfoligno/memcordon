@@ -246,20 +246,39 @@ fn owner_probe(
                 );
                 Ok(())
             })?;
-    let child = child
-        .into_inner()
-        .expect("original peer query holder")
-        .ok_or_else(|| CiError::Message("actual peer child was not held before input".into()))?;
-    if !child.exited().map_err(CiError::Message)? {
-        return Err(CiError::Message(
-            "original peer child not retired after its direct wait".into(),
-        ));
-    }
-    let after: Vec<_> = held
-        .iter()
-        .map(|process| process.live_snapshot())
-        .collect::<std::result::Result<_, _>>()
-        .map_err(CiError::Message)?;
+    let native_result = crate::command::require_successful_output(
+        &format!("owner probe scenario={scenario}; image={probe:?}; arguments={args:?}"),
+        &observed,
+    );
+    let custody = (|| {
+        let child = child
+            .into_inner()
+            .expect("original peer query holder")
+            .ok_or_else(|| {
+                CiError::Message("actual peer child was not held before input".into())
+            })?;
+        if !child.exited().map_err(CiError::Message)? {
+            return Err(CiError::Message(
+                "original peer child not retired after its direct wait".into(),
+            ));
+        }
+        let after: Vec<_> = held
+            .iter()
+            .map(|process| process.live_snapshot())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(CiError::Message)?;
+        Ok((child, after))
+    })();
+    let (child, after) = match (native_result, custody) {
+        (Ok(()), Ok(custody)) => custody,
+        (Err(primary), Err(secondary)) => {
+            return Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            });
+        }
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => return Err(error),
+    };
     let image = artifacts::read_file(probe)?;
     let metadata = fs::symlink_metadata(probe)?;
     use std::os::unix::ffi::OsStrExt;
@@ -271,7 +290,19 @@ fn owner_probe(
             serde_json::to_vec(&observation)?,
         ),
         ("owner-input.json".into(), input_bytes),
-        ("owner-response.json".into(), artifacts::read_file(&output)?),
+        (
+            "owner-response.json".into(),
+            artifacts::read_file(&output).map_err(|error| {
+                error.context(format!(
+                    "owner probe scenario={scenario}: read response {output:?}; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-prefix={:?}; stderr-truncated={}",
+                    observed.status,
+                    observed.stdout.len(),
+                    observed.stderr.len(),
+                    String::from_utf8_lossy(&observed.stderr[..observed.stderr.len().min(2048)]),
+                    observed.stderr.len() > 2048,
+                ))
+            })?,
+        ),
         ("owner-stdout.bin".into(), observed.stdout),
         ("owner-stderr.bin".into(), observed.stderr),
     ]))

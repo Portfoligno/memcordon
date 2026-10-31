@@ -222,6 +222,32 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
     ))
 }
 
+fn command_root(
+    current: &Path,
+    command: &Option<TopLevel>,
+    workspace: impl FnOnce(&Path) -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    match command {
+        #[cfg(target_os = "linux")]
+        Some(
+            TopLevel::CurrentLinuxSnapshotProbe { .. } | TopLevel::CurrentLinuxOwnerProbe { .. },
+        ) => Ok(current.to_owned()),
+        Some(TopLevel::ExternalConsumer { .. }) => Ok(current.to_owned()),
+        Some(TopLevel::Release {
+            command:
+                memcordon_ci::release::ReleaseCommand::Publish { .. }
+                | memcordon_ci::release::ReleaseCommand::Inspect { .. }
+                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. }
+                | memcordon_ci::release::ReleaseCommand::RehearsalTransaction { .. },
+        }) => Ok(current.to_owned()),
+        _ => workspace(current),
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/private/standalone_dispatch.rs"]
+mod standalone_dispatch_tests;
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let backend = |suite: &Suite| {
@@ -256,19 +282,7 @@ fn run() -> Result<()> {
         .then(memcordon_ci::cancellation::Scope::install)
         .transpose()?;
     let current = std::env::current_dir()?;
-    let root = match &cli.command {
-        #[cfg(target_os = "linux")]
-        Some(TopLevel::CurrentLinuxSnapshotProbe { .. }) => current,
-        Some(TopLevel::ExternalConsumer { .. }) => current,
-        Some(TopLevel::Release {
-            command:
-                memcordon_ci::release::ReleaseCommand::Publish { .. }
-                | memcordon_ci::release::ReleaseCommand::Inspect { .. }
-                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. }
-                | memcordon_ci::release::ReleaseCommand::RehearsalTransaction { .. },
-        }) => current,
-        _ => workspace_root(&current)?,
-    };
+    let root = command_root(&current, &cli.command, workspace_root)?;
     let result = (|| match cli.command {
         #[cfg(target_os = "linux")]
         Some(TopLevel::CurrentLinuxOwnerProbe { input, output }) => {
