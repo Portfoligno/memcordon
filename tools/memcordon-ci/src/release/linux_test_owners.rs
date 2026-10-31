@@ -796,8 +796,8 @@ fn allocation_experiment(
                 || record["boot_id"]
                     != fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()
                 || record["release"] != "not-released"
-                || !record["namespace_init"].is_null()
-                || !record["target"].is_null()
+                || !crate::linux_allocation_checkpoint::acquired_guardian_ready(&record)
+                || record["cgroup"].is_null()
             {
                 return Err(CiError::Message(
                     "kernel allocation readback does not belong to the original pre-TargetGated-publication attempt"
@@ -823,11 +823,29 @@ fn allocation_experiment(
             let mut guardian = HeldLinuxProcess::acquire(guardian_pid, guardian_birth)
                 .map_err(CiError::Message)?;
             guardian.verify_parent(&worker).map_err(CiError::Message)?;
+            let acquire = |role: &str| -> Result<HeldLinuxProcess> {
+                let pid = u32::try_from(
+                    record[role]["pid"]
+                        .as_u64()
+                        .ok_or_else(|| CiError::Message(format!("original {role} PID absent")))?,
+                )
+                .map_err(|error| CiError::Message(error.to_string()))?;
+                let birth = record[role]["start_time"]
+                    .as_u64()
+                    .ok_or_else(|| CiError::Message(format!("original {role} birth absent")))?;
+                HeldLinuxProcess::acquire(pid, birth).map_err(CiError::Message)
+            };
+            let mut init = acquire("namespace_init")?;
+            init.verify_parent(&worker).map_err(CiError::Message)?;
+            let mut target = acquire("target")?;
+            target.verify_parent(&init).map_err(CiError::Message)?;
             let mut held = vec![
                 ("frontend", frontend),
                 ("worker", worker),
                 ("control", control),
                 ("guardian", guardian),
+                ("namespace_init", init),
+                ("target", target),
             ];
             let manifest_bytes = fs::read("/usr/libexec/memcordon-runtime-manifest.json")?;
             let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
@@ -889,6 +907,44 @@ fn allocation_experiment(
                         "partial native allocation inode differs from original protected record"
                             .into(),
                     ));
+                }
+                if role == "cgroup" {
+                    use std::io::Read;
+                    let members = fs::File::from(
+                        rustix::fs::openat(
+                            &file,
+                            "cgroup.procs",
+                            rustix::fs::OFlags::RDONLY
+                                | rustix::fs::OFlags::NOFOLLOW
+                                | rustix::fs::OFlags::CLOEXEC,
+                            rustix::fs::Mode::empty(),
+                        )
+                        .map_err(std::io::Error::from)?,
+                    );
+                    let mut bytes = String::new();
+                    members.take(65537).read_to_string(&mut bytes)?;
+                    if bytes.len() > 65536 {
+                        return Err(CiError::Message(
+                            "original allocation cgroup membership exceeds bound".into(),
+                        ));
+                    }
+                    let members = bytes
+                        .lines()
+                        .map(|line| {
+                            line.parse::<u32>().map_err(|error| {
+                                CiError::Message(format!("original cgroup member invalid: {error}"))
+                            })
+                        })
+                        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+                    for (role, process) in &held {
+                        if matches!(*role, "namespace_init" | "target")
+                            && !members.contains(&process.process_id)
+                        {
+                            return Err(CiError::Message(format!(
+                                "held original {role} is outside the pinned attempt cgroup"
+                            )));
+                        }
+                    }
                 }
                 resources.push(
                     json!({"role":role,"path":path,"device":identity.dev(),"inode":identity.ino()}),
@@ -977,7 +1033,7 @@ fn allocation_experiment(
                 Err(error) => return Err(error.into()),
             }
             for (role, process) in &held {
-                if *role == "guardian" {
+                if matches!(*role, "guardian" | "namespace_init" | "target") {
                     continue;
                 }
                 while !process.exited().map_err(CiError::Message)? {
@@ -990,11 +1046,12 @@ fn allocation_experiment(
                 }
             }
             let recovery = launch.recover()?;
-            files.insert(
-                "recovery.json".into(),
-                fs::read(directory.join("workload-recovery.json"))?,
-            );
-            files.insert("recovery-process.json".into(),serde_json::to_vec(&json!({"status":recovery.process.status.code(),"stdout":recovery.process.stdout,"stderr":recovery.process.stderr}))?);
+            files.insert("recovery.json".into(), recovery.raw_terminal.clone());
+            files.insert("recovery-process.json".into(),serde_json::to_vec(&json!({"status":recovery.process.status.code(),"stdout":&recovery.process.stdout,"stderr":&recovery.process.stderr}))?);
+            crate::command::require_successful_output(
+                &format!("allocation scenario={scenario}: original public recovery"),
+                &recovery.process,
+            )?;
             files.insert(
                 "journal-after.json".into(),
                 fs::read(Path::new("/var/lib/memcordon/workload-attempts").join(&attempt))?,
@@ -1012,16 +1069,20 @@ fn allocation_experiment(
             let retired:Vec<_>=held.iter().map(|(role,process)|json!({"role":role,"pid":process.process_id,"birth":process.birth,"pidfd_readable":true})).collect();
             files.insert("held-after.json".into(), serde_json::to_vec(&retired)?);
             let mut absent = Vec::new();
-            for (path, _) in &directories {
+            for (path, original) in &directories {
                 match fs::symlink_metadata(path) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         absent.push(json!({"path":path,"absent":true}))
                     }
                     Err(error) => return Err(error.into()),
                     Ok(_) => {
-                        return Err(CiError::Message(
-                            "original partial native directory remains".into(),
-                        ));
+                        let identity = original.metadata()?;
+                        return Err(CiError::Message(format!(
+                            "original partial native directory remains; path={}; original-device={}; original-inode={}",
+                            path.display(),
+                            identity.dev(),
+                            identity.ino()
+                        )));
                     }
                 }
             }

@@ -1,6 +1,8 @@
 //! Factual journal for request-based attempts. A parsed record never owns native resources.
 use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4};
 use super::private_lifecycle::PrivateNativeJournal;
+#[path = "private_acquisition.rs"]
+mod acquisition;
 use memcordon_core::result_v3::ReleaseKnowledgeV3;
 use memcordon_core::{BoundedText, BoundedVec, DiagnosticSha256};
 use serde::{Deserialize, Serialize};
@@ -403,6 +405,62 @@ impl DurableWorkloadAttempt {
     }
 }
 impl PrivateNativeJournal for DurableWorkloadAttempt {
+    fn init_acquired(&mut self, init: ProcessIdentityV4) -> Result<(), String> {
+        if init.pid == 0 {
+            return Err("original acquired init PID is invalid".into());
+        }
+        let context = acquisition::AcquisitionContext {
+            phase: self.record.phase,
+            release: self.record.release,
+            native_published: self.record.native.is_some()
+                || self.record.outcome.is_some()
+                || self.record.terminal.is_some(),
+        };
+        if !acquisition::record_identity(
+            acquisition::AcquisitionRole::NamespaceInit,
+            &context,
+            self.record.intents.namespace_init,
+            self.record.namespace_init.as_ref(),
+            &init,
+        )? {
+            return Ok(());
+        }
+        let mut next = self.record.clone();
+        next.namespace_init = Some(init);
+        self.replace(next)
+    }
+    fn target_acquired(
+        &mut self,
+        init: ProcessIdentityV4,
+        target: ProcessIdentityV4,
+    ) -> Result<(), String> {
+        if !self.record.intents.namespace_init
+            || self.record.namespace_init.as_ref() != Some(&init)
+            || target.pid == 0
+            || target.pid == init.pid
+        {
+            return Err("target acquisition differs from original init custody".into());
+        }
+        let context = acquisition::AcquisitionContext {
+            phase: self.record.phase,
+            release: self.record.release,
+            native_published: self.record.native.is_some()
+                || self.record.outcome.is_some()
+                || self.record.terminal.is_some(),
+        };
+        if !acquisition::record_identity(
+            acquisition::AcquisitionRole::Target,
+            &context,
+            self.record.intents.target,
+            self.record.target.as_ref(),
+            &target,
+        )? {
+            return Ok(());
+        }
+        let mut next = self.record.clone();
+        next.target = Some(target);
+        self.replace(next)
+    }
     fn namespace_intent(&mut self) -> Result<(), String> {
         let mut next = self.record.clone();
         if next.intents.namespace_init || next.intents.target {
@@ -471,9 +529,24 @@ impl PrivateNativeJournal for DurableWorkloadAttempt {
         target: ProcessIdentityV4,
         network: u64,
     ) -> Result<(), String> {
+        let context = acquisition::AcquisitionContext {
+            phase: self.record.phase,
+            release: self.record.release,
+            native_published: self.record.native.is_some()
+                || self.record.outcome.is_some()
+                || self.record.terminal.is_some(),
+        };
+        if !self.record.intents.namespace_init || !self.record.intents.target {
+            return Err("gated target lacks original allocation intents".into());
+        }
+        acquisition::require_gated_pair(
+            &context,
+            self.record.namespace_init.as_ref(),
+            self.record.target.as_ref(),
+            &init,
+            &target,
+        )?;
         let mut next = self.record.clone();
-        next.namespace_init = Some(init);
-        next.target = Some(target);
         next.network_namespace_inode = Some(network);
         next.phase = PrivateAttemptPhase::TargetGated;
         self.replace(next)

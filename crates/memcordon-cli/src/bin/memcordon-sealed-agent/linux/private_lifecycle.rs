@@ -221,6 +221,12 @@ pub enum PrivateMonitorOutcome {
 
 pub trait PrivateNativeJournal {
     fn namespace_intent(&mut self) -> Result<(), String>;
+    fn init_acquired(&mut self, init: ProcessIdentityV4) -> Result<(), String>;
+    fn target_acquired(
+        &mut self,
+        init: ProcessIdentityV4,
+        target: ProcessIdentityV4,
+    ) -> Result<(), String>;
     fn guardian_intent(&mut self) -> Result<(), String>;
     fn boundary_intent(&mut self) -> Result<(), String>;
     fn root_received(&mut self, device: u64, inode: u64) -> Result<(), String>;
@@ -569,8 +575,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         }
         self.namespace_init = Some(init);
         let init = self.namespace_init.as_ref().expect("init was just stored");
-        ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
-        Ok(())
+        let identity = ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
+        self.record_mut().init_acquired(identity)
     }
 
     pub fn start_guardian(
@@ -716,6 +722,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 .as_fd(),
         )?;
         let namespace_init = ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
+        self.record_mut()
+            .target_acquired(namespace_init.clone(), target.clone())?;
         self.record_mut().target_gated(
             namespace_init.clone(),
             target.clone(),

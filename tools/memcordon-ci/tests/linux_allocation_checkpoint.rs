@@ -1,4 +1,4 @@
-use memcordon_ci::linux_allocation_checkpoint::{matches_gate, unpublished_guardian_ready};
+use memcordon_ci::linux_allocation_checkpoint::{acquired_guardian_ready, matches_gate};
 use serde_json::{Value, json};
 
 const WORKER: u32 = 321;
@@ -27,7 +27,7 @@ fn journal() -> Value {
         "phase":"guardian-ready", "release":"not-released",
         "intents":{"cgroup":true,"input_staging":true,"root_staging":true,"footprint":true,
             "namespace_init":true,"target":true,"guardian":true},
-        "namespace_init":null, "target":null, "native":null,
+        "namespace_init":{"pid":323,"start_time":114}, "target":{"pid":324,"start_time":115}, "native":null,
         "outcome":null, "terminal":null,
         "cgroup":{"device":4,"inode":501}, "staging":{"device":4,"inode":502},
         "input_staging":{"device":4,"inode":503}, "root":{"device":4,"inode":504},
@@ -36,14 +36,14 @@ fn journal() -> Value {
 }
 
 #[test]
-fn guardian_ready_allocation_intents_precede_native_identity_publication() {
+fn guardian_ready_acquired_identities_precede_native_authorization() {
     let original = journal();
     let bytes = serde_json::to_vec(&original).unwrap();
-    assert!(unpublished_guardian_ready(&original));
+    assert!(acquired_guardian_ready(&original));
     assert!(matches_gate(&original, WORKER, REQUEST, CALLER));
     for field in ["namespace_init", "target"] {
         assert_eq!(original["intents"][field], true);
-        assert!(original[field].is_null());
+        assert!(original[field]["pid"].as_u64().is_some());
     }
     assert_eq!(serde_json::to_vec(&original).unwrap(), bytes);
 }
@@ -54,12 +54,12 @@ fn every_allocation_intent_must_be_the_exact_durable_true_value() {
         for wrong in [json!(false), Value::Null, json!(1), json!("true")] {
             let mut invalid = journal();
             invalid["intents"][field] = wrong;
-            assert!(!unpublished_guardian_ready(&invalid), "{field}");
+            assert!(!acquired_guardian_ready(&invalid), "{field}");
             assert!(!matches_gate(&invalid, WORKER, REQUEST, CALLER));
         }
         let mut invalid = journal();
         invalid["intents"].as_object_mut().unwrap().remove(field);
-        assert!(!unpublished_guardian_ready(&invalid));
+        assert!(!acquired_guardian_ready(&invalid));
     }
 }
 
@@ -77,22 +77,50 @@ fn other_phases_release_knowledge_and_published_facts_cannot_select_this_stop() 
     ] {
         let mut invalid = journal();
         invalid["phase"] = phase.into();
-        assert!(!unpublished_guardian_ready(&invalid), "{phase}");
+        assert!(!acquired_guardian_ready(&invalid), "{phase}");
     }
     for release in [json!("released"), json!("unknown"), Value::Null] {
         let mut invalid = journal();
         invalid["release"] = release;
-        assert!(!unpublished_guardian_ready(&invalid));
+        assert!(!acquired_guardian_ready(&invalid));
     }
-    for field in ["namespace_init", "target", "native", "outcome", "terminal"] {
+    for field in ["native", "outcome", "terminal"] {
         let mut published = journal();
         published[field] = json!({"pid":999,"start_time":114});
-        assert!(!unpublished_guardian_ready(&published), "published {field}");
+        assert!(!acquired_guardian_ready(&published), "published {field}");
         assert!(!matches_gate(&published, WORKER, REQUEST, CALLER));
         let mut omitted = journal();
         omitted.as_object_mut().unwrap().remove(field);
-        assert!(!unpublished_guardian_ready(&omitted), "omitted {field}");
+        assert!(!acquired_guardian_ready(&omitted), "omitted {field}");
     }
+}
+
+#[test]
+fn factual_identities_are_required_without_claiming_native_authorization() {
+    for field in ["namespace_init", "target"] {
+        for identity in [
+            Value::Null,
+            json!({"pid":0,"start_time":114}),
+            json!({"pid":u64::from(u32::MAX) + 1,"start_time":114}),
+            json!({"pid":323,"start_time":null}),
+            json!({"pid":323,"start_time":-1}),
+        ] {
+            let mut invalid = journal();
+            invalid[field] = identity;
+            assert!(!acquired_guardian_ready(&invalid));
+        }
+        let mut missing = journal();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(!acquired_guardian_ready(&missing));
+    }
+    let mut aliased = journal();
+    aliased["target"] = aliased["namespace_init"].clone();
+    assert!(!acquired_guardian_ready(&aliased));
+    let mut earliest_birth = journal();
+    earliest_birth["namespace_init"]["start_time"] = json!(0);
+    assert!(acquired_guardian_ready(&earliest_birth));
+    assert_eq!(earliest_birth["release"], "not-released");
+    assert!(earliest_birth["native"].is_null());
 }
 
 #[test]
@@ -108,12 +136,12 @@ fn acquisition_also_requires_original_event_worker_request_and_caller_binding() 
     ] {
         let mut invalid = journal();
         invalid[field] = wrong;
-        assert!(unpublished_guardian_ready(&invalid));
+        assert!(acquired_guardian_ready(&invalid));
         assert!(!matches_gate(&invalid, WORKER, REQUEST, CALLER), "{field}");
     }
     let mut foreign_worker = journal();
     foreign_worker["worker"]["pid"] = json!(WORKER + 1);
-    assert!(unpublished_guardian_ready(&foreign_worker));
+    assert!(acquired_guardian_ready(&foreign_worker));
     assert!(!matches_gate(&foreign_worker, WORKER, REQUEST, CALLER));
     let original = journal();
     assert!(!matches_gate(&original, WORKER + 1, REQUEST, CALLER));

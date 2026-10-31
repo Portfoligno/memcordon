@@ -515,7 +515,7 @@ fn allocation(
         .strip_suffix("-allocation")
         .ok_or_else(|| fail("allocation actor absent"))?;
     if before["association"] != *value
-        || !crate::linux_allocation_checkpoint::unpublished_guardian_ready(&before)
+        || !crate::linux_allocation_checkpoint::acquired_guardian_ready(&before)
     {
         return Err(fail(
             "allocation fault did not reach incomplete state before TargetGated publication",
@@ -550,7 +550,14 @@ fn allocation(
         &doc(experiment, "held-before.json")?,
         &doc(experiment, "held-after.json")?,
         &before,
-        &["frontend", "worker", "control", "guardian"],
+        &[
+            "frontend",
+            "worker",
+            "control",
+            "guardian",
+            "namespace_init",
+            "target",
+        ],
     )?;
     let terminal = LinuxWorkloadTerminalV1::parse(raw(experiment, "recovery.json")?)
         .map_err(CiError::Message)?;
