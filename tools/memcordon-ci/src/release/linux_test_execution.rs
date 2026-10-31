@@ -606,25 +606,17 @@ fn run_recipe_inner(
             let original_frontend = launch.retain_frontend(input.work_cutoff)?;
             let frontend_identity = (original_frontend.process_id, original_frontend.birth);
             let locator_path = input.directory.join("workload-observation.json");
-            while !locator_path.try_exists()? {
-                if Instant::now() >= input.work_cutoff {
-                    return Err(CiError::Message(
-                        "original attempt locator cutoff expired".into(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            launch.wait_for_event(input.work_cutoff, "original attempt locator", || {
+                locator_path.try_exists().map_err(CiError::from)
+            })?;
             let locator = launch.association()?;
             let prepared_name = format!("{}.prepared.json", hex::encode(locator.attempt));
             let prepared_path = observation_directory.join(&prepared_name);
-            while !prepared_path.try_exists()? {
-                if Instant::now() >= input.work_cutoff {
-                    return Err(CiError::Message(
-                        "original native prepared observation cutoff expired".into(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            launch.wait_for_event(
+                input.work_cutoff,
+                "original native prepared observation",
+                || prepared_path.try_exists().map_err(CiError::from),
+            )?;
             let mut prepared_file = File::from(
                 rustix::fs::openat(
                     &observation_owner,
@@ -1414,7 +1406,11 @@ fn run_recipe_inner(
                 eprintln!("caller directory restoration after unwind: {error}");
             }
             match launch.cancel_and_settle(input.cleanup_cutoff) {
-                Ok(_) => {
+                Ok(receipt) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "original frontend settlement after unwind (interrupt_sent is cleanup action, not producer cause): {receipt}"
+                    );
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
                         eprintln!("caller input retirement after unwind: {error}");
                     }
@@ -1440,13 +1436,18 @@ fn run_recipe_inner(
     match execution {
         Ok(case) => Ok(case),
         Err(primary) => match launch.cancel_and_settle(input.cleanup_cutoff) {
-            Ok(_) => match launch.retire_bundle_exact(&fixture) {
-                Ok(()) => Err(primary),
-                Err(retirement) => Err(CiError::LaneFailures {
-                    primary: Box::new(primary),
-                    secondary: Box::new(retirement.context("original caller input retirement")),
-                }),
-            },
+            Ok(receipt) => {
+                let primary = primary.context(format!(
+                    "original frontend settlement receipt (interrupt_sent is cleanup action, not producer cause): {receipt}"
+                ));
+                match launch.retire_bundle_exact(&fixture) {
+                    Ok(()) => Err(primary),
+                    Err(retirement) => Err(CiError::LaneFailures {
+                        primary: Box::new(primary),
+                        secondary: Box::new(retirement.context("original caller input retirement")),
+                    }),
+                }
+            }
             Err(cleanup) => Err(CiError::LaneFailures {
                 primary: Box::new(primary),
                 secondary: Box::new(cleanup.context("original frontend settlement")),
