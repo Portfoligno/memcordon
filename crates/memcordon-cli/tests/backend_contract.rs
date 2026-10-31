@@ -771,8 +771,13 @@ fn linux_guardian_kills_process_group_after_wrapper_crash() {
 #[ignore = "requires protected Linux cgroup v2 runner"]
 fn linux_cgroup_kill_reaps_continually_forking_workload() {
     require_backend();
-    let pid_file = temporary_pid_file();
-    let report_file = pid_file.with_extension("json");
+    // This owner survives the killed publisher and removes unpublished staging.
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-continual-fork-")
+        .tempdir()
+        .expect("continual-fork case directory should be created");
+    let pid_file = directory.path().join("children.pid");
+    let report_file = directory.path().join("report.json");
     let callback_pid_file = pid_file.clone();
     let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     command
@@ -835,6 +840,9 @@ fn linux_cgroup_kill_reaps_continually_forking_workload() {
     }
     fs::remove_file(pid_file).expect("PID list should be removable");
     fs::remove_file(report_file).expect("report should be removable");
+    directory
+        .close()
+        .expect("continual-fork case and staging should be removable");
 }
 
 #[cfg(target_os = "linux")]
