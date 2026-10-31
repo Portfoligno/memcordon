@@ -515,6 +515,21 @@ impl WindowsProviderRejectionV3 {
                         },
                         None,
                     ) => true,
+                    // A held target cancelled before resume retires through the
+                    // Reject carrier with its truthful Interrupted outcome.
+                    (
+                        WindowsTerminalPayloadV3::Execution {
+                            outcome: RunOutcome::Interrupted { .. },
+                            ..
+                        },
+                        diagnostic,
+                    ) => !self.target_released && diagnostic.is_none_or(|failure| {
+                        failure.provider_binding.generation.as_str() == receipt.retirement_proof.provider_generation
+                            && String::from(failure.attempt_id.clone()) == receipt.attempt_id
+                            && String::from(failure.request_sha256.clone()) == receipt.request_sha256
+                            && matches!(failure.original,
+                                crate::OriginalFailureV1::Observed { ref event } if event.sequence > 0)
+                    }),
                     (
                         WindowsTerminalPayloadV3::RecoveredClosure {
                             primary_failure, ..

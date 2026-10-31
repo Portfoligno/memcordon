@@ -465,8 +465,40 @@ fn run_held(
             &serde_json::json!({"format":"memcordon.windows-current-control-wait","revision":1,"native_status":native_status,"stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),"stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr)}),
         )?,
     )?;
-    let result = memcordon_core::ResultV3::parse(&fs::read(report)?)
-        .map_err(|error| CiError::Message(error.to_string()))?;
+    let scenario = if during_drain {
+        "during-drain"
+    } else if after_release {
+        "after-release"
+    } else {
+        "held-before-release"
+    };
+    let expected_status = if during_drain {
+        matches!(native_status, 125 | 130)
+    } else {
+        native_status == 130
+    };
+    if !expected_status {
+        return Err(CiError::Message(format!(
+            "Windows control scenario={scenario} result={} unexpected frontend status={native_status}; native={:?}; stdout-bytes={}; stderr-bytes={}; stderr={:?}",
+            report.display(),
+            output.status,
+            output.stdout.len(),
+            output.stderr.len(),
+            crate::command::bounded_excerpt(&output.stderr),
+        )));
+    }
+    let bytes = fs::read(&report).map_err(|error| {
+        CiError::from(error).context(format!(
+            "Windows control scenario={scenario} expected frontend status={native_status} result read {}",
+            report.display(),
+        ))
+    })?;
+    let result = memcordon_core::ResultV3::parse(&bytes).map_err(|error| {
+        CiError::Message(error.to_string()).context(format!(
+            "Windows control scenario={scenario} result parse {}",
+            report.display(),
+        ))
+    })?;
     if result.release
         != if after_release {
             memcordon_core::result_v3::ReleaseKnowledgeV3::Released
