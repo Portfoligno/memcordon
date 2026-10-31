@@ -515,19 +515,10 @@ fn allocation(
         .strip_suffix("-allocation")
         .ok_or_else(|| fail("allocation actor absent"))?;
     if before["association"] != *value
-        || before["phase"] != "guardian-ready"
-        || before["release"] != "not-released"
-        || before["intents"]["namespace_init"] != false
-        || before["intents"]["target"] != false
-        || before["intents"]["guardian"] != true
-        || !before["namespace_init"].is_null()
-        || !before["target"].is_null()
-        || !before["native"].is_null()
-        || !before["outcome"].is_null()
-        || !before["terminal"].is_null()
+        || !crate::linux_allocation_checkpoint::unpublished_guardian_ready(&before)
     {
         return Err(fail(
-            "allocation fault did not reach incomplete pre-target state",
+            "allocation fault did not reach incomplete state before TargetGated publication",
         ));
     }
     let blocked = &action["blocked"];

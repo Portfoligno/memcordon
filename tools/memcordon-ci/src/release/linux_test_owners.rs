@@ -526,12 +526,24 @@ fn before_preparation_experiment(
         Ok(result) => result,
         Err(panic) => {
             match launch.cancel_and_settle(cleanup) {
-                Ok(_) => {
+                Ok(settled) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "owner phase=before-preparation unwind; original frontend settlement: {settled}"
+                    );
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                        eprintln!("native input retirement after unwind: {error}");
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "native input retirement after unwind: {error}"
+                        );
                     }
                 }
-                Err(error) => eprintln!("native request settlement after unwind: {error}"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "native request settlement after unwind: {error}"
+                    );
+                }
             }
             std::panic::resume_unwind(panic)
         }
@@ -542,10 +554,15 @@ fn before_preparation_experiment(
             Ok(observed)
         }
         Err(primary) => match launch.cancel_and_settle(cleanup) {
-            Ok(_) => Err(primary),
-            Err(settlement) => Err(CiError::Message(format!(
-                "{primary}; original pre-input child settlement incomplete: {settlement}"
+            Ok(settled) => Err(primary.context(format!(
+                "owner phase=before-preparation; original frontend settlement: {settled}"
             ))),
+            Err(settlement) => Err(CiError::LaneFailures {
+                primary: Box::new(primary.context("owner phase=before-preparation")),
+                secondary: Box::new(
+                    settlement.context("original before-preparation frontend settlement"),
+                ),
+            }),
         },
     }
 }
@@ -718,15 +735,7 @@ fn allocation_experiment(
         work,
         move |pid, bytes| {
             serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|record| {
-                record["format"] == "memcordon.private-workload-journal"
-                    && record["revision"] == 1
-                    && record["request_sha256"] == expected
-                    && record["caller_uid"] == uid
-                    && record["worker"]["pid"] == pid
-                    && record["phase"] == "guardian-ready"
-                    && record["intents"]["namespace_init"] == false
-                    && record["intents"]["target"] == false
-                    && record["native"].is_null()
+                crate::linux_allocation_checkpoint::matches_gate(&record, pid, &expected, uid)
             })
         },
     )?;
@@ -791,7 +800,7 @@ fn allocation_experiment(
                 || !record["target"].is_null()
             {
                 return Err(CiError::Message(
-                    "kernel allocation readback does not belong to the original pre-target attempt"
+                    "kernel allocation readback does not belong to the original pre-TargetGated-publication attempt"
                         .into(),
                 ));
             }
@@ -1081,12 +1090,24 @@ fn allocation_experiment(
         Ok(result) => result,
         Err(panic) => {
             match launch.cancel_and_settle(cleanup) {
-                Ok(_) => {
+                Ok(settled) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "allocation scenario={scenario} unwind; expected-checkpoint=before TargetGated publication; original frontend settlement: {settled}"
+                    );
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                        eprintln!("native input retirement after unwind: {error}");
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "native input retirement after unwind: {error}"
+                        );
                     }
                 }
-                Err(error) => eprintln!("native request settlement after unwind: {error}"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "native request settlement after unwind: {error}"
+                    );
+                }
             }
             std::panic::resume_unwind(panic)
         }
@@ -1097,10 +1118,13 @@ fn allocation_experiment(
             Ok(observed)
         }
         Err(primary) => match launch.cancel_and_settle(cleanup) {
-            Ok(_) => Err(primary),
-            Err(settlement) => Err(CiError::Message(format!(
-                "{primary}; original allocation frontend settlement incomplete: {settlement}"
+            Ok(settled) => Err(primary.context(format!(
+                "allocation scenario={scenario}; expected-phase=guardian-ready before TargetGated publication; original frontend settlement: {settled}"
             ))),
+            Err(settlement) => Err(CiError::LaneFailures {
+                primary: Box::new(primary.context(format!("allocation scenario={scenario}; expected-phase=guardian-ready before TargetGated publication"))),
+                secondary: Box::new(settlement.context("original allocation frontend settlement")),
+            }),
         },
     }
 }

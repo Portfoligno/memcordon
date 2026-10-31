@@ -3,6 +3,8 @@
 // All other CI orchestration remains safe Rust.
 #![deny(unsafe_code)]
 
+pub mod linux_allocation_checkpoint;
+
 pub mod windows_status_streams;
 
 pub mod bootstrap_profile;
