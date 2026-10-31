@@ -1313,6 +1313,7 @@ pub fn run_cli_case(
     #[cfg(not(target_os = "linux"))]
     let output = command
         .output_limit(1024 * 1024)
+        .defer_group_failure()
         .output_owned()
         .into_result()?;
     #[cfg(not(target_os = "linux"))]

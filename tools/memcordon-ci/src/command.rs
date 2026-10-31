@@ -211,8 +211,9 @@ impl CommandSpec {
         self
     }
 
-    /// Optional cache version probes can reject an image and rebuild it.
-    /// Their caller still propagates unknown native settlement as a failure.
+    /// Defer exit classification to a caller that immediately validates the
+    /// semantic result and propagates failures through its enclosing operation.
+    /// Native capture errors and unknown settlement remain failures.
     pub fn defer_group_failure(mut self) -> Self {
         self.defer_group_failure = true;
         self
