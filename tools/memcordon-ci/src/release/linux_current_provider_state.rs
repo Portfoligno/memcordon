@@ -6,6 +6,13 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
 };
 const NAME: &str = "memcordon-runtime-manifest.json";
+fn io_at(error: std::io::Error, operation: &str, name: &str) -> CiError {
+    let path = std::path::Path::new("/usr/libexec").join(name);
+    CiError::from(error).context(format!(
+        "provider descriptor {operation} {}",
+        path.display()
+    ))
+}
 
 struct Fixture {
     parent: File,
@@ -27,17 +34,23 @@ fn open(parent: &File, name: &str) -> Result<Option<File>> {
     ) {
         Ok(file) => Ok(Some(File::from(file))),
         Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(error) => Err(std::io::Error::from(error).into()),
+        Err(error) => Err(io_at(std::io::Error::from(error), "openat nofollow", name)),
     }
 }
 fn same(left: &File, right: &File) -> Result<bool> {
-    let left = left.metadata()?;
-    let right = right.metadata()?;
+    let left = left
+        .metadata()
+        .map_err(|error| io_at(error, "held left descriptor metadata", ""))?;
+    let right = right
+        .metadata()
+        .map_err(|error| io_at(error, "held right descriptor metadata", ""))?;
     Ok((left.dev(), left.ino(), left.uid(), left.mode())
         == (right.dev(), right.ino(), right.uid(), right.mode()))
 }
 fn bytes(file: &File) -> Result<Vec<u8>> {
-    let metadata = file.metadata()?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_at(error, "held bytes descriptor metadata", ""))?;
     if !metadata.is_file()
         || metadata.uid() != 0
         || metadata.mode() & 0o022 != 0
@@ -50,7 +63,8 @@ fn bytes(file: &File) -> Result<Vec<u8>> {
         usize::try_from(metadata.len())
             .map_err(|error| CiError::Message(error.to_string()))?
     ];
-    file.read_exact_at(&mut bytes, 0)?;
+    file.read_exact_at(&mut bytes, 0)
+        .map_err(|error| io_at(error, "held descriptor read_exact_at", ""))?;
     Ok(bytes)
 }
 impl Fixture {
@@ -58,8 +72,11 @@ impl Fixture {
         let parent = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/usr/libexec")?;
-        let metadata = parent.metadata()?;
+            .open("/usr/libexec")
+            .map_err(|error| io_at(error, "open protected parent", ""))?;
+        let metadata = parent
+            .metadata()
+            .map_err(|error| io_at(error, "held parent metadata", ""))?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
             return Err(fail("installed descriptor parent is not protected"));
         }
@@ -95,10 +112,13 @@ impl Fixture {
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::from_raw_mode(0o444),
             )
-            .map_err(std::io::Error::from)?,
+            .map_err(std::io::Error::from)
+            .map_err(|error| io_at(error, "create malformed O_TMPFILE", "."))?,
         );
-        bad.write_all(&serde_json::to_vec(&malformed)?)?;
-        bad.sync_all()?;
+        bad.write_all(&serde_json::to_vec(&malformed)?)
+            .map_err(|error| io_at(error, "write malformed held O_TMPFILE", "."))?;
+        bad.sync_all()
+            .map_err(|error| io_at(error, "sync malformed held O_TMPFILE", "."))?;
         Ok(Self {
             parent,
             original,
@@ -121,7 +141,8 @@ impl Fixture {
             self.stage.as_str(),
             rustix::fs::AtFlags::EMPTY_PATH,
         )
-        .map_err(std::io::Error::from)?;
+        .map_err(std::io::Error::from)
+        .map_err(|error| io_at(error, "linkat malformed inode into stage", &self.stage))?;
         rustix::fs::linkat(
             &self.parent,
             NAME,
@@ -129,10 +150,14 @@ impl Fixture {
             self.backup.as_str(),
             rustix::fs::AtFlags::empty(),
         )
-        .map_err(std::io::Error::from)?;
+        .map_err(std::io::Error::from)
+        .map_err(|error| io_at(error, "linkat original inode backup", &self.backup))?;
         rustix::fs::renameat(&self.parent, self.stage.as_str(), &self.parent, NAME)
-            .map_err(std::io::Error::from)?;
-        self.parent.sync_all()?;
+            .map_err(std::io::Error::from)
+            .map_err(|error| io_at(error, "renameat stage over installed name", &self.stage))?;
+        self.parent
+            .sync_all()
+            .map_err(|error| io_at(error, "sync parent after publish", NAME))?;
         Ok(())
     }
     fn restore(&self) -> Result<()> {
@@ -157,7 +182,10 @@ impl Fixture {
                 return Err(fail("owned original descriptor bytes changed"));
             }
             rustix::fs::renameat(&self.parent, self.backup.as_str(), &self.parent, NAME)
-                .map_err(std::io::Error::from)?;
+                .map_err(std::io::Error::from)
+                .map_err(|error| {
+                    io_at(error, "renameat original backup restoration", &self.backup)
+                })?;
         } else if let Some(backup) = open(&self.parent, &self.backup)? {
             if !same(&backup, &self.original)? {
                 return Err(fail("owned descriptor backup name was replaced"));
@@ -167,7 +195,8 @@ impl Fixture {
                 self.backup.as_str(),
                 rustix::fs::AtFlags::empty(),
             )
-            .map_err(std::io::Error::from)?;
+            .map_err(std::io::Error::from)
+            .map_err(|error| io_at(error, "unlinkat owned original backup", &self.backup))?;
         }
         if let Some(stage) = open(&self.parent, &self.stage)? {
             if !same(&stage, &self.bad)? {
@@ -178,9 +207,12 @@ impl Fixture {
                 self.stage.as_str(),
                 rustix::fs::AtFlags::empty(),
             )
-            .map_err(std::io::Error::from)?;
+            .map_err(std::io::Error::from)
+            .map_err(|error| io_at(error, "unlinkat owned malformed stage", &self.stage))?;
         }
-        self.parent.sync_all()?;
+        self.parent
+            .sync_all()
+            .map_err(|error| io_at(error, "sync parent after restoration", NAME))?;
         let restored =
             open(&self.parent, NAME)?.ok_or_else(|| fail("restored descriptor absent"))?;
         if !same(&restored, &self.original)? || bytes(&restored)? != self.original_bytes {
@@ -191,19 +223,28 @@ impl Fixture {
 }
 
 pub fn with<T>(scenario: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    let fixture = Fixture::prepare(scenario)?;
+    let fixture = Fixture::prepare(scenario).map_err(|error| {
+        error.context(format!(
+            "prepare provider descriptor scenario {scenario} installed-name={NAME}"
+        ))
+    })?;
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fixture.publish()?;
-        operation()
+        fixture.publish().map_err(|error|error.context(format!("publish provider descriptor scenario {scenario} installed-name={NAME} stage={} backup={}",fixture.stage,fixture.backup)))?;
+        operation().map_err(|error| {
+            error.context(format!(
+                "execute provider descriptor refusal scenario {scenario} installed-name={NAME}"
+            ))
+        })
     }));
-    let restoration = fixture.restore();
+    let restoration = fixture.restore().map_err(|error|error.context(format!("restore provider descriptor scenario {scenario} installed-name={NAME} stage={} backup={}",fixture.stage,fixture.backup)));
     match execution {
         Ok(Ok(value)) => restoration.map(|()| value),
         Ok(Err(primary)) => match restoration {
             Ok(()) => Err(primary),
-            Err(secondary) => Err(CiError::Message(format!(
-                "{primary}; installed descriptor restoration: {secondary}"
-            ))),
+            Err(secondary) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
         },
         Err(panic) => {
             if let Err(error) = restoration {

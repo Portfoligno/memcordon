@@ -87,6 +87,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CiError {
+    #[error("{context}: {source}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<CiError>,
+    },
     #[error("{0}")]
     CacheSafety(Box<CiError>),
     #[error("{source}")]
@@ -138,6 +144,60 @@ pub enum CiError {
     Process(#[from] memcordon_testkit::ProcessTestError),
     #[error("ZIP operation failed: {0}")]
     Zip(#[from] zip::result::ZipError),
+}
+
+impl CiError {
+    /// Add bounded diagnostic context without discarding operational envelopes.
+    pub fn context(self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        let limit = 4096;
+        let context = if context.len() > limit {
+            let mut head = limit / 2;
+            while !context.is_char_boundary(head) {
+                head -= 1;
+            }
+            let mut tail = context.len() - limit / 2;
+            while !context.is_char_boundary(tail) {
+                tail += 1;
+            }
+            format!(
+                "{} [context omitted {} bytes] {}",
+                &context[..head],
+                tail - head,
+                &context[tail..],
+            )
+        } else {
+            context
+        };
+        match self {
+            Self::OwnedWork {
+                source,
+                writers,
+                facts,
+            } => Self::OwnedWork {
+                source: Box::new(source.context(context)),
+                writers,
+                facts,
+            },
+            Self::CacheSafety(source) => Self::CacheSafety(Box::new(source.context(context))),
+            Self::LaneFailures { primary, secondary } => Self::LaneFailures {
+                primary: Box::new(primary.context(context.clone())),
+                secondary: Box::new(secondary.context(context)),
+            },
+            Self::Cancelled(detail) => Self::Cancelled(format!("{context}: {detail}")),
+            Self::SettledCancellation(detail) => {
+                Self::SettledCancellation(format!("{context}: {detail}"))
+            }
+            Self::SettledCommandFailure(detail) => {
+                Self::SettledCommandFailure(format!("{context}: {detail}"))
+            }
+            Self::NotStartedAfterFailure => Self::NotStartedAfterFailure,
+            source => Self::Context {
+                context,
+                source: Box::new(source),
+            },
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CiError>;

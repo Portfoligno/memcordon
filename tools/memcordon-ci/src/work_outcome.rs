@@ -284,7 +284,9 @@ pub fn has_unresolved_owner(error: &CiError) -> bool {
         CiError::OwnedWork {
             writers, source, ..
         } => *writers == WriterSettlement::Unknown || has_unresolved_owner(source),
-        CiError::CacheSafety(source) => has_unresolved_owner(source),
+        CiError::CacheSafety(source) | CiError::Context { source, .. } => {
+            has_unresolved_owner(source)
+        }
         CiError::Process(error) => native_error_settlement(error) == WriterSettlement::Unknown,
         CiError::Cancelled(_) => true,
         CiError::LaneFailures { primary, secondary } => {
@@ -296,6 +298,7 @@ pub fn has_unresolved_owner(error: &CiError) -> bool {
 
 fn error_settlement(error: &CiError) -> WriterSettlement {
     match error {
+        CiError::Context { source, .. } => error_settlement(source),
         CiError::OwnedWork { writers, .. } => *writers,
         CiError::NotStartedAfterFailure | CiError::CommandSpawnFailure(_) => {
             WriterSettlement::NotStarted

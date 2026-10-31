@@ -612,17 +612,28 @@ pub fn run_privileged(root: &Path, args: &PrivilegedArgs) -> Result<()> {
         cleanup,
     };
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fs::set_permissions(&session.working.path, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&session.working.path, fs::Permissions::from_mode(0o755)).map_err(
+            |error| {
+                CiError::from(error).context(format!(
+                    "installed working directory permissions path={}",
+                    session.working.path.display()
+                ))
+            },
+        )?;
         execute(&mut session, &inputs, &args.output, work)
+            .map_err(|error| error.context("installed Linux workload execution"))
     }));
-    let retirement = session.finish();
+    let retirement = session
+        .finish()
+        .map_err(|error| error.context("installed Linux session retirement"));
     let result = match execution {
         Ok(Ok(())) => retirement,
         Ok(Err(primary)) => match retirement {
             Ok(()) => Err(primary),
-            Err(cleanup) => Err(CiError::Message(format!(
-                "{primary}; installed cleanup: {cleanup}"
-            ))),
+            Err(cleanup) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(cleanup),
+            }),
         },
         Err(panic) => {
             if let Err(error) = retirement {
@@ -640,18 +651,33 @@ fn execute(
     _output: &Path,
     work: Instant,
 ) -> Result<()> {
-    protect_payload(inputs, &session.admin.path, work, &mut session.source_files)?;
+    protect_payload(inputs, &session.admin.path, work, &mut session.source_files).map_err(
+        |error| {
+            error.context(format!(
+                "installed payload protection path={}",
+                session.admin.path.display()
+            ))
+        },
+    )?;
     let agent = session.admin.path.join("memcordon-sealed-agent");
-    refuse_opaque_install(session.root, &agent, work)?;
+    refuse_opaque_install(session.root, &agent, work)
+        .map_err(|error| error.context("installed opaque-install refusal"))?;
     session.installed = true; // Even a partially failed install requires owned removal.
-    operation(session.root, &agent, &["package", "install"], work)?;
+    operation(session.root, &agent, &["package", "install"], work)
+        .map_err(|error| error.context("installed package install"))?;
     let verified = operation(
         session.root,
         Path::new("/usr/libexec/memcordon-sealed-agent"),
         &["package", "verify", "--json"],
         work,
-    )?;
-    let manifest_bytes = fs::read("/usr/libexec/memcordon-runtime-manifest.json")?;
+    )
+    .map_err(|error| error.context("installed package verification"))?;
+    let manifest_bytes =
+        fs::read("/usr/libexec/memcordon-runtime-manifest.json").map_err(|error| {
+            CiError::from(error).context(
+                "installed manifest read path=/usr/libexec/memcordon-runtime-manifest.json",
+            )
+        })?;
     let manifest = memcordon_core::runtime_manifest_v2::RuntimeManifestV2::parse(&manifest_bytes)
         .map_err(CiError::Message)?;
     if manifest.source_commit != inputs.source.commit()
@@ -693,11 +719,18 @@ fn execute(
         .session
         .as_ref()
         .expect("allocated foreign actor has native credentials");
-    let copied = copy_images(&inputs.images, &session.working.path.join("images"), work)?;
+    let copied = copy_images(&inputs.images, &session.working.path.join("images"), work)
+        .map_err(|error| error.context("installed caller image copy"))?;
     let images =
-        CallerImages::materialize(copied, &session.working.path.join("images"), caller, work)?;
+        CallerImages::materialize(copied, &session.working.path.join("images"), caller, work)
+            .map_err(|error| error.context("installed caller image materialization"))?;
     let controllers = session.working.path.join("controllers");
-    fs::create_dir(&controllers)?;
+    fs::create_dir(&controllers).map_err(|error| {
+        CiError::from(error).context(format!(
+            "installed controllers create path={}",
+            controllers.display()
+        ))
+    })?;
     if inputs.components_only {
         for facet in [
             "release-barrier",
@@ -705,31 +738,48 @@ fn execute(
             "crash-before-root-retirement",
             "lost-terminal-response",
         ] {
-            crate::cancellation::check_admission()?;
-            let controller = controllers.join(facet);
-            fs::create_dir(&controller)?;
-            let directory = session.working.path.join(facet);
-            fs::create_dir(&directory)?;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-            std::os::unix::fs::chown(&directory, Some(caller.uid), Some(caller.gid))?;
-            let observed = super::linux_test_lifetime::experiment(
-                caller,
-                &images,
-                &provider,
-                super::linux_test_lifetime::ExperimentContext {
-                    controller: &controller,
-                    directory: &directory,
-                    scenario: facet,
-                    facet,
-                    work,
-                    cleanup: session.cleanup,
-                },
-            )?;
-            super::linux_test_lifetime_assertions::assert_experiment(&observed, facet, &provider)?;
+            let result = (|| -> Result<()> {
+                crate::cancellation::check_admission()?;
+                let controller = controllers.join(facet);
+                fs::create_dir(&controller)?;
+                let directory = session.working.path.join(facet);
+                fs::create_dir(&directory)?;
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+                std::os::unix::fs::chown(&directory, Some(caller.uid), Some(caller.gid))?;
+                let observed = super::linux_test_lifetime::experiment(
+                    caller,
+                    &images,
+                    &provider,
+                    super::linux_test_lifetime::ExperimentContext {
+                        controller: &controller,
+                        directory: &directory,
+                        scenario: facet,
+                        facet,
+                        work,
+                        cleanup: session.cleanup,
+                    },
+                )?;
+                super::linux_test_lifetime_assertions::assert_experiment(
+                    &observed, facet, &provider,
+                )?;
+                Ok(())
+            })();
+            result.map_err(|error| {
+                error.context(format!(
+                    "installed component facet={facet} root={}",
+                    session.working.path.display()
+                ))
+            })?;
         }
         return Ok(());
     }
-    let probe = copy_current_probe(&session.working.path, &inputs.distribution.target, work)?;
+    let probe = copy_current_probe(&session.working.path, &inputs.distribution.target, work)
+        .map_err(|error| {
+            error.context(format!(
+                "installed current probe copy path={}",
+                session.working.path.display()
+            ))
+        })?;
     super::linux_test_refusals::run(TestInput {
         controller_directory: &controllers,
         caller,
@@ -738,14 +788,16 @@ fn execute(
         directory: &session.working.path.join("request-refusals"),
         work_cutoff: work,
         cleanup_cutoff: session.cleanup,
-    })?;
+    })
+    .map_err(|error| error.context("installed phase=request-refusals"))?;
     super::linux_test_socket_imports::run_socket_import_refusals(
         caller,
         &images,
         &controllers,
         &session.working.path,
         work,
-    )?;
+    )
+    .map_err(|error| error.context("installed phase=socket-import-refusals"))?;
     super::linux_test_owners::run_installed(
         session.root,
         caller,
@@ -757,7 +809,8 @@ fn execute(
         &session.working.path,
         work,
         session.cleanup,
-    )?;
+    )
+    .map_err(|error| error.context("installed phase=owners"))?;
     super::linux_test_isolation::run(
         session.root,
         caller,
@@ -768,7 +821,8 @@ fn execute(
         &controllers,
         work,
         session.cleanup,
-    )?;
+    )
+    .map_err(|error| error.context("installed phase=isolation"))?;
     super::linux_test_image_cases::run_installed(
         session.root,
         caller,
@@ -779,7 +833,8 @@ fn execute(
         &session.working.path,
         work,
         session.cleanup,
-    )?;
+    )
+    .map_err(|error| error.context("installed phase=image-cases"))?;
     super::linux_test_snapshots::run_installed(
         session.root,
         caller,
@@ -791,80 +846,108 @@ fn execute(
         &session.working.path,
         work,
         session.cleanup,
-    )?;
-    let scenarios = super::linux_test_scenarios::scenarios()?;
+    )
+    .map_err(|error| error.context("installed phase=snapshots"))?;
+    let scenarios = super::linux_test_scenarios::scenarios()
+        .map_err(|error| error.context("installed scenario inventory"))?;
     if scenarios.is_empty() {
         return Err(fail("required installed Linux scenarios are empty"));
     }
     for (ordinal, mut scenario) in scenarios.into_iter().enumerate() {
-        crate::cancellation::check_admission()?;
-        if Instant::now() >= work {
-            return Err(fail("original installed work cutoff expired"));
-        }
-        if scenario.key.family == "L-LIFE-02"
-            || super::linux_test_execution::is_isolation_case(&scenario.key)
-        {
-            continue; // The concrete live fault/isolation owners above execute these operations.
-        }
-        if scenario.key.family == "C-STATUS" && scenario.key.scenario == "memory" {
-            scenario.mode = "memory-pressure".into();
-            scenario.memory = "+128MiB".into();
-            scenario.product_deadline = "+30s".into();
-        }
-        if scenario.key.family == "C-STATUS" && scenario.key.scenario == "deadline" {
-            scenario.mode = "deadline-demand".into();
-            scenario.arguments.clear();
-            scenario.product_deadline = "+2s".into();
-        }
-        let case_directory = session.working.path.join(ordinal.to_string());
-        let controller = controllers.join(ordinal.to_string());
-        fs::create_dir(&controller)?;
-        eprintln!(
-            "installed Linux test: {} / {}",
-            scenario.key.family, scenario.key.scenario
+        let scenario_label = format!(
+            "installed scenario family={} scenario={} path={}",
+            scenario.key.family,
+            scenario.key.scenario,
+            session.working.path.join(ordinal.to_string()).display()
         );
-        let case = super::linux_test_execution::run_recipe(
-            TestInput {
-                controller_directory: &controller,
-                caller,
-                images: &images,
-                provider: &provider,
-                directory: &case_directory,
-                work_cutoff: work,
-                cleanup_cutoff: session.cleanup,
-            },
-            scenario,
-        )?;
-        super::linux_test_assertions::assert_case(&case)?;
-        let acknowledged = caller
-            .command(&case.directory, session.cleanup)?
-            .args(["workload", "acknowledge", "--observation"])
-            .arg(case.directory.join("workload-observation.json"))
-            .output()?;
-        require_successful_output("completed workload acknowledgment", &acknowledged)?;
-        let acknowledgment =
-            memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&acknowledged.stdout)
-                .map_err(|error| CiError::Message(error.to_string()))?;
-        if acknowledgment.association != case.locator {
-            return Err(fail(
-                "current acknowledgment refers to another actual workload",
-            ));
-        }
+        let result = (|| -> Result<()> {
+            crate::cancellation::check_admission()?;
+            if Instant::now() >= work {
+                return Err(fail("original installed work cutoff expired"));
+            }
+            if scenario.key.family == "L-LIFE-02"
+                || super::linux_test_execution::is_isolation_case(&scenario.key)
+            {
+                return Ok(()); // The concrete live fault/isolation owners above execute these operations.
+            }
+            if scenario.key.family == "C-STATUS" && scenario.key.scenario == "memory" {
+                scenario.mode = "memory-pressure".into();
+                scenario.memory = "+128MiB".into();
+                scenario.product_deadline = "+30s".into();
+            }
+            if scenario.key.family == "C-STATUS" && scenario.key.scenario == "deadline" {
+                scenario.mode = "deadline-demand".into();
+                scenario.arguments.clear();
+                scenario.product_deadline = "+2s".into();
+            }
+            let case_directory = session.working.path.join(ordinal.to_string());
+            let controller = controllers.join(ordinal.to_string());
+            fs::create_dir(&controller)?;
+            eprintln!(
+                "installed Linux test: {} / {}",
+                scenario.key.family, scenario.key.scenario
+            );
+            let case = super::linux_test_execution::run_recipe(
+                TestInput {
+                    controller_directory: &controller,
+                    caller,
+                    images: &images,
+                    provider: &provider,
+                    directory: &case_directory,
+                    work_cutoff: work,
+                    cleanup_cutoff: session.cleanup,
+                },
+                scenario,
+            )
+            .map_err(|error| error.context("scenario recipe execution"))?;
+            super::linux_test_assertions::assert_case(&case)
+                .map_err(|error| error.context("scenario native assertions"))?;
+            let acknowledged = caller
+                .command(&case.directory, session.cleanup)
+                .map_err(|error| error.context("scenario acknowledgment command preparation"))?
+                .args(["workload", "acknowledge", "--observation"])
+                .arg(case.directory.join("workload-observation.json"))
+                .output()
+                .map_err(|error| error.context("scenario acknowledgment execution"))?;
+            require_successful_output("completed workload acknowledgment", &acknowledged)
+                .map_err(|error| error.context("scenario acknowledgment status"))?;
+            let acknowledgment = memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(
+                &acknowledged.stdout,
+            )
+            .map_err(|error| {
+                CiError::Message(error.to_string()).context("scenario acknowledgment parse")
+            })?;
+            if acknowledgment.association != case.locator {
+                return Err(fail(
+                    "current acknowledgment refers to another actual workload",
+                ));
+            }
+            Ok(())
+        })();
+        result.map_err(|error| error.context(scenario_label))?;
     }
-    super::linux_current_package_fault::interrupt(session.root, &agent, work)?;
-    operation(session.root, &agent, &["package", "upgrade"], work)?;
+    super::linux_current_package_fault::interrupt(session.root, &agent, work)
+        .map_err(|error| error.context("installed package interrupted-upgrade experiment"))?;
+    operation(session.root, &agent, &["package", "upgrade"], work)
+        .map_err(|error| error.context("installed package recovery upgrade"))?;
     operation(
         session.root,
         Path::new("/usr/libexec/memcordon-sealed-agent"),
         &["package", "verify", "--json"],
         work,
-    )?;
+    )
+    .map_err(|error| error.context("installed recovered package verification"))?;
     match fs::symlink_metadata("/usr/libexec/.memcordon-current-package-transaction.json") {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(CiError::from(error).context("installed recovery transaction metadata path=/usr/libexec/.memcordon-current-package-transaction.json")),
         Ok(_) => return Err(fail("current package recovery left its transaction active")),
     }
-    if fs::read("/usr/libexec/memcordon-runtime-manifest.json")? != manifest_bytes {
+    if fs::read("/usr/libexec/memcordon-runtime-manifest.json").map_err(|error| {
+        CiError::from(error).context(
+            "installed recovery manifest read path=/usr/libexec/memcordon-runtime-manifest.json",
+        )
+    })? != manifest_bytes
+    {
         return Err(fail(
             "current package recovery changed selected bytes or left its transaction active",
         ));

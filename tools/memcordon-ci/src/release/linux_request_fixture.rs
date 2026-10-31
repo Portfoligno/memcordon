@@ -83,7 +83,12 @@ impl CallerSession {
 impl CallerRequestFixture {
     #[cfg(target_os = "linux")]
     pub(super) fn bundle_identity(&self) -> Result<(u64, u64)> {
-        let metadata = self.bundle_file.metadata()?;
+        let metadata = self.bundle_file.metadata().map_err(|error| {
+            CiError::from(error).context(format!(
+                "read held bundle identity {}",
+                self.bundle.display()
+            ))
+        })?;
         Ok((metadata.dev(), metadata.ino()))
     }
     /// Caller-visible directory and sources belong to the outer fixture lease.
@@ -108,7 +113,12 @@ impl CallerRequestFixture {
             ));
         }
         let command = caller.command(directory, cutoff)?;
-        let directory_metadata = std::fs::symlink_metadata(directory)?;
+        let directory_metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+            CiError::from(error).context(format!(
+                "pack caller directory metadata {}",
+                directory.display()
+            ))
+        })?;
         if !directory_metadata.is_dir() || directory_metadata.uid() != caller.uid {
             return Err(CiError::Message(
                 "request fixture directory is not owned by its ordinary caller".into(),
@@ -151,8 +161,13 @@ impl CallerRequestFixture {
                     root: input.source_root,
                 },
             },
-        )?;
-        source::write_diagnostic_json(&request_path, &request)?;
+        )
+        .map_err(|error| {
+            error.context(format!("write pack specification {}", spec_path.display()))
+        })?;
+        source::write_diagnostic_json(&request_path, &request).map_err(|error| {
+            error.context(format!("write pack request {}", request_path.display()))
+        })?;
         let observed = command
             .arg("workload")
             .arg("pack")
@@ -160,24 +175,55 @@ impl CallerRequestFixture {
             .arg(&spec_path)
             .arg("--output")
             .arg(&bundle)
-            .output()?;
-        require_successful_output("ordinary caller workload pack", &observed)?;
+            .output()
+            .map_err(|error| {
+                error.context(format!(
+                    "execute ordinary caller pack spec={} output={}",
+                    spec_path.display(),
+                    bundle.display()
+                ))
+            })?;
+        require_successful_output("ordinary caller workload pack", &observed).map_err(|error| {
+            error.context(format!(
+                "ordinary caller pack returned status for {}",
+                bundle.display()
+            ))
+        })?;
         #[cfg(target_os = "linux")]
         let (bundle_file, bundle_directory) = {
             use std::os::unix::fs::OpenOptionsExt;
             let bundle_file = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&bundle)?;
+                .open(&bundle)
+                .map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "open packed caller bundle nofollow {}",
+                        bundle.display()
+                    ))
+                })?;
             let bundle_directory = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(directory)?;
-            let metadata = bundle_file.metadata()?;
+                .open(directory)
+                .map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "open packed caller directory nofollow {}",
+                        directory.display()
+                    ))
+                })?;
+            let metadata = bundle_file.metadata().map_err(|error| {
+                CiError::from(error).context(format!(
+                    "read packed caller bundle metadata {}",
+                    bundle.display()
+                ))
+            })?;
             if !metadata.is_file() || metadata.uid() != caller.uid || metadata.nlink() != 1 {
-                return Err(CiError::Message(
-                    "packed caller bundle custody invalid".into(),
-                ));
+                return Err(
+                    CiError::Message("packed caller bundle custody invalid".into()).context(
+                        format!("validate packed caller bundle {}", bundle.display()),
+                    ),
+                );
             }
             (bundle_file, bundle_directory)
         };
@@ -198,7 +244,12 @@ impl CallerRequestFixture {
     /// capture readers have actually settled.
     #[cfg(target_os = "linux")]
     pub(super) fn retire_bundle_exact(&self) -> Result<()> {
-        let held = self.bundle_file.metadata()?;
+        let held = self.bundle_file.metadata().map_err(|error| {
+            CiError::from(error).context(format!(
+                "retire held caller bundle metadata {}",
+                self.bundle.display()
+            ))
+        })?;
         let named = std::fs::File::from(
             rustix::fs::openat(
                 &self.bundle_directory,
@@ -208,9 +259,21 @@ impl CallerRequestFixture {
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(std::io::Error::from)?,
+            .map_err(std::io::Error::from)
+            .map_err(|error| {
+                CiError::from(error).context(format!(
+                    "retire caller bundle openat nofollow {}",
+                    self.bundle.display()
+                ))
+            })?,
         )
-        .metadata()?;
+        .metadata()
+        .map_err(|error| {
+            CiError::from(error).context(format!(
+                "retire named caller bundle metadata {}",
+                self.bundle.display()
+            ))
+        })?;
         if !held.is_file()
             || held.uid() != self.bundle_uid
             || held.nlink() != 1
@@ -222,15 +285,30 @@ impl CallerRequestFixture {
         {
             return Err(CiError::Message(
                 "settled caller bundle identity changed; retaining named entry".into(),
-            ));
+            )
+            .context(format!(
+                "retire exact caller bundle {}",
+                self.bundle.display()
+            )));
         }
         rustix::fs::unlinkat(
             &self.bundle_directory,
             "workload-inputs.mci",
             rustix::fs::AtFlags::empty(),
         )
-        .map_err(std::io::Error::from)?;
-        self.bundle_directory.sync_all()?;
+        .map_err(std::io::Error::from)
+        .map_err(|error| {
+            CiError::from(error).context(format!(
+                "retire caller bundle unlinkat {}",
+                self.bundle.display()
+            ))
+        })?;
+        self.bundle_directory.sync_all().map_err(|error| {
+            CiError::from(error).context(format!(
+                "sync caller bundle directory after retirement {}",
+                self.bundle.display()
+            ))
+        })?;
         Ok(())
     }
 }
