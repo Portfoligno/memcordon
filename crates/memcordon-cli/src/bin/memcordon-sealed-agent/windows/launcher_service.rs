@@ -1322,13 +1322,36 @@ fn handle_control(
             // The package lease excludes new public admissions. Existing admissions
             // may not have reached Membership yet, so wait for those as well as
             // workers whose Job handles have closed but terminal writes continue.
+            let mut admission_snapshot = None;
+            let mut admission_unavailable = None;
             let settlement = SETTLEMENT.settle_until(deadline, || {
                 terminate_active_jobs(deadline)?;
-                super::record::admissions_empty()
+                let empty = super::record::admissions_empty()?;
+                if !empty {
+                    let observed = super::record::admission_blocker_observation(deadline);
+                    if observed.unavailable.is_none() {
+                        admission_snapshot = Some(observed);
+                        admission_unavailable = None;
+                    } else {
+                        admission_unavailable = Some(observed);
+                    }
+                }
+                Ok(empty)
             });
             let result = match &settlement {
                 Ok(_) => converge_package_cleanup(deadline),
-                Err(error) => Err(super::record::PackageCleanupError::Failed(error.clone())),
+                Err(error) => {
+                    let mut detail = error.clone();
+                    if let Some(observed) = admission_snapshot {
+                        detail.push_str("; last-admission-name-snapshot-after-false-quiesce: ");
+                        detail.push_str(&observed.detail());
+                    }
+                    if let Some(observed) = admission_unavailable {
+                        detail.push_str("; admission-name-inspection-unavailable: ");
+                        detail.push_str(&observed.detail());
+                    }
+                    Err(super::record::PackageCleanupError::Failed(detail))
+                }
             };
             let (mut status, mut attempts_empty, mut detail) = match result {
                 Ok(()) => (

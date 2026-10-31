@@ -5,6 +5,7 @@
 
 pub mod linux_allocation_checkpoint;
 
+pub mod windows_original_gate_failure;
 pub mod windows_status_streams;
 
 pub mod bootstrap_profile;

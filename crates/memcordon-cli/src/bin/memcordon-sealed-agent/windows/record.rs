@@ -2118,6 +2118,42 @@ pub fn admissions_empty() -> Result<bool, String> {
     directory_empty(&admissions_root())
 }
 
+#[path = "admission_blockers.rs"]
+mod admission_blockers;
+pub(super) use admission_blockers::Observation as AdmissionBlockerObservation;
+
+/// Observation only: this never changes the authoritative quiescence result.
+pub(super) fn admission_blocker_observation(cutoff: Instant) -> AdmissionBlockerObservation {
+    use std::os::windows::fs::MetadataExt;
+    if Instant::now() >= cutoff {
+        return AdmissionBlockerObservation::unavailable(
+            admission_blockers::Unavailable::OriginalCutoff,
+        );
+    }
+    let root = admissions_root();
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) => return AdmissionBlockerObservation::unavailable(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return AdmissionBlockerObservation::unavailable(
+            admission_blockers::Unavailable::UnsafeRoot,
+        );
+    }
+    if Instant::now() >= cutoff {
+        return AdmissionBlockerObservation::unavailable(
+            admission_blockers::Unavailable::OriginalCutoff,
+        );
+    }
+    match fs::read_dir(root) {
+        Ok(entries) => admission_blockers::observe_names(
+            entries.map(|entry| entry.map(|entry| entry.file_name())),
+            cutoff,
+        ),
+        Err(error) => AdmissionBlockerObservation::unavailable(error.into()),
+    }
+}
+
 pub fn recovery_clear() -> Result<bool, String> {
     directory_empty(&quarantine_root())
 }

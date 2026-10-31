@@ -5049,6 +5049,46 @@ pub(crate) mod native {
             }
             Ok(())
         })();
+        let failure_case = serde_json::to_value(input.descriptor.case).ok();
+        let failure_fixture = family.lock().ok().and_then(|held| {
+            held.first()
+                .map(|process| (process.identity.pid, process.identity.birth))
+        });
+        let failure_guardian = guardian_owner.lock().ok().and_then(|held| {
+            held.first().map(|process| {
+                (
+                    process.identity.process_id,
+                    u128::from(process.identity.creation_time_100ns),
+                )
+            })
+        });
+        let expected_gate_failure = match (
+            failure_case.as_ref(),
+            input.descriptor.gate_access_diagnostic.as_ref(),
+            failure_fixture,
+        ) {
+            (Some(case), Some(binding), Some((fixture_pid, fixture_birth))) => {
+                Some(crate::windows_original_gate_failure::Expected {
+                    case,
+                    challenge_sha256: &binding.challenge_sha256,
+                    gate_name_utf16_sha256: &binding.name_utf16_sha256,
+                    fixture_pid,
+                    fixture_birth,
+                    guardian: failure_guardian,
+                    guardian_query_failed: super::guardian_query::update(
+                        &guardian_query,
+                        |trace| trace.failure().is_some(),
+                    ),
+                })
+            }
+            _ => None,
+        };
+        let callback_error = |error| {
+            crate::windows_original_gate_failure::callback_failure(
+                error,
+                expected_gate_failure.as_ref(),
+            )
+        };
         let collection = (|| -> Result<()> {
             if let Err(memcordon_testkit::ProcessTestError::Callback {
                 stdout,
@@ -5095,10 +5135,14 @@ pub(crate) mod native {
                     Ok(())
                 })();
                 if let Err(retention) = retention {
-                    return Err(CiError::Message(format!(
-                        "{}; callback diagnostic retention failed: {retention}",
-                        output.as_ref().expect_err("callback failure was matched")
-                    )));
+                    return Err(CiError::LaneFailures {
+                        primary: Box::new(callback_error(
+                            output.expect_err("callback failure was matched"),
+                        )),
+                        secondary: Box::new(
+                            retention.context("callback diagnostic retention failed"),
+                        ),
+                    });
                 }
                 if *capture_complete
                     && cleanup.is_ok()
@@ -5182,14 +5226,18 @@ pub(crate) mod native {
                         Ok(())
                     })();
                     if let Err(diagnostic) = diagnostics {
-                        return Err(CiError::Message(format!(
-                            "{}; secondary OS diagnostic retention failed: {diagnostic}",
-                            output.as_ref().expect_err("callback failure was matched")
-                        )));
+                        return Err(CiError::LaneFailures {
+                            primary: Box::new(callback_error(
+                                output.expect_err("callback failure was matched"),
+                            )),
+                            secondary: Box::new(
+                                diagnostic.context("secondary OS diagnostic retention failed"),
+                            ),
+                        });
                     }
                 }
             }
-            let output = output.map_err(|error| CiError::Message(error.to_string()))?;
+            let output = output.map_err(callback_error)?;
             let exit_bytes = serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.windows-positive-exit","revision":1,
                 "target":config.target,"executable_sha256":execution_sha256,"public_executable_sha256":config.cli.sha256,
@@ -5542,9 +5590,10 @@ pub(crate) mod native {
             eprintln!("optional native gate diagnostics unavailable: {error}");
         }
         match (collection, retirement) {
-            (Err(primary), Err(cleanup)) => Err(CiError::Message(format!(
-                "{primary}; owned retirement: {cleanup}"
-            ))),
+            (Err(primary), Err(cleanup)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(cleanup.context("owned retirement")),
+            }),
             (Err(primary), _) => Err(primary),
             (Ok(()), retirement) => retirement,
         }
