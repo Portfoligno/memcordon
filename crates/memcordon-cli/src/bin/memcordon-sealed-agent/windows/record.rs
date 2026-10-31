@@ -3317,6 +3317,18 @@ fn bound_recovery_terminal_response(
     record: &WindowsAttemptRecordV1,
     outbox: &str,
 ) -> Result<memcordon_core::WindowsLauncherResponseV4, String> {
+    bound_recovery_terminal_response_with_binding(
+        record,
+        outbox,
+        super::package::installed_public_provider_binding,
+    )
+}
+
+fn bound_recovery_terminal_response_with_binding(
+    record: &WindowsAttemptRecordV1,
+    outbox: &str,
+    resolve: impl FnOnce() -> Result<memcordon_core::PublicProviderBindingV1, String>,
+) -> Result<memcordon_core::WindowsLauncherResponseV4, String> {
     let mut response: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(outbox).map_err(|error| error.to_string())?;
     if !memcordon_core::windows_terminal_outbox_is_bound_v4(&decoded_v4(record), &response) {
@@ -3326,7 +3338,7 @@ fn bound_recovery_terminal_response(
     // the authenticated record's current projection separately, as live replay
     // does, without changing terminal authority or its acknowledgement digest.
     if let memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. } = &mut response {
-        rejection.provider_failure = provider_projection(Some(record)).0;
+        rejection.provider_failure = provider_projection_with_binding(Some(record), resolve).0;
         rejection.guardian_causal_receipt = guardian_causal_projection(record)?;
     }
     Ok(response)
@@ -4931,6 +4943,16 @@ fn provider_projection(
     Option<memcordon_core::ProviderFailureDiagnosticV1>,
     memcordon_core::DiagnosticProjectionAvailabilityV1,
 ) {
+    provider_projection_with_binding(record, super::package::installed_public_provider_binding)
+}
+
+fn provider_projection_with_binding(
+    record: Option<&WindowsAttemptRecordV1>,
+    resolve: impl FnOnce() -> Result<memcordon_core::PublicProviderBindingV1, String>,
+) -> (
+    Option<memcordon_core::ProviderFailureDiagnosticV1>,
+    memcordon_core::DiagnosticProjectionAvailabilityV1,
+) {
     use memcordon_core::DiagnosticProjectionAvailabilityV1 as Availability;
     let Some(record) = record else {
         return (None, Availability::RecordUnavailable);
@@ -4938,7 +4960,7 @@ fn provider_projection(
     if !diagnostic_export_eligible(record) {
         return (None, Availability::RetentionExpired);
     }
-    let binding = match super::package::installed_public_provider_binding() {
+    let binding = match resolve() {
         Ok(binding) if binding.generation.as_str() == record.provider_generation => binding,
         _ => return (None, Availability::ProviderBindingUnavailable),
     };

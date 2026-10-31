@@ -1217,6 +1217,17 @@ fn native_durable_record_rejects_provider_generation_substitution() {
 #[ignore = "runs current native provider projection and recovery vectors"]
 fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     let mut record = observed_record();
+    assert!(record.guardian_identity.is_none());
+    // The temporary record uses its real compiled generation. The remaining
+    // binding fields are explicit fixture inputs, not an installed package.
+    let binding = memcordon_core::PublicProviderBindingV1 {
+        generation: memcordon_core::BoundedText::new(record.provider_generation.as_str()).unwrap(),
+        source_commit: memcordon_core::BoundedText::new(&"12".repeat(20)).unwrap(),
+        runtime_manifest_sha256: memcordon_core::hash_bytes(
+            b"native provider projection fixture manifest",
+        ),
+    };
+    assert!(binding.is_consistent());
     let original = record.causal_diagnostics.original.clone();
     let memcordon_core::OriginalFailureV1::Observed { event } = &original else {
         panic!("fixture must have original cause");
@@ -1239,7 +1250,8 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     record.publish_at(&path, 0, |_| Ok(())).unwrap();
     let bytes = read_record_bounded(&path).unwrap();
     authenticate(&record, &record.attempt_id).unwrap();
-    let (projection, availability) = provider_projection(Some(&record));
+    let (projection, availability) =
+        provider_projection_with_binding(Some(&record), || Ok(binding.clone()));
     let stored: WindowsAttemptRecordV1 = serde_json::from_slice(&bytes).unwrap();
     authenticate(&stored, &stored.attempt_id).unwrap();
     assert_eq!(
@@ -1255,6 +1267,45 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     assert_eq!(projection.loss.secondary_events_omitted, 17);
     let projection_bytes = serde_json::to_vec(&projection).unwrap();
     assert!(projection_bytes.len() <= memcordon_core::MAX_DIAGNOSTIC_PROJECTION_BYTES);
+    let (unavailable, reason) = provider_projection_with_binding(Some(&record), || {
+        Err("fixture binding intentionally unavailable".into())
+    });
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::ProviderBindingUnavailable
+    );
+    let mut foreign_binding = binding.clone();
+    foreign_binding.generation =
+        memcordon_core::BoundedText::new("foreign-fixture-generation").unwrap();
+    assert!(foreign_binding.is_consistent());
+    assert_ne!(foreign_binding.generation, binding.generation);
+    let (unavailable, reason) =
+        provider_projection_with_binding(Some(&record), || Ok(foreign_binding.clone()));
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::ProviderBindingUnavailable
+    );
+    let (unavailable, reason) = provider_projection_with_binding(None, || {
+        panic!("absent record must not resolve installed state")
+    });
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::RecordUnavailable
+    );
+    let mut expired_record = record.clone();
+    expired_record.diagnostic_retention.tombstone =
+        Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
+    let (unavailable, reason) = provider_projection_with_binding(Some(&expired_record), || {
+        panic!("expired record must not resolve installed state")
+    });
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::RetentionExpired
+    );
     let mut recovered_record = record.clone();
     let rejection = terminal_fixture::postauthorization_failure(
         &mut recovered_record,
@@ -1265,6 +1316,11 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
         true,
         "MCSEALED-WINDOWS-AUTHORITY-LOSS",
         memcordon_core::BoundarySetupPhase::Retirement,
+    );
+    assert!(recovered_record.guardian_identity.is_none());
+    assert_eq!(
+        binding.generation.as_str(),
+        recovered_record.provider_generation
     );
     recovered_record.terminal_disposition =
         Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
@@ -1307,19 +1363,47 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
         rejection, ..
     } if rejection.provider_failure.is_none())
     );
-    let recovered = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
+    let recovered =
+        bound_recovery_terminal_response_with_binding(&recovered_record, &authority, || {
+            Ok(binding.clone())
+        })
+        .unwrap();
     assert!(
         matches!(&recovered, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..
     } if rejection.provider_failure.as_ref() == Some(&transport_projection))
     );
     assert_eq!(recovered.terminal_authority_json().unwrap(), authority);
+    for unavailable_binding in [false, true] {
+        let unavailable =
+            bound_recovery_terminal_response_with_binding(&recovered_record, &authority, || {
+                if unavailable_binding {
+                    Err("fixture binding intentionally unavailable".into())
+                } else {
+                    Ok(foreign_binding.clone())
+                }
+            })
+            .unwrap();
+        assert!(
+            matches!(&unavailable, memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. } if rejection.provider_failure.is_none())
+        );
+        assert_eq!(unavailable.terminal_authority_json().unwrap(), authority);
+    }
     let mut foreign = recovered_record.clone();
     foreign.request_sha256 = "ab".repeat(32);
-    assert!(bound_recovery_terminal_response(&foreign, &authority).is_err());
+    assert!(
+        bound_recovery_terminal_response_with_binding(&foreign, &authority, || {
+            panic!("foreign recovery outbox must fail before resolving installed state")
+        })
+        .is_err()
+    );
     recovered_record.diagnostic_retention.tombstone =
         Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
-    let expired = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
+    let expired =
+        bound_recovery_terminal_response_with_binding(&recovered_record, &authority, || {
+            panic!("expired recovery diagnostics must not resolve installed state")
+        })
+        .unwrap();
     assert!(
         matches!(&expired, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..
