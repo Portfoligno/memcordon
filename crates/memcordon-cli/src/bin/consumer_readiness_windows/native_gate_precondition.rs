@@ -137,10 +137,26 @@ pub(super) fn run(
         super::native_fixture_default_dacl::snapshot(source)?.stable_eq(&source_before);
     let selected_unchanged =
         super::native_fixture_default_dacl::snapshot(token)?.stable_eq(&selected_before);
+    let gate_name = descriptor
+        .start_gate
+        .as_ref()
+        .ok_or_else(|| io::Error::other("gate control original name missing"))?;
+    let gate_name_bytes: Vec<u8> = gate_name
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
     let summary = serde_json::to_vec(&serde_json::json!({"format":"memcordon.fixture-gate-precondition-controller","revision":1,
+        "case":descriptor.case,"challenge_sha256":super::descriptor::gate_precondition::sha256(&descriptor.challenge),
+        "gate_name_utf16_sha256":super::descriptor::gate_precondition::sha256(&gate_name_bytes),
+        "expected_token_envelope":selected_before.envelope(),
         "diagnostic_only":true,"child_pid":process.dwProcessId,"child_exit_status":code,"child_settled":true,
         "same_retained_primary_token_input":true,"source_token_stable_identity_security_unchanged":source_unchanged,"selected_token_stable_identity_security_unchanged":selected_unchanged,
         "same_original_event_identity_proved":false,"acceptance_authority":false})).map_err(io::Error::other)?;
+    if summary.len() > super::descriptor::gate_precondition::RECORD_BYTES {
+        return Err(io::Error::other(
+            "gate control controller record exceeds bound",
+        ));
+    }
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

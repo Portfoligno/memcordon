@@ -5058,6 +5058,12 @@ pub(crate) mod native {
             Ok(())
         })();
         let failure_case = serde_json::to_value(input.descriptor.case).ok();
+        let failure_challenge =
+            crate::windows_causal_acceptance::sha256(&input.descriptor.challenge);
+        let failure_name = input.descriptor.start_gate.as_ref().map(|name| {
+            let bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            crate::windows_causal_acceptance::sha256(&bytes)
+        });
         let failure_fixture = family.lock().ok().and_then(|held| {
             held.first()
                 .map(|process| (process.identity.pid, process.identity.birth))
@@ -5070,25 +5076,68 @@ pub(crate) mod native {
                 )
             })
         });
-        let expected_gate_failure = match (
-            failure_case.as_ref(),
-            input.descriptor.gate_access_diagnostic.as_ref(),
-            failure_fixture,
-        ) {
-            (Some(case), Some(binding), Some((fixture_pid, fixture_birth))) => {
-                Some(crate::windows_original_gate_failure::Expected {
-                    case,
-                    challenge_sha256: &binding.challenge_sha256,
-                    gate_name_utf16_sha256: &binding.name_utf16_sha256,
-                    fixture_pid,
-                    fixture_birth,
-                    guardian: failure_guardian,
-                    guardian_query_failed: super::guardian_query::update(
-                        &guardian_query,
-                        |trace| trace.failure().is_some(),
-                    ),
+        let control_context = input.descriptor.gate_precondition.as_ref().map(|control| {
+            if !matches!(
+                &output,
+                Err(memcordon_testkit::ProcessTestError::Callback {
+                    capture_complete: true,
+                    cleanup: Ok(()),
+                    ..
                 })
+            ) {
+                return "unavailable: original callback capture/cleanup not settled".into();
             }
+            let observed = (|| -> Result<String> {
+                let case = failure_case
+                    .as_ref()
+                    .ok_or_else(|| CiError::Message("control case unavailable".into()))?;
+                let name = failure_name
+                    .as_ref()
+                    .ok_or_else(|| CiError::Message("control gate name unavailable".into()))?;
+                let controller = read(
+                    &input
+                        .descriptor
+                        .output_root
+                        .join("gate-precondition-control.json"),
+                    descriptor::gate_precondition::RECORD_BYTES,
+                )?;
+                let child = read(
+                    &input
+                        .descriptor
+                        .output_root
+                        .join("gate-precondition-child.json"),
+                    descriptor::gate_precondition::RECORD_BYTES,
+                )?;
+                crate::windows_original_gate_failure::control_summary(
+                    &controller,
+                    &child,
+                    control,
+                    case,
+                    &failure_challenge,
+                    name,
+                )
+                .map_err(CiError::Message)
+            })();
+            match observed {
+                Ok(value) => value,
+                Err(error) => format!(
+                    "unavailable: {}",
+                    crate::command::bounded_excerpt(error.to_string().as_bytes())
+                ),
+            }
+        });
+        let expected_gate_failure = match (failure_case.as_ref(), failure_name.as_ref()) {
+            (Some(case), Some(name)) => Some(crate::windows_original_gate_failure::Expected {
+                case,
+                challenge_sha256: &failure_challenge,
+                gate_name_utf16_sha256: name,
+                fixture: failure_fixture,
+                guardian: failure_guardian,
+                guardian_query_failed: super::guardian_query::update(&guardian_query, |trace| {
+                    trace.failure().is_some()
+                }),
+                pre_handoff_control: control_context.as_deref(),
+            }),
             _ => None,
         };
         let callback_error = |error| {
@@ -5456,11 +5505,9 @@ pub(crate) mod native {
             let held = family
                 .lock()
                 .map_err(|_| CiError::Message("fixture ownership poisoned".into()))?;
-            if held.is_empty() || held.iter().any(|p| !p.has_exited().unwrap_or(false)) {
-                return Err(CiError::Message(
-                    "independently held fixture family did not retire".into(),
-                ));
-            }
+            crate::windows_original_gate_failure::retired_family(
+                held.iter().map(|process| process.has_exited()),
+            )?;
             let remaining = memcordon_testkit::windows_processes_for_image_until(
                 &config.fixture.path,
                 work_deadline,

@@ -13,10 +13,10 @@ fn expected(case: &Value) -> Expected<'_> {
         case,
         challenge_sha256: CHALLENGE,
         gate_name_utf16_sha256: NAME,
-        fixture_pid: 123,
-        fixture_birth: 456,
+        fixture: Some((123, 456)),
         guardian: Some((42, 777)),
         guardian_query_failed: true,
+        pre_handoff_control: None,
     }
 }
 fn record() -> Value {
@@ -158,7 +158,7 @@ fn malformed_truncated_duplicate_conflicting_and_oversized_records_are_inconclus
 }
 
 #[test]
-fn incomplete_cleanup_missing_original_holder_or_query_observation_never_promotes_a_record() {
+fn incomplete_cleanup_remains_unproved_but_missing_owner_is_explicit_diagnostic_context() {
     let case = json!("envelope");
     let mut expected = expected(&case);
     let bytes = line(&record());
@@ -178,14 +178,205 @@ fn incomplete_cleanup_missing_original_holder_or_query_observation_never_promote
     let error = callback_failure(query(bytes.clone(), true, Ok(())), None);
     assert_original(&error, &bytes);
     expected.guardian_query_failed = false;
-    assert!(!matches!(
+    assert!(matches!(
         callback_failure(query(bytes.clone(), true, Ok(())), Some(&expected)),
         CiError::LaneFailures { .. }
     ));
+    expected.fixture = None;
+    let unowned = callback_failure(query(bytes.clone(), true, Ok(())), Some(&expected));
+    assert_original(&unowned, &bytes);
+    let text = unowned.to_string();
+    assert!(text.contains("controller-held-target=unavailable"));
+    assert!(text.contains("target-association=unavailable"));
+    assert!(text.contains("acceptance-authority=false"));
+    assert!(!text.contains("controller-held-fixture-pid="));
     expected.guardian_query_failed = true;
-    expected.fixture_pid = 0;
+    expected.fixture = Some((0, 456));
     assert!(!matches!(
         callback_failure(query(bytes, true, Ok(())), Some(&expected)),
         CiError::LaneFailures { .. }
     ));
+}
+
+#[test]
+fn retirement_owner_absence_live_observation_and_query_failure_stay_distinct_errors() {
+    use memcordon_ci::windows_original_gate_failure::retired_family;
+    let missing = retired_family(Vec::<std::io::Result<bool>>::new()).unwrap_err();
+    assert!(missing.to_string().contains("ownership unavailable"));
+    assert!(!missing.to_string().contains("remains live"));
+    let live = retired_family([Ok(true), Ok(false)]).unwrap_err();
+    assert!(live.to_string().contains("remains live; member-index=1"));
+    let query = retired_family([Err(std::io::Error::from_raw_os_error(5))]).unwrap_err();
+    assert!(query.to_string().contains("query failed"));
+    assert_eq!(
+        query
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(5)
+    );
+    retired_family([Ok(true), Ok(true)]).unwrap();
+}
+
+fn control_pair(
+    opened: bool,
+) -> (
+    Value,
+    Value,
+    memcordon_ci::windows_consumer_readiness::descriptor::gate_precondition::Input,
+) {
+    use memcordon_ci::windows_consumer_readiness::descriptor::gate_precondition::{
+        Input, TokenObservation,
+    };
+    let token = TokenObservation {
+        user_sid: vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
+        restricted: true,
+        integrity_rid: 8192,
+        elevated: false,
+        restricting_sids: vec![vec![1, 1, 0, 0, 0, 0, 0, 5, 12, 0, 0, 0]],
+    };
+    let envelope = json!({"user_sid":"S-1-5-18","owner_sid":"S-1-5-18","primary_group_sid":"S-1-5-18",
+        "groups_sha256":"a".repeat(64),"privileges_sha256":"b".repeat(64),"restricted_sids_sha256":"c".repeat(64),
+        "integrity_level":"S-1-16-8192","mandatory_policy":1,"session_id":2,"elevation_type":1,"elevated":false,
+        "virtualization_allowed":false,"virtualization_enabled":false,"ui_access":false,"appcontainer":false,
+        "authentication_id":100,"token_type":1,"impersonation_level":0});
+    let controller = json!({"format":"memcordon.fixture-gate-precondition-controller","revision":1,"diagnostic_only":true,
+        "case":"envelope","challenge_sha256":CHALLENGE,"gate_name_utf16_sha256":NAME,"expected_token_envelope":envelope,
+        "child_pid":321,"child_exit_status":0,"child_settled":true,"same_retained_primary_token_input":true,
+        "source_token_stable_identity_security_unchanged":true,"selected_token_stable_identity_security_unchanged":true,
+        "same_original_event_identity_proved":false,"acceptance_authority":false});
+    let child = json!({"format":"memcordon.fixture-gate-precondition","revision":1,"diagnostic_only":true,"case":"envelope",
+        "challenge_sha256":CHALLENGE,"gate_name_utf16_sha256":NAME,"operation":"OpenEventW-pre-handoff-control",
+        "desired_access":0x100000,"attempted":true,"opened":opened,"native_error":if opened {None}else{Some(5)},
+        "token":token,"token_envelope":envelope,"same_original_event_identity_proved":false,"acceptance_authority":false});
+    (
+        controller,
+        child,
+        Input {
+            revision: 1,
+            expected_token: token,
+            work_cutoff_qpc: 1000,
+            qpc_frequency: 10,
+        },
+    )
+}
+
+#[test]
+fn settled_same_input_control_is_context_not_target_ownership_or_success() {
+    use memcordon_ci::windows_original_gate_failure::control_summary;
+    let case = json!("envelope");
+    for opened in [false, true] {
+        let (controller, child, input) = control_pair(opened);
+        let summary = control_summary(
+            &serde_json::to_vec(&controller).unwrap(),
+            &serde_json::to_vec(&child).unwrap(),
+            &input,
+            &case,
+            CHALLENGE,
+            NAME,
+        )
+        .unwrap();
+        assert!(summary.contains("independent-control-child=321"));
+        assert!(summary.contains("same-original-event-identity-proved=false"));
+        assert!(summary.contains("acceptance-authority=false"));
+        assert!(summary.contains(&format!("opened={opened}")));
+        let mut expected = expected(&case);
+        expected.fixture = None;
+        expected.guardian_query_failed = false;
+        expected.pre_handoff_control = Some(&summary);
+        let bytes = line(&record());
+        let failure = callback_failure(query(bytes.clone(), true, Ok(())), Some(&expected));
+        assert_original(&failure, &bytes);
+        assert!(
+            failure
+                .to_string()
+                .contains("controller-held-target=unavailable")
+        );
+        assert!(
+            failure
+                .to_string()
+                .contains("independent-control-child=321")
+        );
+        assert!(matches!(failure, CiError::LaneFailures { .. }));
+    }
+    let oversized = "untrusted-control-summary".repeat(300);
+    let mut expected = expected(&case);
+    expected.fixture = None;
+    expected.pre_handoff_control = Some(&oversized);
+    let failure = callback_failure(query(line(&record()), true, Ok(())), Some(&expected));
+    assert!(
+        failure
+            .to_string()
+            .contains("control-summary-exceeds-bound")
+    );
+    assert!(!failure.to_string().contains(&oversized));
+}
+
+#[test]
+fn control_context_rejects_foreign_binding_token_mismatch_and_unsettled_records() {
+    use memcordon_ci::windows_original_gate_failure::control_summary;
+    let (controller, child, input) = control_pair(false);
+    let case = json!("envelope");
+    let check = |controller: &Value, child: &Value| {
+        control_summary(
+            &serde_json::to_vec(controller).unwrap(),
+            &serde_json::to_vec(child).unwrap(),
+            &input,
+            &case,
+            CHALLENGE,
+            NAME,
+        )
+    };
+    for (pointer, value) in [
+        ("/case", json!("other")),
+        ("/challenge_sha256", json!(NAME)),
+        ("/gate_name_utf16_sha256", json!(CHALLENGE)),
+        ("/child_pid", json!(0)),
+        ("/child_exit_status", json!(1)),
+        ("/child_settled", json!(false)),
+        ("/same_retained_primary_token_input", json!(false)),
+        (
+            "/source_token_stable_identity_security_unchanged",
+            json!(false),
+        ),
+        (
+            "/selected_token_stable_identity_security_unchanged",
+            json!(false),
+        ),
+        ("/acceptance_authority", json!(true)),
+        ("/same_original_event_identity_proved", json!(true)),
+        ("/expected_token_envelope/session_id", json!(3)),
+    ] {
+        let mut changed = controller.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(check(&changed, &child).is_err(), "{pointer}");
+    }
+    for (pointer, value) in [
+        ("/token/restricted", json!(false)),
+        ("/token_envelope/groups_sha256", json!("d".repeat(64))),
+        ("/challenge_sha256", json!(NAME)),
+        ("/native_error", Value::Null),
+    ] {
+        let mut changed = child.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(check(&controller, &changed).is_err(), "{pointer}");
+    }
+    assert!(control_summary(&vec![b'x'; 65537], b"{}", &input, &case, CHALLENGE, NAME).is_err());
+    let bytes = serde_json::to_string(&controller).unwrap();
+    let duplicate = format!("{{\"revision\":1,{}", bytes.strip_prefix('{').unwrap());
+    assert!(
+        control_summary(
+            duplicate.as_bytes(),
+            &serde_json::to_vec(&child).unwrap(),
+            &input,
+            &case,
+            CHALLENGE,
+            NAME
+        )
+        .is_err()
+    );
 }

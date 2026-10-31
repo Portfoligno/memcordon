@@ -137,6 +137,51 @@ fn path_components_depth_and_storage_are_closed_without_guessed_mapping() {
     );
 }
 
+#[test]
+fn final_query_prefix_is_exact_bound_utf16_parent_and_never_the_event_leaf() {
+    let (mut value, _, challenge) = fixture();
+    let mut proof = value.namespace.take().unwrap();
+    proof.components = vec![
+        wide("Sessions"),
+        wide("2"),
+        wide("BaseNamedObjects"),
+        wide("event-🦀"),
+    ];
+    proof.path_sha256 = namespace::path_sha256(&proof.components).unwrap();
+    let name = wide("Local\\event-🦀");
+    value.name_utf16_sha256 = input::name_sha256(&name);
+    proof.name_utf16_sha256 = value.name_utf16_sha256.clone();
+    value.namespace = Some(proof.clone());
+    value.validate(&name, &challenge).unwrap();
+    let parent = proof.event_parent().unwrap();
+    assert_eq!(parent, &proof.components[..proof.components.len() - 1]);
+    assert_eq!(
+        namespace::rooted_path(parent).unwrap(),
+        wide("\\Sessions\\2\\BaseNamedObjects")
+    );
+    assert_eq!(proof.event_leaf().unwrap(), wide("event-🦀"));
+    assert_ne!(namespace::path_sha256(parent).unwrap(), proof.path_sha256);
+    for component in [vec![], wide(".."), wide("one\\two"), vec![0]] {
+        let mut changed = proof.clone();
+        changed.components[1] = component;
+        assert!(changed.event_parent().is_err());
+    }
+    let mut foreign = proof.clone();
+    foreign.path_sha256 = input::sha256(b"foreign original path");
+    assert!(foreign.event_parent().is_err());
+    for depth in [0, 1] {
+        let mut short = proof.clone();
+        short.components.truncate(depth);
+        assert!(short.event_parent().is_err());
+    }
+    let mut unconfirmed = proof.clone();
+    unconfirmed.complete = false;
+    assert!(unconfirmed.event_parent().is_err());
+    let mut leaf = proof;
+    *leaf.components.last_mut().unwrap() = wide("bad/leaf");
+    assert!(leaf.event_parent().is_err());
+}
+
 fn native_buffer() -> (Vec<u8>, usize, Counted, Counted, usize) {
     let header = size_of::<u64>() * 4;
     let base = 0x1000usize;
