@@ -105,7 +105,7 @@ fn descriptor() -> Descriptor {
         .join("rust-lld.exe");
     Descriptor {
         format: "memcordon.fixture-workload".into(),
-        revision: 1,
+        revision: descriptor::DESCRIPTOR_REVISION,
         case: Case::Churn,
         transcript: root.join("events.bin"),
         output_root: root.clone(),
@@ -352,6 +352,134 @@ fn fixture_descriptor_rejects_duplicate_and_unknown_fields() {
     assert!(serde_json::from_str::<Descriptor>(&duplicate).is_err());
     let unknown = bytes.replacen('{', "{\"pretend_success\":true,", 1);
     assert!(serde_json::from_str::<Descriptor>(&unknown).is_err());
+}
+
+#[test]
+fn production_fixture_vectors_fit_the_private_wire_bound_and_round_trip_exactly() {
+    use memcordon_ci::windows_consumer_readiness::{fixture_parameters, validate_descriptor};
+    let mut full_stream_cases = 0;
+    let mut backpressure_cases = 0;
+    for key in positive_keys() {
+        let parameters = fixture_parameters(&key).unwrap();
+        let mut input = descriptor();
+        input.case = parameters.case;
+        input.stdout = parameters.stdout;
+        input.stderr = parameters.stderr;
+        input.arguments = parameters.arguments;
+        input.application_status = parameters.application_status;
+        if matches!(input.case, Case::RootFirst | Case::IntermediateFirst) {
+            input.descendant_gate = Some("Local\\memcordon-readiness-portable-descendant".into());
+        }
+        validate_descriptor(&key, &input).unwrap();
+        let bytes = serde_json::to_vec(&input).unwrap();
+        assert!(bytes.len() <= descriptor::MAX_DESCRIPTOR_BYTES, "{key:?}");
+        let parsed = Descriptor::parse(&bytes).unwrap();
+        assert_eq!(parsed.stdout, input.stdout, "{key:?}");
+        assert_eq!(parsed.stderr, input.stderr, "{key:?}");
+        assert_eq!(parsed.arguments, input.arguments, "{key:?}");
+        assert_eq!(parsed.application_status, input.application_status);
+        if (key.family == "C-IO" && key.scenario == "bounded-large-output")
+            || (key.family == "W-RETIREMENT" && key.scenario == "output-backpressure")
+        {
+            assert_eq!(parsed.stdout.len(), descriptor::MAX_STREAM_BYTES);
+            assert_eq!(parsed.stderr.len(), descriptor::MAX_STREAM_BYTES);
+            assert_ne!(parsed.stdout, parsed.stderr);
+            full_stream_cases += 1;
+        }
+        if key.family == "W-IO" && key.scenario == "backpressure-separated-streams" {
+            assert_eq!(parsed.stdout.len(), 8192);
+            assert_eq!(parsed.stderr.len(), 8192);
+            assert_ne!(parsed.stdout, parsed.stderr);
+            backpressure_cases += 1;
+        }
+    }
+    assert_eq!(full_stream_cases, 2);
+    assert_eq!(backpressure_cases, 1);
+}
+
+#[test]
+fn compact_stream_codec_preserves_binary_empty_and_maximum_bytes() {
+    for bytes in [
+        Vec::new(),
+        vec![0, 255, 128, 1],
+        (0..=255).collect(),
+        vec![255; descriptor::MAX_STREAM_BYTES],
+    ] {
+        let mut input = descriptor();
+        input.stdout = bytes.clone();
+        input.stderr = bytes.clone();
+        let wire = serde_json::to_vec(&input).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert!(json["stdout_base64"].is_string());
+        assert!(json.get("stdout").is_none());
+        let parsed = Descriptor::parse(&wire).unwrap();
+        assert_eq!(parsed.stdout, bytes);
+        assert_eq!(parsed.stderr, bytes);
+    }
+}
+
+#[test]
+fn stream_encoding_rejects_noncanonical_and_over_limit_input_before_admission() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let valid = serde_json::to_value(descriptor()).unwrap();
+    for field in ["stdout_base64", "stderr_base64"] {
+        for encoded in [
+            "@AAA", "Zg", "Zg=", "Zg===", "Zh==", "Zm9=", "AAAA\n", "====", "A===",
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = encoded.into();
+            assert!(
+                serde_json::from_value::<Descriptor>(changed).is_err(),
+                "{field}: {encoded:?}"
+            );
+        }
+        let mut changed = valid.clone();
+        changed[field] = STANDARD
+            .encode(vec![0; descriptor::MAX_STREAM_BYTES + 1])
+            .into();
+        assert!(serde_json::from_value::<Descriptor>(changed).is_err());
+    }
+    for stdout in [true, false] {
+        let mut input = descriptor();
+        if stdout {
+            input.stdout.resize(descriptor::MAX_STREAM_BYTES + 1, 0);
+        } else {
+            input.stderr.resize(descriptor::MAX_STREAM_BYTES + 1, 0);
+        }
+        assert!(serde_json::to_vec(&input).is_err());
+        assert!(input.validate().is_err());
+    }
+    let mut old = valid.clone();
+    old["revision"] = 1.into();
+    assert!(Descriptor::parse(&serde_json::to_vec(&old).unwrap()).is_err());
+    let mut unknown = valid;
+    unknown["stdout"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<Descriptor>(unknown).is_err());
+    let wire = serde_json::to_string(&descriptor()).unwrap();
+    let duplicate = format!(
+        "{{\"stdout_base64\":\"\",{}",
+        wire.strip_prefix('{').unwrap()
+    );
+    assert!(Descriptor::parse(duplicate.as_bytes()).is_err());
+}
+
+#[test]
+fn compact_streams_do_not_relax_the_aggregate_descriptor_bound() {
+    use memcordon_ci::windows_consumer_readiness::{CaseKey, validate_descriptor};
+    let mut input = descriptor();
+    input.arguments = vec!["x".repeat(4096); 16];
+    let wire = serde_json::to_vec(&input).unwrap();
+    assert!(wire.len() > descriptor::MAX_DESCRIPTOR_BYTES);
+    assert!(Descriptor::parse(&wire).is_err());
+    assert!(input.validate().is_err());
+    let key = CaseKey {
+        family: "C-IO".into(),
+        scenario: "bounded-large-output".into(),
+    };
+    let error = validate_descriptor(&key, &input).unwrap_err().to_string();
+    assert!(error.contains("C-IO/bounded-large-output"));
+    assert!(error.contains(&format!("encoded-bytes={}", wire.len())));
+    assert!(error.contains(&format!("limit={}", descriptor::MAX_DESCRIPTOR_BYTES)));
 }
 
 #[test]

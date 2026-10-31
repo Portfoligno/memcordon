@@ -322,7 +322,7 @@ pub fn validate_suite(input: &SuiteInput) -> Result<()> {
         if !keys.insert(case.key.clone()) {
             return Err(CiError::Message("duplicate Windows positive case".into()));
         }
-        case.descriptor.validate().map_err(CiError::Message)?;
+        validate_descriptor(&case.key, &case.descriptor)?;
         if !case.workload_request.is_absolute()
             || !case.descriptor_path.is_absolute()
             || matches!(
@@ -410,6 +410,108 @@ fn validate_vectors(case: &CaseInput) -> Result<()> {
         return Err(CiError::Message("churn must retain 63 cohort leaves plus one TCP peer within the frozen 64-live-child bound".into()));
     }
     Ok(())
+}
+
+/// Deterministic execution inputs shared by provisioning and portable boundary checks.
+pub struct FixtureParameters {
+    pub case: descriptor::Case,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub arguments: Vec<String>,
+    pub application_status: u32,
+}
+
+pub fn fixture_parameters(key: &CaseKey) -> Result<FixtureParameters> {
+    let case = expected_fixture_case(key)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut arguments = Vec::new();
+    if key.family == "W-IO" {
+        match key.scenario.as_str() {
+            "all-bytes" => {
+                stdout = (0..=255).collect();
+                stderr = (0..=255).rev().collect();
+            }
+            "embedded-nul" => {
+                stdout = vec![1, 0, 2];
+                stderr = vec![3, 0, 4];
+            }
+            "invalid-utf8" => {
+                stdout = vec![255, 128];
+                stderr = vec![254, 129];
+            }
+            "final-fragment" => {
+                stdout = b"final-fragment".to_vec();
+                stderr = b"stderr-fragment".to_vec();
+            }
+            "backpressure-separated-streams" => {
+                stdout = (0..=255).cycle().take(8192).collect();
+                stderr = (0..=255).rev().cycle().take(8192).collect();
+            }
+            "argv-empty" => arguments.push(String::new()),
+            "argv-whitespace" => arguments.push("space and\ttab".into()),
+            "argv-quotes" => arguments.push("literal \"quotes\"".into()),
+            "argv-backslashes" => arguments.push("trailing\\".into()),
+            "argv-unicode" => arguments.push("日本語-λ".into()),
+            "argv-path" => arguments.push("C:\\path with spaces\\file".into()),
+            _ => {}
+        }
+    }
+    if key.family == "W-RETIREMENT" && key.scenario == "output-backpressure" {
+        stdout = (u8::MIN..=u8::MAX).cycle().take(16384).collect();
+        stderr = (u8::MIN..=u8::MAX).rev().cycle().take(16384).collect();
+    }
+    if key.family == "C-IO" {
+        match key.scenario.as_str() {
+            "binary-streams" => {
+                stdout = (u8::MIN..=u8::MAX).collect();
+                stderr = (u8::MIN..=u8::MAX).rev().collect();
+            }
+            "bounded-large-output" => {
+                stdout = (u8::MIN..=u8::MAX).cycle().take(16384).collect();
+                stderr = (u8::MIN..=u8::MAX).rev().cycle().take(16384).collect();
+            }
+            "native-argv" => {
+                arguments = vec![
+                    String::new(),
+                    "space and\ttab".into(),
+                    "literal \"quotes\"".into(),
+                    "trailing\\".into(),
+                    "日本語-λ".into(),
+                    "C:\\path with spaces\\file".into(),
+                ]
+            }
+            _ => {}
+        }
+    }
+    Ok(FixtureParameters {
+        case,
+        stdout,
+        stderr,
+        arguments,
+        application_status: expected_status(key),
+    })
+}
+
+/// Validate the actual input once complete, retaining its case and wire-size boundary.
+pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -> Result<()> {
+    let bytes = serde_json::to_vec(descriptor).map_err(|error| {
+        CiError::Message(format!(
+            "Windows fixture {}/{} encoding failed: {error}; limit={}",
+            key.family,
+            key.scenario,
+            descriptor::MAX_DESCRIPTOR_BYTES
+        ))
+    })?;
+    descriptor.validate().map_err(|error| {
+        CiError::Message(format!(
+            "Windows fixture {}/{} descriptor invalid: {error}; encoded-bytes={} limit={}",
+            key.family,
+            key.scenario,
+            bytes.len(),
+            descriptor::MAX_DESCRIPTOR_BYTES
+        ))
+    })
 }
 
 fn expected_fixture_case(key: &CaseKey) -> Result<descriptor::Case> {
@@ -2180,68 +2282,13 @@ pub(crate) mod native {
                 .candidate_output_root
                 .join(&key.family)
                 .join(&key.scenario);
-            let case = expected_fixture_case(&key)?;
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut arguments = Vec::new();
-            if key.family == "W-IO" {
-                match key.scenario.as_str() {
-                    "all-bytes" => {
-                        stdout = (0..=255).collect();
-                        stderr = (0..=255).rev().collect();
-                    }
-                    "embedded-nul" => {
-                        stdout = vec![1, 0, 2];
-                        stderr = vec![3, 0, 4];
-                    }
-                    "invalid-utf8" => {
-                        stdout = vec![255, 128];
-                        stderr = vec![254, 129];
-                    }
-                    "final-fragment" => {
-                        stdout = b"final-fragment".to_vec();
-                        stderr = b"stderr-fragment".to_vec();
-                    }
-                    "backpressure-separated-streams" => {
-                        stdout = (0..=255).cycle().take(8192).collect();
-                        stderr = (0..=255).rev().cycle().take(8192).collect();
-                    }
-                    "argv-empty" => arguments.push(String::new()),
-                    "argv-whitespace" => arguments.push("space and\ttab".into()),
-                    "argv-quotes" => arguments.push("literal \"quotes\"".into()),
-                    "argv-backslashes" => arguments.push("trailing\\".into()),
-                    "argv-unicode" => arguments.push("日本語-λ".into()),
-                    "argv-path" => arguments.push("C:\\path with spaces\\file".into()),
-                    _ => {}
-                }
-            }
-            if key.family == "W-RETIREMENT" && key.scenario == "output-backpressure" {
-                stdout = (u8::MIN..=u8::MAX).cycle().take(16384).collect();
-                stderr = (u8::MIN..=u8::MAX).rev().cycle().take(16384).collect();
-            }
-            if key.family == "C-IO" {
-                match key.scenario.as_str() {
-                    "binary-streams" => {
-                        stdout = (u8::MIN..=u8::MAX).collect();
-                        stderr = (u8::MIN..=u8::MAX).rev().collect();
-                    }
-                    "bounded-large-output" => {
-                        stdout = (u8::MIN..=u8::MAX).cycle().take(16384).collect();
-                        stderr = (u8::MIN..=u8::MAX).rev().cycle().take(16384).collect();
-                    }
-                    "native-argv" => {
-                        arguments = vec![
-                            String::new(),
-                            "space and\ttab".into(),
-                            "literal \"quotes\"".into(),
-                            "trailing\\".into(),
-                            "日本語-λ".into(),
-                            "C:\\path with spaces\\file".into(),
-                        ]
-                    }
-                    _ => {}
-                }
-            }
+            let FixtureParameters {
+                case,
+                stdout,
+                stderr,
+                arguments,
+                application_status: status,
+            } = fixture_parameters(&key)?;
             let event_stem = format!(
                 "Local\\memcordon-readiness-{run}-{}-{}",
                 key.family, key.scenario
@@ -2257,7 +2304,6 @@ pub(crate) mod native {
                     .to_string_lossy()
                     .into_owned()
             });
-            let status = expected_status(&key);
             let caller = if matches!(
                 key.scenario.as_str(),
                 "restricted" | "restricted-token-preserved"
@@ -2268,7 +2314,7 @@ pub(crate) mod native {
             };
             let descriptor = descriptor::Descriptor {
                 format: "memcordon.fixture-workload".into(),
-                revision: 1,
+                revision: descriptor::DESCRIPTOR_REVISION,
                 case,
                 output_root: output.clone(),
                 transcript: output.join("fixture-events.bin"),
@@ -2302,6 +2348,7 @@ pub(crate) mod native {
                 )
                 .then(|| plan.toolchain.clone()),
             };
+            validate_descriptor(&key, &descriptor)?;
             cases.push(CaseInput {
                 key,
                 descriptor,
@@ -2582,6 +2629,7 @@ pub(crate) mod native {
             final_input.descriptor.gate_access_diagnostic = None;
             binding_setup = serde_json::json!({"state":"unavailable","reason":"original-descriptor-aggregate-bound"});
         }
+        validate_descriptor(&final_input.key, &final_input.descriptor)?;
         Ok(PreparedGateInput {
             input: final_input,
             gate,
@@ -3776,7 +3824,16 @@ pub(crate) mod native {
         }
         fs::create_dir_all(&input.descriptor.output_root)?;
         let descriptor_bytes = serde_json::to_vec(&input.descriptor)?;
-        descriptor::Descriptor::parse(&descriptor_bytes).map_err(CiError::Message)?;
+        validate_descriptor(&input.key, &input.descriptor)?;
+        descriptor::Descriptor::parse(&descriptor_bytes).map_err(|error| {
+            CiError::Message(format!(
+                "Windows fixture {}/{} publication failed: {error}; encoded-bytes={} limit={}",
+                input.key.family,
+                input.key.scenario,
+                descriptor_bytes.len(),
+                descriptor::MAX_DESCRIPTOR_BYTES
+            ))
+        })?;
         OpenOptions::new()
             .write(true)
             .create_new(true)

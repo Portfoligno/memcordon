@@ -4,10 +4,14 @@ use std::path::{Path, PathBuf};
 
 #[path = "controller_gate_access_input.rs"]
 pub mod gate_access;
+#[path = "stream_bytes.rs"]
+mod stream_bytes;
 #[path = "toolchain_command.rs"]
 pub mod toolchain_command;
 
 pub const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
+pub const DESCRIPTOR_REVISION: u32 = 2;
+pub const MAX_STREAM_BYTES: usize = stream_bytes::MAX_STREAM_BYTES;
 pub const CHURN_CREATIONS: u32 = 4096;
 // One TCP peer remains live alongside the cohort, so 63 leaves preserve the
 // profile's maximum of 64 simultaneous workload descendants.
@@ -156,7 +160,9 @@ pub struct Descriptor {
     pub output_root: PathBuf,
     pub transcript: PathBuf,
     pub challenge: Vec<u8>,
+    #[serde(rename = "stdout_base64", with = "stream_bytes")]
     pub stdout: Vec<u8>,
+    #[serde(rename = "stderr_base64", with = "stream_bytes")]
     pub stderr: Vec<u8>,
     pub arguments: Vec<String>,
     pub application_status: u32,
@@ -187,7 +193,7 @@ impl Descriptor {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.format != "memcordon.fixture-workload" || self.revision != 1 {
+        if self.format != "memcordon.fixture-workload" || self.revision != DESCRIPTOR_REVISION {
             return Err("unsupported fixture workload format/revision".into());
         }
         if let Some(diagnostic) = &self.gate_access_diagnostic {
@@ -215,8 +221,8 @@ impl Descriptor {
         }
         if self.challenge.is_empty()
             || self.challenge.len() > 4096
-            || self.stdout.len() > 16 * 1024
-            || self.stderr.len() > 16 * 1024
+            || self.stdout.len() > MAX_STREAM_BYTES
+            || self.stderr.len() > MAX_STREAM_BYTES
             || self.arguments.len() > 64
             || self.denied_write_paths.len() > 16
             || self.sentinel_handles.len() > 16

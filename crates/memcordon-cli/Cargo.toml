@@ -16,7 +16,7 @@ autobins = false
 sealed-runtime = []
 private-tcp = ["sealed-runtime"]
 windows-sealed-runtime = ["sealed-runtime"]
-test-fixtures = ["memcordon-platform/test-support", "memcordon-core/test-support"]
+test-fixtures = ["memcordon-platform/test-support", "memcordon-core/test-support", "dep:base64"]
 test-support = ["memcordon-platform/test-support", "memcordon-windows-launch-core/test-support", "test-fixtures"]
 
 [[bin]]
@@ -64,6 +64,7 @@ required-features = ["test-fixtures"]
 
 [dependencies]
 anstream.workspace = true
+base64 = { workspace = true, optional = true }
 anstyle.workspace = true
 anstyle-query.workspace = true
 clap.workspace = true

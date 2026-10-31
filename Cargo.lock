@@ -685,6 +685,7 @@ dependencies = [
  "anstream",
  "anstyle",
  "anstyle-query",
+ "base64",
  "clap",
  "flate2",
  "hex",
