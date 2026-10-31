@@ -2768,7 +2768,7 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers workspace-fetch
       - id: context
         if: (matrix.channel == 'cargo') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness
+        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime
         timeout-minutes: 20
       - id: native
         if: (matrix.channel == 'native') && runner.os == 'Windows'
@@ -2778,14 +2778,6 @@ jobs:
         if: (matrix.channel == 'cargo') && runner.os == 'Windows'
         run: ./target/ci-runtime/current/memcordon-ci.exe release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo
         timeout-minutes: 135
-      - id: loader-cleanup-native
-        if: always() && matrix.channel == 'native' && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native
-        timeout-minutes: 15
-      - id: loader-cleanup-cargo
-        if: always() && matrix.channel == 'cargo' && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo
-        timeout-minutes: 15
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
         with:
@@ -3158,7 +3150,7 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers workspace-fetch
       - id: context
         if: (matrix.channel == 'cargo') && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness
+        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime
         timeout-minutes: 20
       - id: native
         if: (matrix.channel == 'native') && runner.os == 'Windows'
@@ -3168,14 +3160,6 @@ jobs:
         if: (matrix.channel == 'cargo') && runner.os == 'Windows'
         run: ./target/ci-runtime/current/memcordon-ci.exe release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo
         timeout-minutes: 135
-      - id: loader-cleanup-native
-        if: always() && matrix.channel == 'native' && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native
-        timeout-minutes: 15
-      - id: loader-cleanup-cargo
-        if: always() && matrix.channel == 'cargo' && runner.os == 'Windows'
-        run: ./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo
-        timeout-minutes: 15
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
         with:

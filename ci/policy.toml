@@ -277,8 +277,6 @@ allowed_run_commands = [
   "./target/ci-runtime/current/memcordon-ci.exe ci segment windows-fixture-native",
   "./target/ci-runtime/current/memcordon-ci.exe ci segment workspace-fetch",
   "./target/ci-runtime/current/memcordon-ci.exe ci workflows --check",
-  "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo",
-  "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native",
   "./target/ci-runtime/current/memcordon-ci.exe release compile-target --build-source .release/build-source.json --runtime-components",
   "./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime",
   "./target/ci-runtime/current/memcordon-ci.exe release prepare-test-tools --build-source .release/build-source.json",

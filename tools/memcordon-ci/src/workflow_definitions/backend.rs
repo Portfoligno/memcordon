@@ -10838,8 +10838,6 @@ fn node_707() -> Value {
     values.push(node_790());
     values.push(node_791());
     values.push(node_792());
-    values.push(node_793());
-    values.push(node_794());
     values.push(node_795());
     values.push(node_797());
     Value::Sequence(values)
@@ -10885,30 +10883,6 @@ fn node_796() -> Value {
     Value::Mapping(values)
 }
 
-fn node_794() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-cargo"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'cargo' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
-fn node_793() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-native"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'native' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
 fn node_792() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("cargo"));
@@ -10940,7 +10914,7 @@ fn node_790() -> Value {
         text("if"),
         text("(matrix.channel == 'cargo') && runner.os == 'Windows'"),
     );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness"));
+    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime"));
     values.insert(text("timeout-minutes"), Value::Number(20.into()));
     Value::Mapping(values)
 }
@@ -12262,8 +12236,6 @@ fn node_608() -> Value {
     values.push(node_691());
     values.push(node_692());
     values.push(node_693());
-    values.push(node_694());
-    values.push(node_695());
     values.push(node_696());
     values.push(node_698());
     Value::Sequence(values)
@@ -12309,30 +12281,6 @@ fn node_697() -> Value {
     Value::Mapping(values)
 }
 
-fn node_695() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-cargo"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'cargo' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
-fn node_694() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-native"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'native' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
 fn node_693() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("cargo"));
@@ -12364,7 +12312,7 @@ fn node_691() -> Value {
         text("if"),
         text("(matrix.channel == 'cargo') && runner.os == 'Windows'"),
     );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness"));
+    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime"));
     values.insert(text("timeout-minutes"), Value::Number(20.into()));
     Value::Mapping(values)
 }

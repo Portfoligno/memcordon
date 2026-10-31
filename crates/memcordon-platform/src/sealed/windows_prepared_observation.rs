@@ -41,11 +41,14 @@ impl WindowsPreparedObservationScope {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
         };
         let path = std::path::absolute(path).map_err(|error| error.to_string())?;
         let directory = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(FILE_SHARE_READ)
+            // Atomic child publication needs FILE_ADD_FILE on the directory;
+            // withholding FILE_SHARE_DELETE still pins the directory itself.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&path)
             .map_err(|error| error.to_string())?;
