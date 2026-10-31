@@ -305,19 +305,28 @@ fn before_preparation_experiment(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&fixture.bundle)?;
     let identity = bundle.metadata()?;
-    let watcher = NativeNamespaceWatch::new(&[
-        ("journal", Path::new("/var/lib/memcordon/workload-attempts")),
-        (
-            "input-staging",
-            Path::new("/var/lib/memcordon/workload-inputs"),
-        ),
-        (
-            "footprint",
-            Path::new("/var/lib/memcordon/workload-resources"),
-        ),
-        ("root-staging", Path::new("/run/memcordon")),
-        ("cgroup", Path::new("/sys/fs/cgroup/memcordon-sealed")),
-    ])?;
+    let watcher = NativeNamespaceWatch::new(
+        &[
+            ("journal", Path::new("/var/lib/memcordon/workload-attempts")),
+            (
+                "input-staging",
+                Path::new("/var/lib/memcordon/workload-inputs"),
+            ),
+            (
+                "footprint",
+                Path::new("/var/lib/memcordon/workload-resources"),
+            ),
+            ("root-staging", Path::new("/run/memcordon")),
+            ("cgroup", Path::new("/sys/fs/cgroup/memcordon-sealed")),
+        ],
+        work,
+    )
+    .map_err(|error| {
+        error.context(format!(
+            "before-preparation namespace watch root={}",
+            directory.display()
+        ))
+    })?;
     let namespace_before = watcher.snapshot()?;
     let gate = NativeReadGate::on_file(&bundle, caller.uid, work)?;
     let observations = directory.join("observations");

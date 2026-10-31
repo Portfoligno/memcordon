@@ -925,70 +925,248 @@ impl Drop for NativeTraceStop {
 
 pub struct NativeNamespaceWatch {
     events: File,
-    roots: Vec<(String, std::path::PathBuf, File, i32)>,
+    roots: Vec<NamespaceRoot>,
+    subscriptions: Vec<crate::namespace_watch_model::Subscription>,
+    cutoff: Instant,
+}
+struct NamespaceRoot {
+    role: String,
+    path: std::path::PathBuf,
+    parent: File,
+    basename: std::ffi::OsString,
+    directory: Option<File>,
+}
+
+fn namespace_identity(file: &File) -> Result<(u64, u64, u32, u32)> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(CiError::Message(
+            "native namespace observation directory is unprotected".into(),
+        ));
+    }
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+    ))
+}
+
+fn namespace_open(parent: &File, name: &std::ffi::OsStr) -> Result<Option<File>> {
+    match rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(file) => Ok(Some(File::from(file))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(std::io::Error::from(error).into()),
+    }
+}
+
+fn namespace_parent(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(CiError::Message(
+            "native namespace path must be absolute".into(),
+        ));
+    }
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    namespace_identity(&directory)?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => (),
+            std::path::Component::Normal(name) => {
+                directory = namespace_open(&directory, name)?.ok_or_else(|| {
+                    CiError::Message(format!(
+                        "native namespace parent component absent: {}",
+                        path.display()
+                    ))
+                })?;
+                namespace_identity(&directory)?;
+            }
+            _ => {
+                return Err(CiError::Message(
+                    "native namespace parent is not normalized".into(),
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn namespace_add_watch(events: &File, directory: &File) -> Result<i32> {
+    let name = std::ffi::CString::new(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .expect("numeric held directory path");
+    // SAFETY: the held directory FD pins this path for this call.
+    let watch = unsafe {
+        libc::inotify_add_watch(
+            events.as_raw_fd(),
+            name.as_ptr(),
+            libc::IN_CREATE
+                | libc::IN_MOVED_TO
+                | libc::IN_DELETE
+                | libc::IN_MOVED_FROM
+                | libc::IN_DELETE_SELF
+                | libc::IN_MOVE_SELF
+                | libc::IN_UNMOUNT
+                | libc::IN_ONLYDIR,
+        )
+    };
+    if watch < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(watch)
 }
 impl NativeNamespaceWatch {
-    pub fn new(roots: &[(&str, &Path)]) -> Result<Self> {
+    pub fn new(roots: &[(&str, &Path)], cutoff: Instant) -> Result<Self> {
         // SAFETY: fixed flags request a new, nonblocking kernel event FD.
         let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if raw < 0 {
-            return Err(CiError::Message(format!(
-                "native namespace observation unavailable: {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(CiError::from(std::io::Error::last_os_error())
+                .context("native namespace inotify initialization"));
         }
         // SAFETY: inotify_init1 transferred this fresh descriptor exactly once.
         let events = unsafe { File::from_raw_fd(raw) };
         let mut held = Vec::new();
+        let mut subscriptions = Vec::new();
         for (role, path) in roots {
-            let directory = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(path)?;
-            let metadata = directory.metadata()?;
-            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            use std::os::unix::ffi::OsStrExt;
+            if Instant::now() >= cutoff {
                 return Err(CiError::Message(
-                    "native namespace observation directory is unprotected".into(),
+                    "native namespace original cutoff expired".into(),
                 ));
             }
-            let name = std::ffi::CString::new(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-                .expect("numeric held directory path");
-            // SAFETY: the held directory FD pins this path for the call.
-            let watch = unsafe {
-                libc::inotify_add_watch(
-                    events.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::IN_CREATE
-                        | libc::IN_MOVED_TO
-                        | libc::IN_DELETE
-                        | libc::IN_MOVED_FROM
-                        | libc::IN_DELETE_SELF
-                        | libc::IN_MOVE_SELF
-                        | libc::IN_ONLYDIR,
-                )
-            };
-            if watch < 0 {
-                return Err(CiError::Message(format!(
-                    "native namespace watch unavailable: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            held.push(((*role).into(), (*path).to_path_buf(), directory, watch));
+            let admitted = (|| -> Result<NamespaceRoot> {
+                let basename = path
+                    .file_name()
+                    .ok_or_else(|| {
+                        CiError::Message("native namespace root basename absent".into())
+                    })?
+                    .to_os_string();
+                if !matches!(
+                    path.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    return Err(CiError::Message(
+                        "native namespace root basename is not normal".into(),
+                    ));
+                }
+                let parent = namespace_parent(path.parent().ok_or_else(|| {
+                    CiError::Message("native namespace root parent absent".into())
+                })?)?;
+                let watch = namespace_add_watch(&events, &parent)?;
+                subscriptions.push(crate::namespace_watch_model::Subscription {
+                    watch,
+                    role: (*role).into(),
+                    basename: Some(basename.as_bytes().to_vec()),
+                });
+                let directory = namespace_open(&parent, &basename)?;
+                if let Some(directory) = &directory {
+                    namespace_identity(directory)?;
+                    let watch = namespace_add_watch(&events, directory)?;
+                    subscriptions.push(crate::namespace_watch_model::Subscription {
+                        watch,
+                        role: (*role).into(),
+                        basename: None,
+                    });
+                }
+                Ok(NamespaceRoot {
+                    role: (*role).into(),
+                    path: (*path).to_path_buf(),
+                    parent,
+                    basename,
+                    directory,
+                })
+            })()
+            .map_err(|error| {
+                error.context(format!(
+                    "native namespace admission role={role} path={}",
+                    path.display()
+                ))
+            })?;
+            held.push(admitted);
         }
-        Ok(Self {
+        let observer = Self {
             events,
             roots: held,
-        })
+            subscriptions,
+            cutoff,
+        };
+        // Revalidate the original admission without consuming queued setup events.
+        observer.snapshot()?;
+        Ok(observer)
     }
     pub fn snapshot(&self) -> Result<serde_json::Value> {
         use std::os::unix::ffi::OsStrExt;
         let mut observed = Vec::new();
-        for (role, path, directory, _) in &self.roots {
-            let metadata = directory.metadata()?;
+        for root in &self.roots {
+            if Instant::now() >= self.cutoff {
+                return Err(CiError::Message(
+                    "native namespace original cutoff expired".into(),
+                ));
+            }
+            let NamespaceRoot {
+                role,
+                path,
+                parent,
+                basename,
+                directory,
+            } = root;
+            let validation = (|| -> Result<()> {
+                let named_parent = namespace_parent(path.parent().expect("admitted parent"))?;
+                crate::namespace_watch_model::require_same_identity(
+                    Some(namespace_identity(parent)?),
+                    Some(namespace_identity(&named_parent)?),
+                )?;
+                let named = namespace_open(parent, basename)?;
+                crate::namespace_watch_model::require_same_identity(
+                    directory.as_ref().map(namespace_identity).transpose()?,
+                    named.as_ref().map(namespace_identity).transpose()?,
+                )
+            })();
+            validation.map_err(|error| {
+                error.context(format!(
+                    "native namespace snapshot role={role} path={}",
+                    path.display()
+                ))
+            })?;
+            let parent_identity = namespace_identity(parent)?;
+            let Some(directory) = directory else {
+                observed.push(serde_json::json!({"role":role,"path":path,"parent":parent_identity,"absent":true}));
+                continue;
+            };
+            let metadata = directory.metadata().map_err(|error| {
+                CiError::from(error).context(format!(
+                    "native namespace held metadata role={role} path={}",
+                    path.display()
+                ))
+            })?;
             let root = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
             let mut entries = Vec::new();
-            for entry in std::fs::read_dir(&root)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(&root).map_err(|error| {
+                CiError::from(error).context(format!(
+                    "native namespace entries role={role} path={}",
+                    path.display()
+                ))
+            })? {
+                if Instant::now() >= self.cutoff {
+                    return Err(CiError::Message(
+                        "native namespace original cutoff expired".into(),
+                    ));
+                }
+                let entry = entry.map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "native namespace entry read role={role} path={}",
+                        path.display()
+                    ))
+                })?;
                 let name = entry.file_name();
                 if role == "root-staging" && !name.as_bytes().starts_with(b"private-root-") {
                     continue;
@@ -998,18 +1176,45 @@ impl NativeNamespaceWatch {
                         "native namespace entry inventory exceeds bound".into(),
                     ));
                 }
-                let identity = std::fs::symlink_metadata(root.join(&name))?;
+                let identity = std::fs::symlink_metadata(root.join(&name)).map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "native namespace entry metadata role={role} path={} name={name:?}",
+                        path.display()
+                    ))
+                })?;
                 entries.push(serde_json::json!({"name":name.as_bytes(),"device":identity.dev(),"inode":identity.ino(),"uid":identity.uid(),"mode":identity.mode(),"length":identity.len()}));
             }
             entries.sort_by(|left, right| left["name"].to_string().cmp(&right["name"].to_string()));
-            observed.push(serde_json::json!({"role":role,"path":path,"device":metadata.dev(),"inode":metadata.ino(),"uid":metadata.uid(),"mode":metadata.mode(),"entries":entries}));
+            let named_parent = namespace_parent(path.parent().expect("admitted parent"))?;
+            crate::namespace_watch_model::require_same_identity(
+                Some(parent_identity),
+                Some(namespace_identity(&named_parent)?),
+            )?;
+            let named = namespace_open(parent, basename)?;
+            crate::namespace_watch_model::require_same_identity(
+                Some(namespace_identity(directory)?),
+                named.as_ref().map(namespace_identity).transpose()?,
+            )
+            .map_err(|error| {
+                error.context(format!(
+                    "native namespace snapshot final readback role={role} path={}",
+                    path.display()
+                ))
+            })?;
+            observed.push(serde_json::json!({"role":role,"path":path,"parent":parent_identity,"absent":false,"device":metadata.dev(),"inode":metadata.ino(),"uid":metadata.uid(),"mode":metadata.mode(),"entries":entries}));
         }
         Ok(serde_json::Value::Array(observed))
     }
     pub fn drain(&self) -> Result<serde_json::Value> {
         let mut buffer = [0u8; 65536];
         let mut observed = Vec::new();
+        let mut raw_events = 0;
         loop {
+            if Instant::now() >= self.cutoff {
+                return Err(CiError::Message(
+                    "native namespace original cutoff expired".into(),
+                ));
+            }
             let mut source = &self.events;
             let count = match source.read(&mut buffer) {
                 Ok(0) => return Err(CiError::Message("native namespace observer closed".into())),
@@ -1019,6 +1224,11 @@ impl NativeNamespaceWatch {
             };
             let mut offset = 0;
             while offset < count {
+                if Instant::now() >= self.cutoff {
+                    return Err(CiError::Message(
+                        "native namespace original cutoff expired".into(),
+                    ));
+                }
                 if count - offset < 16 {
                     return Err(CiError::Message("native namespace event truncated".into()));
                 }
@@ -1048,25 +1258,17 @@ impl NativeNamespaceWatch {
                     .position(|byte| *byte == 0)
                     .unwrap_or(name.len())];
                 offset += 16 + length;
-                let (role, _, _, _) = self
-                    .roots
-                    .iter()
-                    .find(|(_, _, _, id)| *id == watch)
-                    .ok_or_else(|| {
-                        CiError::Message("native namespace event belongs to another watch".into())
-                    })?;
-                if role == "root-staging"
-                    && !name.starts_with(b"private-root-")
-                    && mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) == 0
+                raw_events += 1;
+                crate::namespace_watch_model::check_event_bounds(raw_events, observed.len())?;
+                for role in
+                    crate::namespace_watch_model::classify(&self.subscriptions, watch, mask, name)?
                 {
-                    continue;
+                    crate::namespace_watch_model::check_event_bounds(
+                        raw_events,
+                        observed.len() + 1,
+                    )?;
+                    observed.push(serde_json::json!({"role":role,"mask":mask,"name":name}));
                 }
-                if observed.len() >= 4096 {
-                    return Err(CiError::Message(
-                        "native namespace event inventory exceeds bound".into(),
-                    ));
-                }
-                observed.push(serde_json::json!({"role":role,"mask":mask,"name":name}));
             }
         }
         Ok(serde_json::Value::Array(observed))

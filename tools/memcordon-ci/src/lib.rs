@@ -29,6 +29,7 @@ pub mod linux_request_arguments;
 pub mod macos_probe_contract;
 pub mod miri_cache;
 pub mod miri_targets;
+pub mod namespace_watch_model;
 pub mod native_channel;
 pub mod native_coverage;
 pub mod native_paths;
