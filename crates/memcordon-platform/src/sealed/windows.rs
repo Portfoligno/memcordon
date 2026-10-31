@@ -23,9 +23,9 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NO_DATA, ERROR_NOT_FOUND,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -1453,7 +1453,6 @@ impl Drop for OwnedHandle {
 struct Relays {
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<Result<(), String>>>,
-    handles: Vec<OwnedHandle>,
     relay_retired_event: OwnedHandle,
     retired: bool,
 }
@@ -1499,20 +1498,16 @@ impl Relays {
             }
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::with_capacity(prepared.len());
         let mut threads = Vec::with_capacity(prepared.len());
         for (role, handle) in prepared {
-            let raw = handle.raw() as usize;
             let stop_for_thread = Arc::clone(&stop);
             threads.push(std::thread::spawn(move || {
-                relay(role, raw as HANDLE, &stop_for_thread)
+                relay(role, handle, &stop_for_thread)
             }));
-            handles.push(handle);
         }
         Ok(Self {
             stop,
             threads,
-            handles,
             relay_retired_event,
             retired: false,
         })
@@ -1541,22 +1536,45 @@ impl Relays {
             }
         }
         for thread in &threads {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let wait_millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
-            // SAFETY: the JoinHandle owns a live Windows thread handle.
-            match unsafe { WaitForSingleObject(thread.as_raw_handle() as HANDLE, wait_millis) } {
-                WAIT_OBJECT_0 => {}
-                WAIT_TIMEOUT => {
-                    // A stuck relay would otherwise keep the frontend and its
-                    // provider-owned stream handles alive indefinitely. Exit
-                    // the frontend so the guardian becomes cleanup authority.
-                    std::process::abort();
+            let mut cancellation_error = None;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let wait_millis = u32::try_from(remaining.as_millis().min(20)).unwrap_or(20);
+                // SAFETY: the JoinHandle owns a live Windows thread handle.
+                match unsafe { WaitForSingleObject(thread.as_raw_handle() as HANDLE, wait_millis) }
+                {
+                    WAIT_OBJECT_0 => break,
+                    WAIT_TIMEOUT => {
+                        if std::time::Instant::now() >= deadline {
+                            // Preserve bounded containment if an original relay
+                            // cannot settle within the existing retirement cap.
+                            std::process::abort();
+                        }
+                        // Cancellation may have preceded the thread entering
+                        // its blocking call. Reissue against the same original
+                        // thread, never by closing its borrowed endpoint.
+                        if unsafe { CancelSynchronousIo(thread.as_raw_handle() as HANDLE) } == 0 {
+                            let error = io::Error::last_os_error();
+                            if error.raw_os_error().map(|code| code as u32) != Some(ERROR_NOT_FOUND)
+                            {
+                                cancellation_error.get_or_insert_with(|| {
+                                    format!("failed to cancel stream relay I/O: {error}")
+                                });
+                            }
+                        }
+                    }
+                    WAIT_FAILED => {
+                        // An unproven join cannot extend the retirement cap;
+                        // even writing a diagnostic could block on a full sink.
+                        std::process::abort();
+                    }
+                    _ => {
+                        std::process::abort();
+                    }
                 }
-                WAIT_FAILED => errors.push(format!(
-                    "failed while waiting for stream relay retirement: {}",
-                    io::Error::last_os_error()
-                )),
-                status => errors.push(format!("unexpected stream relay wait status: {status}")),
+            }
+            if let Some(error) = cancellation_error {
+                errors.push(error);
             }
         }
         for thread in threads {
@@ -1566,7 +1584,6 @@ impl Relays {
                 Err(_) => errors.push("stream relay thread panicked".to_owned()),
             }
         }
-        self.handles.clear();
         // SAFETY: this event is the exact launcher-created retirement channel
         // adopted before validating the transferred manifest.
         if unsafe { SetEvent(self.relay_retired_event.raw()) } == 0 {
@@ -1590,21 +1607,31 @@ impl Drop for Relays {
     }
 }
 
-fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result<(), String> {
+fn relay(role: WindowsStreamRoleV1, remote: OwnedHandle, stop: &AtomicBool) -> Result<(), String> {
+    // This thread is the sole owner of the transferred endpoint. In particular,
+    // stdin EOF closes its writer before the target can finish and retire.
+    let remote_handle = remote.raw();
     let (source, destination) = match role {
         // SAFETY: standard handle selectors do not transfer ownership.
-        WindowsStreamRoleV1::Stdin => (unsafe { GetStdHandle(STD_INPUT_HANDLE) }, remote),
-        WindowsStreamRoleV1::Stdout => (remote, unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }),
-        WindowsStreamRoleV1::Stderr => (remote, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
+        WindowsStreamRoleV1::Stdin => (unsafe { GetStdHandle(STD_INPUT_HANDLE) }, remote_handle),
+        WindowsStreamRoleV1::Stdout => (remote_handle, unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }),
+        WindowsStreamRoleV1::Stderr => (remote_handle, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
     };
+    relay_io(remote, source, destination, stop)
+}
+
+fn relay_io(
+    _endpoint: OwnedHandle,
+    source: HANDLE,
+    destination: HANDLE,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let mut buffer = [0_u8; 16 * 1024];
     while !stop.load(Ordering::SeqCst) {
-        // SAFETY: source is a live standard/pipe handle used only for waiting.
-        if unsafe { WaitForSingleObject(source, 20) } != WAIT_OBJECT_0 {
-            continue;
-        }
         let mut read = 0_u32;
-        // SAFETY: buffer and count are live for synchronous IO.
+        // SAFETY: buffer/count and the source are live for synchronous IO.
+        // Standard input may be NUL or a finite file, not a waitable pipe;
+        // retirement cancels this thread's synchronous IO before joining it.
         if unsafe {
             ReadFile(
                 source,
@@ -1615,7 +1642,18 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
             )
         } == 0
         {
-            break;
+            let error = io::Error::last_os_error();
+            let code = error.raw_os_error().map(|code| code as u32);
+            if matches!(
+                code,
+                Some(
+                    ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
+                )
+            ) || code == Some(ERROR_OPERATION_ABORTED) && stop.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            return Err(format!("stream relay read failed: {error}"));
         }
         if read == 0 {
             break;
@@ -1634,7 +1672,16 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
                 )
             } == 0
             {
-                return Ok(());
+                let error = io::Error::last_os_error();
+                let code = error.raw_os_error().map(|code| code as u32);
+                if matches!(
+                    code,
+                    Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
+                ) || code == Some(ERROR_OPERATION_ABORTED) && stop.load(Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
+                return Err(format!("stream relay write failed: {error}"));
             }
             if written == 0 {
                 return Err("zero-byte stream relay write".to_owned());
@@ -1644,6 +1691,10 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/private/windows_relay_eof.rs"]
+mod relay_eof_tests;
 
 fn native_api_failure(operation: &'static str) -> String {
     let error = io::Error::last_os_error();

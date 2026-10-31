@@ -2,6 +2,30 @@
 mod policy;
 
 #[test]
+fn actual_restricted_cases_share_the_original_gate_diagnostics() {
+    let selected: Vec<_> = memcordon_ci::windows_consumer_readiness::positive_keys()
+        .into_iter()
+        .filter(|key| policy::capture_restricted_gate(&key.family, &key.scenario))
+        .map(|key| (key.family, key.scenario))
+        .collect();
+    assert_eq!(
+        selected,
+        [
+            ("W-BINDING".into(), "restricted-token-preserved".into()),
+            ("W-ENVELOPE".into(), "restricted".into()),
+        ]
+    );
+    for (family, scenario) in [
+        ("W-BINDING", "restricted"),
+        ("W-ENVELOPE", "restricted-token-preserved"),
+        ("W-ENVELOPE", "ordinary"),
+        ("C-IO", "bounded-large-output"),
+    ] {
+        assert!(!policy::capture_restricted_gate(family, scenario));
+    }
+}
+
+#[test]
 fn selected_waiter_is_exact_noninheritable_sync_without_changing_existing_grants() {
     let user = [1, 2, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 42, 0, 0, 0];
     let actual = policy::sddl(&user, "S-1-5-21-42").unwrap();

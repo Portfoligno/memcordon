@@ -79,6 +79,26 @@ fn unsettled_writer_times_out_without_entering_recovery() {
     let _worker = gate.enter().unwrap();
     let error = gate.settle_until(Instant::now(), || Ok(true)).unwrap_err();
     assert!(error.contains("phase=wait-launcher-settlement"));
+    assert!(error.contains("last-quiesce=true"));
+    assert!(error.contains("last-exclusive-attempted=true"));
+    assert!(error.contains("last-exclusive-would-block=true"));
+    assert!(error.contains("requested-ms=0"));
+}
+
+#[test]
+fn nonquiescent_deadline_is_distinct_from_a_blocked_exclusive_lease() {
+    let gate = SettlementGate::default();
+    let error = gate.settle_until(Instant::now(), || Ok(false)).unwrap_err();
+    assert!(error.contains("last-quiesce=false"));
+    assert!(error.contains("last-exclusive-attempted=false"));
+    assert!(error.contains("last-exclusive-would-block=false"));
+    assert!(error.contains("elapsed-ms="));
+    assert!(error.contains("requested-ms=0"));
+    assert_eq!(
+        gate.settle_until(Instant::now(), || Err("original quiesce failure".into()))
+            .unwrap_err(),
+        "original quiesce failure"
+    );
 }
 
 #[test]

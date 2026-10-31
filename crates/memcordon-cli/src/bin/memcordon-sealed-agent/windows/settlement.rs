@@ -20,11 +20,17 @@ impl SettlementGate {
         deadline: Instant,
         mut quiesce: impl FnMut() -> Result<bool, String>,
     ) -> Result<RwLockWriteGuard<'_, ()>, String> {
+        let started = Instant::now();
+        let requested = deadline.saturating_duration_since(started);
         loop {
-            if quiesce()? {
+            let quiescent = quiesce()?;
+            let mut exclusive_attempted = false;
+            let mut exclusive_would_block = false;
+            if quiescent {
+                exclusive_attempted = true;
                 match self.0.try_write() {
                     Ok(lease) => return Ok(lease),
-                    Err(TryLockError::WouldBlock) => {}
+                    Err(TryLockError::WouldBlock) => exclusive_would_block = true,
                     Err(TryLockError::Poisoned(_)) => {
                         return Err("launcher settlement gate is poisoned".to_owned());
                     }
@@ -32,10 +38,11 @@ impl SettlementGate {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(
-                    "phase=wait-launcher-settlement deadline expired before live writers and admissions retired"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "phase=wait-launcher-settlement deadline expired before live writers and admissions retired; last-quiesce={quiescent}; last-exclusive-attempted={exclusive_attempted}; last-exclusive-would-block={exclusive_would_block}; elapsed-ms={}; requested-ms={}",
+                    now.saturating_duration_since(started).as_millis(),
+                    requested.as_millis(),
+                ));
             }
             std::thread::sleep(Duration::from_millis(10).min(deadline - now));
         }

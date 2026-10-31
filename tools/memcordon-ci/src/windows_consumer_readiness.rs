@@ -1013,15 +1013,25 @@ pub fn released_target_loader_event_candidate(result: &ResultV3) -> bool {
         && validate_retirement(result).is_ok()
 }
 
+/// Original frontend exit observations retained by the running controller.
+pub struct FrontendExit {
+    pub status: i32,
+    pub original_pid: Option<u32>,
+}
+
 pub fn assess(
     case: &CaseInput,
     result_bytes: &[u8],
     stdout: &[u8],
     stderr: &[u8],
     transcript: &[u8],
-    native_status: i32,
+    frontend: FrontendExit,
     expected_association: &memcordon_core::execution_facts::ProviderAttemptAssociationV1,
 ) -> Result<()> {
+    let FrontendExit {
+        status: native_status,
+        original_pid: frontend_pid,
+    } = frontend;
     let result = ResultV3::parse(result_bytes).map_err(CiError::Message)?;
     let target_status = expected_status(&case.key);
     let policy_kind = match case.descriptor.case {
@@ -1038,9 +1048,17 @@ pub fn assess(
             Some(ChildTermination::WindowsStatus { status }) if *status == target_status)
             && !matches!(result.outcome.native_termination.as_ref(), Some(ChildTermination::ExitCode { code }) if *code == target_status as i32)
     {
-        return Err(CiError::Message(
-            "positive Windows case did not complete with exact application origin/status".into(),
-        ));
+        return Err(CiError::Message(format!(
+            "positive Windows case {}/{} did not complete with exact application origin/status; expected-kind={:?}; expected-target-status={target_status}; observed-kind={:?}; wrapper-status={}; native-status={native_status}; release={:?}; termination={:?}; diagnostics={}",
+            case.key.family,
+            case.key.scenario,
+            policy_kind.unwrap_or(OutcomeKindV1::Completed),
+            result.outcome.kind,
+            result.outcome.wrapper_status,
+            result.release,
+            result.outcome.native_termination,
+            result.diagnostics.as_slice().len(),
+        )));
     }
     if current_association(&result)? != expected_association {
         return Err(CiError::Message(
@@ -1100,10 +1118,16 @@ pub fn assess(
                 "exact independent stdout/stderr bytes differ".into(),
             ));
         }
-    } else if !stdout.is_empty() || !stderr.is_empty() {
-        return Err(CiError::Message(
-            "positive fixture unexpectedly wrote standard streams".into(),
-        ));
+    } else {
+        crate::windows_status_streams::validate(
+            stdout,
+            stderr,
+            native_status,
+            result.outcome.kind,
+            frontend_pid,
+            case.expected_token.restricted,
+        )
+        .map_err(CiError::Message)?;
     }
     let has = |stage: &str| event.iter().any(|e| e.stage == stage);
     if policy_kind.is_some() && (!has("policy-demand-started") || has("finished")) {
@@ -2546,7 +2570,8 @@ pub(crate) mod native {
         let mut prelaunch_label =
             serde_json::json!({"state":"unavailable","reason":"comparison-not-requested"});
         let mut namespace = None;
-        if input.key.family == "W-ENVELOPE" && input.key.scenario == "restricted" {
+        if super::start_gate_policy::capture_restricted_gate(&input.key.family, &input.key.scenario)
+        {
             prelaunch_label =
                 gate_query_result(super::workload_diagnostic::gate_mandatory_label_snapshot(
                     gate.as_ref(),
@@ -3808,6 +3833,13 @@ pub(crate) mod native {
         let association = Arc::new(Mutex::new(None));
         let held_family = Arc::clone(&family);
         let held_association = Arc::clone(&association);
+        let frontend = Arc::new(Mutex::new(None::<WindowsImageProcess>));
+        let held_frontend = Arc::clone(&frontend);
+        let capture_frontend_identity = expected_status(&input.key) != 0
+            || matches!(
+                input.descriptor.case,
+                descriptor::Case::DeadlineDemand | descriptor::Case::MemoryDemand
+            );
         let report = config
             .output_directory
             .join(&input.key.family)
@@ -3925,8 +3957,10 @@ pub(crate) mod native {
         let callback_guardian_query = Arc::clone(&guardian_query);
         let gate_root_diagnostic = Arc::new(Mutex::new(None::<serde_json::Value>));
         let callback_gate_root_diagnostic = Arc::clone(&gate_root_diagnostic);
-        let capture_gate_diagnostic =
-            input.key.family == "W-ENVELOPE" && input.key.scenario == "restricted";
+        let capture_gate_diagnostic = super::start_gate_policy::capture_restricted_gate(
+            &input.key.family,
+            &input.key.scenario,
+        );
         let gate_diagnostic = capture_gate_diagnostic.then(|| {
             let name_utf16: Vec<_> = gate_name.encode_utf16().collect();
             let name_bytes: Vec<_> = name_utf16.iter().flat_map(|unit| unit.to_le_bytes()).collect();
@@ -3967,7 +4001,7 @@ pub(crate) mod native {
             work_budget,
             4 * 1024 * 1024,
             |mut command| command.spawn(),
-            move |_, _, _| {
+            move |wrapper_pid, _, _| {
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                 let (held, root_pid) = loop {
                     if barrier_report.try_exists()? {
@@ -4027,6 +4061,27 @@ pub(crate) mod native {
                 *held_family
                     .lock()
                     .map_err(|_| io::Error::other("fixture ownership poisoned"))? = held;
+                if capture_frontend_identity {
+                    let mut selected = Vec::new();
+                    for process in
+                        memcordon_testkit::windows_processes_for_image_until(&cli, deadline)?
+                    {
+                        if process.native_parent_process_id()? == wrapper_pid
+                            && !process.has_exited()?
+                        {
+                            selected.push(process);
+                        }
+                    }
+                    if selected.len() != 1 {
+                        return Err(io::Error::other(
+                            "status fixture lacks one original held frontend child",
+                        ));
+                    }
+                    *held_frontend
+                        .lock()
+                        .map_err(|_| io::Error::other("frontend ownership poisoned"))? =
+                        selected.pop();
+                }
                 let guardian = baseline
                     .hold_new_guardian_excluding(&excluded)
                     .map_err(io::Error::other)?;
@@ -5221,10 +5276,27 @@ pub(crate) mod native {
                 &output.stdout,
                 &output.stderr,
                 &transcript,
-                output
-                    .status
-                    .code()
-                    .ok_or_else(|| CiError::Message("missing native frontend status".into()))?,
+                FrontendExit {
+                    status: output
+                        .status
+                        .code()
+                        .ok_or_else(|| CiError::Message("missing native frontend status".into()))?,
+                    original_pid: {
+                        let frontend = frontend
+                            .lock()
+                            .map_err(|_| CiError::Message("frontend ownership poisoned".into()))?;
+                        match frontend.as_ref() {
+                            Some(process) if process.has_exited()? => Some(process.identity.pid),
+                            Some(_) => {
+                                return Err(CiError::Message(
+                                    "original status frontend remains live after wrapper exit"
+                                        .into(),
+                                ));
+                            }
+                            None => None,
+                        }
+                    },
+                },
                 held,
             )?;
             if terminal.format != "memcordon.windows-terminal-observation"
@@ -5541,12 +5613,13 @@ pub(crate) mod native {
                 work_deadline,
                 diagnostic_deadlines.map(|deadlines| deadlines.cleanup),
             ) {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                if assessment.retirement.is_err() {
-                    break;
-                }
+                let error = error.context(format!(
+                    "Windows required case {}/{} failed after original case cleanup",
+                    case.key.family, case.key.scenario
+                ));
+                eprintln!("{error}");
+                first_error = Some(error);
+                break;
             }
         }
         if let Some(error) = first_error {

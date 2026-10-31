@@ -3,6 +3,14 @@ use std::io;
 pub const BASE_SDDL: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x00100000;;;RC)";
 pub const WAIT_ACCESS: u32 = 0x0010_0000;
 
+/// Select only existing same-held-object diagnostics, never gate admission.
+pub fn capture_restricted_gate(family: &str, scenario: &str) -> bool {
+    matches!(
+        (family, scenario),
+        ("W-ENVELOPE", "restricted") | ("W-BINDING", "restricted-token-preserved")
+    )
+}
+
 pub fn validate_sid(bytes: &[u8]) -> io::Result<()> {
     const HEADER: usize = 8;
     const MAX_SUBAUTHORITIES: usize = 15;
