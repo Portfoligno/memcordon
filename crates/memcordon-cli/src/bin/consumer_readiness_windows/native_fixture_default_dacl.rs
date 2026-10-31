@@ -210,13 +210,23 @@ struct StableToken {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct Snapshot {
+pub(super) struct Snapshot {
     stable: StableToken,
     modified_id: u64,
     default_acl: Option<Vec<u8>>,
 }
 
-fn snapshot(token: HANDLE) -> io::Result<Snapshot> {
+impl Snapshot {
+    pub(super) fn envelope(&self) -> &WindowsCallerTokenEnvelopeV1 {
+        &self.stable.envelope
+    }
+
+    pub(super) fn stable_eq(&self, other: &Self) -> bool {
+        self.stable == other.stable && self.default_acl == other.default_acl
+    }
+}
+
+pub(super) fn snapshot(token: HANDLE) -> io::Result<Snapshot> {
     let envelope =
         memcordon_windows_launch_core::query_token_envelope(token).map_err(io::Error::other)?;
     let captured = query(token, TokenStatistics)?;

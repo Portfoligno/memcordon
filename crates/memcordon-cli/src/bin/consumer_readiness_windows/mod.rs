@@ -9,10 +9,12 @@ mod controller_gate_token;
 pub mod descriptor;
 mod fixture_default_dacl;
 mod fixture_environment;
+mod gate_precondition_child;
 mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;
 mod native_fixture_default_dacl;
+mod native_gate_precondition;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
@@ -594,6 +596,28 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         Some("restricted-frontend") => return native::restricted_frontend(args),
         Some("system-frontend") => return native::system_frontend(args),
         Some("system-restricted-frontend") => return native::system_restricted_frontend(args),
+        Some("system-restricted-gate-control-frontend") => {
+            return native::system_restricted_gate_control_frontend(args);
+        }
+        Some("gate-precondition-child") => {
+            let path = args
+                .next()
+                .ok_or_else(|| io::Error::other("gate control descriptor missing"))?;
+            let envelope = args
+                .next()
+                .ok_or_else(|| io::Error::other("gate control envelope missing"))?;
+            if args.next().is_some() || envelope.len() > descriptor::gate_precondition::RECORD_BYTES
+            {
+                return Err(io::Error::other("gate control operands exceed bound"));
+            }
+            let envelope = serde_json::from_str(
+                envelope
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("gate control envelope is not JSON"))?,
+            )
+            .map_err(io::Error::other)?;
+            return gate_precondition_child::run(Path::new(&path), &envelope);
+        }
         Some("system-sentinel-frontend") => return native::system_sentinel_frontend(args),
         Some("sentinel-frontend") => return native::sentinel_frontend(args),
         Some("tcp-peer") => {

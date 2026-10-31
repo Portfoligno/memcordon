@@ -97,15 +97,7 @@ pub struct CaseInput {
     pub expected_token: TokenObservation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TokenObservation {
-    pub user_sid: Vec<u8>,
-    pub restricted: bool,
-    pub integrity_rid: u32,
-    pub elevated: bool,
-    pub restricting_sids: Vec<Vec<u8>>,
-}
+pub use descriptor::gate_precondition::TokenObservation;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -795,16 +787,22 @@ fn public_command_observation(
     }
     let cli = std::path::absolute(cli)?;
     if case.expected_token.restricted {
+        let gate_control = terminal_observation && case.descriptor.gate_precondition.is_some();
         let mut restricted: Vec<OsString> = vec![
             "consumer-readiness-windows".into(),
-            if system_environment {
+            if gate_control {
+                "system-restricted-gate-control-frontend"
+            } else if system_environment {
                 "system-restricted-frontend"
             } else {
                 "restricted-frontend"
             }
             .into(),
-            cli.into_os_string(),
         ];
+        if gate_control {
+            restricted.push(case.descriptor_path.clone().into_os_string());
+        }
+        restricted.push(cli.into_os_string());
         restricted.extend(args);
         Ok(crate::command::CommandSpec::new(
             std::path::absolute(fixture)?,
@@ -2361,6 +2359,7 @@ pub(crate) mod native {
                 descendant_gate,
                 start_gate,
                 gate_access_diagnostic: None,
+                gate_precondition: None,
                 completion_gate: None,
                 cohort_gate: (case == descriptor::Case::Churn)
                     .then(|| format!("{event_stem}-cohort")),
@@ -2563,6 +2562,7 @@ pub(crate) mod native {
         let mut final_input = input.clone();
         // Serialized suite input is a plan, never a substitute descriptor owner.
         final_input.descriptor.gate_access_diagnostic = None;
+        final_input.descriptor.gate_precondition = None;
         let mut prelaunch_security =
             serde_json::json!({"state":"unavailable","reason":"comparison-not-requested"});
         let mut binding_setup = prelaunch_security.clone();
@@ -2572,6 +2572,14 @@ pub(crate) mod native {
         let mut namespace = None;
         if super::start_gate_policy::capture_restricted_gate(&input.key.family, &input.key.scenario)
         {
+            let (work_cutoff_qpc, qpc_frequency) =
+                memcordon_testkit::windows_native_work_cutoff(work_deadline)?;
+            final_input.descriptor.gate_precondition = Some(descriptor::gate_precondition::Input {
+                revision: 1,
+                expected_token: selected.clone(),
+                work_cutoff_qpc,
+                qpc_frequency,
+            });
             prelaunch_label =
                 gate_query_result(super::workload_diagnostic::gate_mandatory_label_snapshot(
                     gate.as_ref(),

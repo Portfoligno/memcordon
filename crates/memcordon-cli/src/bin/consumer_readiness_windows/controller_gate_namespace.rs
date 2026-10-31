@@ -290,34 +290,37 @@ pub fn probe(proof: &Proof, check: impl Fn() -> io::Result<()>) -> Value {
                     unprefixed_observation("native-reference-not-opened");
                 observation["native_event_status"] = json!(error.status);
                 observation["native_event_opened"] = json!(false);
-                let mut prefixes = Vec::new();
-                for count in 1..proof.components.len() {
-                    let prefix = super::rooted_path(&proof.components[..count])
-                        .map_err(|_| refused("fixture-prefix", "invalid-proof"))?;
-                    let mut prefix_status = None;
-                    match api.open_recorded(
-                        false,
-                        ptr::null_mut(),
-                        &prefix,
-                        2,
-                        &check,
-                        &mut prefix_status,
-                    ) {
-                        Ok(owner) => {
-                            drop(owner);
-                            prefixes.push(json!({"component_count":count,"ntstatus":0,"traverse_opened":true}));
-                        }
-                        Err(error) => {
-                            prefixes.push(json!({"component_count":count,"ntstatus":prefix_status,"attempted":prefix_status.is_some(),"traverse_opened":prefix_status.map(|status|status==0),"reason":error.reason}));
-                            observation["prefixes"] = json!(prefixes);
-                            return Err(error);
-                        }
-                    }
-                }
-                observation["prefixes"] = json!(prefixes);
             }
             Err(error) => return Err(error),
         }
+        // A completed event open (success or denial) says nothing about the
+        // separately requested directory traversal handles. Preserve both.
+        let mut prefixes = Vec::new();
+        for count in 1..proof.components.len() {
+            let prefix = super::rooted_path(&proof.components[..count])
+                .map_err(|_| refused("fixture-prefix", "invalid-proof"))?;
+            let mut prefix_status = None;
+            match api.open_recorded(
+                false,
+                ptr::null_mut(),
+                &prefix,
+                2,
+                &check,
+                &mut prefix_status,
+            ) {
+                Ok(owner) => {
+                    drop(owner);
+                    prefixes
+                        .push(json!({"component_count":count,"ntstatus":0,"traverse_opened":true}));
+                }
+                Err(error) => {
+                    prefixes.push(json!({"component_count":count,"ntstatus":prefix_status,"attempted":prefix_status.is_some(),"traverse_opened":prefix_status.map(|status|status==0),"reason":error.reason}));
+                    observation["prefixes"] = json!(prefixes);
+                    return Err(error);
+                }
+            }
+        }
+        observation["prefixes"] = json!(prefixes);
         live(&check)?;
         Ok(())
     };

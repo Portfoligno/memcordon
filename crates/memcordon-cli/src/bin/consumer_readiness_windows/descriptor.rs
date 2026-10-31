@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 #[path = "controller_gate_access_input.rs"]
 pub mod gate_access;
+#[path = "gate_precondition_input.rs"]
+pub mod gate_precondition;
 #[path = "stream_bytes.rs"]
 mod stream_bytes;
 #[path = "toolchain_command.rs"]
@@ -174,6 +176,8 @@ pub struct Descriptor {
     pub start_gate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_access_diagnostic: Option<gate_access::Input>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_precondition: Option<gate_precondition::Input>,
     pub completion_gate: Option<String>,
     pub cohort_gate: Option<String>,
     pub generation_gate: Option<String>,
@@ -195,6 +199,12 @@ impl Descriptor {
     pub fn validate(&self) -> Result<(), String> {
         if self.format != "memcordon.fixture-workload" || self.revision != DESCRIPTOR_REVISION {
             return Err("unsupported fixture workload format/revision".into());
+        }
+        if let Some(control) = &self.gate_precondition {
+            control.validate()?;
+            if self.case != Case::Envelope || self.start_gate.is_none() {
+                return Err("gate precondition control requires an original envelope gate".into());
+            }
         }
         if let Some(diagnostic) = &self.gate_access_diagnostic {
             let name = self

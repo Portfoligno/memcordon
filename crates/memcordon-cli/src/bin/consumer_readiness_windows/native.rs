@@ -761,17 +761,26 @@ fn frontend_os_error(operation: &'static str) -> io::Error {
 /// Trusted test launcher only: it changes the frontend caller envelope and waits
 /// for that frontend. The installed provider remains the workload supervisor.
 pub fn restricted_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, true, None, false)
+    launch_frontend(arguments, true, None, false, None)
 }
 
 pub fn system_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, false, None, true)
+    launch_frontend(arguments, false, None, true, None)
 }
 
 pub fn system_restricted_frontend(
     arguments: impl Iterator<Item = std::ffi::OsString>,
 ) -> io::Result<i32> {
-    launch_frontend(arguments, true, None, true)
+    launch_frontend(arguments, true, None, true, None)
+}
+
+pub fn system_restricted_gate_control_frontend(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> io::Result<i32> {
+    let descriptor = arguments
+        .next()
+        .ok_or_else(|| io::Error::other("gate control descriptor missing"))?;
+    launch_frontend(arguments, true, None, true, Some(Path::new(&descriptor)))
 }
 
 pub fn system_sentinel_frontend(
@@ -780,7 +789,7 @@ pub fn system_sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)), true)
+    launch_frontend(arguments, false, Some(Path::new(&descriptor)), true, None)
 }
 
 pub fn sentinel_frontend(
@@ -789,7 +798,7 @@ pub fn sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)), false)
+    launch_frontend(arguments, false, Some(Path::new(&descriptor)), false, None)
 }
 
 fn launch_frontend(
@@ -797,7 +806,9 @@ fn launch_frontend(
     restrict: bool,
     sentinel_descriptor: Option<&Path>,
     system_environment: bool,
+    gate_control_descriptor: Option<&Path>,
 ) -> io::Result<i32> {
+    let original_watchdog = std::time::Instant::now() + std::time::Duration::from_secs(660);
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
         GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
@@ -1005,6 +1016,18 @@ fn launch_frontend(
         } else {
             primary_owned.as_raw_handle()
         };
+        if let Some(path) = gate_control_descriptor {
+            super::native_gate_precondition::run(
+                primary_owned.as_raw_handle(),
+                token,
+                &startup,
+                environment
+                    .as_ref()
+                    .map_or(std::ptr::null(), |block| block.as_ptr().cast()),
+                path,
+                original_watchdog,
+            )?;
+        }
         if unsafe {
             CreateProcessAsUserW(
                 token,
@@ -1041,7 +1064,20 @@ fn launch_frontend(
             return Err(cause);
         }
         // SAFETY: held frontend process, bounded driver owns emergency termination.
-        if unsafe { WaitForSingleObject(process_owned.as_raw_handle(), 660_000) } != 0 {
+        if unsafe {
+            WaitForSingleObject(
+                process_owned.as_raw_handle(),
+                if gate_control_descriptor.is_some() {
+                    original_watchdog
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(u128::from(u32::MAX - 1)) as u32
+                } else {
+                    660_000
+                },
+            )
+        } != 0
+        {
             terminate_frontend(&process_owned)?;
             return Err(io::Error::other(
                 "restricted frontend exceeded its driver watchdog",

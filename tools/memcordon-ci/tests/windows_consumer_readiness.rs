@@ -121,6 +121,7 @@ fn descriptor() -> Descriptor {
         descendant_gate: None,
         start_gate: Some("Local\\memcordon-readiness-test-start".into()),
         gate_access_diagnostic: None,
+        gate_precondition: None,
         completion_gate: None,
         cohort_gate: Some("Local\\memcordon-readiness-test-cohort".into()),
         generation_gate: Some("Local\\memcordon-readiness-test-generation".into()),
@@ -248,6 +249,34 @@ fn separate_loader_command_selects_only_the_restricted_envelope_route() {
             restricting_sids: vec![vec![2]],
         },
     };
+    case.descriptor.gate_precondition = Some(
+        memcordon_ci::windows_consumer_readiness::descriptor::gate_precondition::Input {
+            revision: 1,
+            expected_token: case.expected_token.clone(),
+            work_cutoff_qpc: 1,
+            qpc_frequency: 1,
+        },
+    );
+    let controlled = memcordon_ci::windows_consumer_readiness::public_command(
+        &root.join("measured-cli.exe"),
+        &root.join("measured-wrapper.exe"),
+        &root,
+        &root.join("result.json"),
+        &case,
+    )
+    .unwrap()
+    .materialize()
+    .unwrap();
+    let controlled_args: Vec<_> = controlled
+        .get_args()
+        .map(std::ffi::OsStr::to_owned)
+        .collect();
+    assert!(controlled_args.starts_with(&[
+        "consumer-readiness-windows".into(),
+        "system-restricted-gate-control-frontend".into(),
+        case.descriptor_path.clone().into_os_string(),
+        root.join("measured-cli.exe").into_os_string(),
+    ]));
     let build = |case: &CaseInput, installed: bool| {
         let builder = if installed {
             installed_support_loader_command
