@@ -466,10 +466,10 @@ fn retain_product_inputs(
     distribution: &TargetDistribution,
 ) -> Result<()> {
     let inputs = product_inputs(root, selected, distribution)?;
-    let path = crate::native_paths::record_path(
-        root,
-        Path::new("target/ci-session/native-products.json"),
-    )?;
+    let relative = Path::new("target/ci-session/native-products.json");
+    let path = crate::native_paths::record_path(root, relative)?;
+    fs::create_dir_all(path.parent().expect("fixed native product input parent"))?;
+    let path = crate::native_paths::record_path(root, relative)?;
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

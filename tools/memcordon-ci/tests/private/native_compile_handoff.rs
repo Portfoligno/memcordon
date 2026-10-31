@@ -19,10 +19,12 @@ fn later_phase_requires_exact_selected_product_bytes_and_distribution() {
     // A modeled header exercises byte/path handoff validation, not native execution.
     let image = [0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1];
     fs::write(&product, image).unwrap();
-    fs::create_dir_all(root.join("target/ci-session")).unwrap();
+    assert!(!root.join("target/ci-session").exists());
     assert!(verify_product_inputs(root, &selected, &distribution).is_err());
+    assert!(!root.join("target/ci-session").exists());
     retain_product_inputs(root, &selected, &distribution).unwrap();
     verify_product_inputs(root, &selected, &distribution).unwrap();
+    assert!(retain_product_inputs(root, &selected, &distribution).is_err());
     let mut changed = distribution.clone();
     changed.features.push("changed".into());
     assert!(verify_product_inputs(root, &selected, &changed).is_err());
