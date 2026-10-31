@@ -1,4 +1,32 @@
 use memcordon_ci::workflow_definitions;
+use serde_yaml::Value;
+
+fn rejects(workflow: &Value, boundary: &str, mutation: impl FnOnce(&mut Value)) {
+    let mut changed = workflow.clone();
+    mutation(&mut changed);
+    assert_ne!(&changed, workflow, "mutation must change {boundary}");
+    assert!(
+        workflow_definitions::validate_semantics(&changed).is_err(),
+        "semantic validation accepted changed {boundary}"
+    );
+}
+
+fn step_index(job: &Value, command: &str) -> usize {
+    let matches = job["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step["run"].as_str() == Some(command))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "actual operation must be unique: {command}"
+    );
+    matches[0]
+}
 
 #[test]
 fn private_payloads_and_runtime_are_required_exact_host_artifact_phases() {
@@ -70,6 +98,7 @@ fn private_payloads_and_runtime_are_required_exact_host_artifact_phases() {
             .as_mapping_mut()
             .unwrap()
             .remove(serde_yaml::Value::String("needs".into()));
+        assert_ne!(missing, workflow);
         assert!(workflow_definitions::validate_semantics(&missing).is_err());
         let mut optional = workflow.clone();
         for step in optional["jobs"][runtime]["steps"]
@@ -84,6 +113,163 @@ fn private_payloads_and_runtime_are_required_exact_host_artifact_phases() {
                 step["continue-on-error"] = serde_yaml::Value::Bool(true);
             }
         }
+        assert_ne!(optional, workflow);
         assert!(workflow_definitions::validate_semantics(&optional).is_err());
+    }
+}
+
+#[test]
+fn private_phase_inputs_hosts_and_required_execution_order_are_independent_invariants() {
+    let workflow = workflow_definitions::definition("backend-certification.yml").unwrap();
+    for (tools, prepare, runtime, wrong_tools, wrong_prepare) in [
+        (
+            "private-linux-tools-x64",
+            "private-linux-prepare-x64",
+            "private-linux",
+            "private-linux-tools-arm64",
+            "private-linux-prepare-arm64",
+        ),
+        (
+            "private-linux-tools-arm64",
+            "private-linux-prepare-arm64",
+            "private-linux-arm64",
+            "private-linux-tools-x64",
+            "private-linux-prepare-x64",
+        ),
+    ] {
+        for (owner, predecessor, wrong_predecessor, kind, extraction, segment) in [
+            (
+                prepare,
+                tools,
+                wrong_tools,
+                "private-driver",
+                "tar -xf target/ci/private-driver-transfer/private-driver.tar",
+                "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-prepare",
+            ),
+            (
+                runtime,
+                prepare,
+                wrong_prepare,
+                "private",
+                "tar -xf target/ci/private-transfer/private-prepared.tar",
+                "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-runtime",
+            ),
+        ] {
+            let job = &workflow["jobs"][owner];
+            let command = format!(
+                "./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind {kind}"
+            );
+            let check = step_index(job, &command);
+            let extract = step_index(job, extraction);
+            let execute = step_index(job, segment);
+            let fetch = step_index(
+                job,
+                "./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch",
+            );
+            let download = job["steps"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .position(|step| step["with"]["artifact-ids"].is_string())
+                .unwrap();
+            assert_eq!(job["needs"], predecessor);
+            assert!(download < extract && extract < check && check < fetch && fetch < execute);
+            assert_eq!(job["steps"][execute]["if"], "runner.os != 'Windows'");
+            for mutation in 0..18 {
+                rejects(&workflow, owner, |changed| {
+                    let job = &mut changed["jobs"][owner];
+                    match mutation {
+                        0 => {
+                            job.as_mapping_mut()
+                                .unwrap()
+                                .remove(Value::String("needs".into()));
+                        }
+                        1 => job["needs"] = wrong_predecessor.into(),
+                        2 => job["strategy"]["matrix"]["include"][0]["id"] = "wrong-host".into(),
+                        3 => {
+                            job["steps"][download]["with"]["artifact-ids"] =
+                                format!("${{{{ needs.{wrong_predecessor}.outputs.artifact-id }}}}")
+                                    .into()
+                        }
+                        4 => job["steps"][download]["with"]["digest-mismatch"] = "ignore".into(),
+                        5 => {
+                            job["steps"][download]["with"]["path"] =
+                                "target/wrong-private-input".into()
+                        }
+                        6 => job["steps"][check]["continue-on-error"] = true.into(),
+                        7 => job["steps"][check]["if"] = "always()".into(),
+                        8 => {
+                            let duplicate = job["steps"][check].clone();
+                            job["steps"]
+                                .as_sequence_mut()
+                                .unwrap()
+                                .insert(check, duplicate);
+                        }
+                        9 => job["steps"].as_sequence_mut().unwrap().swap(extract, check),
+                        10 => job["steps"].as_sequence_mut().unwrap().swap(check, fetch),
+                        11 => job["steps"][execute]["if"] = "always()".into(),
+                        12 => job["steps"][execute]["continue-on-error"] = true.into(),
+                        13 => {
+                            job["steps"].as_sequence_mut().unwrap().remove(check);
+                        }
+                        14 => {
+                            job["steps"].as_sequence_mut().unwrap().remove(execute);
+                        }
+                        15 => job["runs-on"] = "ubuntu-24.04".into(),
+                        16 => job["steps"][check]["continue-on-error"] = "${{ always() }}".into(),
+                        _ => {
+                            job["strategy"]["matrix"]["include"][0]["runner"] =
+                                "wrong-runner".into()
+                        }
+                    }
+                });
+            }
+        }
+        for (owner, upload_id, package, archive) in [
+            (
+                tools,
+                "private-driver-upload",
+                "./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind private-driver",
+                "tar -cf target/ci/private-driver.tar target/ci-runtime/current target/ci-preparation/private-driver.json",
+            ),
+            (
+                prepare,
+                "private-prepared-upload",
+                "./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind private",
+                "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json",
+            ),
+        ] {
+            let job = &workflow["jobs"][owner];
+            let package = step_index(job, package);
+            let archive = step_index(job, archive);
+            let upload = job["steps"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .position(|step| step["id"] == upload_id)
+                .unwrap();
+            assert!(package < archive && archive < upload);
+            for mutation in 0..5 {
+                rejects(&workflow, owner, |changed| {
+                    let job = &mut changed["jobs"][owner];
+                    match mutation {
+                        0 => {
+                            job["outputs"]["artifact-id"] =
+                                "${{ steps.unrelated.outputs.artifact-id }}".into()
+                        }
+                        1 => job["steps"][upload]["continue-on-error"] = true.into(),
+                        2 => {
+                            job["steps"][upload]["with"]["path"] =
+                                "target/wrong-private-output.tar".into()
+                        }
+                        3 => job["steps"][upload]["with"]["if-no-files-found"] = "warn".into(),
+                        _ => job["steps"]
+                            .as_sequence_mut()
+                            .unwrap()
+                            .swap(package, archive),
+                    }
+                });
+            }
+        }
     }
 }

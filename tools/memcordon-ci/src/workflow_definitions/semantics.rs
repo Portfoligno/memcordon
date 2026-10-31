@@ -61,6 +61,231 @@ fn operation<'a>(document: &'a Value, owner: &str, command: &str) -> Result<&'a 
     Ok(selected[0])
 }
 
+fn private_command_index(steps: &[Value], command: &str) -> Result<usize> {
+    let matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "run") == command)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(reject("private phase operation missing or duplicated"));
+    }
+    Ok(matches[0])
+}
+
+fn private_segment_index(steps: &[Value], command: &str, minutes: u64) -> Result<usize> {
+    let index = private_command_index(steps, command)?;
+    let step = &steps[index];
+    required(step)?;
+    if field(step, "if") != "runner.os != 'Windows'"
+        || step["timeout-minutes"].as_u64() != Some(minutes)
+    {
+        return Err(reject(
+            "private segment lost its required Linux guard or cutoff",
+        ));
+    }
+    Ok(index)
+}
+
+fn validate_private_export(
+    document: &Value,
+    owner: &str,
+    kind: &str,
+    artifact: &str,
+) -> Result<usize> {
+    let (upload_id, tar, tar_command) = match kind {
+        "private-driver" => (
+            "private-driver-upload",
+            "target/ci/private-driver.tar",
+            "tar -cf target/ci/private-driver.tar target/ci-runtime/current target/ci-preparation/private-driver.json",
+        ),
+        "private" => (
+            "private-prepared-upload",
+            "target/ci/private-prepared.tar",
+            "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json",
+        ),
+        _ => return Err(reject("unknown private executable transport")),
+    };
+    let job = &document["jobs"][owner];
+    let steps = job["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("private producer steps absent"))?;
+    let package = format!(
+        "./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind {kind}"
+    );
+    operation(document, owner, &package)?;
+    operation(document, owner, tar_command)?;
+    let package_index = private_command_index(steps, &package)?;
+    let tar_index = private_command_index(steps, tar_command)?;
+    let uploads = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "id") == upload_id)
+        .collect::<Vec<_>>();
+    if uploads.len() != 1 {
+        return Err(reject("private producer upload missing or duplicated"));
+    }
+    let (upload_index, upload) = uploads[0];
+    required(upload)?;
+    if package_index >= tar_index
+        || tar_index >= upload_index
+        || !upload["if"].is_null()
+        || !field(upload, "uses").starts_with("actions/upload-artifact@")
+        || upload["with"]["name"] != artifact
+        || upload["with"]["path"] != tar
+        || upload["with"]["if-no-files-found"] != "error"
+        || upload["with"]["include-hidden-files"] != true
+        || job["outputs"]["artifact-id"]
+            != format!("${{{{ steps.{upload_id}.outputs.artifact-id }}}}")
+    {
+        return Err(reject(
+            "private producer must package and expose its exact native inputs",
+        ));
+    }
+    Ok(package_index)
+}
+
+fn validate_private_input(
+    document: &Value,
+    owner: &str,
+    predecessor: &str,
+    kind: &str,
+) -> Result<usize> {
+    requires(document, owner, &[predecessor])?;
+    let job = &document["jobs"][owner];
+    if dependencies(job) != [predecessor] {
+        return Err(reject(
+            "private phase must depend only on its exact input producer",
+        ));
+    }
+    let (destination, extraction, segment, minutes) = match kind {
+        "private-driver" => (
+            "target/ci/private-driver-transfer",
+            "tar -xf target/ci/private-driver-transfer/private-driver.tar",
+            "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-prepare",
+            190,
+        ),
+        "private" => (
+            "target/ci/private-transfer",
+            "tar -xf target/ci/private-transfer/private-prepared.tar",
+            "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-runtime",
+            195,
+        ),
+        _ => return Err(reject("unknown private executable transport")),
+    };
+    let steps = job["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("private consumer steps absent"))?;
+    let downloads = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| !step["with"]["artifact-ids"].is_null())
+        .collect::<Vec<_>>();
+    if downloads.len() != 1 {
+        return Err(reject(
+            "private phase exact artifact acquisition missing or duplicated",
+        ));
+    }
+    let (download_index, download) = downloads[0];
+    required(download)?;
+    if !download["if"].is_null()
+        || !field(download, "uses").starts_with("actions/download-artifact@")
+        || download["with"]["artifact-ids"]
+            != format!("${{{{ needs.{predecessor}.outputs.artifact-id }}}}")
+        || download["with"]["path"] != destination
+        || download["with"]["digest-mismatch"] != "error"
+        || !download["with"]["name"].is_null()
+    {
+        return Err(reject(
+            "private phase must acquire its exact same-host artifact",
+        ));
+    }
+    let check = format!(
+        "./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind {kind}"
+    );
+    operation(document, owner, extraction)?;
+    operation(document, owner, &check)?;
+    let extraction_index = private_command_index(steps, extraction)?;
+    let check_index = private_command_index(steps, &check)?;
+    let fetch_index = private_segment_index(
+        steps,
+        "./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch",
+        25,
+    )?;
+    let segment_index = private_segment_index(steps, segment, minutes)?;
+    if !(download_index < extraction_index
+        && extraction_index < check_index
+        && check_index < fetch_index
+        && fetch_index < segment_index)
+        || steps[..check_index]
+            .iter()
+            .any(|step| field(step, "run").contains("memcordon-ci"))
+        || steps.iter().any(|step| {
+            let command = field(step, "run");
+            command.contains(" ci driver-")
+                || command.contains("--target-dir target/ci-driver-cold")
+        })
+    {
+        return Err(reject(
+            "private consumer must validate transported inputs before real work",
+        ));
+    }
+    Ok(segment_index)
+}
+
+fn validate_private_phases(document: &Value) -> Result<()> {
+    for (arch, runner, runtime) in [
+        ("x64", "ubuntu-24.04", "private-linux"),
+        ("arm64", "ubuntu-24.04-arm", "private-linux-arm64"),
+    ] {
+        let host = format!("linux-{arch}");
+        let tools = format!("private-linux-tools-{arch}");
+        let prepare = format!("private-linux-prepare-{arch}");
+        let mut row = serde_yaml::Mapping::new();
+        row.insert(text("id"), text(&host));
+        row.insert(text("runner"), text(runner));
+        let expected = Value::Sequence(vec![Value::Mapping(row)]);
+        for owner in [tools.as_str(), prepare.as_str(), runtime] {
+            let job = &document["jobs"][owner];
+            required(job)?;
+            let matrix = &job["strategy"]["matrix"];
+            if matrix.as_mapping().is_none_or(|matrix| matrix.len() != 1)
+                || matrix["include"] != expected
+                || job["runs-on"] != "${{ matrix.runner }}"
+                || job["if"] != "github.event.deleted != true"
+            {
+                return Err(reject(
+                    "private phases must retain their exact native host and source gate",
+                ));
+            }
+        }
+        if !document["jobs"][&tools]["needs"].is_null() {
+            return Err(reject(
+                "private tools must remain an independent prerequisite",
+            ));
+        }
+        validate_private_export(
+            document,
+            &tools,
+            "private-driver",
+            &format!("private-driver-{host}"),
+        )?;
+        let prepared = validate_private_input(document, &prepare, &tools, "private-driver")?;
+        let packaged = validate_private_export(
+            document,
+            &prepare,
+            "private",
+            &format!("private-prepared-{host}"),
+        )?;
+        if prepared >= packaged {
+            return Err(reject("private payload must be prepared before packaging"));
+        }
+        validate_private_input(document, runtime, &prepare, "private")?;
+    }
+    Ok(())
+}
+
 fn validate_current_graph(document: &Value) -> Result<()> {
     let jobs = document["jobs"]
         .as_mapping()
@@ -204,6 +429,9 @@ fn validate_current_graph(document: &Value) -> Result<()> {
                 &["source-docs", "supply-chain-audit", "supply-chain-deny"],
             )?;
         }
+    }
+    if document["name"] == "Native backend tests" {
+        validate_private_phases(document)?;
     }
     if document["name"] != "Release" {
         return Ok(());
