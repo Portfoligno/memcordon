@@ -288,7 +288,7 @@ fn node_1186() -> Value {
 fn node_1184() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Current external consumer contracts"));
-    values.insert(text("run"), text("rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow"));
+    values.insert(text("run"), text("rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow --test suite_failure_policy"));
     values.insert(text("timeout-minutes"), Value::Number(10.into()));
     Value::Mapping(values)
 }
