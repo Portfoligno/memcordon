@@ -179,6 +179,17 @@ fn socket_stage_preserves_original_error_kind_and_native_code() {
             .contains("toolchain-diagnostic-publication=before-debug-wait")
     );
     assert!(error.to_string().contains("original-raw-os-error=Some(5)"));
+    assert_eq!(
+        error
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(5)
+    );
     let missing = diagnostics::observer_gate_error(
         "selected-start-toolchain-observer",
         controller_gate_error::open_diagnostic(
