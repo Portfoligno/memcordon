@@ -1171,6 +1171,9 @@ fn configure_no_failure_actions(service: &ScHandle) -> Result<(), String> {
 
 pub fn start(service: &ScHandle, name: &str) -> Result<(), String> {
     require_support_work_admission()?;
+    // Sample before startup can publish its first-failure diagnostic.
+    // SAFETY: this system tick query takes no pointers or handles.
+    let minimum_tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
     // SAFETY: service is live; zero arguments permits a null argument vector.
     if unsafe { StartServiceW(service.raw(), 0, ptr::null()) } == 0 {
         let error = io::Error::last_os_error();
@@ -1188,6 +1191,7 @@ pub fn start(service: &ScHandle, name: &str) -> Result<(), String> {
         SERVICE_RUNNING,
         Duration::from_secs(30),
         ServiceStatePhase::Start,
+        Some(minimum_tick),
     )
 }
 
@@ -1204,6 +1208,9 @@ pub fn start_with_arguments(
         pointers.as_ptr()
     };
     require_support_work_admission()?;
+    // A fast demand-start failure may publish before wait_state is entered.
+    // SAFETY: this system tick query takes no pointers or handles.
+    let minimum_tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
     // SAFETY: each argument is NUL-terminated and all storage lives through
     // the synchronous call. StartServiceW accepts only additional arguments;
     // SCM supplies the service identity as ServiceMain argv[0].
@@ -1226,6 +1233,7 @@ pub fn start_with_arguments(
         SERVICE_RUNNING,
         Duration::from_secs(30),
         ServiceStatePhase::DemandStart,
+        Some(minimum_tick),
     )
 }
 
@@ -1267,6 +1275,7 @@ pub fn wait_stopped(service: &ScHandle, name: &str) -> Result<(), String> {
         SERVICE_STOPPED,
         Duration::from_secs(30),
         ServiceStatePhase::OneShotRetirement,
+        None,
     )
 }
 
@@ -1289,6 +1298,7 @@ pub fn stop(service: &ScHandle, name: &str) -> Result<(), String> {
         SERVICE_STOPPED,
         Duration::from_secs(30),
         ServiceStatePhase::Stop,
+        None,
     )
 }
 
@@ -1594,7 +1604,9 @@ pub(super) fn launcher_startup_observation(minimum_tick: u64) -> Result<String, 
 }
 
 fn startup_diagnostic(service_exit: u32) -> String {
-    if service_exit == super::control_service::STARTUP_POLICY_REGISTRY {
+    if let Some(stage) = super::service_startup_render::launcher_startup_stage(service_exit) {
+        format!("; startup_diagnostic=role=launcher operation=startup stage={stage}")
+    } else if service_exit == super::control_service::STARTUP_POLICY_REGISTRY {
         "; startup_diagnostic=role=control operation=startup stage=policy-registry".to_owned()
     } else if let Some((role, component)) =
         super::security::pipe_mismatch_diagnostic_from_exit(service_exit)
@@ -1640,6 +1652,7 @@ fn stopped_before_running_diagnostic(
     status: &SERVICE_STATUS_PROCESS,
     phase: ServiceStatePhase,
     elapsed_millis: u128,
+    minimum_tick: Option<u64>,
 ) -> String {
     let original = if name == memcordon_core::WINDOWS_CONTROL_SERVICE_NAME {
         match super::startup_diagnostics::read(status.dwServiceSpecificExitCode, elapsed_millis) {
@@ -1647,6 +1660,17 @@ fn stopped_before_running_diagnostic(
             Ok(None) => String::new(),
             Err(error) => format!("; startup_diagnostic_read_failure={error}"),
         }
+    } else if name == memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME {
+        super::service_startup_render::launcher_failure_suffix(
+            name,
+            status.dwServiceSpecificExitCode,
+            minimum_tick,
+            |exit, minimum_tick| {
+                // This convergence loop holds no original process identity.
+                // A stopped SCM PID is not reopened as process authority.
+                super::startup_diagnostics::read_launcher(exit, None, minimum_tick)
+            },
+        )
     } else {
         String::new()
     };
@@ -1667,7 +1691,13 @@ pub(crate) fn demand_start_stopped_diagnostic_for_test(
     status: &SERVICE_STATUS_PROCESS,
     elapsed_millis: u128,
 ) -> String {
-    stopped_before_running_diagnostic(name, status, ServiceStatePhase::DemandStart, elapsed_millis)
+    stopped_before_running_diagnostic(
+        name,
+        status,
+        ServiceStatePhase::DemandStart,
+        elapsed_millis,
+        None,
+    )
 }
 
 fn original_service_cutoff(fallback: Instant, cleanup: bool) -> Instant {
@@ -1702,6 +1732,7 @@ fn wait_state(
     expected: u32,
     timeout: Duration,
     phase: ServiceStatePhase,
+    minimum_tick: Option<u64>,
 ) -> Result<(), String> {
     let started = Instant::now();
     let deadline = original_service_cutoff(started + timeout, expected == SERVICE_STOPPED);
@@ -1732,6 +1763,7 @@ fn wait_state(
                 &status,
                 phase,
                 started.elapsed().as_millis(),
+                minimum_tick,
             ));
         }
         if Instant::now() >= deadline {

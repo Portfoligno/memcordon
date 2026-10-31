@@ -21,6 +21,7 @@ pub mod record;
 pub mod security;
 pub mod service;
 pub mod service_manager;
+mod service_startup_render;
 pub mod session_broker;
 mod settlement;
 mod startup_diagnostics;
