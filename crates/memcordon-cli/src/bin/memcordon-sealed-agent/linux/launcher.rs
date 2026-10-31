@@ -36,9 +36,9 @@ impl Drop for AllocatedRecordGuard {
 }
 
 pub fn serve() -> Result<(), String> {
-    serve_selected(ListenerMode::Legacy(
+    serve_selected(ListenerMode::Legacy(Box::new(
         super::qualification::observe_readiness()?,
-    ))
+    )))
 }
 
 #[cfg(feature = "private-tcp")]
@@ -59,7 +59,7 @@ pub fn serve_network() -> Result<(), String> {
 }
 
 enum ListenerMode {
-    Legacy(super::qualification::ReadinessObservation),
+    Legacy(Box<super::qualification::ReadinessObservation>),
     #[cfg(feature = "private-tcp")]
     Current,
 }
