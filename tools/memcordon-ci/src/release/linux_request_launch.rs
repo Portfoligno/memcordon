@@ -46,8 +46,8 @@ pub struct RequestLaunch {
     bundle_identity: (u64, u64),
     provider: PublicProviderBindingV1,
     cleanup_cutoff: Instant,
-    observer: Receiver<std::result::Result<HeldLinuxProcess, String>>,
-    frontend: Option<HeldLinuxProcess>,
+    observer: Receiver<std::result::Result<std::sync::Arc<HeldLinuxProcess>, String>>,
+    frontend: Option<std::sync::Arc<HeldLinuxProcess>>,
     capture: Option<JoinHandle<Result<ObservedOutput>>>,
     observed: Option<ObservedOutput>,
     input: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
@@ -212,13 +212,16 @@ impl RequestLaunch {
         let work_cutoff = input.work_cutoff;
         let capture_directory = input.directory.to_path_buf();
         let (sender, observer) = std::sync::mpsc::sync_channel(1);
+        let input_frontend: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<HeldLinuxProcess>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
         let capture = std::thread::spawn(move || {
+            let observer_frontend = std::sync::Arc::clone(&input_frontend);
             let observe = |child: &std::process::Child| {
                 let held = crate::linux_consumer_readiness::process_birth(child.id())
                     .and_then(|birth| HeldLinuxProcess::acquire(child.id(), birth))
                     .and_then(|mut held| {
                         held.verify_parent(&creator)?;
-                        Ok(held)
+                        Ok(std::sync::Arc::new(held))
                     });
                 let observed_error = held.as_ref().err().cloned();
                 if let Ok(held) = &held {
@@ -276,6 +279,9 @@ impl RequestLaunch {
                     )?;
                     controller.sync_all()?;
                 }
+                if let Ok(held) = &held {
+                    let _ = observer_frontend.set(std::sync::Arc::clone(held));
+                }
                 sender.send(held).map_err(|_| {
                     CiError::Message("original frontend observer receiver lost".into())
                 })?;
@@ -300,6 +306,11 @@ impl RequestLaunch {
                         rustix::fs::fcntl_setfl(&stdin, flags | rustix::fs::OFlags::NONBLOCK)
                             .map_err(std::io::Error::from)?;
                         loop {
+                            if let Some(held) = input_frontend.get()
+                                && held.exited().map_err(std::io::Error::other)?
+                            {
+                                return Ok(());
+                            }
                             let remaining = work_cutoff.saturating_duration_since(Instant::now());
                             if remaining.is_zero() {
                                 return Err(std::io::Error::new(
@@ -318,6 +329,11 @@ impl RequestLaunch {
                             };
                             let mut offset = 0;
                             while offset < bytes.len() {
+                                if let Some(held) = input_frontend.get()
+                                    && held.exited().map_err(std::io::Error::other)?
+                                {
+                                    return Ok(());
+                                }
                                 if Instant::now() >= work_cutoff {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::TimedOut,
@@ -461,7 +477,32 @@ impl RequestLaunch {
                     .map_err(CiError::Message)?,
             );
         }
-        Ok(self.frontend.as_ref().expect("original frontend retained"))
+        Ok(self
+            .frontend
+            .as_deref()
+            .expect("original frontend retained"))
+    }
+
+    /// Wait only while the original frontend can still publish this event.
+    /// Post-exit cleanup evidence uses its separate existing cleanup waits.
+    pub fn wait_for_event(
+        &mut self,
+        cutoff: Instant,
+        label: &str,
+        observed: impl FnMut() -> Result<bool>,
+    ) -> Result<()> {
+        let result = crate::launch_event_wait::wait_for_event(cutoff, label, observed, || {
+            let exited = self
+                .retain_frontend(cutoff)?
+                .exited()
+                .map_err(CiError::Message)?;
+            Ok(exited || self.capture_finished())
+        });
+        if result.is_err() {
+            self.close_input();
+        }
+        // The enclosing actor-error path retains sole capture settlement.
+        result
     }
 
     pub fn association(&self) -> Result<WorkloadAttemptAssociationV1> {
@@ -553,13 +594,16 @@ impl RequestLaunch {
             Ok(capture) => {
                 use std::os::unix::process::ExitStatusExt;
                 serde_json::json!({"format":"memcordon.current-request-settlement","revision":1,"frontend":frontend,"interrupt_sent":interrupted,
-                    "raw_wait_status":capture.status.into_raw(),"stdout_sha256":super::artifacts::checksum(&capture.stdout),"stderr_sha256":super::artifacts::checksum(&capture.stderr),"signal_failure":failure})
+                    "raw_wait_status":capture.status.into_raw(),"stdout_sha256":super::artifacts::checksum(&capture.stdout),"stderr_sha256":super::artifacts::checksum(&capture.stderr),"stderr":crate::command::bounded_excerpt(&capture.stderr),"signal_failure":failure})
             }
             Err(error) => {
-                return Err(CiError::Message(match failure {
-                    Some(first) => format!("{first}; original supervisor settlement: {error}"),
-                    None => error.to_string(),
-                }));
+                return Err(match failure {
+                    Some(first) => CiError::LaneFailures {
+                        primary: Box::new(CiError::Message(first)),
+                        secondary: Box::new(error),
+                    },
+                    None => error,
+                });
             }
         };
         write_record(

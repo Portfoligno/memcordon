@@ -255,12 +255,12 @@ pub(super) fn experiment_with_phases(
     let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Experiment> {
         let frontend = launch.retain_frontend(work)?;
         let frontend_identity = json!({"pid":frontend.process_id,"birth":frontend.birth});
-        wait_until(work, || {
+        launch.wait_for_event(work, "workload observation", || {
             Ok(directory.join("workload-observation.json").try_exists()?)
         })?;
         let association = launch.association()?;
         let name = hex::encode(association.attempt);
-        wait_until(work, || {
+        launch.wait_for_event(work, "prepared observation", || {
             Ok(observations
                 .join(format!("{name}.prepared.json"))
                 .try_exists()?)
@@ -393,7 +393,9 @@ pub(super) fn experiment_with_phases(
             files.insert("prepared-ack.json".into(), bytes);
             action["prepared_ack"] = json!(true);
             let snapshot = launch.snapshot_until(work)?;
-            wait_until(work, || Ok(!snapshot.stdout()?.is_empty()))?;
+            launch.wait_for_event(work, "released stdout", || {
+                Ok(!snapshot.stdout()?.is_empty())
+            })?;
             let stdout = snapshot.stdout()?;
             action["released_stdout"] = json!(artifacts::checksum(&stdout));
             files.insert("released-stdout.bin".into(), stdout);
@@ -621,10 +623,11 @@ pub(super) fn experiment_with_phases(
             Ok(experiment)
         }
         Err(primary) => match launch.cancel_and_settle(cleanup) {
-            Ok(_) => Err(primary),
-            Err(settlement) => Err(CiError::Message(format!(
-                "{primary}; original frontend settlement incomplete: {settlement}"
-            ))),
+            Ok(settled) => Err(primary.context(format!("original frontend settlement: {settled}"))),
+            Err(settlement) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(settlement),
+            }),
         },
     }
 }

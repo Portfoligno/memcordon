@@ -205,6 +205,7 @@ pub type Result<T> = std::result::Result<T, CiError>;
 pub mod arm32_abi_helper;
 pub mod exact_harness;
 pub mod external_consumer;
+pub mod launch_event_wait;
 #[cfg(target_os = "linux")]
 pub mod linux_snapshot_probe;
 pub mod macos_performance;

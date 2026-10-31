@@ -2342,6 +2342,16 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
                 ["enable", "--now", "memcordon-sealed-launcher.socket"],
             )?;
             systemctl(cutoff, ["enable", "--now", "memcordon-sealed-agent.socket"])?;
+            if cfg!(feature = "private-tcp") {
+                systemctl(
+                    cutoff,
+                    [
+                        "enable",
+                        "--now",
+                        "memcordon-sealed-network-launcher.socket",
+                    ],
+                )?;
+            }
             systemctl(cutoff, ["restart", "memcordon-sealed-launcher.service"])?;
             systemctl(cutoff, ["restart", "memcordon-sealed-agent.service"])?;
             wait_provider_ready(cutoff)?;

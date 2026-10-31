@@ -304,7 +304,7 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test sealed_agent_distribution",
   "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon --test windows_namespace_primary fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities -- --exact --nocapture",
   "rustup run 1.97.1 cargo test --locked --all-features --target-dir target/ci-current-contracts -p memcordon-core --test diagnostics --test current_formats --test windows_guardian_observation",
-  "rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow --test suite_failure_policy --test windows_consumer_readiness",
+  "rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow --test suite_failure_policy --test windows_consumer_readiness --test launch_event_wait",
   "rustup toolchain install 1.85.0 --profile minimal",
   "rustup toolchain install 1.97.1 --profile minimal",
   "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",

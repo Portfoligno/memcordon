@@ -88,13 +88,6 @@ pub fn observe_readiness() -> Result<ReadinessObservation, String> {
     observe_after_package_verification()
 }
 
-#[cfg(feature = "private-tcp")]
-pub fn observe_network_readiness() -> Result<ReadinessObservation, String> {
-    verify_provider_identity()?;
-    crate::package::verify()?;
-    observe_selected_after_package_verification(true)
-}
-
 #[cfg(feature = "test-support")]
 pub(crate) fn observe_after_package_verification_for_test() -> Result<ReadinessObservation, String>
 {

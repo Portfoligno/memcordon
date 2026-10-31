@@ -36,27 +36,35 @@ impl Drop for AllocatedRecordGuard {
 }
 
 pub fn serve() -> Result<(), String> {
-    serve_selected(false)
+    serve_selected(ListenerMode::Legacy(
+        super::qualification::observe_readiness()?,
+    ))
 }
 
 #[cfg(feature = "private-tcp")]
 pub fn serve_network() -> Result<(), String> {
-    serve_selected(true)
+    // Current requests authenticate their actual installed runtime and account;
+    // no sacrificial qualification report authorizes this transport.
+    // SAFETY: geteuid has no pointer or handle preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("MCSEALED-PROVIDER-IDENTITY: provider must run as root".into());
+    }
+    super::runtime_manifest::installed_binding()?;
+    super::workload_account::verify()?;
+    super::attempt::secure_state_root()?;
+    super::cgroup::prepare_private_root()?;
+    let unresolved = super::recovery::recover()?;
+    super::qualification::require_unambiguous_recovery(&unresolved)?;
+    serve_selected(ListenerMode::Current)
 }
 
-fn serve_selected(network: bool) -> Result<(), String> {
-    let qualification = if network {
-        #[cfg(feature = "private-tcp")]
-        {
-            super::qualification::observe_network_readiness()?
-        }
-        #[cfg(not(feature = "private-tcp"))]
-        {
-            return Err("private network launcher is unavailable".into());
-        }
-    } else {
-        super::qualification::observe_readiness()?
-    };
+enum ListenerMode {
+    Legacy(super::qualification::ReadinessObservation),
+    #[cfg(feature = "private-tcp")]
+    Current,
+}
+
+fn serve_selected(mode: ListenerMode) -> Result<(), String> {
     let listener = activated_listener()?;
     loop {
         let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
@@ -70,7 +78,7 @@ fn serve_selected(network: bool) -> Result<(), String> {
         }
         if worker == 0 {
             drop(listener);
-            let code = match handle(&mut stream, &qualification, network) {
+            let code = match handle(&mut stream, &mode) {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!("sealed launcher rejected request: {error}");
@@ -140,11 +148,8 @@ pub fn launch(
     Ok(response)
 }
 
-fn handle(
-    stream: &mut UnixStream,
-    qualification: &super::qualification::ReadinessObservation,
-    network: bool,
-) -> Result<(), String> {
+fn handle(stream: &mut UnixStream, mode: &ListenerMode) -> Result<(), String> {
+    let network = !matches!(mode, ListenerMode::Legacy(_));
     let peer = authenticate_peer(stream, CONTROL_UNIT)?;
     // The listener belongs to systemd, so the client authenticates this accepted-stream worker
     // from kernel-supplied message credentials before it sends the broker request.
@@ -216,7 +221,13 @@ fn handle(
                     kind: MessageKind::ProbeReceipt,
                     nonce: request.nonce,
                     attempt_id: request.attempt_id,
-                    payload: qualification.render().into_bytes(),
+                    payload: match mode {
+                        ListenerMode::Legacy(qualification) => qualification.render().into_bytes(),
+                        #[cfg(feature = "private-tcp")]
+                        ListenerMode::Current => {
+                            unreachable!("current listener rejects legacy probe")
+                        }
+                    },
                 }
             }
             MessageKind::BrokerLaunch if !network => launch_response(&request, descriptors, peer)?,
