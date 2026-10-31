@@ -263,7 +263,15 @@ pub(super) fn run(
                 }
                 _ => return Err("unknown isolation path operation".into()),
             }
-            transcript.record("isolation-path-alias",serde_json::json!({"kind":kind,"source":source,"probe":probe,"native_import_errno":native_errno}))?;
+            transcript.record(
+                "isolation-path-alias",
+                super::path_alias::observation(
+                    &kind,
+                    source.as_bytes(),
+                    probe.as_bytes(),
+                    native_errno,
+                ),
+            )?;
             super::outside_file(transcript, &kind, &probe, None)
         }
         _ => Err("unknown current isolation fixture operation".into()),

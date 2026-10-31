@@ -27,7 +27,7 @@ fn fail(message: &str) -> CiError {
     CiError::Message(message.into())
 }
 fn binary(value: &Value) -> Result<Vec<u8>> {
-    Ok(serde_json::from_value(value.clone())?)
+    crate::linux_path_alias::binary(value)
 }
 fn recipe(family: &str, scenario: &str) -> Result<Scenario> {
     linux_test_scenarios::scenarios()?
@@ -367,12 +367,12 @@ fn host_paths(context: &Context<'_>) -> Result<()> {
                     ),
                 _ => probe.clone(),
             };
-            if alias["kind"] != scenario
-                || alias["source"] != source.to_string_lossy().as_ref()
-                || alias["probe"] != expected.to_string_lossy().as_ref()
-            {
-                return Err(fail("target path alias differs from actual host object"));
-            }
+            crate::linux_path_alias::verify_alias(
+                alias,
+                scenario,
+                source.as_os_str().as_encoded_bytes(),
+                expected.as_os_str().as_encoded_bytes(),
+            )?;
             match scenario {
                 "hardlink" => {
                     if ![1, 2, 13, 18]

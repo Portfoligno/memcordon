@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 mod images;
 mod isolation;
+mod path_alias;
 mod snapshot;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
