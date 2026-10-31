@@ -5,6 +5,9 @@ use crate::{CiError, Result};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
 
+#[path = "windows_fixture_semantics.rs"]
+mod windows_fixture;
+
 fn reject(reason: &str) -> CiError {
     CiError::Message(reason.into())
 }
@@ -61,7 +64,7 @@ fn operation<'a>(document: &'a Value, owner: &str, command: &str) -> Result<&'a 
     Ok(selected[0])
 }
 
-fn private_command_index(steps: &[Value], command: &str) -> Result<usize> {
+fn command_index(steps: &[Value], command: &str) -> Result<usize> {
     let matches = steps
         .iter()
         .enumerate()
@@ -69,13 +72,13 @@ fn private_command_index(steps: &[Value], command: &str) -> Result<usize> {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if matches.len() != 1 {
-        return Err(reject("private phase operation missing or duplicated"));
+        return Err(reject("required phase operation missing or duplicated"));
     }
     Ok(matches[0])
 }
 
 fn private_segment_index(steps: &[Value], command: &str, minutes: u64) -> Result<usize> {
-    let index = private_command_index(steps, command)?;
+    let index = command_index(steps, command)?;
     let step = &steps[index];
     required(step)?;
     if field(step, "if") != "runner.os != 'Windows'"
@@ -116,8 +119,8 @@ fn validate_private_export(
     );
     operation(document, owner, &package)?;
     operation(document, owner, tar_command)?;
-    let package_index = private_command_index(steps, &package)?;
-    let tar_index = private_command_index(steps, tar_command)?;
+    let package_index = command_index(steps, &package)?;
+    let tar_index = command_index(steps, tar_command)?;
     let uploads = steps
         .iter()
         .enumerate()
@@ -206,8 +209,8 @@ fn validate_private_input(
     );
     operation(document, owner, extraction)?;
     operation(document, owner, &check)?;
-    let extraction_index = private_command_index(steps, extraction)?;
-    let check_index = private_command_index(steps, &check)?;
+    let extraction_index = command_index(steps, extraction)?;
+    let check_index = command_index(steps, &check)?;
     let fetch_index = private_segment_index(
         steps,
         "./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch",
@@ -787,7 +790,238 @@ pub fn validate(document: &Value) -> Result<()> {
     if jobs.contains_key(text("fuzz-setup")) && document["name"].as_str() == Some("Deep CI") {
         validate_fuzz_split(document)?;
     }
+    if document["name"] == "Release" {
+        validate_release_fuzz(document)?;
+    }
+    if document["name"] == "CI" {
+        windows_fixture::validate(document)?;
+    }
     validate_current_graph(document)?;
+    Ok(())
+}
+
+fn release_fuzz_step_index(steps: &[Value], id: &str) -> Result<usize> {
+    let matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "id") == id)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(reject("Release fuzz checkpoint missing or duplicated"));
+    }
+    Ok(matches[0])
+}
+
+fn release_fuzz_download(
+    steps: &[Value],
+    destination: &str,
+    artifact: &str,
+    merge: Option<bool>,
+) -> Result<usize> {
+    let matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step["with"]["path"] == destination)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(reject(
+            "Release fuzz exact input acquisition missing or duplicated",
+        ));
+    }
+    let (index, step) = matches[0];
+    required(step)?;
+    if !step["if"].is_null()
+        || !field(step, "uses").starts_with("actions/download-artifact@")
+        || step["with"]["artifact-ids"] != artifact
+        || step["with"]["digest-mismatch"] != "error"
+        || !step["with"]["name"].is_null()
+        || match merge {
+            Some(expected) => step["with"]["merge-multiple"].as_bool() != Some(expected),
+            None => !step["with"]["merge-multiple"].is_null(),
+        }
+    {
+        return Err(reject(
+            "Release fuzz must acquire its exact selected executable inputs",
+        ));
+    }
+    Ok(index)
+}
+
+fn release_fuzz_source(steps: &[Value]) -> Result<usize> {
+    let checkout = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "uses").starts_with("actions/checkout@"))
+        .collect::<Vec<_>>();
+    if checkout.len() != 1 {
+        return Err(reject(
+            "Release fuzz selected checkout missing or duplicated",
+        ));
+    }
+    let (checkout_index, checkout) = checkout[0];
+    required(checkout)?;
+    if !checkout["if"].is_null()
+        || checkout["with"]["ref"] != "${{ needs.select.outputs.selected-commit }}"
+        || checkout["with"]["persist-credentials"] != false
+        || checkout["with"]["fetch-depth"].as_u64() != Some(0)
+    {
+        return Err(reject(
+            "Release fuzz must use the exact selected source checkout",
+        ));
+    }
+    let selection = release_fuzz_download(
+        steps,
+        ".release",
+        "${{ needs.select.outputs.selection-artifact-id }}",
+        Some(true),
+    )?;
+    if checkout_index >= selection {
+        return Err(reject(
+            "Release fuzz selection must follow its source checkout",
+        ));
+    }
+    Ok(selection)
+}
+
+fn validate_release_fuzz(document: &Value) -> Result<()> {
+    requires(document, "fuzz-setup", &["select"])?;
+    requires(document, "fuzz", &["select", "fuzz-setup"])?;
+    let setup = &document["jobs"]["fuzz-setup"];
+    let shard = &document["jobs"]["fuzz"];
+    required(setup)?;
+    required(shard)?;
+    if dependencies(setup) != ["select"]
+        || dependencies(shard) != ["select", "fuzz-setup"]
+        || field(setup, "if") != "needs.select.outputs.recovery-mode == 'reprepare'"
+        || field(shard, "if")
+            != "!cancelled() && needs.select.result == 'success' && (needs.select.outputs.recovery-mode == 'reprepare')"
+        || setup["runs-on"] != "ubuntu-24.04"
+        || shard["runs-on"] != "ubuntu-24.04"
+        || !setup["strategy"].is_null()
+        || shard["strategy"]["fail-fast"] != false
+        || shard["strategy"]["max-parallel"].as_u64() != Some(4)
+        || shard["strategy"]["matrix"]
+            .as_mapping()
+            .is_none_or(|matrix| matrix.len() != 1)
+        || shard["strategy"]["matrix"]["shard"]
+            != Value::Sequence(
+                ["one", "two", "three", "four"]
+                    .map(|quarter| text(&format!("quarter-{quarter}")))
+                    .to_vec(),
+            )
+    {
+        return Err(reject(
+            "Release fuzz must retain selected setup and four independent shards",
+        ));
+    }
+    let early = setup["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("Release fuzz setup steps absent"))?;
+    let late = shard["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("Release fuzz shard steps absent"))?;
+    let selected_setup = release_fuzz_source(early)?;
+    let selected_shard = release_fuzz_source(late)?;
+    let admission = release_fuzz_step_index(late, "fuzz-setup-required")?;
+    required(&late[admission])?;
+    if admission != 0
+        || field(&late[admission], "run") != "false"
+        || field(&late[admission], "if") != "needs.fuzz-setup.result != 'success'"
+        || late[admission]["timeout-minutes"].as_u64() != Some(1)
+    {
+        return Err(reject(
+            "Release fuzz setup failure must fail selected shards immediately",
+        ));
+    }
+    let tools = release_fuzz_download(
+        early,
+        ".release/tool",
+        "${{ needs.select.outputs.preparation-tool-artifact-id }}",
+        Some(true),
+    )?;
+    let unpack = "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool";
+    let prepare = "./.release/tool/memcordon-ci ci segment prepare-fuzz";
+    let package = "./.release/tool/memcordon-ci ci preparation-tools package --kind release-fuzz";
+    let archive = "tar -czf target/release-fuzz-setup.tar.gz .release/tool/memcordon-ci target/ci-tools/bin/cargo-fuzz target/ci-preparation/release-fuzz.json";
+    for command in [unpack, prepare, package, archive] {
+        operation(document, "fuzz-setup", command)?;
+    }
+    let unpack = command_index(early, unpack)?;
+    let prepare = command_index(early, prepare)?;
+    let package = command_index(early, package)?;
+    let archive = command_index(early, archive)?;
+    let upload = release_fuzz_step_index(early, "fuzz-setup-upload")?;
+    required(&early[upload])?;
+    if !(selected_setup < tools
+        && tools < unpack
+        && unpack < prepare
+        && prepare < package
+        && package < archive
+        && archive < upload)
+        || package != release_fuzz_step_index(early, "fuzz-setup-inputs")?
+        || archive != release_fuzz_step_index(early, "fuzz-setup-package")?
+        || !early[upload]["if"].is_null()
+        || !field(&early[upload], "uses").starts_with("actions/upload-artifact@")
+        || early[upload]["with"]["path"] != "target/release-fuzz-setup.tar.gz"
+        || early[upload]["with"]["if-no-files-found"] != "error"
+        || early[upload]["with"]["overwrite"] != false
+        || setup["outputs"]["artifact-id"] != "${{ steps.fuzz-setup-upload.outputs.artifact-id }}"
+    {
+        return Err(reject(
+            "Release fuzz setup must expose its actual prepared executable archive",
+        ));
+    }
+    let download = release_fuzz_download(
+        late,
+        "target/ci/release-fuzz-download",
+        "${{ needs.fuzz-setup.outputs.artifact-id }}",
+        None,
+    )?;
+    let extract = "tar -xzf target/ci/release-fuzz-download/release-fuzz-setup.tar.gz -C .";
+    let check = "./.release/tool/memcordon-ci ci preparation-tools check --kind release-fuzz";
+    let fetch = "./.release/tool/memcordon-ci ci segment workspace-fetch";
+    for command in [extract, check, fetch] {
+        operation(document, "fuzz", command)?;
+    }
+    let extract = command_index(late, extract)?;
+    let check = command_index(late, check)?;
+    let fetch = command_index(late, fetch)?;
+    if !(selected_shard < download && download < extract && extract < check && check < fetch)
+        || download != release_fuzz_step_index(late, "fuzz-setup-download")?
+        || extract != release_fuzz_step_index(late, "fuzz-setup-extract")?
+        || check != release_fuzz_step_index(late, "fuzz-setup-check")?
+        || late
+            .iter()
+            .any(|step| recipe(field(step, "run")) == Some("prepare-fuzz"))
+    {
+        return Err(reject(
+            "Release fuzz must validate setup bytes before shard work",
+        ));
+    }
+    for quarter in ["one", "two", "three", "four"] {
+        let compile =
+            format!("./.release/tool/memcordon-ci ci segment fuzz-compile-quarter-{quarter}");
+        let execute =
+            format!("./.release/tool/memcordon-ci ci segment fuzz-execute-quarter-{quarter}");
+        let compile = command_index(late, &compile)?;
+        let execute = command_index(late, &execute)?;
+        for index in [compile, execute] {
+            required(&late[index])?;
+            if field(&late[index], "if") != format!("matrix.shard == 'quarter-{quarter}'")
+                || late[index]["timeout-minutes"].as_u64() != Some(70)
+            {
+                return Err(reject(
+                    "Release fuzz quarter lost its exact guard or operation ceiling",
+                ));
+            }
+        }
+        if !(fetch < compile && compile < execute) {
+            return Err(reject(
+                "Release fuzz must compile each quarter before executing it",
+            ));
+        }
+    }
     Ok(())
 }
 
