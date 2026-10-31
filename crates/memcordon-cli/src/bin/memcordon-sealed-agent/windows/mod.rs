@@ -7,6 +7,7 @@ pub mod guardian_service;
 pub mod job;
 mod job_diagnostics;
 pub mod launcher_service;
+mod launcher_startup_progress;
 pub(crate) mod loader_access;
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_native_process.rs"]

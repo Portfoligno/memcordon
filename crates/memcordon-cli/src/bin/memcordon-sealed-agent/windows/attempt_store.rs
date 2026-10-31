@@ -347,18 +347,48 @@ pub(super) fn try_commit_diagnostics(record: &mut WindowsAttemptRecordV1) -> Res
     Ok(())
 }
 
-pub(super) fn ensure_no_quarantined_writer() -> Result<(), String> {
+#[derive(Debug)]
+pub(super) enum WriterRegistryCheckError {
+    Unavailable,
+    Unconfirmed {
+        detail: String,
+        native_code: Option<u32>,
+    },
+}
+
+impl std::fmt::Display for WriterRegistryCheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("attempt writer registry unavailable"),
+            Self::Unconfirmed { detail, .. } => formatter.write_str(detail),
+        }
+    }
+}
+
+pub(super) fn ensure_no_quarantined_writer() -> Result<(), WriterRegistryCheckError> {
     let lanes = LANES
         .try_lock()
-        .map_err(|_| "attempt writer registry unavailable".to_owned())?;
+        .map_err(|_| WriterRegistryCheckError::Unavailable)?;
     if let Some((attempt_id, lane)) = lanes
         .iter()
         .find(|(_, lane)| lane.quarantined.load(Ordering::Acquire))
     {
-        return Err(format!(
-            "attempt writer publication remains unconfirmed; attempt={attempt_id}; {}",
-            quarantine_detail(lane)
-        ));
+        // Preserve an already observed Win32 publisher error, without parsing
+        // its display text or reinterpreting another native error domain.
+        let native_code =
+            lane.publisher_error
+                .get()
+                .and_then(|error| match error.event.native_code {
+                    Some(memcordon_core::NativeFailureCodeV1::Win32(code)) => Some(code),
+                    _ => None,
+                });
+        return Err(WriterRegistryCheckError::Unconfirmed {
+            detail: format!(
+                "attempt writer publication remains unconfirmed; attempt={attempt_id}; {}",
+                quarantine_detail(lane)
+            ),
+            native_code,
+        });
     }
     Ok(())
 }

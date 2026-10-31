@@ -15,6 +15,19 @@ pub enum WindowsLauncherStartupStageV1 {
     TokenPolicy,
     GuardianSlots,
     WriterQuarantine,
+    WriterRegistry,
+    /// Preparation with create_dir_all, not an ownership assertion.
+    AttemptsDirectory,
+    /// Preparation with create_dir_all, not an ownership assertion.
+    QuarantineDirectory,
+    /// Preparation with create_dir_all, not an ownership assertion.
+    ReplayDirectory,
+    /// Preparation with create_dir_all, not an ownership assertion.
+    AdmissionDirectory,
+    /// Preparation with create_dir_all, not an ownership assertion.
+    GuardianReceiptDirectory,
+    QuarantineOpen,
+    QuarantineEntry,
     StagedAck,
     GuardianDirectory,
     ReaderAdmission,
@@ -55,6 +68,7 @@ pub enum WindowsLauncherStartupReasonV1 {
     UnjoinedAdmission,
     LiveReader,
     UnconfirmedWriter,
+    WriterRegistryUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -1713,23 +1713,51 @@ fn reconcile_until(
             super::startup_diagnostics::launcher_blocker(reason);
         }
     };
-    stage(Stage::WriterQuarantine);
-    super::attempt_store::ensure_no_quarantined_writer()?;
+    let io_failure = |error: std::io::Error| {
+        if startup {
+            let native_code = error
+                .raw_os_error()
+                .map(|code| u32::from_ne_bytes(code.to_ne_bytes()));
+            super::startup_diagnostics::launcher_failure(Reason::OperationFailed, native_code);
+        }
+        error.to_string()
+    };
+    stage(Stage::WriterRegistry);
+    super::attempt_store::ensure_no_quarantined_writer().map_err(|error| {
+        if startup {
+            let (reason, native_code) = match &error {
+                super::attempt_store::WriterRegistryCheckError::Unavailable => {
+                    (Reason::WriterRegistryUnavailable, None)
+                }
+                super::attempt_store::WriterRegistryCheckError::Unconfirmed {
+                    native_code, ..
+                } => (Reason::UnconfirmedWriter, *native_code),
+            };
+            super::startup_diagnostics::launcher_failure(reason, native_code);
+        }
+        error.to_string()
+    })?;
     let attempts = attempts_root();
-    fs::create_dir_all(&attempts).map_err(|error| error.to_string())?;
-    fs::create_dir_all(quarantine_root()).map_err(|error| error.to_string())?;
-    fs::create_dir_all(replay_root()).map_err(|error| error.to_string())?;
+    stage(Stage::AttemptsDirectory);
+    fs::create_dir_all(&attempts).map_err(io_failure)?;
+    stage(Stage::QuarantineDirectory);
+    fs::create_dir_all(quarantine_root()).map_err(io_failure)?;
+    stage(Stage::ReplayDirectory);
+    fs::create_dir_all(replay_root()).map_err(io_failure)?;
     stage(Stage::StagedAck);
     recover_staged_ack_tombstones().map_err(PackageCleanupError::Ambiguous)?;
-    fs::create_dir_all(admissions_root()).map_err(|error| error.to_string())?;
-    fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
-    stage(Stage::WriterQuarantine);
+    stage(Stage::AdmissionDirectory);
+    fs::create_dir_all(admissions_root()).map_err(io_failure)?;
+    stage(Stage::GuardianReceiptDirectory);
+    fs::create_dir_all(guardian_receipts_root()).map_err(io_failure)?;
+    stage(Stage::QuarantineOpen);
     let mut ambiguous = fs::read_dir(quarantine_root())
-        .map_err(|error| error.to_string())?
+        .map_err(io_failure)?
         .map(|entry| {
+            stage(Stage::QuarantineEntry);
             entry
                 .map(|entry| format!("{} (durable quarantine)", entry.path().to_string_lossy()))
-                .map_err(|error| error.to_string())
+                .map_err(io_failure)
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !ambiguous.is_empty() {
