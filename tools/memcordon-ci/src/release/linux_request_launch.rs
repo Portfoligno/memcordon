@@ -666,6 +666,12 @@ impl RequestLaunch {
                     "result native caller does not match the original held frontend".into(),
                 ));
             }
+            crate::linux_result_publication::writer(
+                result.delivery,
+                &native.caller,
+                (frontend.process_id, frontend.birth),
+            )
+            .map_err(CiError::Message)?;
         }
         Ok(result)
     }

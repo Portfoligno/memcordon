@@ -205,6 +205,23 @@ pub(super) fn assert_case_with(
     case: &ExecutedCase,
     assertion: impl FnOnce(&[Value], &Value, &Value) -> Result<()>,
 ) -> Result<()> {
+    assert_case_inner(case, assertion).map_err(|error| {
+        error.context(format!(
+            "scenario={}/{}; original frontend={:?}; native-status={:?}; stderr-bytes={}; stderr={}",
+            case.key.family,
+            case.key.scenario,
+            case.frontend_identity,
+            case.frontend_wait,
+            case.stderr.len(),
+            crate::linux_result_publication::stderr_detail(&case.stderr)
+        ))
+    })
+}
+
+fn assert_case_inner(
+    case: &ExecutedCase,
+    assertion: impl FnOnce(&[Value], &Value, &Value) -> Result<()>,
+) -> Result<()> {
     if case.key.family == "L-LIFE-05" && case.key.scenario == "report-persistence-failure" {
         return report_failure(case);
     }
@@ -213,6 +230,21 @@ pub(super) fn assert_case_with(
         .as_ref()
         .ok_or_else(|| fail("report persistence assertion requires its explicit recovery path"))?;
     result.validate().map_err(CiError::Message)?;
+    if let memcordon_core::result_v3::RuntimeExecutionV3::LinuxPrivate { native, .. } =
+        &result.runtime
+    {
+        crate::linux_result_publication::writer(
+            result.delivery,
+            &native.caller,
+            case.frontend_identity,
+        )
+        .map_err(CiError::Message)?;
+    }
+    crate::linux_result_publication::wrapper_status(
+        case.frontend_wait.code(),
+        result.outcome.wrapper_status,
+    )
+    .map_err(CiError::Message)?;
     let result = serde_json::to_value(result)?;
     let request = serde_json::to_value(&case.request)?;
     let declared = request["runtime"]["layout"]["output_files"]
@@ -262,34 +294,100 @@ pub(super) fn assert_case_with(
     );
     let native = &result["runtime"]["native"];
     let held_cancel = case.key.family == "C-CANCEL" && case.key.scenario == "held-before-release";
-    if result["workload_attempt"] != locator
-        || result["provider"] != locator["provider"]
-        || result["request"]["request_sha256"] != digest
-        || locator["request_sha256"] != digest
-        || result["runtime"]["kind"] != "linux-private"
-        || result["runtime"]["profile"] != "linux-private-workload-v1"
-        || result["cleanup"]["state"] != "complete"
-        || result["delivery"] != "complete"
-        || native["boot_id"] != locator["boot_id"]
-        || number(&native["target_uid"])? == 0
-        || number(&native["target_gid"])? == 0
-        || native["target_uid"] == native["caller_uid"]
-        || native["target_uid"] == native["init_uid"]
-        || native["supplementary_groups"] != serde_json::json!([])
-        || native["no_new_privileges"] != true
-        || native["capabilities_empty"] != true
-        || native["init_nondumpable"] != true
-        || native["exec_observed"] != !held_cancel
-        || result["release"]
-            != if held_cancel {
+    for (field, actual, expected) in [
+        (
+            "workload_attempt",
+            &result["workload_attempt"],
+            locator.clone(),
+        ),
+        ("provider", &result["provider"], locator["provider"].clone()),
+        (
+            "request.request_sha256",
+            &result["request"]["request_sha256"],
+            digest.clone().into(),
+        ),
+        (
+            "locator.request_sha256",
+            &locator["request_sha256"],
+            digest.into(),
+        ),
+        (
+            "runtime.kind",
+            &result["runtime"]["kind"],
+            "linux-private".into(),
+        ),
+        (
+            "runtime.profile",
+            &result["runtime"]["profile"],
+            "linux-private-workload-v1".into(),
+        ),
+        (
+            "cleanup.state",
+            &result["cleanup"]["state"],
+            "complete".into(),
+        ),
+        (
+            "native.boot_id",
+            &native["boot_id"],
+            locator["boot_id"].clone(),
+        ),
+        (
+            "native.supplementary_groups",
+            &native["supplementary_groups"],
+            serde_json::json!([]),
+        ),
+        (
+            "native.no_new_privileges",
+            &native["no_new_privileges"],
+            true.into(),
+        ),
+        (
+            "native.capabilities_empty",
+            &native["capabilities_empty"],
+            true.into(),
+        ),
+        (
+            "native.init_nondumpable",
+            &native["init_nondumpable"],
+            true.into(),
+        ),
+        (
+            "native.exec_observed",
+            &native["exec_observed"],
+            (!held_cancel).into(),
+        ),
+        (
+            "release",
+            &result["release"],
+            if held_cancel {
                 "not-released"
             } else {
                 "released"
             }
-    {
-        return Err(fail(
-            "current result binding/native boundary/cleanup differs",
-        ));
+            .into(),
+        ),
+    ] {
+        if actual != &expected {
+            return Err(fail(&format!(
+                "current result {field} differs; observed={}; expected={}",
+                crate::command::bounded_excerpt(&serde_json::to_vec(actual)?),
+                crate::command::bounded_excerpt(&serde_json::to_vec(&expected)?)
+            )));
+        }
+    }
+    for field in ["target_uid", "target_gid"] {
+        if number(&native[field]).map_err(|error| error.context(format!("native.{field}")))? == 0 {
+            return Err(fail(&format!(
+                "current result native.{field} must be nonzero"
+            )));
+        }
+    }
+    for field in ["caller_uid", "init_uid"] {
+        if native["target_uid"] == native[field] {
+            return Err(fail(&format!(
+                "current result native.target_uid equals native.{field}"
+            )));
+        }
     }
     let obligations = result["cleanup"]["obligations"]
         .as_array()

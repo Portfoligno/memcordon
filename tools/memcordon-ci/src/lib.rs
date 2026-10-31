@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 pub mod linux_allocation_checkpoint;
+pub mod linux_result_publication;
 
 pub mod windows_original_gate_failure;
 pub mod windows_status_streams;
