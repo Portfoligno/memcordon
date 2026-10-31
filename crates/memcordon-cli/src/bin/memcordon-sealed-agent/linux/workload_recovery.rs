@@ -1,5 +1,8 @@
 //! Cleanup-only recovery reacquires exact native owners. Serialized locators
 //! select no execution identity, release gate, host source or output destination.
+#[path = "../../workload_terminal_refinement.rs"]
+mod terminal_refinement;
+
 use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4};
 use super::workload_attempt::{
     DirectoryIdentity, RecoveryJournal, RecoveryJournalError, WorkloadAttemptRecordV1,
@@ -387,24 +390,22 @@ pub(super) fn recover_brokered(
             // Native retirement cannot certify the still-independent public
             // control's forwarded handles. Observe that exact process absent
             // before reporting their already-completed closure on a retry.
-            let mut observed = terminal.clone();
-            let mut obligations = BoundedVec::default();
-            for obligation in observed.cleanup.obligations.as_slice() {
-                if obligation.resource != CleanupResourceV3::ControlHandles {
-                    obligations
-                        .try_push(obligation.clone())
-                        .map_err(|_| "cleanup obligation ceiling")?;
-                }
+            if !journal.record().outstanding.as_slice().is_empty() {
+                return Err("retired complete workload retains outstanding resources".into());
             }
-            obligations
-                .try_push(CleanupObligationV3 {
-                    resource: CleanupResourceV3::ControlHandles,
-                    settled: true,
-                })
-                .map_err(|_| "cleanup obligation ceiling")?;
-            observed.cleanup.obligations = obligations;
-            observed.validate()?;
-            return terminal_frame(frame, &observed);
+            if let Some(observed) = terminal_refinement::settle_control_handles(terminal)? {
+                let mut next = journal.record().clone();
+                next.terminal = Some(observed);
+                journal.update(next)?;
+            }
+            return terminal_frame(
+                frame,
+                journal
+                    .record()
+                    .terminal
+                    .as_ref()
+                    .expect("retained terminal"),
+            );
         }
     }
     let cutoff = recovery_cutoff(&mut journal, boot.trim(), same_boot)?;

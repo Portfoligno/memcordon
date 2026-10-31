@@ -9,6 +9,7 @@ use memcordon_core::{
     },
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 fn fail(message: &str) -> CiError {
     CiError::Message(message.into())
@@ -301,14 +302,31 @@ pub(super) fn assert_experiment(
         let terminal = LinuxWorkloadTerminalV1::parse(raw(experiment, "recovery.json")?)
             .map_err(CiError::Message)?;
         let recovered = serde_json::to_value(&terminal)?;
-        if terminal.association != association
-            || terminal.request != prepared.request
-            || doc(experiment, "recovery-process.json")?["status"] != 0
-            || after["terminal"] != recovered
-        {
+        if terminal.association != association {
             return Err(fail(
-                "current public recovery differs from original durable attempt",
+                "current public recovery association differs from original durable attempt",
             ));
+        }
+        if terminal.request != prepared.request {
+            return Err(fail(
+                "current public recovery request differs from original durable attempt",
+            ));
+        }
+        let recovery_process = doc(experiment, "recovery-process.json")?;
+        let recovery_status = &recovery_process["status"];
+        if recovery_process["status"] != 0 {
+            return Err(fail(&format!(
+                "current public recovery process failed; integer-status={:?}; status-is-null={}",
+                recovery_status.as_i64(),
+                recovery_status.is_null(),
+            )));
+        }
+        if after["terminal"] != recovered {
+            return Err(fail(&format!(
+                "current public recovery terminal differs from original durable attempt; recovery-json-sha256={}; journal-after-json-sha256={}",
+                hex::encode(Sha256::digest(raw(experiment, "recovery.json")?)),
+                hex::encode(Sha256::digest(raw(experiment, "journal-after.json")?)),
+            )));
         }
         cleanup(&recovered["cleanup"])?;
         for field in [
