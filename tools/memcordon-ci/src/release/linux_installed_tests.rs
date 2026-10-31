@@ -137,7 +137,7 @@ fn run_selected(
         .arg(work_millis.to_string())
         .arg("--cleanup-cutoff-millis")
         .arg(cleanup_millis.to_string())
-        .output_quiet_with_creation_and_io(
+        .output_quiet_for_installed_helper_with_creation_and_io(
             |child| {
                 let birth = crate::linux_consumer_readiness::process_birth(child.id())
                     .map_err(CiError::Message)?;

@@ -660,6 +660,48 @@ impl CommandSpec {
         crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
     }
 
+    /// Launch the installed administrative helper without an exec trace, so
+    /// its setuid elevation remains available. The original child still has
+    /// one bounded wait owner, capture and live cancellation input.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_for_installed_helper_with_creation_and_io(
+        &self,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        io: impl FnOnce(
+            u32,
+            Option<std::process::ChildStdin>,
+            memcordon_testkit::OutputSnapshot,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> Result<ObservedOutput> {
+        let mut command = self.materialize()?;
+        command.stdin(std::process::Stdio::piped());
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
+            command,
+            self.available_budget()?,
+            self.output_limit,
+            |mut command| {
+                let child = command.spawn()?;
+                if let Err(error) = observe_creation(&child) {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            io,
+        );
+        let writers = crate::work_outcome::native_settlement(&output);
+        let result = match (output, observation_error) {
+            (Ok(output), None) => Ok(output),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "installed helper creation observation={original:?}; native settlement={error}"
+            ))),
+        };
+        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
+    }
+
     /// Observe the genuine executed image while the original child is stopped
     /// at its kernel exec event, then release it under the same cutoff.
     #[cfg(target_os = "linux")]
