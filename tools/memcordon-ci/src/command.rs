@@ -15,14 +15,25 @@ pub fn require_successful_output(operation: &str, output: &ObservedOutput) -> Re
     if output.status.success() {
         return Ok(());
     }
-    let end = output.stderr.len().min(2048);
+    let limit = 2048;
+    let (head, tail, omitted) = if output.stderr.len() <= limit {
+        (output.stderr.as_slice(), &[][..], 0)
+    } else {
+        let section = limit / 2;
+        (
+            &output.stderr[..section],
+            &output.stderr[output.stderr.len() - section..],
+            output.stderr.len() - limit,
+        )
+    };
     Err(CiError::Message(format!(
-        "{operation}: native command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr={:?}",
+        "{operation}: native command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr-omitted-bytes={omitted}; stderr-head={:?}; stderr-tail={:?}",
         output.status,
         output.stdout.len(),
         output.stderr.len(),
-        end != output.stderr.len(),
-        String::from_utf8_lossy(&output.stderr[..end])
+        omitted != 0,
+        String::from_utf8_lossy(head),
+        String::from_utf8_lossy(tail),
     )))
 }
 
@@ -666,6 +677,7 @@ impl CommandSpec {
     #[cfg(target_os = "linux")]
     pub(crate) fn output_quiet_for_installed_helper_with_creation_and_io(
         &self,
+        diagnostics: &Path,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
         io: impl FnOnce(
             u32,
@@ -692,14 +704,41 @@ impl CommandSpec {
             io,
         );
         let writers = crate::work_outcome::native_settlement(&output);
+        let retention = match &output {
+            Ok(output) => crate::current_command_evidence::retain_output(
+                diagnostics,
+                output,
+                self.output_limit,
+            ),
+            Err(error) => crate::current_command_evidence::retain_failure(
+                diagnostics,
+                error,
+                self.output_limit,
+            ),
+        }
+        .map_err(|error| {
+            let message = error.to_string();
+            let bytes = message.as_bytes();
+            let end = bytes.len().min(2048);
+            CiError::Message(format!(
+                "installed helper diagnostic retention failed; error-bytes={}; error-truncated={}; error={:?}",
+                bytes.len(),
+                end != bytes.len(),
+                String::from_utf8_lossy(&bytes[..end]),
+            ))
+        });
         let result = match (output, observation_error) {
-            (Ok(output), None) => Ok(output),
+            (Ok(output), None) => {
+                require_successful_output("direct installed Linux helper", &output).map(|()| output)
+            }
             (Ok(_), Some(error)) => Err(error),
             (Err(error), original) => Err(CiError::Message(format!(
                 "installed helper creation observation={original:?}; native settlement={error}"
             ))),
         };
-        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
+        crate::work_outcome::WorkOutcome::observed(result, writers)
+            .postcondition(retention)
+            .into_result()
     }
 
     /// Observe the genuine executed image while the original child is stopped

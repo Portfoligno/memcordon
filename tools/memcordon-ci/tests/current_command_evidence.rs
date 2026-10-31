@@ -146,3 +146,52 @@ fn returned_output_is_retained_without_claiming_observer_success() {
         b"original error"
     );
 }
+
+#[test]
+fn capture_write_failure_preserves_creation_error_and_original_settlement() {
+    use memcordon_ci::{
+        CiError,
+        work_outcome::{WorkOutcome, WriterSettlement},
+    };
+    for writers in [WriterSettlement::Settled, WriterSettlement::Unknown] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("stdout.bin"), b"original capture").unwrap();
+        let output = memcordon_testkit::ObservedOutput {
+            status: exited(0),
+            stdout: b"returned output".to_vec(),
+            stderr: b"returned stderr".to_vec(),
+            elapsed: std::time::Duration::ZERO,
+        };
+        let retention =
+            memcordon_ci::current_command_evidence::retain_output(directory.path(), &output, 1024)
+                .map_err(CiError::Io);
+        let error = WorkOutcome::<()>::from_result(Err(CiError::OwnedWork {
+            source: Box::new(CiError::Message("original creation callback failed".into())),
+            writers,
+            facts: Default::default(),
+        }))
+        .postcondition(retention)
+        .into_result()
+        .unwrap_err();
+        let CiError::OwnedWork {
+            source,
+            writers: retained_writers,
+            ..
+        } = error
+        else {
+            panic!("capture postcondition must preserve original owner facts");
+        };
+        assert_eq!(retained_writers, writers);
+        let CiError::LaneFailures { primary, secondary } = *source else {
+            panic!("capture failure must append to the original creation failure");
+        };
+        assert_eq!(primary.to_string(), "original creation callback failed");
+        assert!(
+            matches!(*secondary, CiError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("stdout.bin")).unwrap(),
+            b"original capture"
+        );
+    }
+}

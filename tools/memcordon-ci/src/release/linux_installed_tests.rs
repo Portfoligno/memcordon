@@ -57,7 +57,7 @@ pub fn run(
     work: Instant,
     cleanup: Instant,
 ) -> Result<()> {
-    run_selected(root, payload, output, work, cleanup, false)
+    run_selected(root, payload, output, work, cleanup, false, None)
 }
 
 pub fn run_components(root: &Path, output: &Path, work: Instant, cleanup: Instant) -> Result<()> {
@@ -70,8 +70,26 @@ pub fn run_components(root: &Path, output: &Path, work: Instant, cleanup: Instan
     )?;
     let execution = session.path().join("execution");
     fs::create_dir(&execution)?;
-    let _ = output;
-    run_selected(root, &payload, &execution, work, cleanup, true)
+    let relative = output.strip_prefix(root).unwrap_or(output);
+    let record = relative.join("helper-command").join("command-output.json");
+    let checked = crate::native_paths::record_path(root, &record)?;
+    let diagnostics = checked
+        .parent()
+        .expect("fixed helper record parent")
+        .parent()
+        .expect("fixed helper diagnostics parent")
+        .to_path_buf();
+    fs::create_dir_all(&diagnostics)?;
+    crate::native_paths::record_path(root, &record)?;
+    run_selected(
+        root,
+        &payload,
+        &execution,
+        work,
+        cleanup,
+        true,
+        Some(&diagnostics),
+    )
 }
 
 fn run_selected(
@@ -81,6 +99,7 @@ fn run_selected(
     work: Instant,
     cleanup: Instant,
     components_only: bool,
+    capture_parent: Option<&Path>,
 ) -> Result<()> {
     if rustix::process::geteuid().is_root() || work >= cleanup || Instant::now() >= work {
         return Err(fail(
@@ -109,6 +128,11 @@ fn run_selected(
             components_only,
         },
     )?;
+    let helper_capture = capture_parent
+        .unwrap_or(&native_output)
+        .join("helper-command");
+    fs::create_dir(&helper_capture)?;
+    fs::set_permissions(&helper_capture, fs::Permissions::from_mode(0o700))?;
     let native_now = super::linux_test_images::monotonic_millis()?;
     let now = Instant::now();
     let work_millis = native_now
@@ -138,6 +162,7 @@ fn run_selected(
         .arg("--cleanup-cutoff-millis")
         .arg(cleanup_millis.to_string())
         .output_quiet_for_installed_helper_with_creation_and_io(
+            &helper_capture,
             |child| {
                 let birth = crate::linux_consumer_readiness::process_birth(child.id())
                     .map_err(CiError::Message)?;

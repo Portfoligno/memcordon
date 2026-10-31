@@ -846,7 +846,7 @@ fn node_1485() -> Value {
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
     values.insert(
         text("path"),
-        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json"),
+        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json\ntarget/ci/private-installed/installed/linux/helper-command/stdout.bin\ntarget/ci/private-installed/installed/linux/helper-command/stderr.bin\ntarget/ci/private-installed/installed/linux/helper-command/command-output.json\ntarget/ci/private-installed/installed/linux/helper-command/command-failure.json"),
     );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
@@ -10202,7 +10202,7 @@ fn node_844() -> Value {
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
     values.insert(
         text("path"),
-        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json"),
+        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json\ntarget/ci/private-installed/installed/linux/helper-command/stdout.bin\ntarget/ci/private-installed/installed/linux/helper-command/stderr.bin\ntarget/ci/private-installed/installed/linux/helper-command/command-output.json\ntarget/ci/private-installed/installed/linux/helper-command/command-failure.json"),
     );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));

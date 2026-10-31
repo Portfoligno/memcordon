@@ -3362,6 +3362,10 @@ jobs:
             target/ci/private-installed/installed/public-deadline.stdout.bin
             target/ci/private-installed/installed/public-deadline.stderr.bin
             target/ci/private-installed/installed/linux/inputs.json
+            target/ci/private-installed/installed/linux/helper-command/stdout.bin
+            target/ci/private-installed/installed/linux/helper-command/stderr.bin
+            target/ci/private-installed/installed/linux/helper-command/command-output.json
+            target/ci/private-installed/installed/linux/helper-command/command-failure.json
           if-no-files-found: error
           include-hidden-files: true
         timeout-minutes: 6
@@ -5913,6 +5917,10 @@ jobs:
             target/ci/private-installed/installed/public-deadline.stdout.bin
             target/ci/private-installed/installed/public-deadline.stderr.bin
             target/ci/private-installed/installed/linux/inputs.json
+            target/ci/private-installed/installed/linux/helper-command/stdout.bin
+            target/ci/private-installed/installed/linux/helper-command/stderr.bin
+            target/ci/private-installed/installed/linux/helper-command/command-output.json
+            target/ci/private-installed/installed/linux/helper-command/command-failure.json
           if-no-files-found: error
           include-hidden-files: true
         timeout-minutes: 6
