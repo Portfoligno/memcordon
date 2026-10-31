@@ -638,6 +638,15 @@ impl RequestLaunch {
             self.caller.uid,
         )?)
         .map_err(CiError::Message)?;
+        let frontend = self
+            .frontend
+            .as_ref()
+            .expect("original native frontend retained");
+        crate::linux_result_publication::publication_writer(
+            result.delivery,
+            (frontend.process_id, frontend.birth),
+        )
+        .map_err(CiError::Message)?;
         if result.workload_attempt.as_ref() != Some(&association)
             || result.provider.as_ref() != Some(&self.provider)
             || result
@@ -653,10 +662,6 @@ impl RequestLaunch {
         if let memcordon_core::result_v3::RuntimeExecutionV3::LinuxPrivate { native, .. } =
             &result.runtime
         {
-            let frontend = self
-                .frontend
-                .as_ref()
-                .expect("original native frontend retained");
             if native.caller.pid != frontend.process_id
                 || native.caller.birth != frontend.birth
                 || native.caller_uid != self.caller.uid

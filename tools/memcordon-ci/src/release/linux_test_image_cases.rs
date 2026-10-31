@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -341,16 +341,38 @@ fn negative(
     } else {
         RequestLaunch::start(launch_input)?
     };
+    let mut failure_context = None;
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let frontend = launch.retain_frontend(work)?;
+        let original = (frontend.process_id, frontend.birth);
         let frontend_identity = json!({"pid":frontend.process_id,"birth":frontend.birth});
         let output = launch.capture_until(work)?;
         use std::os::unix::process::ExitStatusExt;
+        let original_wait = output.status;
         let stdout = output.stdout.clone();
         let stderr = output.stderr.clone();
         let wait = json!({"process":frontend_identity,"status":output.status.code(),"raw_wait_status":output.status.into_raw()});
+        failure_context = Some(format!(
+            "loader scenario={scenario}; original-frontend={original:?}; observed-status={:?}; raw-wait-status={}; stderr={}",
+            original_wait.code(),
+            original_wait.into_raw(),
+            crate::linux_result_publication::stderr_detail(&stderr)
+        ));
         let result_bytes = artifacts::read_file(&directory.join("workload-result.json"))?;
         let result = memcordon_core::result_v3::ResultV3::parse(&result_bytes).map_err(fail)?;
+        crate::linux_result_publication::publication_writer(result.delivery, original)
+            .map_err(fail)?;
+        crate::linux_result_publication::wrapper_status(
+            original_wait.code(),
+            result.outcome.wrapper_status,
+        )
+        .map_err(fail)?;
+        crate::linux_result_publication::preparation_report(
+            &result.runtime,
+            &result.cleanup,
+            &result.outcome,
+        )
+        .map_err(fail)?;
         let association = if scenario == "ld-injection" {
             None
         } else {
@@ -365,6 +387,17 @@ fn negative(
         );
         let start_bytes = artifacts::read_file(&start_path)?;
         let recovery = association.as_ref().map(|_| launch.recover()).transpose()?;
+        if let Some(recovery) = &recovery {
+            crate::command::require_successful_output(
+                "original rejected loader recovery",
+                &recovery.process,
+            )
+            .map_err(|error| {
+                error.context(format!(
+                    "loader scenario={scenario}; original recovery process"
+                ))
+            })?;
+        }
         let journal = association
             .as_ref()
             .map(|association| -> Result<Vec<u8>> {
@@ -381,8 +414,6 @@ fn negative(
             || raw["runtime"]["kind"] != "preparation-failed"
             || raw["outcome"]["kind"] != "launch-failure"
             || raw["outcome"]["wrapper_status"] != 125
-            || raw["delivery"] != "complete"
-            || raw["cleanup"]["state"] != "complete"
             || raw["request"]["request_sha256"]
                 != serde_json::to_value(request.digest().map_err(|error| fail(error.to_string()))?)?
             || wait["status"] != 125
@@ -390,7 +421,7 @@ fn negative(
             || !stdout.is_empty()
         {
             return Err(fail(
-                "loader mutation did not produce its actual prelaunch refusal and complete cleanup",
+                "loader mutation did not produce its actual prelaunch refusal and original status/request",
             ));
         }
         if scenario == "ld-injection" {
@@ -463,21 +494,41 @@ fn negative(
             match launch.cancel_and_settle(cleanup) {
                 Ok(_) => {
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                        eprintln!("loader input retirement after unwind: {error}");
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "loader input retirement after unwind: {error}"
+                        );
                     }
                 }
-                Err(error) => eprintln!("loader native settlement after unwind: {error}"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "loader native settlement after unwind: {error}"
+                    );
+                }
             }
             std::panic::resume_unwind(panic)
         }
     };
     if let Err(primary) = execution {
-        let settled = launch.cancel_and_settle(cleanup);
-        let mut detail = primary.to_string();
-        if let Err(secondary) = settled {
-            detail = format!("{detail}; loader native settlement: {secondary}");
-        }
-        return Err(fail(detail));
+        let primary = primary.context(failure_context.unwrap_or_else(|| {
+            format!("loader scenario={scenario}; original capture unavailable")
+        }));
+        let retirement =
+            match launch.cancel_and_settle(cleanup) {
+                Ok(_) => launch.retire_bundle_exact(&fixture).map_err(|error| {
+                    error.context("loader exact bundle retirement after original settlement")
+                }),
+                Err(error) => Err(error
+                    .context("loader original native settlement; bundle retirement not admitted")),
+            };
+        return Err(match retirement {
+            Ok(()) => primary,
+            Err(secondary) => CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            },
+        });
     }
     Ok(())
 }

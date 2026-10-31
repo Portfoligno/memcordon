@@ -6,6 +6,7 @@
 pub mod linux_allocation_checkpoint;
 pub mod linux_path_alias;
 pub mod linux_result_publication;
+pub mod linux_snapshot_rejection;
 
 pub mod windows_original_gate_failure;
 pub mod windows_status_streams;

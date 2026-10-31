@@ -945,20 +945,36 @@ fn run_corruptions(
             )?,
             None => super::linux_request_launch::RequestLaunch::start(launch_input)?,
         };
-        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+        let mut source_settled = false;
+        let mut failure_context =
+            format!("corrupt snapshot scenario={scenario}; original frontend not yet observed");
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let frontend = launch.retain_frontend(work)?;
             let frontend_identity = (frontend.process_id, frontend.birth);
+            failure_context = format!(
+                "corrupt snapshot scenario={scenario}; original frontend={frontend_identity:?}"
+            );
             launch.close_input();
             let captured = launch.capture_until(cleanup)?;
+            let original_status = captured.status;
             let stdout = captured.stdout.clone();
             let stderr = captured.stderr.clone();
-            let wait = json!({"process":{"pid":frontend_identity.0,"birth":frontend_identity.1},"raw_wait_status":captured.status.into_raw(),"status":captured.status.code(),"held_before_input":true,"retired":true});
+            failure_context = format!(
+                "corrupt snapshot scenario={scenario}; original frontend={frontend_identity:?}; original status={original_status:?}; stderr={}",
+                crate::linux_result_publication::stderr_detail(&stderr)
+            );
             let result = launch.result()?;
             let association = launch.association()?;
             let recovery = launch.recover()?;
+            crate::command::require_successful_output(
+                "corrupt snapshot original recovery",
+                &recovery.process,
+            )?;
             let (phase, helper) = if let Some(actor) = actor.as_mut() {
                 actor.send(b"D\n")?;
-                (Value::Null, actor.finish(cleanup)?)
+                let helper = actor.finish(cleanup)?;
+                source_settled = true;
+                (Value::Null, helper)
             } else {
                 copy_rx
                     .recv_timeout(cleanup.saturating_duration_since(Instant::now()))
@@ -974,123 +990,152 @@ fn run_corruptions(
                     "corrupted snapshot reached native Prepared".into(),
                 ));
             }
-            let start = std::fs::read(
+            let _start = std::fs::read(
                 observation.join(format!("{}.start.json", hex::encode(association.attempt))),
             )?;
-            Ok((
-                phase,
-                stdout,
-                stderr,
-                wait,
-                result,
-                association,
-                recovery.raw_terminal,
-                helper,
-                start,
-            ))
+            let request_bytes = std::fs::read(&fixture.request)?;
+            let request =
+                memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+            if result.provider.as_ref() != Some(provider) {
+                return Err(CiError::Message(
+                    "corrupt snapshot report original provider differs".into(),
+                ));
+            }
+            crate::linux_snapshot_rejection::validate(
+                &result,
+                &recovery.terminal,
+                &association,
+                &request
+                    .digest()
+                    .map_err(|error| CiError::Message(error.to_string()))?,
+                frontend_identity,
+                original_status.code(),
+            )
+            .map_err(CiError::Message)?;
+            if original_status.into_raw() != 125 * 256 {
+                return Err(CiError::Message(
+                    "corrupt snapshot original raw frontend wait differs from 125".into(),
+                ));
+            }
+            if !stdout.is_empty() {
+                return Err(CiError::Message(
+                    "corrupt snapshot produced target stdout".into(),
+                ));
+            }
+            assert_helper_change(
+                &helper,
+                &original_bundle,
+                &super::artifacts::read_file(&fixture.bundle)?,
+            )?;
+            if scenario == "source-mutation-during-copy"
+                && (phase["changed"].is_null() || phase["original_child_wait_not_started"] != true)
+            {
+                return Err(CiError::Message(
+                    "source mutation was not observed at the held native copy boundary".into(),
+                ));
+            }
+            let _retirement = crate::cancellation::retirement_scope(cleanup);
+            let ack = caller
+                .command(&directory, cleanup)?
+                .args(["workload", "acknowledge", "--observation"])
+                .arg(directory.join("workload-observation.json"))
+                .output()?;
+            crate::command::require_successful_output("rejected snapshot acknowledgment", &ack)?;
+            let ack =
+                memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&ack.stdout)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+            if ack.association != association {
+                return Err(CiError::Message(
+                    "corruption ACK differs from original association".into(),
+                ));
+            }
+            let _ = memory_bytes;
+            launch.retire_bundle_exact(&fixture)?;
+            Ok(())
         }));
         let _retirement = crate::cancellation::retirement_scope(cleanup);
         let execution = match execution {
             Ok(result) => result,
             Err(panic) => {
-                if let Err(error) = launch.cancel_and_settle(cleanup) {
-                    eprintln!("corrupt snapshot native settlement after unwind: {error}");
-                }
-                if let Some(actor) = actor.as_mut() {
+                let settled = match launch.cancel_and_settle(cleanup) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "corrupt snapshot native settlement after unwind: {error}"
+                        );
+                        false
+                    }
+                };
+                if !source_settled
+                    && let Some(actor) = actor.as_mut()
+                    && actor.worker.is_some()
+                {
                     let _ = actor.send(b"D\n");
-                    if let Err(error) = actor.finish(cleanup) {
-                        eprintln!("corrupt snapshot source settlement after unwind: {error}");
+                    match actor.finish(cleanup) {
+                        Ok(_) => source_settled = true,
+                        Err(error) => {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "corrupt snapshot source settlement after unwind: {error}"
+                            );
+                        }
                     }
                 }
-                if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                    eprintln!("corrupt snapshot input retirement after unwind: {error}");
+                if settled
+                    && (source_settled || actor.is_none())
+                    && let Err(error) = launch.retire_bundle_exact(&fixture)
+                {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "corrupt snapshot input retirement after unwind: {error}"
+                    );
                 }
                 std::panic::resume_unwind(panic)
             }
         };
-        let (phase, stdout, stderr, wait, result, association, recovery, helper, start) =
-            match execution {
-                Ok(value) => value,
-                Err(primary) => {
-                    let settlement = launch.cancel_and_settle(cleanup);
-                    let helper = if let Some(actor) = actor.as_mut() {
-                        let _ = actor.send(b"D\n");
-                        actor.finish(cleanup).map(|_| ())
-                    } else {
-                        Ok(())
-                    };
-                    return Err(CiError::Message(format!(
-                        "{primary}; original corrupt-input settlement: {:?}; caller source settlement: {:?}",
-                        settlement.as_ref().err(),
-                        helper.as_ref().err()
-                    )));
+        if let Err(primary) = execution {
+            let mut failure = primary.context(failure_context);
+            let settlement = launch.cancel_and_settle(cleanup);
+            let settled = settlement.is_ok();
+            if let Err(error) = settlement {
+                failure = CiError::LaneFailures {
+                    primary: Box::new(failure),
+                    secondary: Box::new(error.context("original corrupt-input settlement")),
+                };
+            }
+            if !source_settled
+                && let Some(actor) = actor.as_mut()
+                && actor.worker.is_some()
+            {
+                let _ = actor.send(b"D\n");
+                match actor.finish(cleanup) {
+                    Ok(_) => source_settled = true,
+                    Err(error) => {
+                        failure = CiError::LaneFailures {
+                            primary: Box::new(failure),
+                            secondary: Box::new(error.context("caller source settlement")),
+                        };
+                    }
                 }
-            };
-        let raw = serde_json::to_value(&result)?;
-        let terminal: Value = serde_json::from_slice(&recovery)?;
-        let request_bytes = std::fs::read(&fixture.request)?;
-        let request = memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        if raw["release"] != "not-released"
-            || raw["runtime"]["kind"] != "preparation-failed"
-            || raw["outcome"]["kind"] != "launch-failure"
-            || raw["outcome"]["wrapper_status"] != 125
-            || raw["delivery"] != "complete"
-            || raw["cleanup"]["state"] != "complete"
-            || raw["request"]["request_sha256"]
-                != serde_json::to_value(
-                    request
-                        .digest()
-                        .map_err(|error| CiError::Message(error.to_string()))?,
-                )?
-            || raw["provider"] != serde_json::to_value(provider)?
-            || raw["workload_attempt"] != serde_json::to_value(&association)?
-            || terminal["association"] != serde_json::to_value(&association)?
-            || terminal["release"] != "not-released"
-            || !terminal["native"].is_null()
-            || terminal["outcome"]["kind"] != "setup-failure"
-            || terminal["cleanup"]["state"] != "complete"
-            || wait["status"] != 125
-            || wait["raw_wait_status"] != 125 * 256
-            || !stdout.is_empty()
-            || !terminal["failures"].as_array().is_some_and(|failures| {
-                failures.iter().any(|item| {
-                    item.as_str()
-                        .is_some_and(|text| text.contains("member content digest differs"))
-                })
-            })
-        {
-            return Err(CiError::Message(
-                "corrupted input reached execution or lost actual request/cleanup binding".into(),
-            ));
+            }
+            if settled
+                && (source_settled || actor.is_none())
+                && let Err(error) = launch.retire_bundle_exact(&fixture)
+            {
+                failure = CiError::LaneFailures {
+                    primary: Box::new(failure),
+                    secondary: Box::new(
+                        error.context("original corrupt snapshot bundle retirement"),
+                    ),
+                };
+            }
+            if settled && !source_settled && actor.is_some() {
+                failure = failure.context("exact corrupt snapshot bundle retirement not admitted: original source writer settlement is unproved");
+            }
+            return Err(failure);
         }
-        assert_helper_change(
-            &helper,
-            &original_bundle,
-            &super::artifacts::read_file(&fixture.bundle)?,
-        )?;
-        if scenario == "source-mutation-during-copy"
-            && (phase["changed"].is_null() || phase["original_child_wait_not_started"] != true)
-        {
-            return Err(CiError::Message(
-                "source mutation was not observed at the held native copy boundary".into(),
-            ));
-        }
-        let _ = (stderr, start, memory_bytes);
-        let ack = caller
-            .command(&directory, cleanup)?
-            .args(["workload", "acknowledge", "--observation"])
-            .arg(directory.join("workload-observation.json"))
-            .output()?;
-        crate::command::require_successful_output("rejected snapshot acknowledgment", &ack)?;
-        let ack = memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&ack.stdout)
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        if ack.association != association {
-            return Err(CiError::Message(
-                "corruption ACK differs from original association".into(),
-            ));
-        }
-        launch.retire_bundle_exact(&fixture)?;
     }
     Ok(())
 }
