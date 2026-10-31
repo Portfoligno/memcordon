@@ -846,7 +846,7 @@ fn node_1485() -> Value {
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
     values.insert(
         text("path"),
-        text("target/ci/private-installed-diagnostics"),
+        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json"),
     );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
@@ -1503,7 +1503,7 @@ fn node_1438() -> Value {
 
 fn node_1436() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json"));
+    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
     Value::Mapping(values)
 }
@@ -3650,7 +3650,7 @@ fn node_1286() -> Value {
 
 fn node_1284() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json"));
+    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
     Value::Mapping(values)
 }
@@ -10202,7 +10202,7 @@ fn node_844() -> Value {
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
     values.insert(
         text("path"),
-        text("target/ci/private-installed-diagnostics"),
+        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json"),
     );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));

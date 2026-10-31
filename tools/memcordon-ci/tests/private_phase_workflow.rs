@@ -236,7 +236,7 @@ fn private_phase_inputs_hosts_and_required_execution_order_are_independent_invar
                 prepare,
                 "private-prepared-upload",
                 "./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind private",
-                "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json",
+                "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture",
             ),
         ] {
             let job = &workflow["jobs"][owner];
@@ -249,6 +249,23 @@ fn private_phase_inputs_hosts_and_required_execution_order_are_independent_invar
                 .position(|step| step["id"] == upload_id)
                 .unwrap();
             assert!(package < archive && archive < upload);
+            if owner == prepare {
+                rejects(
+                    &workflow,
+                    "private readiness executable transport",
+                    |changed| {
+                        let step = &mut changed["jobs"][owner]["steps"][archive];
+                        step["run"] = step["run"]
+                            .as_str()
+                            .unwrap()
+                            .strip_suffix(
+                                " target/ci/native/release/memcordon-linux-readiness-fixture",
+                            )
+                            .expect("private preparation transports its required native fixture")
+                            .into();
+                    },
+                );
+            }
             for mutation in 0..5 {
                 rejects(&workflow, owner, |changed| {
                     let job = &mut changed["jobs"][owner];

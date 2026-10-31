@@ -106,7 +106,7 @@ fn validate_private_export(
         "private" => (
             "private-prepared-upload",
             "target/ci/private-prepared.tar",
-            "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json",
+            "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture",
         ),
         _ => return Err(reject("unknown private executable transport")),
     };

@@ -1317,7 +1317,16 @@ pub fn run_cli_case(
         .into_result()?;
     #[cfg(not(target_os = "linux"))]
     capture(&output)?;
-    let bytes = artifacts::read_file(&report_path)?;
+    let bytes = artifacts::read_file(&report_path).map_err(|error| {
+        CiError::Message(format!(
+            "selected CLI case {name} report {} could not be read: {error}; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr={:?}",
+            report_path.display(),
+            output.status,
+            output.stdout.len(),
+            output.stderr.len(),
+            crate::command::bounded_excerpt(&output.stderr),
+        ))
+    })?;
     if bytes.len() > 8 * 1024 * 1024 {
         return Err(CiError::Message(
             "ordinary execution report exceeds byte bound".into(),

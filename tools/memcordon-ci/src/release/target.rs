@@ -753,6 +753,56 @@ pub fn build_native_payload(
     })
 }
 
+pub(super) fn prepare_linux_readiness_fixture(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    target: &str,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    if target != super::distribution::native_target()?
+        || !matches!(
+            target,
+            "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+        )
+        || std::time::Instant::now() >= deadline
+    {
+        return Err(CiError::Message(
+            "Linux fixture requires its native target and remaining preparation cutoff".into(),
+        ));
+    }
+    selected.recheck(root)?;
+    let toolchain = crate::config::toolchains(root)?.stable;
+    rustup_cargo(
+        root,
+        &toolchain,
+        [
+            "build",
+            "--locked",
+            "--release",
+            "--target-dir",
+            "target/ci/native",
+            "-p",
+            "memcordon",
+            "--features",
+            "test-fixtures",
+            "--bin",
+            "memcordon-linux-readiness-fixture",
+        ],
+        Duration::from_secs(60 * 60),
+    )
+    .bounded_until(deadline)
+    .phase(crate::command::CiPhase::NativeCompile)
+    .selection(selected, Some(target))
+    .run()?;
+    selected.recheck(root)?;
+    if std::time::Instant::now() >= deadline {
+        return Err(CiError::Message(
+            "Linux fixture preparation cutoff exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn prepare_test_tools(root: &Path, source_path: &Path) -> Result<()> {
     let selected: BuildSourceIdentity = source::read_json(source_path)?;
     let target = super::distribution::native_target()?;
@@ -786,28 +836,7 @@ pub fn prepare_test_tools(root: &Path, source_path: &Path) -> Result<()> {
             .selection(&selected, Some(target))
             .run()?;
             if target.ends_with("-unknown-linux-gnu") {
-                rustup_cargo(
-                    root,
-                    &toolchain,
-                    [
-                        "build",
-                        "--locked",
-                        "--release",
-                        "--target-dir",
-                        "target/ci/native",
-                        "-p",
-                        "memcordon",
-                        "--features",
-                        "test-fixtures",
-                        "--bin",
-                        "memcordon-linux-readiness-fixture",
-                    ],
-                    Duration::from_secs(60 * 60),
-                )
-                .bounded_until(deadline)
-                .phase(crate::command::CiPhase::NativeCompile)
-                .selection(&selected, Some(target))
-                .run()?;
+                prepare_linux_readiness_fixture(root, &selected, target, deadline)?;
             }
             selected.recheck(root)?;
             crate::preparation_tools::run(

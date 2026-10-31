@@ -313,7 +313,7 @@ allowed_run_commands = [
   "rustup toolchain install 1.97.1 --profile minimal --component rustfmt",
   "rustup toolchain install nightly-2026-07-31 --profile minimal",
   "tar -cf target/ci/private-driver.tar target/ci-runtime/current target/ci-preparation/private-driver.json",
-  "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json",
+  "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture",
   "tar -czf target/fuzz-setup.tar.gz target/ci-runtime/current target/ci-tools/bin/cargo-fuzz",
   "tar -czf target/release-fuzz-setup.tar.gz .release/tool/memcordon-ci target/ci-tools/bin/cargo-fuzz target/ci-preparation/release-fuzz.json",
   "tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json",

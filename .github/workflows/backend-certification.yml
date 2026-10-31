@@ -3354,7 +3354,14 @@ jobs:
         uses: ./.github/actions/upload-artifact
         with:
           name: private-installed-${{ matrix.id }}
-          path: target/ci/private-installed-diagnostics
+          path: |-
+            target/ci/private-installed/installed/public-success.json
+            target/ci/private-installed/installed/public-success.stdout.bin
+            target/ci/private-installed/installed/public-success.stderr.bin
+            target/ci/private-installed/installed/public-deadline.json
+            target/ci/private-installed/installed/public-deadline.stdout.bin
+            target/ci/private-installed/installed/public-deadline.stderr.bin
+            target/ci/private-installed/installed/linux/inputs.json
           if-no-files-found: error
           include-hidden-files: true
         timeout-minutes: 6
@@ -5143,7 +5150,7 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers backend-linux-private-prepare
       - run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind private
         timeout-minutes: 5
-      - run: tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json
+      - run: tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture
         timeout-minutes: 15
       - id: private-prepared-upload
         uses: *action_4
@@ -5724,7 +5731,7 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers backend-linux-private-prepare
       - run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind private
         timeout-minutes: 5
-      - run: tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json
+      - run: tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture
         timeout-minutes: 15
       - id: private-prepared-upload
         uses: *action_4
@@ -5898,7 +5905,14 @@ jobs:
         uses: ./.github/actions/upload-artifact
         with:
           name: private-installed-${{ matrix.id }}
-          path: target/ci/private-installed-diagnostics
+          path: |-
+            target/ci/private-installed/installed/public-success.json
+            target/ci/private-installed/installed/public-success.stdout.bin
+            target/ci/private-installed/installed/public-success.stderr.bin
+            target/ci/private-installed/installed/public-deadline.json
+            target/ci/private-installed/installed/public-deadline.stdout.bin
+            target/ci/private-installed/installed/public-deadline.stderr.bin
+            target/ci/private-installed/installed/linux/inputs.json
           if-no-files-found: error
           include-hidden-files: true
         timeout-minutes: 6

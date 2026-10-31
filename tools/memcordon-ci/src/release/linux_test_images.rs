@@ -351,7 +351,12 @@ pub fn materialize_until(
     std::fs::create_dir(output)?;
     std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o700))?;
     let fixture = workspace.join("target/ci/native/release/memcordon-linux-readiness-fixture");
-    let fixture_bytes = std::fs::read(&fixture)?;
+    let fixture_bytes = std::fs::read(&fixture).map_err(|error| {
+        CiError::Message(format!(
+            "required Linux readiness fixture {} could not be read: {error}",
+            fixture.display()
+        ))
+    })?;
     super::target::validate_executable(&fixture_bytes, &payload.distribution.target)?;
     let rustc = CommandSpec::new("rustup", workspace, Duration::from_secs(30))
         .bounded_until(deadline)
