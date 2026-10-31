@@ -780,14 +780,11 @@ fn run_substitution(
         serde_json::from_slice(response.get("probe-receipt.json").ok_or_else(|| {
             CiError::Message("source substitution native response absent".into())
         })?)?;
-    if effect["opened"]["inode"] == effect["named"]["inode"]
-        || effect["opened"]["sha256"] == effect["named"]["sha256"]
-        || proof.borrow()["permission"]["process_id"] != proof.borrow()["frontend"]["pid"]
-    {
-        return Err(CiError::Message(
-            "source-FD substitution did not replace the name after the held frontend open".into(),
-        ));
-    }
+    crate::linux_source_substitution::validate(
+        &proof.borrow()["permission"],
+        &proof.borrow()["frontend"],
+        &effect,
+    )?;
     assert_snapshot(&case, &token)?;
     acknowledge(caller, &case, cleanup)
 }
