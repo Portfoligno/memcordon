@@ -1,3 +1,5 @@
+#[path = "../src/bin/consumer_readiness_windows/controller_gate_error.rs"]
+mod controller_gate_error;
 #[path = "../src/bin/consumer_readiness_windows/toolchain_diagnostics.rs"]
 mod diagnostics;
 
@@ -179,7 +181,10 @@ fn socket_stage_preserves_original_error_kind_and_native_code() {
     assert!(error.to_string().contains("original-raw-os-error=Some(5)"));
     let missing = diagnostics::observer_gate_error(
         "selected-start-toolchain-observer",
-        std::io::Error::from_raw_os_error(2),
+        controller_gate_error::open_diagnostic(
+            std::io::Error::from_raw_os_error(2),
+            Ok("{}".into()),
+        ),
     );
     assert!(
         missing
@@ -193,13 +198,87 @@ fn socket_stage_preserves_original_error_kind_and_native_code() {
     );
     let blocked = diagnostics::observer_gate_error(
         "selected-start-toolchain-observer",
-        std::io::Error::other("controller descendant gate did not release"),
+        controller_gate_error::context(
+            controller_gate_error::Stage::Wait,
+            Some(258),
+            std::io::Error::other("controller descendant gate did not release"),
+        ),
     );
     assert!(
         blocked
             .to_string()
             .contains("toolchain-operation=wait-toolchain-observer-gate")
     );
+}
+
+#[test]
+fn observer_gate_context_keeps_typed_operation_and_original_error_chain() {
+    use std::io;
+    for (stage, operation, code) in [
+        (
+            controller_gate_error::Stage::Open,
+            "open-toolchain-observer-gate",
+            5,
+        ),
+        (
+            controller_gate_error::Stage::Wait,
+            "wait-toolchain-observer-gate",
+            6,
+        ),
+        (
+            controller_gate_error::Stage::PublishRelease,
+            "publish-toolchain-observer-release",
+            32,
+        ),
+    ] {
+        let native = io::Error::from_raw_os_error(code);
+        let kind = native.kind();
+        let boundary = controller_gate_error::context(stage, Some(u32::MAX), native);
+        assert_eq!(boundary.raw_os_error(), None);
+        let projected = diagnostics::observer_gate_error("exact-selected-gate", boundary);
+        assert_eq!(projected.kind(), kind);
+        assert!(
+            projected
+                .to_string()
+                .contains(&format!("toolchain-operation={operation}"))
+        );
+        assert!(
+            projected
+                .to_string()
+                .contains(&format!("original-raw-os-error=Some({code})"))
+        );
+        let original = projected
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(
+            original
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<controller_gate_error::BoundaryError>()
+                .unwrap()
+                .observation(),
+            (stage, Some(code))
+        );
+        let native = original
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(native.raw_os_error(), Some(code));
+    }
+    let unknown = diagnostics::observer_gate_error("gate", io::Error::from_raw_os_error(2));
+    assert!(
+        unknown
+            .to_string()
+            .contains("toolchain-operation=toolchain-observer-gate;")
+    );
+    assert!(!unknown.to_string().contains("toolchain-operation=open-"));
 }
 
 #[test]

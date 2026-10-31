@@ -8,16 +8,23 @@ pub enum Stage {
     PublishRelease,
 }
 
-struct BoundaryError {
+pub struct BoundaryError {
     stage: Stage,
     wait_status: Option<u32>,
     original: io::Error,
     diagnostic: Option<String>,
 }
 
+impl BoundaryError {
+    pub fn observation(&self) -> (Stage, Option<i32>) {
+        (self.stage, self.original.raw_os_error())
+    }
+}
+
 impl fmt::Display for BoundaryError {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (operation, access) = match self.stage {
+        let (stage, native_code) = self.observation();
+        let (operation, access) = match stage {
             Stage::Open => ("OpenEventW-controller-wait", 0x0010_0000),
             Stage::Wait => ("WaitForSingleObject-controller-wait", 0x0010_0000),
             Stage::PublishRelease => ("controller-released-transcript", 0),
@@ -26,7 +33,7 @@ impl fmt::Display for BoundaryError {
             out,
             "operation={operation}; access={access:#x}; kind={:?}; raw-os-error={:?}; wait-status={:?}",
             self.original.kind(),
-            self.original.raw_os_error(),
+            native_code,
             self.wait_status
         )?;
         if let Some(diagnostic) = &self.diagnostic {

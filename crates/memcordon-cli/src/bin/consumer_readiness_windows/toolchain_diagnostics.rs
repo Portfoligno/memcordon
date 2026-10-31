@@ -148,24 +148,52 @@ pub fn publication_error(phase: &str, error: io::Error) -> io::Error {
 
 pub fn observer_gate_error(name: &str, error: io::Error) -> io::Error {
     use sha2::Digest;
-    // This call site has an infallible ready callback. Native-code errors come
-    // from OpenEvent; its finite wait returns a separate code-free error.
-    let operation = if error.raw_os_error().is_some() {
-        "open-toolchain-observer-gate"
-    } else {
-        "wait-toolchain-observer-gate"
-    };
     let digest = String::from(memcordon_core::DiagnosticSha256::from_bytes(
         sha2::Sha256::digest(name.as_bytes()).into(),
     ));
     io::Error::new(
         error.kind(),
-        format!(
-            "{error}; toolchain-operation={operation}; name-bytes={}; name-sha256={digest}; original-raw-os-error={:?}",
-            name.len(),
-            error.raw_os_error()
-        ),
+        ObserverGateError {
+            original: error,
+            name_bytes: name.len(),
+            name_sha256: digest,
+        },
     )
+}
+
+#[derive(Debug)]
+struct ObserverGateError {
+    original: io::Error,
+    name_bytes: usize,
+    name_sha256: String,
+}
+
+impl std::fmt::Display for ObserverGateError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use super::controller_gate_error::{BoundaryError, Stage};
+        let boundary = self
+            .original
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<BoundaryError>())
+            .map(BoundaryError::observation);
+        let (operation, native_code) = match boundary {
+            Some((Stage::Open, code)) => ("open-toolchain-observer-gate", code),
+            Some((Stage::Wait, code)) => ("wait-toolchain-observer-gate", code),
+            Some((Stage::PublishRelease, code)) => ("publish-toolchain-observer-release", code),
+            None => ("toolchain-observer-gate", self.original.raw_os_error()),
+        };
+        write!(
+            out,
+            "{}; toolchain-operation={operation}; name-bytes={}; name-sha256={}; original-raw-os-error={native_code:?}",
+            self.original, self.name_bytes, self.name_sha256
+        )
+    }
+}
+
+impl std::error::Error for ObserverGateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
 }
 
 #[cfg(windows)]
