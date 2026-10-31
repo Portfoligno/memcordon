@@ -2,19 +2,9 @@
 use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, BorrowedFd};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PrivateAttemptPhase {
-    Allocated,
-    BoundaryCreated,
-    GuardianReady,
-    TargetGated,
-    ReleaseIntent,
-    ExecutionObserved,
-    Retiring,
-    Retired,
-    CleanupIncomplete,
-}
+#[path = "private_attempt_phase.rs"]
+mod private_attempt_phase;
+pub use private_attempt_phase::{PrivateAttemptPhase, ReleaseCheckpoint};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

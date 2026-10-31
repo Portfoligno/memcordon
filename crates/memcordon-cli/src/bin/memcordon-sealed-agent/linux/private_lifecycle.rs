@@ -26,7 +26,7 @@ pub(super) struct PreparedPrivateLaunch {
     pub filter: [u8; 32],
 }
 use super::namespace::{NamespaceInit, NamespaceMode};
-use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4};
+use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4, ReleaseCheckpoint};
 use super::network_filter::NativeAbi;
 use super::network_profile::PrivateNetworkSetup;
 use super::private_guardian::PrivateGuardian;
@@ -779,12 +779,10 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     fn validate_gated_native_resources(
         &self,
         observed: &PrivateObservedTarget,
+        checkpoint: ReleaseCheckpoint,
     ) -> Result<(), String> {
-        if self.record.as_ref().expect("owner retains record").phase()
-            != PrivateAttemptPhase::TargetGated
-            || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
-            || self.relay.is_none()
-        {
+        checkpoint.validate(self.record.as_ref().expect("owner retains record").phase())?;
+        if !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live) || self.relay.is_none() {
             return Err(
                 "MCSEALED-PRIVATE-CHECKPOINT: target or guardian is not gated and live".into(),
             );
@@ -1771,7 +1769,7 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
         frontend: BorrowedFd<'_>,
         deadline: Instant,
     ) -> Result<Instant, String> {
-        self.validate_gated_native_resources(observed)?;
+        self.validate_gated_native_resources(observed, ReleaseCheckpoint::BeforeIntent)?;
         if Instant::now() >= deadline || pidfd_exited(frontend)? {
             return Err("workload original owner/deadline lost before release".into());
         }
@@ -1785,7 +1783,7 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
         self.record_mut().read_back_native()?;
         // Durable publication may block. Recheck the original owners and cutoff
         // after it, before the only release byte can leave this process.
-        self.validate_gated_native_resources(observed)?;
+        self.validate_gated_native_resources(observed, ReleaseCheckpoint::AfterIntent)?;
         self.require_live_target_identity(&observed.target)?;
         if self.mixed_root.is_none()
             || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)

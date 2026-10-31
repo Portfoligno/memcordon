@@ -1401,6 +1401,44 @@ fn recognized_journal_auxiliary(name: &str) -> Option<&str> {
                 .filter(|attempt| super::cgroup::valid_attempt_identity(attempt))
         })
 }
+
+/// Only the authenticated uninstall owner may retire these drained roots.
+/// Upgrade retains its existing directory and coordination lifetime.
+pub(crate) fn retire_empty_roots_for_uninstall(
+    guard: &crate::package::PackageDrainGuard<'_>,
+    cutoff: Instant,
+) -> Result<(), String> {
+    guard.validate()?;
+    for path in [
+        super::workload_attempt::JOURNAL_ROOT,
+        super::workload_attempt::INPUT_ROOT,
+        super::workload_resources::RESOURCE_ROOT,
+    ] {
+        remaining(cutoff)?;
+        let path = Path::new(path);
+        let (parent, name) = match parent_name(path) {
+            Ok(value) => value,
+            Err(error) => {
+                require_absent(path).map_err(|absence| {
+                    format!("current root parent custody: {error}; absence check: {absence}")
+                })?;
+                continue;
+            }
+        };
+        let held = match open_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(held) => held,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                require_absent(path)?;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        super::empty_runtime_directory::retire(&parent, &name, &held, 0, cutoff).map_err(
+            |error| format!("current empty root retirement {}: {error}", path.display()),
+        )?;
+    }
+    guard.validate()
+}
 fn protected_auxiliary(file: &File) -> Result<(), String> {
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file()

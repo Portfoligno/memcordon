@@ -2157,6 +2157,7 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
         ensure_recovery_idle_until("uninstall", cutoff)?;
         // Unknown runtime outputs must refuse uninstall while the complete
         // installed provider is still available for their original recovery.
+        crate::linux::workload_recovery::retire_empty_roots_for_uninstall(&drain_guard, cutoff)?;
         crate::linux::startup::clear()?;
         for path in [crate::linux::CGROUP_ROOT, RUNTIME_DIRECTORY] {
             remove_uninstalled_directory(path)?;
