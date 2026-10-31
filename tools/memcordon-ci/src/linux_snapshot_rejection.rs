@@ -21,10 +21,13 @@ pub fn validate(
         original_status,
         report.outcome.wrapper_status,
     )?;
-    crate::linux_result_publication::preparation_report(
-        &report.runtime,
-        &report.cleanup,
-        &report.outcome,
+    crate::linux_result_publication::intake_report(
+        report,
+        terminal,
+        association,
+        request,
+        original_frontend,
+        original_status,
     )?;
     if report.release != ReleaseKnowledgeV3::NotReleased {
         return Err("corrupt snapshot report release differs".into());
@@ -44,7 +47,7 @@ pub fn validate(
     {
         return Err("corrupt snapshot recovery reached execution or lost setup failure".into());
     }
-    // The report's Unknown is conservative publication, never cleanup proof.
+    // Allocated report cleanup must agree with the authenticated recovery.
     if terminal.cleanup.state != CleanupStateV1::Complete {
         return Err("corrupt snapshot authenticated recovery cleanup is not complete".into());
     }

@@ -33,7 +33,7 @@ fn fixture() -> (ResultV3, LinuxWorkloadTerminalV1) {
         runtime_sha256: None,
         input_sha256: None,
     };
-    let report = ResultV3 {
+    let mut report = ResultV3 {
         format: "memcordon.result".into(),
         revision: 3,
         tool: OperationalToolV1 {
@@ -83,6 +83,7 @@ fn fixture() -> (ResultV3, LinuxWorkloadTerminalV1) {
         CleanupResourceV3::ControlHandles,
         CleanupResourceV3::Staging,
         CleanupResourceV3::Footprint,
+        CleanupResourceV3::Record,
     ] {
         obligations
             .try_push(CleanupObligationV3 {
@@ -110,6 +111,7 @@ fn fixture() -> (ResultV3, LinuxWorkloadTerminalV1) {
         output_delivery: OutputDeliveryStateV3::Unknown,
         failures,
     };
+    report.cleanup = terminal.cleanup.clone();
     (report, terminal)
 }
 
@@ -127,7 +129,7 @@ fn mark_outstanding(terminal: &mut LinuxWorkloadTerminalV1) {
 }
 
 #[test]
-fn conservative_persisted_preparation_report_requires_separate_complete_original_recovery() {
+fn allocated_preparation_report_requires_exact_complete_original_recovery() {
     let (report, terminal) = fixture();
     let report = ResultV3::parse(&serde_json::to_vec(&report).unwrap()).unwrap();
     let terminal = LinuxWorkloadTerminalV1::parse(&serde_json::to_vec(&terminal).unwrap()).unwrap();
@@ -225,7 +227,7 @@ fn wrong_writer_wait_and_self_claimed_cleanup_cannot_pass_snapshot_rejection() {
         )
         .is_err()
     );
-    for state in [CleanupStateV1::Complete, CleanupStateV1::Incomplete] {
+    for state in [CleanupStateV1::Unknown, CleanupStateV1::Incomplete] {
         let mut changed = report.clone();
         changed.cleanup.state = state;
         assert!(
@@ -326,9 +328,13 @@ fn foreign_terminal_request_provider_release_or_missing_digest_refusal_stays_fat
 
 #[test]
 fn preallocation_refusal_uses_publication_and_conservative_shape_without_native_caller() {
-    use memcordon_ci::linux_result_publication::{preparation_report, publication_writer};
+    use memcordon_ci::linux_result_publication::{preallocation_report, publication_writer};
     use memcordon_core::workload_request::{WorkloadRejectionCodeV1, WorkloadRejectionV1};
     let (mut report, _) = fixture();
+    report.cleanup = CleanupV3 {
+        state: CleanupStateV1::Unknown,
+        obligations: BoundedVec::default(),
+    };
     report.workload_attempt = None;
     report.request_rejection = Some(WorkloadRejectionV1 {
         format: "memcordon.workload-rejection".into(),
@@ -344,7 +350,8 @@ fn preallocation_refusal_uses_publication_and_conservative_shape_without_native_
     ));
     assert!(report.outcome.native_termination.is_none());
     publication_writer(report.delivery, (42, 0)).unwrap();
-    preparation_report(&report.runtime, &report.cleanup, &report.outcome).unwrap();
+    let request = report.request.as_ref().unwrap().request_sha256.clone();
+    preallocation_report(&report, &request, (42, 0), Some(125)).unwrap();
     // No terminal or allocation observation is supplied here: this accepts
     // only the conservative report shape, never native cleanup success.
     assert_eq!(report.cleanup.state, CleanupStateV1::Unknown);
@@ -358,16 +365,93 @@ fn preallocation_refusal_uses_publication_and_conservative_shape_without_native_
         assert!(publication_writer(delivery, (42, 0)).is_err());
     }
     assert!(publication_writer(report.delivery, (0, 0)).is_err());
-    let mut cleanup = report.cleanup.clone();
-    cleanup.state = CleanupStateV1::Complete;
-    assert!(preparation_report(&report.runtime, &cleanup, &report.outcome).is_err());
-    cleanup.state = CleanupStateV1::Unknown;
-    cleanup
+    let mut changed = report.clone();
+    changed.cleanup.state = CleanupStateV1::Complete;
+    assert!(preallocation_report(&changed, &request, (42, 0), Some(125)).is_err());
+    changed.cleanup.state = CleanupStateV1::Unknown;
+    changed
+        .cleanup
         .obligations
         .try_push(CleanupObligationV3 {
             resource: CleanupResourceV3::Staging,
             settled: true,
         })
         .unwrap();
-    assert!(preparation_report(&report.runtime, &cleanup, &report.outcome).is_err());
+    assert!(preallocation_report(&changed, &request, (42, 0), Some(125)).is_err());
+    let mut associated = report.clone();
+    associated.workload_attempt = Some(fixture().1.association);
+    assert!(preallocation_report(&associated, &request, (42, 0), Some(125)).is_err());
+    let mut no_rejection = report.clone();
+    no_rejection.request_rejection = None;
+    assert!(preallocation_report(&no_rejection, &request, (42, 0), Some(125)).is_err());
+    assert!(preallocation_report(&report, &request, (42, 0), Some(0)).is_err());
+}
+
+#[test]
+fn allocated_cleanup_is_an_exact_semantic_mapping_not_an_arbitrary_settled_list() {
+    let (report, terminal) = fixture();
+    let check = |report: &ResultV3, terminal: &LinuxWorkloadTerminalV1| {
+        validate(
+            report,
+            terminal,
+            &terminal.association,
+            &terminal.request.request_sha256,
+            (42, 0),
+            Some(125),
+        )
+    };
+    let mut reordered = terminal.clone();
+    let mut obligations = terminal.cleanup.obligations.as_slice().to_vec();
+    obligations.reverse();
+    reordered.cleanup.obligations =
+        serde_json::from_value(serde_json::to_value(obligations).unwrap()).unwrap();
+    check(&report, &reordered).unwrap();
+    for resource in [CleanupResourceV3::Target, CleanupResourceV3::Staging] {
+        let mut changed = report.clone();
+        changed
+            .cleanup
+            .obligations
+            .try_push(CleanupObligationV3 {
+                resource,
+                settled: true,
+            })
+            .unwrap();
+        assert!(check(&changed, &terminal).is_err());
+    }
+    let mut missing = report.clone();
+    missing.cleanup.obligations = serde_json::from_value(
+        serde_json::to_value(&report.cleanup.obligations.as_slice()[..3]).unwrap(),
+    )
+    .unwrap();
+    assert!(check(&missing, &terminal).is_err());
+    let mut wrong_request = report.clone();
+    wrong_request.request.as_mut().unwrap().invocation_sha256 =
+        DiagnosticSha256::from_bytes([8; 32]);
+    assert!(check(&wrong_request, &terminal).is_err());
+    let mut fallback = report.clone();
+    fallback.cleanup = CleanupV3 {
+        state: CleanupStateV1::Unknown,
+        obligations: BoundedVec::default(),
+    };
+    assert!(check(&fallback, &terminal).is_err());
+    let mut wrong_branch = report.clone();
+    wrong_branch.request_rejection = Some(memcordon_core::workload_request::WorkloadRejectionV1 {
+        format: "memcordon.workload-rejection".into(),
+        revision: 1,
+        code: memcordon_core::workload_request::WorkloadRejectionCodeV1::UnsupportedRequirement,
+        detail: BoundedText::new("initial loader environment").unwrap(),
+    });
+    assert!(check(&wrong_branch, &terminal).is_err());
+    let mut native_report = report.clone();
+    native_report.outcome.native_termination =
+        Some(memcordon_core::ChildTermination::ExitCode { code: 0 });
+    assert!(check(&native_report, &terminal).is_err());
+    let mut released = report.clone();
+    released.release = ReleaseKnowledgeV3::Released;
+    assert!(check(&released, &terminal).is_err());
+    let mut profile = report.clone();
+    profile.runtime = RuntimeExecutionV3::PreparationFailed {
+        profile: BoundedText::new("another-profile").unwrap(),
+    };
+    assert!(check(&profile, &terminal).is_err());
 }

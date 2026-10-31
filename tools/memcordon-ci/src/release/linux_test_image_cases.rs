@@ -76,101 +76,7 @@ fn copy_snapshot(
     super::linux_test_execution::caller_tree(destination, caller, cutoff, &mut remaining)
 }
 fn rpath_probe(original: &[u8], target: &str) -> Result<(Vec<u8>, Value)> {
-    let file = |offset: usize, count: usize| {
-        original
-            .get(
-                offset
-                    ..offset
-                        .checked_add(count)
-                        .ok_or_else(|| fail("ELF mutation extent overflow"))?,
-            )
-            .ok_or_else(|| fail("ELF mutation extent invalid"))
-    };
-    let scalar = |offset: usize| -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            file(offset, 8)?
-                .try_into()
-                .map_err(|_| fail("ELF mutation scalar absent"))?,
-        ))
-    };
-    if file(0, 6)? != b"\x7fELF\x02\x01" {
-        return Err(fail("current RPATH fixture is not native ELF64LE"));
-    }
-    let offset = usize::try_from(scalar(32)?).map_err(|error| fail(error.to_string()))?;
-    let count = usize::from(u16::from_le_bytes(
-        file(56, 2)?
-            .try_into()
-            .map_err(|_| fail("ELF program count absent"))?,
-    ));
-    if count == 0 || count > 512 {
-        return Err(fail("ELF mutation program inventory invalid"));
-    }
-    let mut dynamic = None;
-    for index in 0..count {
-        let at = offset
-            .checked_add(index * 56)
-            .ok_or_else(|| fail("ELF header mutation overflow"))?;
-        if u32::from_le_bytes(
-            file(at, 4)?
-                .try_into()
-                .map_err(|_| fail("ELF program kind absent"))?,
-        ) == 2
-        {
-            dynamic = Some((
-                usize::try_from(scalar(at + 8)?).map_err(|error| fail(error.to_string()))?,
-                usize::try_from(scalar(at + 32)?).map_err(|error| fail(error.to_string()))?,
-            ));
-        }
-    }
-    let (dynamic, length) = dynamic.ok_or_else(|| fail("actual fixture has no dynamic table"))?;
-    file(dynamic, length)?;
-    let mut needed = None;
-    let mut end = None;
-    for at in (dynamic..dynamic + length).step_by(16) {
-        match scalar(at)? {
-            1 if needed.is_none() => needed = Some(scalar(at + 8)?),
-            0 => {
-                end = Some(at);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| fail("ELF dynamic terminator absent"))?;
-    if end.checked_add(32).is_none_or(|end| end > dynamic + length) || scalar(end + 16)? != 0 {
-        return Err(fail(
-            "actual ELF has no spare dynamic terminator for RPATH probe",
-        ));
-    }
-    let mut probe = original.to_vec();
-    probe[end..end + 8].copy_from_slice(&29_u64.to_le_bytes());
-    probe[end + 8..end + 16].copy_from_slice(
-        &needed
-            .ok_or_else(|| fail("actual ELF has no needed dependency string"))?
-            .to_le_bytes(),
-    );
-    let held = std::io::Cursor::new(&probe);
-    let elf = memcordon_core::elf_closure::inspect(
-        |offset, buffer| {
-            use std::io::Read;
-            let mut held = held.clone();
-            held.set_position(offset);
-            held.read_exact(buffer).map_err(|error| error.to_string())
-        },
-        probe.len() as u64,
-        target,
-    )
-    .map_err(fail)?
-    .ok_or_else(|| fail("RPATH probe stopped being native ELF"))?;
-    if elf.search_paths.len() != 1 || elf.search_paths[0].starts_with('/') {
-        return Err(fail(
-            "RPATH probe did not select actual relative dynamic search",
-        ));
-    }
-    Ok((
-        probe,
-        json!({"offset":end,"old_tag":0,"new_tag":29,"string_offset":needed,"search":elf.search_paths[0]}),
-    ))
+    crate::linux_elf_rpath::mutate(original, target).map_err(fail)
 }
 #[expect(
     clippy::too_many_arguments,
@@ -367,12 +273,6 @@ fn negative(
             result.outcome.wrapper_status,
         )
         .map_err(fail)?;
-        crate::linux_result_publication::preparation_report(
-            &result.runtime,
-            &result.cleanup,
-            &result.outcome,
-        )
-        .map_err(fail)?;
         let association = if scenario == "ld-injection" {
             None
         } else {
@@ -425,6 +325,13 @@ fn negative(
             ));
         }
         if scenario == "ld-injection" {
+            crate::linux_result_publication::preallocation_report(
+                &result,
+                &request.digest().map_err(|error| fail(error.to_string()))?,
+                original,
+                original_wait.code(),
+            )
+            .map_err(fail)?;
             if association.is_some()
                 || raw["request_rejection"]["code"] != "unsupported-requirement"
                 || !raw["request_rejection"]["detail"]
@@ -443,6 +350,26 @@ fn negative(
             let recovery = recovery
                 .as_ref()
                 .ok_or_else(|| fail("actual rejected loader recovery absent"))?;
+            crate::linux_result_publication::intake_report(
+                &result,
+                &recovery.terminal,
+                association,
+                &request.digest().map_err(|error| fail(error.to_string()))?,
+                original,
+                original_wait.code(),
+            )
+            .map_err(fail)?;
+            if scenario == "rpath-injection"
+                && !recovery.terminal.failures.as_slice().iter().any(|failure| {
+                    failure
+                        .as_str()
+                        .contains("ELF loader search contains unsupported or relative authority")
+                })
+            {
+                return Err(fail(
+                    "RPATH mutation did not reach its original relative loader-authority refusal",
+                ));
+            }
             let terminal: Value = serde_json::from_slice(&recovery.raw_terminal)?;
             if raw["workload_attempt"] != serde_json::to_value(association)?
                 || raw["provider"] != serde_json::to_value(provider)?

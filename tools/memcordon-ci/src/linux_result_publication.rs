@@ -1,7 +1,12 @@
 //! Publication facts checked against the original held frontend and its sole wait.
 use memcordon_core::{
-    execution_facts::{CleanupStateV1, NativeProcessV2, OutcomeKindV1, OutcomeV1},
-    result_v3::{CleanupV3, DeliveryStateV3, RuntimeExecutionV3},
+    DiagnosticSha256,
+    execution_facts::{CleanupStateV1, NativeProcessV2, OutcomeKindV1},
+    result_v3::{
+        CleanupResourceV3, CleanupV3, DeliveryStateV3, LinuxWorkloadTerminalV1,
+        NativeWorkloadOutcomeV1, ReleaseKnowledgeV3, ResultV3, RuntimeExecutionV3,
+    },
+    workload_request::{WorkloadAttemptAssociationV1, WorkloadRejectionCodeV1},
 };
 
 /// The writer PID is serialized; birth remains bound by the original held owner.
@@ -29,28 +34,106 @@ pub fn writer(
     publication_writer(delivery, original)
 }
 
-/// Conservative report shape only. Actual native cleanup must be proved separately.
-pub fn preparation_report(
-    runtime: &RuntimeExecutionV3,
-    cleanup: &CleanupV3,
-    outcome: &OutcomeV1,
-) -> Result<(), String> {
-    if !matches!(runtime, RuntimeExecutionV3::PreparationFailed { .. })
-        || cleanup.state != CleanupStateV1::Unknown
-        || !cleanup.obligations.as_slice().is_empty()
-        || outcome.kind != OutcomeKindV1::LaunchFailure
-        || outcome.wrapper_status != 125
-        || outcome.native_termination.is_some()
+fn preparation_report(report: &ResultV3) -> Result<(), String> {
+    report.validate()?;
+    if !matches!(&report.runtime, RuntimeExecutionV3::PreparationFailed { profile } if profile.as_str() == "linux-private-workload-v1")
+        || report.release != ReleaseKnowledgeV3::NotReleased
+        || report.outcome.kind != OutcomeKindV1::LaunchFailure
+        || report.outcome.wrapper_status != 125
+        || report.outcome.native_termination.is_some()
     {
-        return Err(format!(
-            "preparation-failure report shape differs; preparation-failed={}; cleanup-state={:?}; cleanup-obligations={}; outcome-kind={:?}; wrapper-status={}; native-termination-present={}",
-            matches!(runtime, RuntimeExecutionV3::PreparationFailed { .. }),
-            cleanup.state,
-            cleanup.obligations.as_slice().len(),
-            outcome.kind,
-            outcome.wrapper_status,
-            outcome.native_termination.is_some()
-        ));
+        return Err("preparation-failure runtime/profile/release/outcome differs".into());
+    }
+    Ok(())
+}
+
+/// Preallocation report only; allocation absence/settlement remain native obligations.
+pub fn preallocation_report(
+    report: &ResultV3,
+    request: &DiagnosticSha256,
+    original: (u32, u64),
+    status: Option<i32>,
+) -> Result<(), String> {
+    preparation_report(report)?;
+    publication_writer(report.delivery, original)?;
+    wrapper_status(status, report.outcome.wrapper_status)?;
+    if report.cleanup.state != CleanupStateV1::Unknown
+        || !report.cleanup.obligations.as_slice().is_empty()
+        || report.workload_attempt.is_some()
+        || report.request.as_ref().map(|value| &value.request_sha256) != Some(request)
+        || !report.request_rejection.as_ref().is_some_and(|rejection| {
+            rejection.code == WorkloadRejectionCodeV1::UnsupportedRequirement
+                && rejection
+                    .detail
+                    .as_str()
+                    .contains("initial loader environment")
+        })
+    {
+        return Err(
+            "preallocation loader rejection/report cleanup/request/association differs".into(),
+        );
+    }
+    Ok(())
+}
+
+fn intake_cleanup(
+    cleanup: &CleanupV3,
+) -> Result<std::collections::BTreeMap<CleanupResourceV3, bool>, String> {
+    let expected = [
+        CleanupResourceV3::Staging,
+        CleanupResourceV3::Footprint,
+        CleanupResourceV3::Record,
+        CleanupResourceV3::ControlHandles,
+    ];
+    let mut observed = std::collections::BTreeMap::new();
+    for obligation in cleanup.obligations.as_slice() {
+        if !expected.contains(&obligation.resource)
+            || !obligation.settled
+            || observed
+                .insert(obligation.resource, obligation.settled)
+                .is_some()
+        {
+            return Err("allocated intake cleanup has extra/duplicate/unsettled resources".into());
+        }
+    }
+    if cleanup.state != CleanupStateV1::Complete || observed.len() != expected.len() {
+        return Err(
+            "allocated intake cleanup is not the exact complete four-resource inventory".into(),
+        );
+    }
+    Ok(observed)
+}
+
+/// Requires the existing authenticated terminal; command success is checked separately.
+pub fn intake_report(
+    report: &ResultV3,
+    terminal: &LinuxWorkloadTerminalV1,
+    association: &WorkloadAttemptAssociationV1,
+    request: &DiagnosticSha256,
+    original: (u32, u64),
+    status: Option<i32>,
+) -> Result<(), String> {
+    preparation_report(report)?;
+    terminal.validate()?;
+    publication_writer(report.delivery, original)?;
+    wrapper_status(status, report.outcome.wrapper_status)?;
+    if report.request_rejection.is_some()
+        || report.workload_attempt.as_ref() != Some(association)
+        || report.provider.as_ref() != Some(&association.provider)
+        || terminal.association != *association
+        || report.request.as_ref() != Some(&terminal.request)
+        || terminal.request.request_sha256 != *request
+        || terminal.release != ReleaseKnowledgeV3::NotReleased
+        || terminal.native.is_some()
+        || terminal.outcome != NativeWorkloadOutcomeV1::SetupFailure
+    {
+        return Err(
+            "allocated intake report/terminal original binding or no-execution outcome differs"
+                .into(),
+        );
+    }
+    if intake_cleanup(&report.cleanup)? != intake_cleanup(&terminal.cleanup)? {
+        return Err("allocated intake report/recovery cleanup mappings differ".into());
     }
     Ok(())
 }
