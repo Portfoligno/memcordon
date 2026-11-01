@@ -4,6 +4,11 @@ use crate::{CiError, Result};
 
 const TEXT_BYTES: usize = 128;
 
+/// Exact Linux pipe-writer implementations supported by the observed kernel ABI.
+pub fn supported_pipe_writer(channel: &str) -> bool {
+    matches!(channel.trim(), "pipe_write" | "anon_pipe_write")
+}
+
 /// Bound the original proc read itself, separately from diagnostic rendering.
 pub fn read_native_text(reader: impl std::io::Read) -> std::io::Result<String> {
     use std::io::Read;
@@ -28,7 +33,7 @@ pub struct WriteSample {
     pub wait_channel_truncated: bool,
     pub raw_syscall: String,
     pub raw_syscall_truncated: bool,
-    exact_pipe_write: bool,
+    supported_pipe_writer: bool,
 }
 
 impl WriteSample {
@@ -52,7 +57,7 @@ impl WriteSample {
             wait_channel_truncated,
             raw_syscall,
             raw_syscall_truncated,
-            exact_pipe_write: wchan.trim() == "pipe_write",
+            supported_pipe_writer: supported_pipe_writer(wchan),
         }
     }
 
@@ -70,7 +75,7 @@ impl WriteSample {
             self.number == Some(write_number),
             self.descriptor == Some(expected_descriptor),
             self.length == Some(256),
-            self.exact_pipe_write,
+            self.supported_pipe_writer,
         ]
     }
 
@@ -88,11 +93,11 @@ impl WriteSample {
             write_syscall,
             expected_descriptor,
             length_256,
-            exact_pipe_write,
+            supported_pipe_writer,
         ] = self.checks(expected_descriptor, queued, capacity, write_number);
         serde_json::json!({"queued_positive":queued_positive,"queued_within_capacity":queued_within_capacity,
             "free_below_4096":free_below_4096,"write_syscall":write_syscall,
-            "expected_descriptor":expected_descriptor,"length_256":length_256,"exact_pipe_write":exact_pipe_write})
+            "expected_descriptor":expected_descriptor,"length_256":length_256,"supported_pipe_writer":supported_pipe_writer})
     }
 
     pub fn matches(

@@ -85,10 +85,54 @@ fn malformed_fields_and_kernel_aliases_never_match() {
             "{raw}"
         );
     }
-    for channel in ["anon_pipe_write", "pipe_write_suffix", "", "0"] {
+    for channel in [
+        "fifo_pipe_write",
+        "pipe_write_suffix",
+        "anon_pipe_write_suffix",
+        "prefixpipe_write",
+        "pipe_write anon_pipe_write",
+        "running",
+        "",
+        "0",
+    ] {
         assert!(!WriteSample::parse("64 0x2 0x0 0x100", channel).matches(2, 8192, 8192, 64));
     }
     assert_eq!(WriteSample::parse("-1", "0").number, Some(-1));
+}
+
+#[test]
+fn supported_native_symbols_preserve_every_other_pressure_condition() {
+    for (number, raw) in [(64, "64 0x1 0x1234 0x100"), (1, "1 0x1 0x1234 0x100")] {
+        for channel in ["pipe_write", "anon_pipe_write"] {
+            let sample = WriteSample::parse(raw, channel);
+            assert!(sample.matches(1, 65536, 65536, number));
+            assert_eq!(sample.wait_channel, channel);
+            assert!(!sample.wait_channel_truncated);
+            assert_eq!(
+                sample.predicates(1, 65536, 65536, number)["supported_pipe_writer"],
+                true
+            );
+            for (fd, queued, capacity, syscall) in [
+                (2, 65536, 65536, number),
+                (1, 0, 65536, number),
+                (1, 65537, 65536, number),
+                (1, 61440, 65536, number),
+                (1, 65536, 65536, number + 1),
+            ] {
+                assert!(!sample.matches(fd, queued, capacity, syscall));
+            }
+            for count in ["0xff", "bad"] {
+                let wrong = format!("{number} 0x1 0x1234 {count}");
+                assert!(!WriteSample::parse(&wrong, channel).matches(1, 65536, 65536, number));
+            }
+            let padded = format!(" \n{channel}\t");
+            assert!(WriteSample::parse(raw, &padded).matches(1, 65536, 65536, number));
+            let overlong = format!("{channel}{}", "x".repeat(256));
+            let sample = WriteSample::parse(raw, &overlong);
+            assert!(sample.wait_channel_truncated);
+            assert!(!sample.matches(1, 65536, 65536, number));
+        }
+    }
 }
 
 #[test]

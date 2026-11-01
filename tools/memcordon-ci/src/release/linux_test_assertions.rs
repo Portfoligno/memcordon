@@ -530,7 +530,9 @@ fn assert_case_inner(
                 .is_none_or(|remaining| remaining >= 4096)
             || observed["blocked_write"]["descriptor"] != observed["descriptor"]
             || observed["blocked_write"]["length"] != 256
-            || observed["blocked_write"]["wait_channel"] != "pipe_write"
+            || !observed["blocked_write"]["wait_channel"]
+                .as_str()
+                .is_some_and(crate::linux_relay_sample::supported_pipe_writer)
             || number(&observed["pipe"]["inode"])? == 0
         {
             return Err(fail(
