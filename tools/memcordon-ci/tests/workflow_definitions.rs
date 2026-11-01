@@ -12,6 +12,44 @@ fn root() -> PathBuf {
 const SELECTION_ID: &str = "${{ needs.select.outputs.selection-artifact-id }}";
 
 #[test]
+fn backend_original_failure_carriers_precede_the_full_installed_artifact() {
+    for document in sources("backend-certification.yml") {
+        for job in ["windows-installed-x64", "windows-installed-arm64"] {
+            let steps = document["jobs"][job]["steps"].as_sequence().unwrap();
+            let selected: Vec<_> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["name"] == "Retain original Winsock failure carriers")
+                .collect();
+            assert_eq!(selected.len(), 1);
+            let (index, step) = selected[0];
+            assert_eq!(step["if"], "!cancelled() && failure()");
+            assert_eq!(step["continue-on-error"], true);
+            assert_eq!(step["timeout-minutes"].as_u64(), Some(2));
+            assert_eq!(step["uses"], "./.github/actions/upload-artifact");
+            assert_eq!(step["with"]["if-no-files-found"], "ignore");
+            let paths: Vec<_> = step["with"]["path"].as_str().unwrap().lines().collect();
+            assert_eq!(paths.len(), 3);
+            for (path, name) in paths.iter().zip([
+                "result.callback-failure.json",
+                "result.winsock-startup-trace.json",
+                "result.stderr.bin",
+            ]) {
+                assert_eq!(
+                    *path,
+                    format!(
+                        "target/ci/windows-installed/${{{{ matrix.channel }}}}/cases/windows-installed/W-JOINT/restricted/{name}"
+                    )
+                );
+            }
+            let full = &steps[index + 1];
+            assert_eq!(full["with"]["path"], "target/ci/windows-installed");
+            assert_eq!(full["timeout-minutes"].as_u64(), Some(6));
+        }
+    }
+}
+
+#[test]
 fn every_release_selection_consumer_has_an_adjacent_fatal_exact_retry() {
     for document in sources("release.yml") {
         let mut consumers = BTreeSet::new();

@@ -17,7 +17,7 @@ fn retained_stderr(error: &ProcessTestError) -> String {
     else {
         return "original callback stderr unavailable".into();
     };
-    const EXCERPT_BYTES: usize = 512;
+    const EXCERPT_BYTES: usize = 4 * 1024;
     if stderr.len() <= EXCERPT_BYTES {
         format!(
             "original-stderr-bytes={}; capture-complete={capture_complete}; original-stderr={:?}",
@@ -181,9 +181,14 @@ pub fn callback_failure(error: ProcessTestError, expected: Option<&Expected<'_>>
         }
         Err(reason) => {
             let stderr = retained_stderr(&error);
-            CiError::Process(error).context(format!(
-                "original fixture callback failure; named-gate diagnostic unavailable: {reason}; {stderr}"
-            ))
+            // The raw excerpt is already bounded. Debug escaping can expand it by
+            // six bytes per input byte; avoid clipping its middle a second time.
+            CiError::Context {
+                context: format!(
+                    "original fixture callback failure; named-gate diagnostic unavailable: {reason}; {stderr}"
+                ),
+                source: Box::new(CiError::Process(error)),
+            }
         }
     }
 }

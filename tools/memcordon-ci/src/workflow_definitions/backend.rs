@@ -5,6 +5,27 @@ use serde_yaml::Value;
 pub(super) fn definition() -> Value {
     node_0()
 }
+
+fn installed_failure_carriers() -> Value {
+    let mut inputs = serde_yaml::Mapping::new();
+    inputs.insert(
+        text("name"),
+        text("windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}"),
+    );
+    inputs.insert(text("path"), text("target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json\ntarget/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json\ntarget/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin"));
+    inputs.insert(text("if-no-files-found"), text("ignore"));
+    let mut step = serde_yaml::Mapping::new();
+    step.insert(
+        text("name"),
+        text("Retain original Winsock failure carriers"),
+    );
+    step.insert(text("if"), text("!cancelled() && failure()"));
+    step.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    step.insert(text("continue-on-error"), Value::Bool(true));
+    step.insert(text("timeout-minutes"), Value::Number(2.into()));
+    step.insert(text("with"), Value::Mapping(inputs));
+    Value::Mapping(step)
+}
 fn node_0() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Native backend tests"));
@@ -10838,6 +10859,7 @@ fn node_707() -> Value {
     values.push(node_790());
     values.push(node_791());
     values.push(node_792());
+    values.push(installed_failure_carriers());
     values.push(node_795());
     values.push(node_797());
     Value::Sequence(values)
@@ -12236,6 +12258,7 @@ fn node_608() -> Value {
     values.push(node_691());
     values.push(node_692());
     values.push(node_693());
+    values.push(installed_failure_carriers());
     values.push(node_696());
     values.push(node_698());
     Value::Sequence(values)

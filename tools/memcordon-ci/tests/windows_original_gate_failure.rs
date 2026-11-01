@@ -96,7 +96,32 @@ fn preadmission_start_failure_surfaces_bounded_original_stderr_without_inventing
     assert!(text.contains("original terminal tail"));
     assert!(text.contains("capture-complete=false"));
     assert!(text.contains("omitted-bytes="));
-    assert!(text.len() < 4096);
+    assert!(text.len() < 4 * 1024 * 6 + 2048);
+}
+
+#[test]
+fn complete_middle_trace_and_escaped_binary_excerpt_preserve_original_capture() {
+    let mut stderr = vec![b'a'; 1024];
+    stderr.extend_from_slice(b"original-startup-trace-middle");
+    stderr.resize(2086, b'z');
+    let failure = callback_failure(query(stderr.clone(), true, Ok(())), None);
+    assert_original(&failure, &stderr);
+    assert!(
+        failure
+            .to_string()
+            .contains("original-startup-trace-middle")
+    );
+    assert!(!failure.to_string().contains("omitted-bytes="));
+    for byte in [0x1b, 0xff] {
+        let stderr = vec![byte; 32 * 1024];
+        let failure = callback_failure(query(stderr.clone(), false, Ok(())), None);
+        assert_original(&failure, &stderr);
+        let text = failure.to_string();
+        assert!(text.contains("original-stderr-bytes=32768"));
+        assert!(text.contains("omitted-bytes=28672"));
+        // Debug escaping needs at most six rendered bytes per retained raw byte.
+        assert!(text.len() < 4 * 1024 * 6 + 2048);
+    }
 }
 
 #[test]

@@ -2876,6 +2876,18 @@ jobs:
         if: (matrix.channel == 'cargo') && runner.os == 'Windows'
         run: ./target/ci-runtime/current/memcordon-ci.exe release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo
         timeout-minutes: 135
+      - name: Retain original Winsock failure carriers
+        if: '!cancelled() && failure()'
+        uses: ./.github/actions/upload-artifact
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
+          path: |-
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin
+          if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
         with:
@@ -3272,6 +3284,18 @@ jobs:
         if: (matrix.channel == 'cargo') && runner.os == 'Windows'
         run: ./target/ci-runtime/current/memcordon-ci.exe release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo
         timeout-minutes: 135
+      - name: Retain original Winsock failure carriers
+        if: '!cancelled() && failure()'
+        uses: ./.github/actions/upload-artifact
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
+          path: |-
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin
+          if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
         with:
