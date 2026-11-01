@@ -67,4 +67,6 @@ static_assert(sizeof(TracePacket) == 6664 && offsetof(TracePacket, entries) == 1
 extern "C" void memcordon_gate_trace_prepare(TracePacket*, uint64_t, uint64_t);
 extern "C" void* memcordon_gate_trace_call(TracePacket*, const uint16_t*, uint32_t*, uint32_t*);
 extern "C" uint32_t memcordon_gate_trace_mock();
+extern "C" void memcordon_gate_trace_directories(TracePacket*, uint64_t*, uint32_t*);
+extern "C" void memcordon_gate_trace_release_directories(TracePacket*);
 extern "C" uint32_t memcordon_decode_import_entry(uint32_t, uint64_t, const uint8_t*, size_t, uint64_t*);

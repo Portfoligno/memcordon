@@ -21,6 +21,29 @@ static RouteRecord installation_route = {};
 struct Collector { TracePacket* packet; DWORD thread; };
 // POD static TLS is initialized before user code, never lazily in a hook.
 static __declspec(thread) Collector collector = {nullptr, 0};
+// These references belong to the current control caller until explicit release.
+// They never replace the caller's output or grant access beyond that output.
+static __declspec(thread) HANDLE retained_directories[8] = {};
+static __declspec(thread) DWORD retained_errors[8] = {};
+static __declspec(thread) TracePacket* retained_owner = nullptr;
+
+extern "C" void memcordon_gate_trace_release_directories(TracePacket* owner) {
+    if (owner != retained_owner) return;
+    const DWORD error = GetLastError();
+    for (size_t index = 0; index < 8; ++index) {
+        if (retained_directories[index]) CloseHandle(retained_directories[index]);
+        retained_directories[index] = nullptr;
+        retained_errors[index] = 0;
+    }
+    retained_owner = nullptr;
+    SetLastError(error);
+}
+extern "C" void memcordon_gate_trace_directories(TracePacket* owner, uint64_t* handles, uint32_t* errors) {
+    for (size_t index = 0; index < 8; ++index) {
+        handles[index] = owner == retained_owner ? reinterpret_cast<uintptr_t>(retained_directories[index]) : 0;
+        errors[index] = owner == retained_owner ? retained_errors[index] : ERROR_INVALID_OWNER;
+    }
+}
 
 static void arguments(TraceEntry* entry, POBJECT_ATTRIBUTES attributes) {
     __try {
@@ -92,7 +115,21 @@ static TraceEntry* enter(uint32_t operation, ACCESS_MASK access) {
 static NTSTATUS NTAPI directory_hook(PHANDLE output, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes) {
     TraceEntry* entry = enter(1, access);
     const NTSTATUS status = forward(directory_open.load(std::memory_order_acquire), output, access, attributes, entry);
+    const DWORD original_error = GetLastError();
+    if (entry && status >= 0 && entry->output_handle_readable && entry->output_handle_returned) {
+        const size_t index = entry->sequence - 1;
+        if (retained_owner == collector.packet) {
+            LARGE_INTEGER now;
+            if (!QueryPerformanceCounter(&now)) retained_errors[index] = GetLastError();
+            else if (now.QuadPart < 0 || static_cast<uint64_t>(now.QuadPart) >= collector.packet->original_cutoff_qpc)
+                retained_errors[index] = ERROR_TIMEOUT;
+            else if (!DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(static_cast<uintptr_t>(entry->raw_output)),
+                                      GetCurrentProcess(), &retained_directories[index], 0, FALSE, DUPLICATE_SAME_ACCESS))
+                retained_errors[index] = GetLastError();
+        }
+    }
     if (entry && (!entry->arguments_readable || !entry->name_readable || entry->name_malformed || entry->name_truncated)) collector.packet->incomplete = 1;
+    SetLastError(original_error);
     return status;
 }
 static NTSTATUS NTAPI event_hook(PHANDLE output, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes) {
@@ -653,6 +690,7 @@ extern "C" void* memcordon_gate_trace_call(TracePacket* packet, const uint16_t* 
             packet->clock_live = 0; packet->incomplete = 1; *called = 0; *native_error = ERROR_TIMEOUT; return nullptr;
         }
     }
+    if (!retained_owner) retained_owner = packet;
     collector.thread = GetCurrentThreadId();
     collector.packet = packet->setup_stage == 1 ? packet : nullptr;
     packet->armed_call_count = collector.packet ? 1 : 0;

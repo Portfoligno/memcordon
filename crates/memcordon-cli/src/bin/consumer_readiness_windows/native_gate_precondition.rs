@@ -104,6 +104,162 @@ pub(super) fn run(
             return Err(io::Error::last_os_error());
         }
         let timeout = remaining(input, watchdog)?.min(Duration::from_secs(5));
+        let observation_cutoff = Instant::now() + timeout;
+        loop {
+            let available = remaining(input, watchdog)?;
+            if available.is_zero() || Instant::now() >= observation_cutoff {
+                return Err(io::Error::other(
+                    "gate control original settlement window expired",
+                ));
+            }
+            let state = unsafe { WaitForSingleObject(held.as_raw_handle(), 0) };
+            if state == 0 {
+                break;
+            }
+            if state != 258 {
+                return Err(io::Error::last_os_error());
+            }
+            if descriptor
+                .output_root
+                .join("gate-directory-ready")
+                .try_exists()?
+            {
+                let readback = (|| -> io::Result<serde_json::Value> {
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+                    };
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(descriptor.output_root.join("gate-precondition-child.json"))?;
+                    let metadata = file.metadata()?;
+                    if !metadata.is_file()
+                        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                        || metadata.len()
+                            > super::descriptor::gate_precondition::RECORD_BYTES as u64
+                    {
+                        return Err(io::Error::other(
+                            "directory handoff is not a bounded ordinary record",
+                        ));
+                    }
+                    let mut bytes = Vec::new();
+                    Read::by_ref(&mut file)
+                        .take((super::descriptor::gate_precondition::RECORD_BYTES + 1) as u64)
+                        .read_to_end(&mut bytes)?;
+                    let record = super::descriptor::gate_precondition::Observation::parse(&bytes)
+                        .map_err(io::Error::other)?;
+                    let name = descriptor
+                        .start_gate
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("original control name absent"))?;
+                    let name_bytes: Vec<u8> =
+                        name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    record
+                        .validate(
+                            input,
+                            &serde_json::to_value(descriptor.case).map_err(io::Error::other)?,
+                            &super::descriptor::gate_precondition::sha256(&descriptor.challenge),
+                            &super::descriptor::gate_precondition::sha256(&name_bytes),
+                            selected_before.envelope(),
+                        )
+                        .map_err(io::Error::other)?;
+                    let record = serde_json::to_value(record).map_err(io::Error::other)?;
+                    let mut check = || {
+                        remaining(input, watchdog)?;
+                        if Instant::now() >= observation_cutoff {
+                            return Err(io::Error::other(
+                                "original control settlement window expired",
+                            ));
+                        }
+                        if unsafe { WaitForSingleObject(held.as_raw_handle(), 0) } != 258 {
+                            return Err(io::Error::other(
+                                "original control child no longer live during readback",
+                            ));
+                        }
+                        Ok(())
+                    };
+                    let before = super::native_fixture_default_dacl::snapshot(token)?;
+                    if !before.stable_eq(&selected_before) {
+                        return Err(io::Error::other(
+                            "original selected source token changed before directory comparison",
+                        ));
+                    }
+                    check()?;
+                    let mut result = super::gate_directory_readback::observe(
+                        held.as_raw_handle(),
+                        token,
+                        &record,
+                        &mut check,
+                    )?;
+                    check()?;
+                    result["source_token_stable_identity_security_unchanged"] =
+                        super::native_fixture_default_dacl::snapshot(token)?
+                            .stable_eq(&before)
+                            .into();
+                    check()?;
+                    Ok(result)
+                })();
+                let mut result=readback.unwrap_or_else(|error| serde_json::json!({"diagnostic_only":true,"acceptance_authority":false,
+                    "unavailable":true,"raw_os_error":error.raw_os_error(),"context":"held original directory readback"}));
+                result["original_control_child_pid"] = process.dwProcessId.into();
+                result["original_control_process_handle_held"] = true.into();
+                result["case"] = serde_json::to_value(descriptor.case).map_err(io::Error::other)?;
+                result["challenge_sha256"] =
+                    super::descriptor::gate_precondition::sha256(&descriptor.challenge).into();
+                let mut result = super::gate_call_trace_record::bounded_diagnostic(result);
+                if result["unavailable"] == "trace serialization exceeds bound" {
+                    result["context"] = "original-directory-controller-readback".into();
+                }
+                let bytes = serde_json::to_vec(&result).map_err(io::Error::other)?;
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(
+                        descriptor
+                            .output_root
+                            .join("gate-directory-controller.json"),
+                    )?;
+                output.write_all(&bytes)?;
+                output.sync_all()?;
+                let mut ack = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(descriptor.output_root.join("gate-directory-ack.pending"))?;
+                ack.write_all(&descriptor.challenge)?;
+                ack.sync_all()?;
+                drop(ack);
+                let pending: Vec<u16> = descriptor
+                    .output_root
+                    .join("gate-directory-ack.pending")
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                let published: Vec<u16> = descriptor
+                    .output_root
+                    .join("gate-directory-ack")
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                // Same-parent atomic publication without replacing any existing
+                // acknowledgement; the child cannot observe partial contents.
+                if unsafe {
+                    windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                        pending.as_ptr(),
+                        published.as_ptr(),
+                        0,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let timeout = remaining(input, watchdog)?
+            .min(observation_cutoff.saturating_duration_since(Instant::now()));
         // SAFETY: original retained child only, bounded remaining work.
         if unsafe { WaitForSingleObject(held.as_raw_handle(), timeout.as_millis() as u32) } != 0 {
             return Err(io::Error::other(

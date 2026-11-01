@@ -89,6 +89,7 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
     check(input)?;
     let readback = observed_token(input, expected_envelope);
     let mut original_call_trace = trace.diagnostic();
+    original_call_trace["retained_directories"] = trace.directory_references();
     original_call_trace["source_before_setup_validated"] = true.into();
     original_call_trace["source_after_setup_validated"] = true.into();
     original_call_trace["source_after_call_validated"] = readback.is_ok().into();
@@ -164,6 +165,38 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
         .open(descriptor.output_root.join("gate-precondition-child.json"))?;
     output.write_all(&bytes)?;
     output.sync_all()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(descriptor.output_root.join("gate-directory-ready"))?
+        .sync_all()?;
+    // Keep the same-access diagnostic references alive until the controller
+    // duplicates them from this original process or releases the handoff.
+    // This is bounded by the existing original work cutoff, never a new budget.
+    let acknowledgement = descriptor.output_root.join("gate-directory-ack");
+    loop {
+        check(input)?;
+        use std::io::Read;
+        let acknowledgement_bytes = (|| {
+            let file = std::fs::File::open(&acknowledgement)?;
+            let mut bytes = Vec::new();
+            file.take((descriptor.challenge.len() + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        })();
+        match acknowledgement_bytes {
+            Ok(bytes) if bytes == descriptor.challenge => break,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "gate directory acknowledgement binding differs",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     check(input)?;
     readback?;
     // Access denial is a retained diagnostic, never a passing target result.

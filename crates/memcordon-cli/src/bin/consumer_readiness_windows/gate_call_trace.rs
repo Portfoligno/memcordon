@@ -40,10 +40,18 @@ unsafe extern "C" {
         called: *mut u32,
     ) -> *mut c_void;
     fn memcordon_gate_trace_mock() -> u32;
+    fn memcordon_gate_trace_directories(
+        packet: *const NativeTrace,
+        handles: *mut u64,
+        errors: *mut u32,
+    );
+    fn memcordon_gate_trace_release_directories(packet: *const NativeTrace);
 }
 
 pub struct Prepared {
     packet: NativeTrace,
+    reference_owner: usize,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 pub struct Call {
     pub handle: *mut c_void,
@@ -56,7 +64,11 @@ impl Prepared {
         // SAFETY: C and Rust assert the identical fixed 64-bit packet layout.
         // This sets up child-local pass-through hooks, never a target hook.
         unsafe { memcordon_gate_trace_prepare(&mut packet, cutoff, frequency) };
-        Self { packet }
+        Self {
+            packet,
+            reference_owner: 0,
+            _thread_bound: std::marker::PhantomData,
+        }
     }
 
     pub fn call(&mut self, name: &[u16]) -> io::Result<Call> {
@@ -72,6 +84,7 @@ impl Prepared {
         }
         let mut error = 0;
         let mut called = 0;
+        self.reference_owner = std::ptr::addr_of!(self.packet) as usize;
         // SAFETY: exact validated NUL-terminated original name and writable
         // outputs. The bridge calls OpenEventW(SYNCHRONIZE,FALSE,name) once and
         // saves its result/error before disarming or any diagnostic operation.
@@ -89,6 +102,30 @@ impl Prepared {
 
     pub fn diagnostic(&self) -> serde_json::Value {
         gate_call_trace_record::diagnostic(&self.packet)
+    }
+
+    pub fn directory_references(&self) -> serde_json::Value {
+        let mut handles = [0_u64; 8];
+        let mut errors = [0_u32; 8];
+        // SAFETY: fixed writable eight-element arrays match the private ABI.
+        unsafe {
+            memcordon_gate_trace_directories(
+                self.reference_owner as *const NativeTrace,
+                handles.as_mut_ptr(),
+                errors.as_mut_ptr(),
+            )
+        };
+        serde_json::json!({"handles":handles,"errors":errors,
+            "raw_handles_are_authority":false,"diagnostic_only":true})
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        // SAFETY: same caller thread owns all retained diagnostic references.
+        unsafe {
+            memcordon_gate_trace_release_directories(self.reference_owner as *const NativeTrace)
+        };
     }
 }
 
