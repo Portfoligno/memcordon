@@ -5,6 +5,34 @@ use serde_yaml::Value;
 pub(super) fn definition() -> Value {
     node_0()
 }
+
+fn selection_download_steps(inputs: Value) -> [Value; 2] {
+    let mut first = serde_yaml::Mapping::new();
+    first.insert(
+        text("name"),
+        text("Download release selection (attempt 1/2)"),
+    );
+    first.insert(text("id"), text("selection-download"));
+    first.insert(
+        text("uses"),
+        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
+    );
+    first.insert(text("with"), inputs);
+    first.insert(text("timeout-minutes"), Value::Number(3.into()));
+    first.insert(text("continue-on-error"), Value::Bool(true));
+    let mut retry = first.clone();
+    retry.insert(
+        text("name"),
+        text("Download release selection (attempt 2/2)"),
+    );
+    retry.insert(text("id"), text("selection-download-retry"));
+    retry.remove(text("continue-on-error"));
+    retry.insert(
+        text("if"),
+        text("${{ !cancelled() && steps.selection-download.outcome == 'failure' }}"),
+    );
+    [Value::Mapping(first), Value::Mapping(retry)]
+}
 fn node_0() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Release"));
@@ -104,7 +132,7 @@ fn node_2780() -> Value {
     let mut values = Vec::new();
     values.push(node_2781());
     values.push(node_2782());
-    values.push(node_2784());
+    values.extend(node_2784());
     values.push(node_2786());
     values.push(node_2787());
     values.push(node_2789());
@@ -746,15 +774,8 @@ fn node_2786() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2784() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2785());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2784() -> [Value; 2] {
+    selection_download_steps(node_2785())
 }
 
 fn node_2785() -> Value {
@@ -852,7 +873,7 @@ fn node_2727() -> Value {
     let mut values = Vec::new();
     values.push(node_2728());
     values.push(node_2729());
-    values.push(node_2731());
+    values.extend(node_2731());
     values.push(node_2733());
     values.push(node_2734());
     values.push(node_2736());
@@ -1494,15 +1515,8 @@ fn node_2733() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2731() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2732());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2731() -> [Value; 2] {
+    selection_download_steps(node_2732())
 }
 
 fn node_2732() -> Value {
@@ -1600,7 +1614,7 @@ fn node_2674() -> Value {
     let mut values = Vec::new();
     values.push(node_2675());
     values.push(node_2676());
-    values.push(node_2678());
+    values.extend(node_2678());
     values.push(node_2680());
     values.push(node_2681());
     values.push(node_2683());
@@ -2242,15 +2256,8 @@ fn node_2680() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2678() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2679());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2678() -> [Value; 2] {
+    selection_download_steps(node_2679())
 }
 
 fn node_2679() -> Value {
@@ -2348,7 +2355,7 @@ fn node_2621() -> Value {
     let mut values = Vec::new();
     values.push(node_2622());
     values.push(node_2623());
-    values.push(node_2625());
+    values.extend(node_2625());
     values.push(node_2627());
     values.push(node_2628());
     values.push(node_2630());
@@ -2990,15 +2997,8 @@ fn node_2627() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2625() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2626());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2625() -> [Value; 2] {
+    selection_download_steps(node_2626())
 }
 
 fn node_2626() -> Value {
@@ -4901,7 +4901,7 @@ fn node_2434() -> Value {
     let mut values = Vec::new();
     values.push(node_2435());
     values.push(node_2436());
-    values.push(node_2438());
+    values.extend(node_2438());
     values.push(node_2440());
     values.push(node_2441());
     values.push(node_2443());
@@ -5253,15 +5253,8 @@ fn node_2440() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2438() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2439());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2438() -> [Value; 2] {
+    selection_download_steps(node_2439())
 }
 
 fn node_2439() -> Value {
@@ -5371,7 +5364,7 @@ fn node_2396() -> Value {
     let mut values = Vec::new();
     values.push(node_2397());
     values.push(node_2398());
-    values.push(node_2400());
+    values.extend(node_2400());
     values.push(node_2402());
     values.push(node_2403());
     values.push(node_2405());
@@ -5723,15 +5716,8 @@ fn node_2402() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2400() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2401());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2400() -> [Value; 2] {
+    selection_download_steps(node_2401())
 }
 
 fn node_2401() -> Value {
@@ -5841,7 +5827,7 @@ fn node_2360() -> Value {
     let mut values = Vec::new();
     values.push(node_2361());
     values.push(node_2362());
-    values.push(node_2364());
+    values.extend(node_2364());
     values.push(node_2366());
     values.push(node_2367());
     values.push(node_2369());
@@ -6161,15 +6147,8 @@ fn node_2366() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2364() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2365());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2364() -> [Value; 2] {
+    selection_download_steps(node_2365())
 }
 
 fn node_2365() -> Value {
@@ -6279,7 +6258,7 @@ fn node_2324() -> Value {
     let mut values = Vec::new();
     values.push(node_2325());
     values.push(node_2326());
-    values.push(node_2328());
+    values.extend(node_2328());
     values.push(node_2330());
     values.push(node_2331());
     values.push(node_2333());
@@ -6599,15 +6578,8 @@ fn node_2330() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2328() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2329());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2328() -> [Value; 2] {
+    selection_download_steps(node_2329())
 }
 
 fn node_2329() -> Value {
@@ -6717,7 +6689,7 @@ fn node_2288() -> Value {
     let mut values = Vec::new();
     values.push(node_2289());
     values.push(node_2290());
-    values.push(node_2292());
+    values.extend(node_2292());
     values.push(node_2294());
     values.push(node_2295());
     values.push(node_2297());
@@ -7037,15 +7009,8 @@ fn node_2294() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2292() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2293());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2292() -> [Value; 2] {
+    selection_download_steps(node_2293())
 }
 
 fn node_2293() -> Value {
@@ -7155,7 +7120,7 @@ fn node_2252() -> Value {
     let mut values = Vec::new();
     values.push(node_2253());
     values.push(node_2254());
-    values.push(node_2256());
+    values.extend(node_2256());
     values.push(node_2258());
     values.push(node_2259());
     values.push(node_2261());
@@ -7475,15 +7440,8 @@ fn node_2258() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2256() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2257());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2256() -> [Value; 2] {
+    selection_download_steps(node_2257())
 }
 
 fn node_2257() -> Value {
@@ -7581,7 +7539,7 @@ fn node_2246() -> Value {
 fn node_2175() -> Value {
     let mut values = Vec::new();
     values.push(node_2176());
-    values.push(node_2178());
+    values.extend(node_2178());
     values.push(node_2180());
     values.push(node_2181());
     values.push(node_2183());
@@ -8591,15 +8549,8 @@ fn node_2180() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2178() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2179());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2178() -> [Value; 2] {
+    selection_download_steps(node_2179())
 }
 
 fn node_2179() -> Value {
@@ -8653,7 +8604,7 @@ fn node_2105() -> Value {
 fn node_2106() -> Value {
     let mut values = Vec::new();
     values.push(node_2107());
-    values.push(node_2109());
+    values.extend(node_2109());
     values.push(node_2111());
     values.push(node_2112());
     values.push(node_2114());
@@ -9633,15 +9584,8 @@ fn node_2111() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2109() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2110());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2109() -> [Value; 2] {
+    selection_download_steps(node_2110())
 }
 
 fn node_2110() -> Value {
@@ -9695,7 +9639,7 @@ fn node_2036() -> Value {
 fn node_2037() -> Value {
     let mut values = Vec::new();
     values.push(node_2038());
-    values.push(node_2040());
+    values.extend(node_2040());
     values.push(node_2042());
     values.push(node_2043());
     values.push(node_2045());
@@ -10678,15 +10622,8 @@ fn node_2042() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2040() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2041());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2040() -> [Value; 2] {
+    selection_download_steps(node_2041())
 }
 
 fn node_2041() -> Value {
@@ -10744,7 +10681,7 @@ fn node_1995() -> Value {
     values.push(node_1997());
     values.push(node_1999());
     values.push(node_2001());
-    values.push(node_2003());
+    values.extend(node_2003());
     values.push(node_2005());
     values.push(node_2006());
     values.push(node_2008());
@@ -11197,15 +11134,8 @@ fn node_2005() -> Value {
     Value::Mapping(values)
 }
 
-fn node_2003() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_2004());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_2003() -> [Value; 2] {
+    selection_download_steps(node_2004())
 }
 
 fn node_2004() -> Value {
@@ -11354,7 +11284,7 @@ fn node_1948() -> Value {
     values.push(node_1950());
     values.push(node_1952());
     values.push(node_1954());
-    values.push(node_1956());
+    values.extend(node_1956());
     values.push(node_1958());
     values.push(node_1959());
     values.push(node_1961());
@@ -11807,15 +11737,8 @@ fn node_1958() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1956() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1957());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1956() -> [Value; 2] {
+    selection_download_steps(node_1957())
 }
 
 fn node_1957() -> Value {
@@ -11964,7 +11887,7 @@ fn node_1901() -> Value {
     values.push(node_1903());
     values.push(node_1905());
     values.push(node_1907());
-    values.push(node_1909());
+    values.extend(node_1909());
     values.push(node_1911());
     values.push(node_1912());
     values.push(node_1914());
@@ -12417,15 +12340,8 @@ fn node_1911() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1909() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1910());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1909() -> [Value; 2] {
+    selection_download_steps(node_1910())
 }
 
 fn node_1910() -> Value {
@@ -12574,7 +12490,7 @@ fn node_1854() -> Value {
     values.push(node_1856());
     values.push(node_1858());
     values.push(node_1860());
-    values.push(node_1862());
+    values.extend(node_1862());
     values.push(node_1864());
     values.push(node_1865());
     values.push(node_1867());
@@ -13027,15 +12943,8 @@ fn node_1864() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1862() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1863());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1862() -> [Value; 2] {
+    selection_download_steps(node_1863())
 }
 
 fn node_1863() -> Value {
@@ -13395,7 +13304,7 @@ fn node_1809() -> Value {
     let mut values = Vec::new();
     values.push(node_1810());
     values.push(node_1811());
-    values.push(node_1813());
+    values.extend(node_1813());
     values.push(node_1815());
     values.push(node_1817());
     values.push(node_1819());
@@ -13609,15 +13518,8 @@ fn node_1816() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1813() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1814());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1813() -> [Value; 2] {
+    selection_download_steps(node_1814())
 }
 
 fn node_1814() -> Value {
@@ -13724,7 +13626,7 @@ fn node_1780() -> Value {
     let mut values = Vec::new();
     values.push(node_1781());
     values.push(node_1782());
-    values.push(node_1784());
+    values.extend(node_1784());
     values.push(node_1786());
     values.push(node_1788());
     values.push(node_1790());
@@ -13938,15 +13840,8 @@ fn node_1787() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1784() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1785());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1784() -> [Value; 2] {
+    selection_download_steps(node_1785())
 }
 
 fn node_1785() -> Value {
@@ -14053,7 +13948,7 @@ fn node_1751() -> Value {
     let mut values = Vec::new();
     values.push(node_1752());
     values.push(node_1753());
-    values.push(node_1755());
+    values.extend(node_1755());
     values.push(node_1757());
     values.push(node_1759());
     values.push(node_1761());
@@ -14267,15 +14162,8 @@ fn node_1758() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1755() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1756());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1755() -> [Value; 2] {
+    selection_download_steps(node_1756())
 }
 
 fn node_1756() -> Value {
@@ -14382,7 +14270,7 @@ fn node_1722() -> Value {
     let mut values = Vec::new();
     values.push(node_1723());
     values.push(node_1724());
-    values.push(node_1726());
+    values.extend(node_1726());
     values.push(node_1728());
     values.push(node_1730());
     values.push(node_1732());
@@ -14596,15 +14484,8 @@ fn node_1729() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1726() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1727());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1726() -> [Value; 2] {
+    selection_download_steps(node_1727())
 }
 
 fn node_1727() -> Value {
@@ -14711,7 +14592,7 @@ fn node_1695() -> Value {
     let mut values = Vec::new();
     values.push(node_1696());
     values.push(node_1697());
-    values.push(node_1699());
+    values.extend(node_1699());
     values.push(node_1701());
     values.push(node_1703());
     values.push(node_1705());
@@ -14905,15 +14786,8 @@ fn node_1702() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1699() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1700());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1699() -> [Value; 2] {
+    selection_download_steps(node_1700())
 }
 
 fn node_1700() -> Value {
@@ -15020,7 +14894,7 @@ fn node_1668() -> Value {
     let mut values = Vec::new();
     values.push(node_1669());
     values.push(node_1670());
-    values.push(node_1672());
+    values.extend(node_1672());
     values.push(node_1674());
     values.push(node_1676());
     values.push(node_1678());
@@ -15214,15 +15088,8 @@ fn node_1675() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1672() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1673());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1672() -> [Value; 2] {
+    selection_download_steps(node_1673())
 }
 
 fn node_1673() -> Value {
@@ -15329,7 +15196,7 @@ fn node_1641() -> Value {
     let mut values = Vec::new();
     values.push(node_1642());
     values.push(node_1643());
-    values.push(node_1645());
+    values.extend(node_1645());
     values.push(node_1647());
     values.push(node_1649());
     values.push(node_1651());
@@ -15523,15 +15390,8 @@ fn node_1648() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1645() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1646());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1645() -> [Value; 2] {
+    selection_download_steps(node_1646())
 }
 
 fn node_1646() -> Value {
@@ -15638,7 +15498,7 @@ fn node_1614() -> Value {
     let mut values = Vec::new();
     values.push(node_1615());
     values.push(node_1616());
-    values.push(node_1618());
+    values.extend(node_1618());
     values.push(node_1620());
     values.push(node_1622());
     values.push(node_1624());
@@ -15832,15 +15692,8 @@ fn node_1621() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1618() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1619());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1618() -> [Value; 2] {
+    selection_download_steps(node_1619())
 }
 
 fn node_1619() -> Value {
@@ -16739,7 +16592,7 @@ fn node_1516() -> Value {
     values.push(node_1518());
     values.push(node_1520());
     values.push(node_1522());
-    values.push(node_1523());
+    values.extend(node_1523());
     values.push(node_1525());
     values.push(node_1527());
     values.push(node_1528());
@@ -16897,15 +16750,8 @@ fn node_1526() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1523() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1524());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1523() -> [Value; 2] {
+    selection_download_steps(node_1524())
 }
 
 fn node_1524() -> Value {
@@ -17066,7 +16912,7 @@ fn node_1485() -> Value {
     values.push(node_1487());
     values.push(node_1489());
     values.push(node_1491());
-    values.push(node_1492());
+    values.extend(node_1492());
     values.push(node_1494());
     values.push(node_1496());
     values.push(node_1498());
@@ -17300,15 +17146,8 @@ fn node_1495() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1492() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1493());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1492() -> [Value; 2] {
+    selection_download_steps(node_1493())
 }
 
 fn node_1493() -> Value {
@@ -17435,7 +17274,7 @@ fn node_1439() -> Value {
     values.push(node_1441());
     values.push(node_1443());
     values.push(node_1445());
-    values.push(node_1447());
+    values.extend(node_1447());
     values.push(node_1449());
     values.push(node_1450());
     values.push(node_1452());
@@ -17908,15 +17747,8 @@ fn node_1449() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1447() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1448());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1447() -> [Value; 2] {
+    selection_download_steps(node_1448())
 }
 
 fn node_1448() -> Value {
@@ -18066,7 +17898,7 @@ fn node_1390() -> Value {
     values.push(node_1392());
     values.push(node_1394());
     values.push(node_1396());
-    values.push(node_1398());
+    values.extend(node_1398());
     values.push(node_1400());
     values.push(node_1401());
     values.push(node_1403());
@@ -18539,15 +18371,8 @@ fn node_1400() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1398() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1399());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1398() -> [Value; 2] {
+    selection_download_steps(node_1399())
 }
 
 fn node_1399() -> Value {
@@ -18697,7 +18522,7 @@ fn node_1341() -> Value {
     values.push(node_1343());
     values.push(node_1345());
     values.push(node_1347());
-    values.push(node_1349());
+    values.extend(node_1349());
     values.push(node_1351());
     values.push(node_1352());
     values.push(node_1354());
@@ -19170,15 +18995,8 @@ fn node_1351() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1349() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1350());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1349() -> [Value; 2] {
+    selection_download_steps(node_1350())
 }
 
 fn node_1350() -> Value {
@@ -19328,7 +19146,7 @@ fn node_1292() -> Value {
     values.push(node_1294());
     values.push(node_1296());
     values.push(node_1298());
-    values.push(node_1300());
+    values.extend(node_1300());
     values.push(node_1302());
     values.push(node_1303());
     values.push(node_1305());
@@ -19801,15 +19619,8 @@ fn node_1302() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1300() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1301());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1300() -> [Value; 2] {
+    selection_download_steps(node_1301())
 }
 
 fn node_1301() -> Value {
@@ -19959,7 +19770,7 @@ fn node_1245() -> Value {
     values.push(node_1247());
     values.push(node_1249());
     values.push(node_1251());
-    values.push(node_1253());
+    values.extend(node_1253());
     values.push(node_1255());
     values.push(node_1256());
     values.push(node_1258());
@@ -20412,15 +20223,8 @@ fn node_1255() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1253() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1254());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1253() -> [Value; 2] {
+    selection_download_steps(node_1254())
 }
 
 fn node_1254() -> Value {
@@ -20570,7 +20374,7 @@ fn node_1198() -> Value {
     values.push(node_1200());
     values.push(node_1202());
     values.push(node_1204());
-    values.push(node_1206());
+    values.extend(node_1206());
     values.push(node_1208());
     values.push(node_1209());
     values.push(node_1211());
@@ -21023,15 +20827,8 @@ fn node_1208() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1206() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1207());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1206() -> [Value; 2] {
+    selection_download_steps(node_1207())
 }
 
 fn node_1207() -> Value {
@@ -21181,7 +20978,7 @@ fn node_1151() -> Value {
     values.push(node_1153());
     values.push(node_1155());
     values.push(node_1157());
-    values.push(node_1159());
+    values.extend(node_1159());
     values.push(node_1161());
     values.push(node_1162());
     values.push(node_1164());
@@ -21634,15 +21431,8 @@ fn node_1161() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1159() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1160());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1159() -> [Value; 2] {
+    selection_download_steps(node_1160())
 }
 
 fn node_1160() -> Value {
@@ -21792,7 +21582,7 @@ fn node_1104() -> Value {
     values.push(node_1106());
     values.push(node_1108());
     values.push(node_1110());
-    values.push(node_1112());
+    values.extend(node_1112());
     values.push(node_1114());
     values.push(node_1115());
     values.push(node_1117());
@@ -22245,15 +22035,8 @@ fn node_1114() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1112() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1113());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1112() -> [Value; 2] {
+    selection_download_steps(node_1113())
 }
 
 fn node_1113() -> Value {
@@ -22402,7 +22185,7 @@ fn node_1038() -> Value {
     let mut values = Vec::new();
     values.push(node_1039());
     values.push(node_1040());
-    values.push(node_1042());
+    values.extend(node_1042());
     values.push(node_1044());
     values.push(node_1045());
     values.push(node_1047());
@@ -23218,15 +23001,8 @@ fn node_1044() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1042() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_1043());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_1042() -> [Value; 2] {
+    selection_download_steps(node_1043())
 }
 
 fn node_1043() -> Value {
@@ -23333,7 +23109,7 @@ fn node_971() -> Value {
     let mut values = Vec::new();
     values.push(node_972());
     values.push(node_973());
-    values.push(node_975());
+    values.extend(node_975());
     values.push(node_977());
     values.push(node_978());
     values.push(node_980());
@@ -24149,15 +23925,8 @@ fn node_977() -> Value {
     Value::Mapping(values)
 }
 
-fn node_975() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_976());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_975() -> [Value; 2] {
+    selection_download_steps(node_976())
 }
 
 fn node_976() -> Value {
@@ -24263,7 +24032,7 @@ fn node_906() -> Value {
     let mut values = Vec::new();
     values.push(node_907());
     values.push(node_908());
-    values.push(node_910());
+    values.extend(node_910());
     values.push(node_912());
     values.push(node_913());
     values.push(node_915());
@@ -25059,15 +24828,8 @@ fn node_912() -> Value {
     Value::Mapping(values)
 }
 
-fn node_910() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_911());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_910() -> [Value; 2] {
+    selection_download_steps(node_911())
 }
 
 fn node_911() -> Value {
@@ -25173,7 +24935,7 @@ fn node_852() -> Value {
     let mut values = Vec::new();
     values.push(node_853());
     values.push(node_854());
-    values.push(node_856());
+    values.extend(node_856());
     values.push(node_858());
     values.push(node_859());
     values.push(node_861());
@@ -25791,15 +25553,8 @@ fn node_858() -> Value {
     Value::Mapping(values)
 }
 
-fn node_856() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_857());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_856() -> [Value; 2] {
+    selection_download_steps(node_857())
 }
 
 fn node_857() -> Value {
@@ -25904,7 +25659,7 @@ fn node_800() -> Value {
     let mut values = Vec::new();
     values.push(node_801());
     values.push(node_802());
-    values.push(node_804());
+    values.extend(node_804());
     values.push(node_806());
     values.push(node_807());
     values.push(node_809());
@@ -26502,15 +26257,8 @@ fn node_806() -> Value {
     Value::Mapping(values)
 }
 
-fn node_804() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_805());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_804() -> [Value; 2] {
+    selection_download_steps(node_805())
 }
 
 fn node_805() -> Value {
@@ -26606,7 +26354,7 @@ fn node_749() -> Value {
     let mut values = Vec::new();
     values.push(node_750());
     values.push(node_751());
-    values.push(node_753());
+    values.extend(node_753());
     values.push(node_755());
     values.push(node_756());
     values.push(node_758());
@@ -27204,15 +26952,8 @@ fn node_755() -> Value {
     Value::Mapping(values)
 }
 
-fn node_753() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_754());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_753() -> [Value; 2] {
+    selection_download_steps(node_754())
 }
 
 fn node_754() -> Value {
@@ -27308,7 +27049,7 @@ fn node_698() -> Value {
     let mut values = Vec::new();
     values.push(node_699());
     values.push(node_700());
-    values.push(node_702());
+    values.extend(node_702());
     values.push(node_704());
     values.push(node_705());
     values.push(node_707());
@@ -27906,15 +27647,8 @@ fn node_704() -> Value {
     Value::Mapping(values)
 }
 
-fn node_702() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_703());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_702() -> [Value; 2] {
+    selection_download_steps(node_703())
 }
 
 fn node_703() -> Value {
@@ -28010,7 +27744,7 @@ fn node_647() -> Value {
     let mut values = Vec::new();
     values.push(node_648());
     values.push(node_649());
-    values.push(node_651());
+    values.extend(node_651());
     values.push(node_653());
     values.push(node_654());
     values.push(node_656());
@@ -28608,15 +28342,8 @@ fn node_653() -> Value {
     Value::Mapping(values)
 }
 
-fn node_651() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_652());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_651() -> [Value; 2] {
+    selection_download_steps(node_652())
 }
 
 fn node_652() -> Value {
@@ -28714,7 +28441,7 @@ fn node_583() -> Value {
     let mut values = Vec::new();
     values.push(node_584());
     values.push(node_585());
-    values.push(node_587());
+    values.extend(node_587());
     values.push(node_589());
     values.push(node_590());
     values.push(node_592());
@@ -29510,15 +29237,8 @@ fn node_589() -> Value {
     Value::Mapping(values)
 }
 
-fn node_587() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_588());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_587() -> [Value; 2] {
+    selection_download_steps(node_588())
 }
 
 fn node_588() -> Value {
@@ -29625,7 +29345,7 @@ fn node_518() -> Value {
     let mut values = Vec::new();
     values.push(node_519());
     values.push(node_520());
-    values.push(node_522());
+    values.extend(node_522());
     values.push(node_524());
     values.push(node_525());
     values.push(node_527());
@@ -30421,15 +30141,8 @@ fn node_524() -> Value {
     Value::Mapping(values)
 }
 
-fn node_522() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_523());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_522() -> [Value; 2] {
+    selection_download_steps(node_523())
 }
 
 fn node_523() -> Value {
@@ -30531,7 +30244,7 @@ fn node_379() -> Value {
     let mut values = Vec::new();
     values.push(node_380());
     values.push(node_381());
-    values.push(node_383());
+    values.extend(node_383());
     values.push(node_385());
     values.push(node_386());
     values.push(node_387());
@@ -32512,15 +32225,8 @@ fn node_385() -> Value {
     Value::Mapping(values)
 }
 
-fn node_383() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_384());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_383() -> [Value; 2] {
+    selection_download_steps(node_384())
 }
 
 fn node_384() -> Value {
@@ -32613,7 +32319,7 @@ fn node_265() -> Value {
 fn node_269() -> Value {
     let mut values = Vec::new();
     values.push(node_270());
-    values.push(node_272());
+    values.extend(node_272());
     values.push(node_274());
     values.push(node_275());
     values.push(node_277());
@@ -34174,15 +33880,8 @@ fn node_274() -> Value {
     Value::Mapping(values)
 }
 
-fn node_272() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_273());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_272() -> [Value; 2] {
+    selection_download_steps(node_273())
 }
 
 fn node_273() -> Value {
@@ -34255,7 +33954,7 @@ fn node_219() -> Value {
 fn node_221() -> Value {
     let mut values = Vec::new();
     values.push(node_222());
-    values.push(node_224());
+    values.extend(node_224());
     values.push(node_226());
     values.push(node_227());
     values.push(node_229());
@@ -34845,15 +34544,8 @@ fn node_226() -> Value {
     Value::Mapping(values)
 }
 
-fn node_224() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_225());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_224() -> [Value; 2] {
+    selection_download_steps(node_225())
 }
 
 fn node_225() -> Value {
@@ -34916,7 +34608,7 @@ fn node_176() -> Value {
 fn node_177() -> Value {
     let mut values = Vec::new();
     values.push(node_178());
-    values.push(node_180());
+    values.extend(node_180());
     values.push(node_182());
     values.push(node_183());
     values.push(node_185());
@@ -35471,15 +35163,8 @@ fn node_182() -> Value {
     Value::Mapping(values)
 }
 
-fn node_180() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_181());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_180() -> [Value; 2] {
+    selection_download_steps(node_181())
 }
 
 fn node_181() -> Value {
@@ -35532,7 +35217,7 @@ fn node_132() -> Value {
 fn node_133() -> Value {
     let mut values = Vec::new();
     values.push(node_134());
-    values.push(node_136());
+    values.extend(node_136());
     values.push(node_138());
     values.push(node_139());
     values.push(node_141());
@@ -36098,15 +35783,8 @@ fn node_138() -> Value {
     Value::Mapping(values)
 }
 
-fn node_136() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_137());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_136() -> [Value; 2] {
+    selection_download_steps(node_137())
 }
 
 fn node_137() -> Value {
@@ -36160,7 +35838,7 @@ fn node_89() -> Value {
 fn node_90() -> Value {
     let mut values = Vec::new();
     values.push(node_91());
-    values.push(node_93());
+    values.extend(node_93());
     values.push(node_95());
     values.push(node_96());
     values.push(node_98());
@@ -36715,15 +36393,8 @@ fn node_95() -> Value {
     Value::Mapping(values)
 }
 
-fn node_93() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_94());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_93() -> [Value; 2] {
+    selection_download_steps(node_94())
 }
 
 fn node_94() -> Value {
@@ -36777,7 +36448,7 @@ fn node_55() -> Value {
 fn node_57() -> Value {
     let mut values = Vec::new();
     values.push(node_58());
-    values.push(node_60());
+    values.extend(node_60());
     values.push(node_62());
     values.push(node_63());
     values.push(node_65());
@@ -37169,15 +36840,8 @@ fn node_62() -> Value {
     Value::Mapping(values)
 }
 
-fn node_60() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("uses"),
-        text("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
-    );
-    values.insert(text("with"), node_61());
-    values.insert(text("timeout-minutes"), Value::Number(6.into()));
-    Value::Mapping(values)
+fn node_60() -> [Value; 2] {
+    selection_download_steps(node_61())
 }
 
 fn node_61() -> Value {

@@ -8,6 +8,130 @@ use std::{
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
+
+const SELECTION_ID: &str = "${{ needs.select.outputs.selection-artifact-id }}";
+
+#[test]
+fn every_release_selection_consumer_has_an_adjacent_fatal_exact_retry() {
+    for document in sources("release.yml") {
+        let mut consumers = BTreeSet::new();
+        for (name, job) in document["jobs"].as_mapping().unwrap() {
+            let Some(steps) = job["steps"].as_sequence() else {
+                continue;
+            };
+            let selected: Vec<_> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["with"]["artifact-ids"] == SELECTION_ID)
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            assert!(consumers.insert(name.as_str().unwrap().to_owned()));
+            assert_eq!(selected.len(), 2, "{name:?}");
+            let (first_index, first) = selected[0];
+            let (retry_index, retry) = selected[1];
+            assert_eq!(retry_index, first_index + 1, "{name:?}");
+            assert_eq!(first["id"], "selection-download");
+            assert_eq!(retry["id"], "selection-download-retry");
+            assert_eq!(first["continue-on-error"], true);
+            assert!(first["if"].is_null());
+            assert!(retry["continue-on-error"].is_null());
+            assert_eq!(
+                retry["if"],
+                "${{ !cancelled() && steps.selection-download.outcome == 'failure' }}"
+            );
+            for attempt in [first, retry] {
+                assert_eq!(
+                    attempt["uses"],
+                    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+                );
+                assert_eq!(attempt["timeout-minutes"].as_u64(), Some(3));
+                assert_eq!(attempt["with"]["path"], ".release");
+                assert_eq!(attempt["with"]["merge-multiple"], true);
+                assert_eq!(attempt["with"]["digest-mismatch"], "error");
+                assert_eq!(attempt["with"].as_mapping().unwrap().len(), 4);
+            }
+            assert_eq!(first["with"], retry["with"]);
+            assert_eq!(
+                first["timeout-minutes"].as_u64().unwrap()
+                    + retry["timeout-minutes"].as_u64().unwrap(),
+                6
+            );
+            let mut ids = BTreeSet::new();
+            for step in steps {
+                if let Some(id) = step["id"].as_str() {
+                    assert!(ids.insert(id), "duplicate id in {name:?}: {id}");
+                }
+            }
+        }
+        assert_eq!(consumers.len(), 52);
+        assert!(consumers.contains("native-macos-x64-shard-1"));
+        assert!(consumers.contains("fuzz-setup"));
+    }
+}
+
+#[test]
+fn selection_retry_contract_rejects_missing_optional_or_unbound_attempts() {
+    let baseline = workflow_definitions::definition("release.yml").unwrap();
+    workflow_definitions::validate_semantics(&baseline).unwrap();
+    for job in ["native-macos-x64-shard-1", "fuzz-setup", "assemble-payload"] {
+        let initial = steps(&baseline, job)
+            .iter()
+            .position(|step| step["id"] == "selection-download")
+            .unwrap();
+        for mutation in [
+            "missing-retry",
+            "both-absent",
+            "optional-retry",
+            "wrong-condition",
+            "cancelled-retry",
+            "timeout",
+            "digest",
+            "artifact",
+            "separated",
+        ] {
+            let mut changed = baseline.clone();
+            let selected = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+            match mutation {
+                "missing-retry" => {
+                    selected.remove(initial + 1);
+                }
+                "both-absent" => {
+                    selected.drain(initial..initial + 2);
+                }
+                "optional-retry" => selected[initial + 1]["continue-on-error"] = true.into(),
+                "wrong-condition" => {
+                    selected[initial + 1]["if"] =
+                        "${{ !cancelled() && steps.selection-download.conclusion == 'failure' }}"
+                            .into()
+                }
+                "cancelled-retry" => {
+                    selected[initial + 1]["if"] =
+                        "${{ always() && steps.selection-download.outcome == 'failure' }}".into()
+                }
+                "timeout" => selected[initial]["timeout-minutes"] = 4.into(),
+                "digest" => {
+                    selected[initial]["with"]["digest-mismatch"] = "warn".into();
+                    selected[initial + 1]["with"]["digest-mismatch"] = "warn".into();
+                }
+                "artifact" => {
+                    selected[initial + 1]["with"]["artifact-ids"] =
+                        "${{ needs.other.outputs.artifact-id }}".into()
+                }
+                "separated" => {
+                    let retry = selected.remove(initial + 1);
+                    selected.push(retry);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                workflow_definitions::validate_semantics(&changed).is_err(),
+                "{job}/{mutation}"
+            );
+        }
+    }
+}
 fn sources(file: &str) -> [Value; 2] {
     [
         workflow_definitions::definition(file).unwrap(),

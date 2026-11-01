@@ -791,6 +791,7 @@ pub fn validate(document: &Value) -> Result<()> {
         validate_fuzz_split(document)?;
     }
     if document["name"] == "Release" {
+        validate_release_selection_downloads(document)?;
         validate_release_fuzz(document)?;
     }
     if document["name"] == "CI" {
@@ -848,6 +849,94 @@ fn release_fuzz_download(
     Ok(index)
 }
 
+fn release_selection_download(steps: &[Value]) -> Result<usize> {
+    let selected = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["with"]["artifact-ids"] == "${{ needs.select.outputs.selection-artifact-id }}"
+                || matches!(
+                    field(step, "id"),
+                    "selection-download" | "selection-download-retry"
+                )
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != 2 || selected[1].0 != selected[0].0 + 1 {
+        return Err(reject(
+            "Release selection acquisition requires adjacent bounded attempts",
+        ));
+    }
+    let (first_index, first) = selected[0];
+    let (retry_index, retry) = selected[1];
+    if field(first, "id") != "selection-download"
+        || field(retry, "id") != "selection-download-retry"
+        || first["continue-on-error"] != true
+        || !first["if"].is_null()
+        || !retry["continue-on-error"].is_null()
+        || field(retry, "if")
+            != "${{ !cancelled() && steps.selection-download.outcome == 'failure' }}"
+    {
+        return Err(reject(
+            "Release selection retry lost its failure outcome, cancellation or fatal boundary",
+        ));
+    }
+    for attempt in [first, retry] {
+        if field(attempt, "uses")
+            != "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+            || attempt["timeout-minutes"].as_u64() != Some(3)
+            || attempt["with"]
+                .as_mapping()
+                .is_none_or(|fields| fields.len() != 4)
+            || attempt["with"]["artifact-ids"]
+                != "${{ needs.select.outputs.selection-artifact-id }}"
+            || attempt["with"]["path"] != ".release"
+            || attempt["with"]["merge-multiple"] != true
+            || attempt["with"]["digest-mismatch"] != "error"
+        {
+            return Err(reject(
+                "Release selection acquisition changed its exact immutable input or configured budget",
+            ));
+        }
+    }
+    if first["with"] != retry["with"] || first_index >= retry_index {
+        return Err(reject(
+            "Release selection attempts do not share the exact input",
+        ));
+    }
+    Ok(retry_index)
+}
+
+fn validate_release_selection_downloads(document: &Value) -> Result<()> {
+    let mut consumers = 0;
+    for job in document["jobs"]
+        .as_mapping()
+        .ok_or_else(|| reject("Release jobs absent"))?
+        .values()
+    {
+        let Some(steps) = job["steps"].as_sequence() else {
+            continue;
+        };
+        if steps.iter().any(|step| {
+            step["with"]["artifact-ids"] == "${{ needs.select.outputs.selection-artifact-id }}"
+                || matches!(
+                    field(step, "id"),
+                    "selection-download" | "selection-download-retry"
+                )
+        }) {
+            release_selection_download(steps)?;
+            consumers += 1;
+        }
+    }
+    // The current closed Release graph has 52 required consumers. Count the
+    // inventory as well as each pair so deleting both attempts cannot pass.
+    if consumers != 52 {
+        return Err(reject(
+            "Release selection acquisition lost a required consumer",
+        ));
+    }
+    Ok(())
+}
+
 fn release_fuzz_source(steps: &[Value]) -> Result<usize> {
     let checkout = steps
         .iter()
@@ -870,12 +959,7 @@ fn release_fuzz_source(steps: &[Value]) -> Result<usize> {
             "Release fuzz must use the exact selected source checkout",
         ));
     }
-    let selection = release_fuzz_download(
-        steps,
-        ".release",
-        "${{ needs.select.outputs.selection-artifact-id }}",
-        Some(true),
-    )?;
+    let selection = release_selection_download(steps)?;
     if checkout_index >= selection {
         return Err(reject(
             "Release fuzz selection must follow its source checkout",
