@@ -3,6 +3,7 @@
 // All other CI orchestration remains safe Rust.
 #![deny(unsafe_code)]
 
+pub mod exec_observation;
 pub mod linux_allocation_checkpoint;
 pub mod linux_elf_rpath;
 pub mod linux_execution_order;

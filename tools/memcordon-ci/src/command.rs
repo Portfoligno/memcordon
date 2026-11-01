@@ -9,6 +9,8 @@ use crate::{CiError, Result};
 
 #[cfg(target_os = "linux")]
 pub(crate) type AfterReleaseObserver = Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>;
+#[cfg(target_os = "linux")]
+type ReleasedAt<'a> = Box<dyn FnOnce(&std::process::Child, Instant) -> Result<()> + 'a>;
 
 /// Reject native command failure before decoding its successful-response schema.
 pub fn require_successful_output(operation: &str, output: &ObservedOutput) -> Result<()> {
@@ -596,7 +598,7 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, false, None, None)
+        self.output_quiet_with_creation_mode(|child, _| observe_creation(child), false, None, None)
     }
 
     /// Keep the sole child wait owner and bounded capture while an installed
@@ -749,7 +751,17 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true, None, None)
+        self.output_quiet_with_creation_mode(|child, _| observe_creation(child), true, None, None)
+    }
+    /// Capture original custody while exec-stopped, then perform dependent work
+    /// only after release, sharing the command-selected absolute cutoff.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_with_exec_observers<'a>(
+        &self,
+        held: impl FnOnce(&std::process::Child, Instant) -> Result<()>,
+        released: impl FnOnce(&std::process::Child, Instant) -> Result<()> + 'a,
+    ) -> Result<ObservedOutput> {
+        self.output_quiet_with_creation_mode(held, true, Some(Box::new(released)), None)
     }
     /// Retain bounded original streams/status in this invocation's owned output.
     #[cfg(target_os = "linux")]
@@ -759,27 +771,37 @@ impl CommandSpec {
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
         after_release: Option<AfterReleaseObserver>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true, after_release, Some(directory))
+        let released = after_release.map(|observer| {
+            Box::new(move |child: &std::process::Child, _| observer(child)) as ReleasedAt<'_>
+        });
+        self.output_quiet_with_creation_mode(
+            |child, _| observe_creation(child),
+            true,
+            released,
+            Some(directory),
+        )
     }
 
     #[cfg(target_os = "linux")]
-    fn output_quiet_with_creation_mode(
+    fn output_quiet_with_creation_mode<'a>(
         &self,
-        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        observe_creation: impl FnOnce(&std::process::Child, Instant) -> Result<()>,
         hold_exec: bool,
-        after_release: Option<AfterReleaseObserver>,
+        after_release: Option<ReleasedAt<'a>>,
         evidence_directory: Option<&std::path::Path>,
     ) -> Result<ObservedOutput> {
         let command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
-        let deadline = self
-            .operation_deadline
-            .unwrap_or(Instant::now() + budget)
-            .min(Instant::now() + budget);
-        let mut observation_error = None;
-        let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
-            command,
+        let started = Instant::now();
+        let deadline = crate::exec_observation::cutoff(
+            started,
             budget,
+            self.operation_deadline.unwrap_or(started + budget),
+        )?;
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_until_owned_spawn_after_output_limit(
+            command,
+            deadline,
             self.output_limit,
             |mut command| {
                 if hold_exec {
@@ -794,19 +816,12 @@ impl CommandSpec {
                     } else {
                         None
                     };
-                    observe_creation(&child)?;
-                    if let Some(stop) = stop {
-                        if Instant::now() >= deadline {
-                            return Err(CiError::Message(
-                                "original exec observation cutoff exhausted before release".into(),
-                            ));
-                        }
-                        stop.release()?;
-                    }
-                    if let Some(after_release) = after_release {
-                        after_release(&child)?;
-                    }
-                    Ok(())
+                    crate::exec_observation::observe(
+                        deadline,
+                        || observe_creation(&child, deadline),
+                        || stop.map_or(Ok(()), |stop| stop.release().map_err(CiError::from)),
+                        || after_release.map_or(Ok(()), |observer| observer(&child, deadline)),
+                    )
                 })();
                 if let Err(error) = observed {
                     observation_error = Some(error);
@@ -839,9 +854,11 @@ impl CommandSpec {
         let result = match (output, observation_error) {
             (Ok(output), None) => Ok(output),
             (Ok(_), Some(error)) => Err(error),
-            (Err(error), original) => Err(CiError::Message(format!(
-                "native creation observation={original:?}; native settlement={error}"
-            ))),
+            (Err(error), None) => Err(CiError::Process(error)),
+            (Err(error), Some(original)) => Err(CiError::LaneFailures {
+                primary: Box::new(original),
+                secondary: Box::new(CiError::Process(error)),
+            }),
         };
         crate::work_outcome::WorkOutcome::observed(result, writers)
             .postcondition(custody)

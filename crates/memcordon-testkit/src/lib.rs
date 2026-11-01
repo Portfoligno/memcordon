@@ -479,6 +479,46 @@ pub fn run_with_deadline_owned_spawn_after_output_limit(
     )
 }
 
+/// Use one absolute execution cutoff, including the custom exec-stop callback.
+/// Existing duration-based entrypoints retain their original behavior.
+pub fn run_until_owned_spawn_after_output_limit(
+    mut command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    let started = Instant::now();
+    let deadline = cutoff
+        .checked_duration_since(started)
+        .filter(|value| !value.is_zero())
+        .ok_or_else(|| {
+            ProcessTestError::Spawn(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original absolute child cutoff exhausted before spawn",
+            ))
+        })?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    OuterTestBoundary::configure(&mut command).map_err(ProcessTestError::Spawn)?;
+    if Instant::now() >= cutoff {
+        return Err(ProcessTestError::Spawn(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original absolute child cutoff exhausted during setup",
+        )));
+    }
+    let child = spawn(command).map_err(ProcessTestError::Spawn)?;
+    let spawn_returned = started.elapsed();
+    observe_deadline_child(
+        child,
+        started,
+        spawn_returned,
+        deadline,
+        move |pid, _, _| after_spawn(pid),
+        Some(limit),
+        ProcessControl::default(),
+    )
+}
+
 /// Snapshot access is observational only. Streams remain bounded and owned
 /// by joined readers; callback stdin is the exact sole configured child pipe.
 pub fn run_with_deadline_owned_spawn_with_io_output_limit(
