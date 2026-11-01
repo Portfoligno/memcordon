@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+mod binary_streams;
 mod images;
 mod isolation;
 mod path_alias;
@@ -306,11 +307,7 @@ pub fn run() -> Result<()> {
             std::process::exit(status);
         }
         "raw-byte-streams" => {
-            let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
-            io::stdout().write_all(&bytes)?;
-            io::stdout().flush()?;
-            io::stderr().write_all(&bytes)?;
-            io::stderr().flush()?;
+            binary_streams::raw(&mut io::stdout(), &mut io::stderr())?;
             Ok(())
         }
         "binary-file" => {
@@ -448,13 +445,7 @@ pub fn run() -> Result<()> {
                 )?;
                 wait_release()?;
             }
-            let vector: Vec<u8> = (u8::MIN..=u8::MAX).collect();
-            for _ in 0..8192 {
-                io::stdout().write_all(&vector)?;
-                io::stderr().write_all(&vector)?;
-            }
-            io::stdout().flush()?;
-            io::stderr().flush()?;
+            binary_streams::large(&mut io::stdout(), &mut io::stderr())?;
             Ok(())
         }
         "authority-denial" => {

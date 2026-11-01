@@ -853,6 +853,9 @@ fn execute(
     if scenarios.is_empty() {
         return Err(fail("required installed Linux scenarios are empty"));
     }
+    let scenarios = crate::linux_execution_order::prioritize_bytes(scenarios, |scenario| {
+        (&scenario.key.family, &scenario.key.scenario)
+    });
     for (ordinal, mut scenario) in scenarios.into_iter().enumerate() {
         let scenario_label = format!(
             "installed scenario family={} scenario={} path={}",
