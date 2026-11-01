@@ -269,26 +269,19 @@ impl ImageBuilder {
         entrypoints: Vec<ImageEntrypointV1>,
         libraries: &[PathBuf],
     ) -> Result<SnapshotManifestV1> {
-        let mut library_directories = libraries
+        let library_directories = libraries
             .iter()
             .filter_map(|directory| directory.strip_prefix("/").ok())
             .map(path)
             .collect::<Result<Vec<_>>>()?;
-        library_directories.retain(|directory| {
-            self.entries
-                .values()
-                .any(|entry| memcordon_core::workload_files::is_beneath(entry.path(), directory))
-        });
-        let value = SnapshotManifestV1 {
-            format: "memcordon.workload-snapshot".into(),
-            revision: 1,
-            target: target.into(),
-            entries: bounded(self.entries.into_values())?,
-            entrypoints: bounded(entrypoints)?,
-            library_directories: bounded(library_directories)?,
-        };
-        value.validate().map_err(CiError::Message)?;
-        Ok(value)
+        super::native_toolchain_search::definition(
+            target,
+            self.entries.into_values().collect(),
+            entrypoints,
+            library_directories,
+            &self.toolchain_searches,
+        )
+        .map_err(CiError::Message)
     }
 }
 
@@ -525,15 +518,6 @@ pub fn materialize_until(
             .join(&payload.distribution.target)
             .join("lib"),
     );
-    let mut declared = libraries
-        .iter()
-        .map(|directory| {
-            directory
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
     for (_, _, directory) in &runtime.toolchain_searches {
         let copied = runtime.root.join(directory);
         let present = match std::fs::symlink_metadata(&copied) {
@@ -556,13 +540,7 @@ pub fn materialize_until(
                 "absent toolchain search has copied members".into(),
             ));
         }
-        super::native_toolchain_search::declare(&mut declared, directory.clone())
-            .map_err(CiError::Message)?;
     }
-    libraries = declared
-        .into_iter()
-        .map(|directory| Path::new("/").join(directory))
-        .collect();
     let runtime = runtime.definition(
         &payload.distribution.target,
         vec![ImageEntrypointV1 {

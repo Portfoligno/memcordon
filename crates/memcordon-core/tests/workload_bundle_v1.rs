@@ -58,6 +58,107 @@ fn loader_catalog_requires_immutable_ancestry_and_disjoint_writable_roots() {
     assert!(SnapshotManifestV1::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());
 }
 
+fn search(snapshot: &mut SnapshotManifestV1, directory: &str) {
+    snapshot
+        .library_directories
+        .try_push(RootRelativePath::new(directory.into()).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn empty_search_is_explicit_anchored_and_roundtrips_without_fabricated_members() {
+    let mut runtime = manifest(
+        "toolchain/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld/ld.lld",
+        b"real immutable member",
+    );
+    let directory = "toolchain/lib/rustlib/aarch64-unknown-linux-gnu/bin/lib";
+    search(&mut runtime, directory);
+    search(&mut runtime, "toolchain/absent/deep/lib");
+    runtime.validate().unwrap();
+    let encoded = runtime.canonical_bytes().unwrap();
+    assert_eq!(SnapshotManifestV1::parse(&encoded).unwrap(), runtime);
+    assert_eq!(runtime.entries.as_slice().len(), 1);
+    let input = manifest("input/source", b"input");
+    validate_combined(&runtime, &input).unwrap();
+    for writable in [
+        directory.to_owned(),
+        format!("{directory}/cache"),
+        "toolchain/lib".into(),
+    ] {
+        let layout = serde_json::from_value(serde_json::json!({"writable_roots":[{"id":"w","path":writable,"byte_limit":4096,"generated_execution":false}],"output_files":[]})).unwrap();
+        assert!(validate_layout(&runtime, &input, &layout).is_err());
+    }
+    let layout = serde_json::from_value(serde_json::json!({"writable_roots":[{"id":"w","path":"work","byte_limit":4096,"generated_execution":false}],"output_files":[]})).unwrap();
+    validate_layout(&runtime, &input, &layout).unwrap();
+}
+
+#[test]
+fn empty_search_rejects_unanchored_reserved_and_same_image_object_aliases() {
+    let runtime = manifest("sdk/bin/tool", b"immutable");
+    for directory in [
+        "work",
+        "work/lib",
+        "sdk-other/lib",
+        "proc/self/fd",
+        "dev/fd",
+        "sys/lib",
+        "run/lib",
+        "sdk/bin/tool",
+        "sdk/bin/tool/lib",
+    ] {
+        let mut changed = runtime.clone();
+        search(&mut changed, directory);
+        assert!(changed.validate().is_err(), "accepted {directory}");
+    }
+    let mut alias = runtime;
+    alias
+        .entries
+        .try_push(ImageEntryV1::Symlink {
+            path: RootRelativePath::new("sdk/alias".into()).unwrap(),
+            target: RootRelativePath::new("sdk/bin/tool".into()).unwrap(),
+        })
+        .unwrap();
+    for directory in ["sdk/alias", "sdk/alias/lib"] {
+        let mut changed = alias.clone();
+        search(&mut changed, directory);
+        assert!(changed.validate().is_err(), "accepted {directory}");
+    }
+}
+
+#[test]
+fn empty_search_rejects_cross_image_objects_and_preserves_catalogue_bound() {
+    let mut runtime = manifest("sdk/bin/tool", b"runtime");
+    search(&mut runtime, "sdk/bin/empty/lib");
+    for collision in ["sdk/bin/empty", "sdk/bin/empty/lib"] {
+        let input = manifest(collision, b"conflicting file");
+        assert!(validate_combined(&runtime, &input).is_err());
+        let mut input = manifest("input/target", b"input");
+        input
+            .entries
+            .try_push(ImageEntryV1::Symlink {
+                path: RootRelativePath::new(collision.into()).unwrap(),
+                target: RootRelativePath::new("input/target".into()).unwrap(),
+            })
+            .unwrap();
+        input.validate().unwrap();
+        assert!(validate_combined(&runtime, &input).is_err());
+        assert!(validate_combined(&input, &runtime).is_err());
+    }
+    let mut duplicate = runtime.clone();
+    search(&mut duplicate, "sdk/bin/empty/lib");
+    assert!(duplicate.validate().is_err());
+    for index in runtime.library_directories.as_slice().len()..32 {
+        search(&mut runtime, &format!("sdk/empty-{index}"));
+    }
+    runtime.validate().unwrap();
+    assert!(
+        runtime
+            .library_directories
+            .try_push(RootRelativePath::new("sdk/overflow".into()).unwrap())
+            .is_err()
+    );
+}
+
 #[test]
 fn indexed_snapshot_alias_resolution_accepts_long_chain_and_rejects_cycle() {
     let mut snapshot = manifest("file", b"contents");
