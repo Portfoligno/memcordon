@@ -44,6 +44,7 @@ fn workload_request_selection_is_absolute_exclusive_and_shared_by_both_frontends
         descendant_gate: None,
         start_gate: None,
         start_transport: descriptor::StartTransport::NamedEvent,
+        control_clock: None,
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,

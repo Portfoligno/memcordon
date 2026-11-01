@@ -214,7 +214,12 @@ fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Res
     transcript.event("binary-files", None, &descriptor.challenge)
 }
 
-fn joint(descriptor: &Descriptor, transcript: &mut Transcript, churn: bool) -> io::Result<()> {
+fn joint(
+    descriptor: &Descriptor,
+    transcript: &mut Transcript,
+    churn: bool,
+    control: Option<&mut controller_start_input::Session>,
+) -> io::Result<()> {
     let listener =
         TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(native::tcp_bind_failure)?;
     let address = listener.local_addr()?;
@@ -314,7 +319,7 @@ fn joint(descriptor: &Descriptor, transcript: &mut Transcript, churn: bool) -> i
     )?;
     transcript.event("named-pipe-while-tcp-owned", None, &descriptor.challenge)?;
     binary_files(descriptor, transcript)?;
-    toolchain::execute(descriptor, transcript)?;
+    toolchain::execute(descriptor, transcript, control)?;
     protected_write_probes(descriptor, transcript)?;
     if churn {
         process_churn(descriptor, transcript)?;
@@ -892,9 +897,18 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
     )?;
     let envelope = native::token_observation()?;
     transcript.event("token-envelope", None, &envelope)?;
+    let mut control = match descriptor.start_transport {
+        descriptor::StartTransport::ControllerStdin { .. } => Some(
+            controller_start_input::Session::new(&descriptor, descriptor_digest)?,
+        ),
+        descriptor::StartTransport::NamedEvent => None,
+    };
     let released = match descriptor.start_transport {
         descriptor::StartTransport::ControllerStdin { .. } => {
-            controller_start_input::receive(&descriptor, descriptor_digest)?;
+            control
+                .as_mut()
+                .expect("selected stdin session")
+                .receive(descriptor::controller_start::Phase::Start)?;
             true
         }
         descriptor::StartTransport::NamedEvent => {
@@ -922,9 +936,11 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             })?;
     }
     match descriptor.case {
-        Case::Joint | Case::EndpointMismatch => joint(&descriptor, &mut transcript, false)?,
-        Case::Churn => joint(&descriptor, &mut transcript, true)?,
-        Case::Toolchain => toolchain::execute(&descriptor, &mut transcript)?,
+        Case::Joint | Case::EndpointMismatch => {
+            joint(&descriptor, &mut transcript, false, control.as_mut())?
+        }
+        Case::Churn => joint(&descriptor, &mut transcript, true, control.as_mut())?,
+        Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
         Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
         Case::EmptyInput => {
             let mut actual = Vec::new();

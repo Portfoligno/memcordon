@@ -523,7 +523,9 @@ pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -
 pub fn expected_start_transport(key: &CaseKey) -> descriptor::StartTransport {
     if matches!(
         (key.family.as_str(), key.scenario.as_str()),
-        ("W-ENVELOPE", "restricted") | ("W-BINDING", "restricted-token-preserved")
+        ("W-ENVELOPE", "restricted")
+            | ("W-BINDING", "restricted-token-preserved")
+            | ("W-JOINT", "restricted")
     ) {
         descriptor::StartTransport::ControllerStdin {
             version: descriptor::controller_start::VERSION,
@@ -531,6 +533,13 @@ pub fn expected_start_transport(key: &CaseKey) -> descriptor::StartTransport {
     } else {
         descriptor::StartTransport::NamedEvent
     }
+}
+
+pub fn needs_toolchain_observer(case: descriptor::Case) -> bool {
+    matches!(
+        case,
+        descriptor::Case::Toolchain | descriptor::Case::Joint | descriptor::Case::Churn
+    )
 }
 
 fn expected_fixture_case(key: &CaseKey) -> Result<descriptor::Case> {
@@ -2386,6 +2395,7 @@ pub(crate) mod native {
                 descendant_gate,
                 start_gate,
                 start_transport: super::expected_start_transport(&key),
+                control_clock: None,
                 gate_access_diagnostic: None,
                 gate_precondition: None,
                 completion_gate: None,
@@ -2570,31 +2580,50 @@ pub(crate) mod native {
             Some(&self.primary)
         }
     }
-    fn send_controller_start(
-        mut writer: std::process::ChildStdin,
-        binding: &descriptor::controller_start::Binding,
-        work_deadline: Instant,
-    ) -> io::Result<()> {
-        let owner = memcordon_platform::WindowsSynchronousIoDeadline::start(work_deadline)
-            .map_err(io::Error::other)?;
-        let written = descriptor::controller_start::send(&mut writer, binding, || {
-            provision_budget(work_deadline)
-                .map(|_| ())
-                .map_err(io::Error::other)
-        });
-        drop(writer); // Genuine EOF after the one frame; no application payload in Envelope.
-        let settled = owner.finish(); // Join before the calling thread begins any unrelated I/O.
-        match (written, settled) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(secondary)) => Err(io::Error::other(secondary)),
-            (Err(primary), Err(settlement)) => Err(io::Error::new(
-                primary.kind(),
-                StartWriteFailure {
-                    primary,
-                    settlement,
-                },
-            )),
+    struct ControlSession {
+        writer: Option<std::process::ChildStdin>,
+        binding: descriptor::controller_start::Binding,
+        sender: descriptor::controller_start::Sender,
+        deadline: Instant,
+    }
+    impl ControlSession {
+        fn release(&mut self, phase: descriptor::controller_start::Phase) -> io::Result<()> {
+            if self.writer.is_none() {
+                return Err(io::Error::other("original control writer already closed"));
+            }
+            let owner = match memcordon_platform::WindowsSynchronousIoDeadline::start(self.deadline)
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    self.writer.take();
+                    return Err(io::Error::other(error));
+                }
+            };
+            let writer = self.writer.as_mut().expect("checked original writer");
+            let written = self.sender.send(writer, &self.binding, phase, || {
+                provision_budget(self.deadline)
+                    .map(|_| ())
+                    .map_err(io::Error::other)
+            });
+            if self.sender.completed() || written.is_err() {
+                self.writer.take();
+            }
+            let settled = owner.finish(); // Join before the calling thread begins any unrelated I/O.
+            if settled.is_err() {
+                self.writer.take();
+            }
+            match (written, settled) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(()), Err(secondary)) => Err(io::Error::other(secondary)),
+                (Err(primary), Err(settlement)) => Err(io::Error::new(
+                    primary.kind(),
+                    StartWriteFailure {
+                        primary,
+                        settlement,
+                    },
+                )),
+            }
         }
     }
 
@@ -2646,6 +2675,17 @@ pub(crate) mod native {
         // Serialized suite input is a plan, never a substitute descriptor owner.
         final_input.descriptor.gate_access_diagnostic = None;
         final_input.descriptor.gate_precondition = None;
+        final_input.descriptor.control_clock = if stdin_start {
+            let (work_cutoff_qpc, qpc_frequency) =
+                memcordon_testkit::windows_native_work_cutoff(work_deadline)?;
+            Some(descriptor::ControlClock {
+                revision: 1,
+                work_cutoff_qpc,
+                qpc_frequency,
+            })
+        } else {
+            None
+        };
         let mut prelaunch_security =
             serde_json::json!({"state":"unavailable","reason":"comparison-not-requested"});
         let mut binding_setup = prelaunch_security.clone();
@@ -3877,14 +3917,16 @@ pub(crate) mod native {
         let endpoint_event = (input.descriptor.case == descriptor::Case::EndpointMismatch)
             .then(|| event_create(&format!("{gate_name}-endpoint-observed")))
             .transpose()?;
-        let toolchain_event = matches!(
-            input.descriptor.case,
-            descriptor::Case::Toolchain | descriptor::Case::Joint | descriptor::Case::Churn
-        )
+        let needs_toolchain_observer = super::needs_toolchain_observer(input.descriptor.case);
+        let toolchain_event = (needs_toolchain_observer
+            && matches!(
+                input.descriptor.start_transport,
+                descriptor::StartTransport::NamedEvent
+            ))
         .then(|| event_create(&format!("{gate_name}-toolchain-observer")))
         .transpose()?;
         let mut toolchain_images = Vec::new();
-        if toolchain_event.is_some() {
+        if needs_toolchain_observer {
             let measured: Vec<crate::windows_installed_cases::SelectedArtifact> =
                 serde_json::from_slice(&read(
                     &config.output_directory.join("windows-owned-inputs.json"),
@@ -4095,6 +4137,7 @@ pub(crate) mod native {
         let start_transport = input.descriptor.start_transport.clone();
         let start_challenge = input.descriptor.challenge.clone();
         let start_descriptor = input.descriptor.clone();
+        let start_descriptor_case_is_joint = input.descriptor.case == descriptor::Case::Joint;
         let barrier_report = public_report.clone();
         let descendant_gate = input.descriptor.descendant_gate.clone();
         let intermediate_first = input.descriptor.case == descriptor::Case::IntermediateFirst;
@@ -4115,6 +4158,7 @@ pub(crate) mod native {
             4 * 1024 * 1024,
             |mut command| command.spawn(),
             move |wrapper_pid, mut stdin, _| {
+                let mut control_session = None;
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                 let (held, root_pid) = loop {
                     if barrier_report.try_exists()? {
@@ -4366,7 +4410,19 @@ pub(crate) mod native {
                             pid: root_identity.pid,
                             birth: u64::try_from(root_identity.birth).map_err(io::Error::other)?,
                         };
-                        send_controller_start(writer, &binding, work_deadline)?;
+                        let joint = start_descriptor_case_is_joint;
+                        let mut session = ControlSession {
+                            writer: Some(writer),
+                            binding,
+                            sender: if joint {
+                                descriptor::controller_start::Sender::joint()
+                            } else {
+                                descriptor::controller_start::Sender::default()
+                            },
+                            deadline: work_deadline,
+                        };
+                        session.release(descriptor::controller_start::Phase::Start)?;
+                        control_session = Some(session);
                         super::guardian_query::update(&callback_guardian_query, |trace| {
                             trace.stage("stdin-start-published")
                         });
@@ -4515,8 +4571,22 @@ pub(crate) mod native {
                         held.push(peer);
                     }
                 }
-                if let Some(toolchain_event) = toolchain_event {
-                    signal(&toolchain_event)?;
+                if needs_toolchain_observer {
+                    match start_transport {
+                        descriptor::StartTransport::NamedEvent => {
+                            signal(toolchain_event.as_ref().ok_or_else(|| {
+                                io::Error::other("original toolchain observer event absent")
+                            })?)?
+                        }
+                        descriptor::StartTransport::ControllerStdin { .. } => control_session
+                            .as_mut()
+                            .ok_or_else(|| {
+                                io::Error::other("original Joint control session absent")
+                            })?
+                            .release(
+                                descriptor::controller_start::Phase::ToolchainObserverRelease,
+                            )?,
+                    }
                     observe_toolchain_descendants(
                         &directory,
                         &toolchain_output_root,

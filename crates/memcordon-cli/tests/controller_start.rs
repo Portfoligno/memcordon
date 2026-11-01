@@ -32,11 +32,12 @@ fn exact_wire_and_split_reads_leave_following_binary_application_bytes_untouched
     let binding = binding();
     let bytes = frame(&binding);
     let mut expected = b"MCSTART\0".to_vec();
-    expected.extend(1_u32.to_le_bytes());
+    expected.extend(2_u32.to_le_bytes());
     expected.extend(4_u32.to_le_bytes());
     expected.extend(binding.descriptor_sha256);
     expected.extend(9001_u32.to_le_bytes());
     expected.extend(134_379_920_909_214_884_u64.to_le_bytes());
+    expected.extend(1_u32.to_le_bytes());
     expected.extend([0, 255, b'R', 17]);
     assert_eq!(bytes, expected);
     let application = [0, 255, b'R', b'\n', 128];
@@ -79,7 +80,7 @@ fn exact_wire_and_split_reads_leave_following_binary_application_bytes_untouched
 fn cross_case_wrong_identity_unknown_version_and_invalid_extents_never_release() {
     let binding = binding();
     let bytes = frame(&binding);
-    for offset in [0, 8, 12, 16, 48, 52, 60] {
+    for offset in [0, 8, 12, 16, 48, 52, 60, 64] {
         let mut changed = bytes.clone();
         changed[offset] ^= 1;
         let mut receiver = Receiver::default();
@@ -105,7 +106,7 @@ fn cross_case_wrong_identity_unknown_version_and_invalid_extents_never_release()
             .receive(&mut reader, &binding, || Ok(()))
             .is_err()
     );
-    assert_eq!(reader.position(), 60);
+    assert_eq!(reader.position(), 64);
     for length in 0..bytes.len() {
         assert_eq!(
             Receiver::default()
@@ -283,4 +284,148 @@ fn interrupted_native_io_retains_its_cause_at_cutoff_and_retries_only_while_live
         .receive(&mut reader, &binding, || Ok(()))
         .unwrap();
     assert_eq!(reader.inner.position(), bytes.len() as u64);
+}
+
+#[test]
+fn joint_session_releases_two_distinct_phases_without_reading_following_application_bytes() {
+    use start::Phase::{Start, ToolchainObserverRelease};
+    let binding = binding();
+    let mut sender = start::Sender::joint();
+    let mut bytes = Vec::new();
+    sender.send(&mut bytes, &binding, Start, || Ok(())).unwrap();
+    assert!(!sender.completed());
+    let boundary = bytes.len();
+    sender
+        .send(&mut bytes, &binding, ToolchainObserverRelease, || Ok(()))
+        .unwrap();
+    assert!(sender.completed());
+    let complete = bytes.len();
+    assert!(
+        sender
+            .send(&mut bytes, &binding, ToolchainObserverRelease, || Ok(()))
+            .is_err()
+    );
+    assert_eq!(bytes.len(), complete);
+    bytes.extend([0, 255, 128, b'R']);
+    let mut reader = Split {
+        inner: Cursor::new(bytes),
+        maximum: 2,
+    };
+    let mut session = Receiver::joint();
+    session
+        .receive_phase(&mut reader, &binding, Start, || Ok(()))
+        .unwrap();
+    assert_eq!(reader.inner.position(), boundary as u64);
+    session
+        .receive_phase(&mut reader, &binding, ToolchainObserverRelease, || Ok(()))
+        .unwrap();
+    assert_eq!(reader.inner.position(), complete as u64);
+    assert!(
+        session
+            .receive_phase(&mut reader, &binding, ToolchainObserverRelease, || Ok(()))
+            .is_err()
+    );
+    assert_eq!(reader.inner.position(), complete as u64);
+    let mut remaining = Vec::new();
+    reader.read_to_end(&mut remaining).unwrap();
+    assert_eq!(remaining, [0, 255, 128, b'R']);
+}
+
+#[test]
+fn joint_phase_replay_premature_release_binding_changes_and_second_phase_eof_fail_closed() {
+    use start::Phase::{Start, ToolchainObserverRelease};
+    let binding = binding();
+    let first = frame(&binding);
+    let mut second = Vec::new();
+    start::send_phase(&mut second, &binding, ToolchainObserverRelease, || Ok(())).unwrap();
+    let mut premature = Receiver::joint();
+    assert!(
+        premature
+            .receive_phase(&mut Cursor::new(&second), &binding, Start, || Ok(()))
+            .is_err()
+    );
+    assert!(
+        premature
+            .receive_phase(&mut Cursor::new(&first), &binding, Start, || Ok(()))
+            .is_err()
+    );
+    let mut declared_wrong = Receiver::joint();
+    let mut unread = Cursor::new(&first);
+    assert!(
+        declared_wrong
+            .receive_phase(&mut unread, &binding, ToolchainObserverRelease, || Ok(()))
+            .is_err()
+    );
+    assert_eq!(unread.position(), 0);
+    for offset in [8, 12, 16, 48, 52, 60, 64] {
+        let mut changed = second.clone();
+        changed[offset] ^= 1;
+        let mut session = Receiver::joint();
+        session
+            .receive(&mut Cursor::new(&first), &binding, || Ok(()))
+            .unwrap();
+        assert!(
+            session
+                .receive_phase(
+                    &mut Cursor::new(changed),
+                    &binding,
+                    ToolchainObserverRelease,
+                    || Ok(())
+                )
+                .is_err(),
+            "offset={offset}"
+        );
+    }
+    let mut replay = Receiver::joint();
+    replay
+        .receive(&mut Cursor::new(&first), &binding, || Ok(()))
+        .unwrap();
+    assert!(
+        replay
+            .receive_phase(
+                &mut Cursor::new(&first),
+                &binding,
+                ToolchainObserverRelease,
+                || Ok(())
+            )
+            .is_err()
+    );
+    for extent in 0..second.len() {
+        let mut session = Receiver::joint();
+        session
+            .receive(&mut Cursor::new(&first), &binding, || Ok(()))
+            .unwrap();
+        assert_eq!(
+            session
+                .receive_phase(
+                    &mut Cursor::new(&second[..extent]),
+                    &binding,
+                    ToolchainObserverRelease,
+                    || Ok(())
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+    let mut session = Receiver::joint();
+    session
+        .receive(&mut Cursor::new(&first), &binding, || Ok(()))
+        .unwrap();
+    let mut unread = Cursor::new(&second);
+    assert_eq!(
+        session
+            .receive_phase(&mut unread, &binding, ToolchainObserverRelease, || Err(
+                io::Error::new(io::ErrorKind::TimedOut, "same original deadline")
+            ))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(unread.position(), 0);
+    assert!(
+        session
+            .receive_phase(&mut unread, &binding, ToolchainObserverRelease, || Ok(()))
+            .is_err()
+    );
 }

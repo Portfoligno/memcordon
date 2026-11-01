@@ -121,6 +121,7 @@ fn descriptor() -> Descriptor {
         descendant_gate: None,
         start_gate: Some("Local\\memcordon-readiness-test-start".into()),
         start_transport: descriptor::StartTransport::NamedEvent,
+        control_clock: None,
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,
@@ -178,7 +179,9 @@ fn restricted_envelopes_select_framed_start_and_wire_requires_original_clock() {
         input.start_transport = expected_start_transport(&key);
         assert_eq!(
             input.start_transport,
-            StartTransport::ControllerStdin { version: 1 }
+            StartTransport::ControllerStdin {
+                version: descriptor::controller_start::VERSION
+            }
         );
         validate_descriptor(&key, &input).unwrap(); // Declared plan, before clock preparation.
         assert!(Descriptor::parse(&serde_json::to_vec(&input).unwrap()).is_err());
@@ -194,10 +197,15 @@ fn restricted_envelopes_select_framed_start_and_wire_requires_original_clock() {
                 restricting_sids: vec![vec![2]],
             },
         });
+        input.control_clock = Some(descriptor::ControlClock {
+            revision: 1,
+            work_cutoff_qpc: 999,
+            qpc_frequency: 10,
+        });
         let bytes = serde_json::to_vec(&input).unwrap();
         Descriptor::parse(&bytes).unwrap();
         for (field, value) in [
-            ("version", serde_json::json!(2)),
+            ("version", serde_json::json!(99)),
             ("transport", serde_json::json!("unknown")),
         ] {
             let mut value_descriptor = serde_json::to_value(&input).unwrap();
@@ -215,6 +223,7 @@ fn restricted_envelopes_select_framed_start_and_wire_requires_original_clock() {
         wrong.start_transport = StartTransport::NamedEvent;
         assert!(validate_descriptor(&key, &wrong).is_err());
         input.gate_precondition = None;
+        input.control_clock = None;
     }
     for (family, scenario) in [
         ("W-ENVELOPE", "ordinary"),
@@ -308,6 +317,80 @@ fn compiler_creation_uses_the_exact_frozen_measured_executable_inventory() {
         ),])
         .is_err()
     );
+}
+
+#[test]
+fn restricted_joint_keeps_native_compiler_observation_with_a_separate_control_clock() {
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, expected_start_transport, needs_toolchain_observer, validate_descriptor,
+    };
+    let mut input = descriptor();
+    input.case = Case::Joint;
+    input.cohort_gate = None;
+    input.generation_gate = None;
+    let key = CaseKey {
+        family: "W-JOINT".into(),
+        scenario: "restricted".into(),
+    };
+    input.start_transport = expected_start_transport(&key);
+    input.control_clock = Some(descriptor::ControlClock {
+        revision: 1,
+        work_cutoff_qpc: 999,
+        qpc_frequency: 10,
+    });
+    assert!(input.gate_precondition.is_none());
+    validate_descriptor(&key, &input).unwrap();
+    let parsed = Descriptor::parse(&serde_json::to_vec(&input).unwrap()).unwrap();
+    assert!(needs_toolchain_observer(parsed.case));
+    assert!(parsed.gate_precondition.is_none());
+    for (field, value) in [
+        ("revision", 2),
+        ("work_cutoff_qpc", 0),
+        ("qpc_frequency", 0),
+    ] {
+        let mut invalid = serde_json::to_value(&input).unwrap();
+        invalid["control_clock"][field] = value.into();
+        assert!(Descriptor::parse(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+    let mut missing = input.clone();
+    missing.control_clock = None;
+    assert!(Descriptor::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+    let mut diagnostic = input.clone();
+    diagnostic.gate_precondition = Some(descriptor::gate_precondition::Input {
+        revision: 1,
+        work_cutoff_qpc: 999,
+        qpc_frequency: 10,
+        expected_token: memcordon_ci::windows_consumer_readiness::TokenObservation {
+            user_sid: vec![1],
+            restricted: true,
+            integrity_rid: 12288,
+            elevated: true,
+            restricting_sids: vec![vec![2]],
+        },
+    });
+    assert!(Descriptor::parse(&serde_json::to_vec(&diagnostic).unwrap()).is_err());
+    for case in [Case::Toolchain, Case::Joint, Case::Churn] {
+        assert!(needs_toolchain_observer(case));
+    }
+    for case in [Case::Envelope, Case::EndpointMismatch, Case::EmptyInput] {
+        assert!(!needs_toolchain_observer(case));
+    }
+    for (family, scenario) in [
+        ("W-JOINT", "ordinary"),
+        ("W-CHURN", "restricted"),
+        ("W-JOINT", "endpoint-mismatch"),
+    ] {
+        assert_eq!(
+            expected_start_transport(&CaseKey {
+                family: family.into(),
+                scenario: scenario.into()
+            }),
+            descriptor::StartTransport::NamedEvent
+        );
+    }
+    let mut named = input.clone();
+    named.start_transport = descriptor::StartTransport::NamedEvent;
+    assert!(named.validate().is_err()); // A stdin clock is not another named authority.
 }
 
 #[test]
@@ -487,6 +570,16 @@ fn production_fixture_vectors_fit_the_private_wire_bound_and_round_trip_exactly(
         if matches!(
             input.start_transport,
             descriptor::StartTransport::ControllerStdin { .. }
+        ) {
+            input.control_clock = Some(descriptor::ControlClock {
+                revision: 1,
+                work_cutoff_qpc: 999,
+                qpc_frequency: 10,
+            });
+        }
+        if matches!(
+            (key.family.as_str(), key.scenario.as_str()),
+            ("W-ENVELOPE", "restricted") | ("W-BINDING", "restricted-token-preserved")
         ) {
             input.gate_precondition = Some(descriptor::gate_precondition::Input {
                 revision: 1,

@@ -54,56 +54,75 @@ impl std::error::Error for Failure {
     }
 }
 
-pub(super) fn receive(descriptor: &Descriptor, digest: [u8; 32]) -> io::Result<()> {
-    let input = descriptor
-        .gate_precondition
-        .as_ref()
-        .ok_or_else(|| io::Error::other("controller stdin START lacks original clock input"))?;
-    input.validate().map_err(io::Error::other)?;
-    let sampled = Instant::now();
-    let mut now = 0_i64;
-    let mut frequency = 0_i64;
-    // SAFETY: initialized scalar outputs for the unchanged native clock.
-    if unsafe { QueryPerformanceCounter(&mut now) } == 0
-        || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
-    {
-        return Err(io::Error::last_os_error());
+pub(super) struct Session {
+    binding: controller_start::Binding,
+    receiver: controller_start::Receiver,
+    handle: HANDLE,
+    deadline: Instant,
+}
+impl Session {
+    pub(super) fn new(descriptor: &Descriptor, digest: [u8; 32]) -> io::Result<Self> {
+        let input = descriptor
+            .control_clock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("controller stdin START lacks original clock input"))?;
+        input.validate().map_err(io::Error::other)?;
+        let sampled = Instant::now();
+        let mut now = 0_i64;
+        let mut frequency = 0_i64;
+        // SAFETY: initialized scalar outputs for the unchanged native clock.
+        if unsafe { QueryPerformanceCounter(&mut now) } == 0
+            || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if now < 0
+            || frequency <= 0
+            || frequency as u64 != input.qpc_frequency
+            || now as u64 >= input.work_cutoff_qpc
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original START work cutoff expired or clock differs",
+            ));
+        }
+        let nanos = u128::from(input.work_cutoff_qpc - now as u64) * 1_000_000_000
+            / u128::from(input.qpc_frequency);
+        let deadline = sampled
+            .checked_add(Duration::from_nanos(
+                u64::try_from(nanos).map_err(io::Error::other)?,
+            ))
+            .ok_or_else(|| io::Error::other("original START cutoff cannot be represented"))?;
+        let identity = super::native::current_identity()?;
+        let binding = controller_start::Binding {
+            challenge: descriptor.challenge.clone(),
+            descriptor_sha256: digest,
+            pid: identity.process_id,
+            birth: identity.creation_time_100ns,
+        };
+        // SAFETY: borrowed standard handle is neither replaced nor closed here.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::other(
+                "original fixture stdin handle unavailable",
+            ));
+        }
+        Ok(Self {
+            binding,
+            receiver: if descriptor.case == super::descriptor::Case::Joint {
+                controller_start::Receiver::joint()
+            } else {
+                controller_start::Receiver::default()
+            },
+            handle,
+            deadline,
+        })
     }
-    if now < 0
-        || frequency <= 0
-        || frequency as u64 != input.qpc_frequency
-        || now as u64 >= input.work_cutoff_qpc
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "original START work cutoff expired or clock differs",
-        ));
-    }
-    let nanos = u128::from(input.work_cutoff_qpc - now as u64) * 1_000_000_000
-        / u128::from(input.qpc_frequency);
-    let deadline = sampled
-        .checked_add(Duration::from_nanos(
-            u64::try_from(nanos).map_err(io::Error::other)?,
-        ))
-        .ok_or_else(|| io::Error::other("original START cutoff cannot be represented"))?;
-    let identity = super::native::current_identity()?;
-    let binding = controller_start::Binding {
-        challenge: descriptor.challenge.clone(),
-        descriptor_sha256: digest,
-        pid: identity.process_id,
-        birth: identity.creation_time_100ns,
-    };
-    // SAFETY: borrowed standard handle is neither replaced nor closed here.
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::other(
-            "original fixture stdin handle unavailable",
-        ));
-    }
-    let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(deadline)
-        .map_err(io::Error::other)?;
-    let result =
-        controller_start::Receiver::default().receive(&mut OriginalInput(handle), &binding, || {
+    pub(super) fn receive(&mut self, phase: controller_start::Phase) -> io::Result<()> {
+        let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(self.deadline)
+            .map_err(io::Error::other)?;
+        let deadline = self.deadline;
+        let check = || {
             if Instant::now() >= deadline {
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -112,16 +131,29 @@ pub(super) fn receive(descriptor: &Descriptor, digest: [u8; 32]) -> io::Result<(
             } else {
                 Ok(())
             }
-        });
-    // The timer's exact-thread cancellation worker is joined before unrelated
-    // application I/O. Preserve a native read failure as the primary source.
-    match (result, timer.finish()) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(io::Error::other(error)),
-        (Err(original), Err(deadline)) => Err(io::Error::new(
-            original.kind(),
-            Failure { original, deadline },
-        )),
+        };
+        let result = match phase {
+            controller_start::Phase::Start => {
+                self.receiver
+                    .receive(&mut OriginalInput(self.handle), &self.binding, check)
+            }
+            controller_start::Phase::ToolchainObserverRelease => self.receiver.receive_phase(
+                &mut OriginalInput(self.handle),
+                &self.binding,
+                phase,
+                check,
+            ),
+        };
+        // The timer's exact-thread cancellation worker is joined before unrelated
+        // application I/O. Preserve a native read failure as the primary source.
+        match (result, timer.finish()) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(io::Error::other(error)),
+            (Err(original), Err(deadline)) => Err(io::Error::new(
+                original.kind(),
+                Failure { original, deadline },
+            )),
+        }
     }
 }

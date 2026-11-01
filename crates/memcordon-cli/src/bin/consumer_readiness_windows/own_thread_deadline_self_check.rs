@@ -153,6 +153,76 @@ fn cancellation(cutoff: Instant) -> io::Result<()> {
     };
     settled(settled(observed, retirement), joined)
 }
+fn two_phase_io(cutoff: Instant) -> io::Result<()> {
+    use super::descriptor::controller_start::{self, Binding, Phase, Receiver, Sender};
+    let identity = super::native::current_identity()?;
+    let binding = Binding {
+        challenge: vec![0, 255, 128, b'R'],
+        descriptor_sha256: controller_start::descriptor_digest(
+            b"owned two-phase fixture descriptor",
+        ),
+        pid: identity.process_id,
+        birth: identity.creation_time_100ns,
+    };
+    let producer_binding = binding.clone();
+    let (mut reader, mut writer) = pipe()?;
+    let producer = std::thread::Builder::new()
+        .name("owned-control-frame-writer".into())
+        .spawn(move || -> io::Result<()> {
+            let mut session = Sender::joint();
+            for phase in [Phase::Start, Phase::ToolchainObserverRelease] {
+                let guard = memcordon_platform::WindowsSynchronousIoDeadline::start(cutoff)
+                    .map_err(io::Error::other)?;
+                let sent = session.send(&mut writer, &producer_binding, phase, || {
+                    if Instant::now() >= cutoff {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "original control test cutoff",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                settled(sent, guard.finish().map_err(io::Error::other))?;
+            }
+            drop(writer);
+            Ok(())
+        })?;
+    let received = (|| -> io::Result<()> {
+        let mut session = Receiver::joint();
+        for phase in [Phase::Start, Phase::ToolchainObserverRelease] {
+            let guard = memcordon_platform::WindowsSynchronousIoDeadline::start(cutoff)
+                .map_err(io::Error::other)?;
+            let result = session.receive_phase(&mut reader, &binding, phase, || {
+                if Instant::now() >= cutoff {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "original control test cutoff",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            settled(result, guard.finish().map_err(io::Error::other))?;
+        }
+        let guard = memcordon_platform::WindowsSynchronousIoDeadline::start(cutoff)
+            .map_err(io::Error::other)?;
+        let eof = match byte(&reader) {
+            Err(error) if error.raw_os_error() == Some(109) => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "control session consumed or fabricated application data",
+            )),
+        };
+        settled(eof, guard.finish().map_err(io::Error::other))
+    })();
+    drop(reader);
+    let joined = producer
+        .join()
+        .map_err(|_| io::Error::other("owned control writer panicked"))
+        .and_then(|result| result);
+    settled(received, joined)
+}
 pub(super) fn run() -> io::Result<i32> {
     let cutoff = Instant::now() + Duration::from_secs(5);
     let token: super::descriptor::gate_precondition::TokenObservation =
@@ -168,6 +238,7 @@ pub(super) fn run() -> io::Result<i32> {
     successful_io(cutoff)?;
     cancellation(cutoff)?;
     successful_io(cutoff)?; // No previous watcher may cancel this subsequent I/O.
+    two_phase_io(cutoff)?;
     let (reader, writer) = pipe()?;
     let guard = memcordon_platform::WindowsSynchronousIoDeadline::start(cutoff)
         .map_err(io::Error::other)?;

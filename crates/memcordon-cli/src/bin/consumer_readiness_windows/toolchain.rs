@@ -608,7 +608,11 @@ fn compile(
     )
 }
 
-pub(super) fn execute(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
+pub(super) fn execute(
+    descriptor: &Descriptor,
+    transcript: &mut Transcript,
+    control: Option<&mut super::controller_start_input::Session>,
+) -> io::Result<()> {
     let start = descriptor
         .start_gate
         .as_ref()
@@ -618,10 +622,20 @@ pub(super) fn execute(descriptor: &Descriptor, transcript: &mut Transcript) -> i
         None,
         &descriptor.challenge,
     )?;
-    let observer_name = format!("{start}-toolchain-observer");
-    super::native::wait_controller_gate(std::ffi::OsStr::new(&observer_name), || Ok(())).map_err(
-        |error| super::toolchain_diagnostics::observer_gate_error(&observer_name, error),
-    )?;
+    match descriptor.start_transport {
+        super::descriptor::StartTransport::ControllerStdin { .. } => {
+            control
+                .ok_or_else(|| io::Error::other("original Joint control session unavailable"))?
+                .receive(super::descriptor::controller_start::Phase::ToolchainObserverRelease)?;
+        }
+        super::descriptor::StartTransport::NamedEvent => {
+            let observer_name = format!("{start}-toolchain-observer");
+            super::native::wait_controller_gate(std::ffi::OsStr::new(&observer_name), || Ok(()))
+                .map_err(|error| {
+                    super::toolchain_diagnostics::observer_gate_error(&observer_name, error)
+                })?;
+        }
+    }
     let inputs = descriptor
         .toolchain
         .as_ref()

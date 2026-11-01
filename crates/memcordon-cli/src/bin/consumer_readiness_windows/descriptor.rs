@@ -167,6 +167,22 @@ pub enum StartTransport {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ControlClock {
+    pub revision: u32,
+    pub work_cutoff_qpc: u64,
+    pub qpc_frequency: u64,
+}
+impl ControlClock {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.revision != 1 || self.work_cutoff_qpc == 0 || self.qpc_frequency == 0 {
+            return Err("invalid original fixture control clock".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Descriptor {
     pub format: String,
     pub revision: u32,
@@ -189,6 +205,8 @@ pub struct Descriptor {
     #[serde(default)]
     pub start_transport: StartTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_clock: Option<ControlClock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_access_diagnostic: Option<gate_access::Input>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_precondition: Option<gate_precondition::Input>,
@@ -210,7 +228,7 @@ impl Descriptor {
         if matches!(
             value.start_transport,
             StartTransport::ControllerStdin { .. }
-        ) && value.gate_precondition.is_none()
+        ) && value.control_clock.is_none()
         {
             return Err("wire controller stdin START lacks original work clock".into());
         }
@@ -223,14 +241,16 @@ impl Descriptor {
         }
         if let StartTransport::ControllerStdin { version } = self.start_transport {
             if version != controller_start::VERSION
-                || self.case != Case::Envelope
+                || !matches!(self.case, Case::Envelope | Case::Joint)
                 || self.start_gate.is_none()
             {
-                return Err("controller stdin START requires versioned envelope transport and separate diagnostic name".into());
+                return Err("controller stdin requires supported versioned Envelope/Joint control and separate diagnostic name".into());
             }
-            if let Some(input) = &self.gate_precondition {
+            if let Some(input) = &self.control_clock {
                 input.validate()?;
             }
+        } else if self.control_clock.is_some() {
+            return Err("named-event START cannot declare a stdin control clock".into());
         }
         if let Some(control) = &self.gate_precondition {
             control.validate()?;

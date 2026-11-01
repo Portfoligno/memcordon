@@ -2,11 +2,60 @@
 //! A valid frame supplements, never replaces, the controller's native admission.
 use std::io::{self, Read, Write};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 const MAGIC: &[u8; 8] = b"MCSTART\0";
-const HEADER: usize = 8 + 4 + 4 + 32 + 4 + 8;
+const HEADER: usize = 8 + 4 + 4 + 32 + 4 + 8 + 4;
 pub const MAX_CHALLENGE: usize = 4096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Phase {
+    Start = 1,
+    ToolchainObserverRelease = 2,
+}
+
+struct Progress {
+    expected: Option<Phase>,
+    joint: bool,
+    failed: bool,
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            expected: Some(Phase::Start),
+            joint: false,
+            failed: false,
+        }
+    }
+}
+impl Progress {
+    fn joint() -> Self {
+        Self {
+            joint: true,
+            ..Self::default()
+        }
+    }
+    fn begin(&mut self, phase: Phase) -> io::Result<()> {
+        let allowed = !self.failed && self.expected == Some(phase);
+        self.failed = true;
+        if !allowed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture control phase repeated, out of order, or already failed",
+            ));
+        }
+        Ok(())
+    }
+    fn complete(&mut self, phase: Phase) {
+        self.failed = false;
+        self.expected = if self.joint && phase == Phase::Start {
+            Some(Phase::ToolchainObserverRelease)
+        } else {
+            None
+        };
+    }
+}
+
+#[derive(Clone)]
 pub struct Binding {
     pub challenge: Vec<u8>,
     pub descriptor_sha256: [u8; 32],
@@ -93,6 +142,14 @@ pub fn send(
     binding: &Binding,
     mut check: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
+    send_phase(writer, binding, Phase::Start, &mut check)
+}
+pub fn send_phase(
+    writer: &mut impl Write,
+    binding: &Binding,
+    phase: Phase,
+    mut check: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     binding.validate()?;
     let mut bytes = Vec::with_capacity(HEADER + binding.challenge.len());
     bytes.extend_from_slice(MAGIC);
@@ -101,6 +158,7 @@ pub fn send(
     bytes.extend_from_slice(&binding.descriptor_sha256);
     bytes.extend_from_slice(&binding.pid.to_le_bytes());
     bytes.extend_from_slice(&binding.birth.to_le_bytes());
+    bytes.extend_from_slice(&(phase as u32).to_le_bytes());
     bytes.extend_from_slice(&binding.challenge);
     transfer(
         |part| writer.write(part),
@@ -114,23 +172,61 @@ pub fn send(
 }
 
 #[derive(Default)]
+pub struct Sender {
+    progress: Progress,
+}
+impl Sender {
+    pub fn joint() -> Self {
+        Self {
+            progress: Progress::joint(),
+        }
+    }
+    pub fn completed(&self) -> bool {
+        self.progress.expected.is_none() && !self.progress.failed
+    }
+    pub fn send(
+        &mut self,
+        writer: &mut impl Write,
+        binding: &Binding,
+        phase: Phase,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.progress.begin(phase)?;
+        match phase {
+            Phase::Start => send(writer, binding, check)?,
+            Phase::ToolchainObserverRelease => send_phase(writer, binding, phase, check)?,
+        }
+        self.progress.complete(phase);
+        Ok(())
+    }
+}
+#[derive(Default)]
 pub struct Receiver {
-    attempted: bool,
+    progress: Progress,
 }
 
 impl Receiver {
+    pub fn joint() -> Self {
+        Self {
+            progress: Progress::joint(),
+        }
+    }
     pub fn receive(
         &mut self,
         reader: &mut impl Read,
         binding: &Binding,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<()> {
-        if std::mem::replace(&mut self.attempted, true) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "START release already attempted",
-            ));
-        }
+        self.receive_phase(reader, binding, Phase::Start, &mut check)
+    }
+    pub fn receive_phase(
+        &mut self,
+        reader: &mut impl Read,
+        binding: &Binding,
+        phase: Phase,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.progress.begin(phase)?;
         binding.validate()?;
         let mut header = [0_u8; HEADER];
         transfer(
@@ -146,6 +242,7 @@ impl Receiver {
         expected.extend_from_slice(&binding.descriptor_sha256);
         expected.extend_from_slice(&binding.pid.to_le_bytes());
         expected.extend_from_slice(&binding.birth.to_le_bytes());
+        expected.extend_from_slice(&(phase as u32).to_le_bytes());
         if header != expected.as_slice() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -165,6 +262,8 @@ impl Receiver {
                 "START challenge differs",
             ));
         }
-        check()
+        check()?;
+        self.progress.complete(phase);
+        Ok(())
     }
 }
