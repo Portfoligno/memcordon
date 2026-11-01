@@ -484,12 +484,14 @@ fn active_descendant_survives_original_exit_and_omission_is_explicit() {
     assert_eq!(incomplete["complete"], false);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 #[test]
 fn native_current_record_replacement_publishes_only_complete_readback() {
     let directory = tempfile::tempdir().unwrap();
+    let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let owner = diagnostics::PublicationOwner::new(directory.path(), cutoff).unwrap();
     let binding = json!({"role":"child","original_child":{"process_id":20,"creation_time_100ns":200},"native_work_cutoff_ticks":900});
-    let publisher = diagnostics::Publisher::new(directory.path(), binding.clone()).unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, binding.clone()).unwrap();
     for phase in ["before-debug-run", "after-debug-run-before-wait-retired"] {
         publisher
             .publish(false, phase, &json!({"diagnostic_only":true}))
