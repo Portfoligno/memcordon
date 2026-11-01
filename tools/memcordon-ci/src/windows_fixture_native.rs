@@ -9,7 +9,14 @@ pub const TRACE_TEST_SELECTOR: &str =
     "isolated_native_mock_and_owned_event_calls_preserve_original_results";
 pub const DEADLINE_TEST_SELECTOR: &str =
     "restricted_initial_thread_deadline_cancels_only_original_io_and_joins";
-pub const TEST_SELECTORS: [&str; 3] = [TEST_SELECTOR, TRACE_TEST_SELECTOR, DEADLINE_TEST_SELECTOR];
+pub const WINSOCK_TEST_SELECTOR: &str =
+    "restricted_owned_winsock_forwarding_preserves_arguments_results_and_tls_scope";
+pub const TEST_SELECTORS: [&str; 4] = [
+    TEST_SELECTOR,
+    TRACE_TEST_SELECTOR,
+    DEADLINE_TEST_SELECTOR,
+    WINSOCK_TEST_SELECTOR,
+];
 
 pub struct Command {
     pub arguments: Vec<&'static str>,
@@ -29,6 +36,8 @@ pub fn commands(compile: Duration, execute: Duration) -> [Command; 2] {
         "windows_gate_call_trace",
         "--test",
         "windows_own_thread_deadline",
+        "--test",
+        "windows_winsock_call_trace",
         "--all-features",
     ];
     let mut compilation = base.clone();

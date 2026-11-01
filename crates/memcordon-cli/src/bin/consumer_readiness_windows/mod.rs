@@ -27,6 +27,8 @@ mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
 mod winsock_startup;
+mod winsock_trace;
+mod winsock_trace_record;
 
 use descriptor::{Case, Descriptor};
 use serde::{Deserialize, Serialize};
@@ -156,7 +158,7 @@ fn read_http_header(stream: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 fn tcp_peer(port: u16, challenge: &[u8], output_root: &std::path::Path) -> io::Result<()> {
-    let _winsock = native::winsock_startup()?;
+    let _winsock = native::winsock_startup(None)?;
     let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
     let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .map_err(|error| context("connect", error))?;
@@ -221,8 +223,18 @@ fn joint(
     transcript: &mut Transcript,
     churn: bool,
     control: Option<&mut controller_start_input::Session>,
+    token_envelope: &[u8],
 ) -> io::Result<()> {
-    let _winsock = native::winsock_startup()?;
+    let trace = match (descriptor.control_clock.as_ref(), control.as_deref()) {
+        (Some(clock), Some(session)) => Some(winsock_trace::Context {
+            clock,
+            output_root: &descriptor.output_root,
+            binding: session.original_binding(),
+            token_envelope,
+        }),
+        _ => None,
+    };
+    let _winsock = native::winsock_startup(trace)?;
     let listener =
         TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(native::tcp_bind_failure)?;
     let address = listener.local_addr()?;
@@ -628,6 +640,15 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             }
             return gate_call_trace_self_check::run();
         }
+        Some("winsock-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "Winsock forwarding self-check takes no operands",
+                ));
+            }
+            winsock_trace::mock()?;
+            return Ok(0);
+        }
         Some("own-thread-deadline-self-check") => {
             if args.next().is_some() {
                 return Err(io::Error::other(
@@ -939,10 +960,20 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             })?;
     }
     match descriptor.case {
-        Case::Joint | Case::EndpointMismatch => {
-            joint(&descriptor, &mut transcript, false, control.as_mut())?
-        }
-        Case::Churn => joint(&descriptor, &mut transcript, true, control.as_mut())?,
+        Case::Joint | Case::EndpointMismatch => joint(
+            &descriptor,
+            &mut transcript,
+            false,
+            control.as_mut(),
+            &envelope,
+        )?,
+        Case::Churn => joint(
+            &descriptor,
+            &mut transcript,
+            true,
+            control.as_mut(),
+            &envelope,
+        )?,
         Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
         Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
         Case::EmptyInput => {

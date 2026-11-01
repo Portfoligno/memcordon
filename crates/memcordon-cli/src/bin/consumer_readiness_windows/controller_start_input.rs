@@ -61,6 +61,9 @@ pub(super) struct Session {
     deadline: Instant,
 }
 impl Session {
+    pub(super) fn original_binding(&self) -> &controller_start::Binding {
+        &self.binding
+    }
     pub(super) fn new(descriptor: &Descriptor, digest: [u8; 32]) -> io::Result<Self> {
         let input = descriptor
             .control_clock

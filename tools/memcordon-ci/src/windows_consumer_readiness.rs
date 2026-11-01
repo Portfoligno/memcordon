@@ -5440,6 +5440,22 @@ pub(crate) mod native {
             }) = &output
             {
                 let retention = (|| -> Result<()> {
+                    // Copy this bounded diagnostic into the existing small failure
+                    // carrier. It never supplies launch or object-identity authority.
+                    let winsock_trace=(||->Result<serde_json::Value>{
+                        let source=input.descriptor.output_root.join("winsock-startup-trace.json");
+                        if !source.try_exists()? {return Ok(serde_json::json!({"state":"absent","authority":false}));}
+                        let bytes=read(&source,64*1024)?;
+                        let parsed:serde_json::Value=serde_json::from_slice(&bytes)?;
+                        if parsed["format"]!="memcordon.original-winsock-startup-trace" || parsed["revision"]!=1 {
+                            return Err(CiError::Message("startup diagnostic carrier format differs".into()));
+                        }
+                        let path=report.with_extension("winsock-startup-trace.json");
+                        let mut file=OpenOptions::new().write(true).create_new(true).open(&path)?;
+                        file.write_all(&bytes)?;file.sync_all()?;drop(file);
+                        if read(&path,64*1024)?!=bytes {return Err(CiError::Message("startup diagnostic retained bytes differ".into()));}
+                        Ok(serde_json::json!({"state":"retained","path":path,"sha256":crate::windows_causal_acceptance::sha256(&bytes),"authority":false,"identity_admission":false}))
+                    })().map_err(|error|error.to_string());
                     let product_context = if *capture_complete && cleanup.is_ok() {
                         retain_callback_product_context(&public_report, &report, &config.provider)
                             .map_err(|error| error.to_string())
@@ -5452,6 +5468,7 @@ pub(crate) mod native {
                         "observed_status":observed_status.map(|status| status.code()),
                         "termination":termination.map(|status| status.code()), "cleanup":cleanup,
                         "product_context":product_context,
+                        "winsock_trace":winsock_trace,
                     }))?;
                     for (extension, bytes) in [
                         ("stdout.bin", stdout.as_slice()),

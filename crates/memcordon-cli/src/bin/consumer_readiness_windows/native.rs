@@ -28,19 +28,61 @@ pub fn tcp_bind_failure(original: io::Error) -> io::Error {
     tcp_failure("listener-bind", original)
 }
 
-pub fn winsock_startup() -> io::Result<super::winsock_startup::Startup<impl FnOnce()>> {
-    use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
+fn winsock_cleanup() {
+    // SAFETY: this callback owns exactly one successful explicit startup reference.
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::WSACleanup();
+    }
+}
+pub fn winsock_startup(
+    trace: Option<super::winsock_trace::Context<'_>>,
+) -> io::Result<super::winsock_startup::Startup<fn()>> {
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
     // SAFETY: WSADATA is a native output structure valid with all scalar/pointer fields zeroed.
     let mut data: WSADATA = unsafe { std::mem::zeroed() };
-    // SAFETY: initialized native output; this original process/token owns this call.
-    let returned = unsafe { WSAStartup(0x0202, &mut data) };
-    super::winsock_startup::acquire(returned, data.wVersion, || {
-        // SAFETY: this closure owns exactly one successful explicit startup reference.
-        unsafe {
-            WSACleanup();
+    let mut observed = trace.as_ref().map(|context| {
+        super::winsock_trace::call(
+            WSAStartup as *const () as usize,
+            context.clock.work_cutoff_qpc,
+            context.clock.qpc_frequency,
+        )
+    });
+    if observed
+        .as_ref()
+        .is_some_and(|value| value.packet.called != 1)
+    {
+        let mut observation = observed.expect("checked trace");
+        if let Some(context) = &trace {
+            observation.retain(context);
         }
+        let error = if observation.packet.setup_error != 0 {
+            io::Error::from_raw_os_error(observation.packet.setup_error as i32)
+        } else {
+            io::Error::other("original startup call unavailable")
+        };
+        return Err(observation.context(error));
+    }
+    let (returned, version) = if let Some(observed) = &observed {
+        (
+            observed.packet.original_return,
+            observed.packet.negotiated_version as u16,
+        )
+    } else {
+        // SAFETY: initialized native output; this original process/token owns this call.
+        (unsafe { WSAStartup(0x0202, &mut data) }, data.wVersion)
+    };
+    let acquired = super::winsock_startup::acquire(returned, version, winsock_cleanup as fn());
+    // Successful native ownership is established before any allocating/file diagnostic.
+    if let (Some(observation), Some(context)) = (&mut observed, &trace) {
+        observation.retain(context);
+    }
+    acquired.map_err(|error| {
+        let error = match observed {
+            Some(trace) => trace.context(error),
+            None => error,
+        };
+        tcp_failure("startup", error)
     })
-    .map_err(|error| tcp_failure("startup", error))
 }
 
 #[derive(Debug)]
@@ -68,7 +110,8 @@ fn tcp_failure(stage: &str, original: io::Error) -> io::Error {
     let mut entries: Vec<WSAPROTOCOL_INFOW> = (0..ENTRIES)
         .map(|_| unsafe { std::mem::zeroed() })
         .collect();
-    let mut bytes = (ENTRIES * std::mem::size_of::<WSAPROTOCOL_INFOW>()) as u32;
+    let initial_bytes = (ENTRIES * std::mem::size_of::<WSAPROTOCOL_INFOW>()) as u32;
+    let mut bytes = initial_bytes;
     let mut catalog_error = 0;
     // SAFETY: the aligned vector has the exact advertised writable capacity.
     let count = unsafe {
@@ -80,15 +123,17 @@ fn tcp_failure(stage: &str, original: io::Error) -> io::Error {
         )
     };
     let mut observations = Vec::new();
-    let mut matching_count = 0;
+    let mut matching_count = None;
     if count >= 0 && (count as usize) <= ENTRIES {
-        matching_count = entries
-            .iter()
-            .take(count as usize)
-            .filter(|entry| {
-                entry.iAddressFamily == 2 && entry.iSocketType == 1 && entry.iProtocol == 6
-            })
-            .count();
+        matching_count = Some(
+            entries
+                .iter()
+                .take(count as usize)
+                .filter(|entry| {
+                    entry.iAddressFamily == 2 && entry.iSocketType == 1 && entry.iProtocol == 6
+                })
+                .count(),
+        );
         for entry in entries
             .iter()
             .take(count as usize)
@@ -143,11 +188,13 @@ fn tcp_failure(stage: &str, original: io::Error) -> io::Error {
         }
     }
     let diagnostic = format!(
-        "native TCP {stage} failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-bytes={bytes}; matching-provider-count={matching_count}; providers-truncated={}; IPv4-TCP-provider-observations={observations:?}",
+        "native TCP {stage} failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-initial-bytes={initial_bytes}; catalog-returned-bytes={bytes}; catalog-structure-bytes={}; catalog-observation-complete={}; matching-provider-count={matching_count:?}; providers-truncated={}; provider-paths-are-configuration-not-load-proof=true; IPv4-TCP-provider-observations={observations:?}",
         original.raw_os_error(),
         std::env::var_os("SystemRoot").is_some(),
         std::env::var_os("windir").is_some(),
-        matching_count > 8,
+        std::mem::size_of::<WSAPROTOCOL_INFOW>(),
+        count >= 0 && (count as usize) <= ENTRIES,
+        matching_count.is_some_and(|count| count > 8),
     );
     io::Error::new(
         original.kind(),

@@ -148,6 +148,8 @@ fn build_gate_call_trace() {
     detours.compile("memcordon_fixture_detours");
     println!("cargo:rerun-if-changed=native/gate_call_trace.cpp");
     println!("cargo:rerun-if-changed=native/gate_call_trace.h");
+    println!("cargo:rerun-if-changed=native/winsock_call_trace.cpp");
+    println!("cargo:rerun-if-changed=native/winsock_call_trace.h");
     cc::Build::new()
         .cpp(true)
         .static_crt(true)
@@ -156,6 +158,7 @@ fn build_gate_call_trace() {
         .include(vendor)
         .define("_WIN32_WINNT", "0x0A00")
         .file("native/gate_call_trace.cpp")
+        .file("native/winsock_call_trace.cpp")
         .compile("memcordon_fixture_gate_call_trace");
     println!("cargo:rustc-link-arg-bin=memcordon-test-fixture=/guard:cf");
     println!("cargo:rustc-link-arg-bin=memcordon-test-fixture=/DYNAMICBASE");
