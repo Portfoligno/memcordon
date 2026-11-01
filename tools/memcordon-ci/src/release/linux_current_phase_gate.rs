@@ -392,6 +392,7 @@ pub struct NativeTraceStop {
     cutoff: Instant,
     attached: bool,
     stopped: bool,
+    observations: crate::linux_transaction_trace::TraceWindow,
 }
 impl NativeTraceStop {
     pub fn original_exited(&self) -> Result<bool> {
@@ -415,6 +416,7 @@ impl NativeTraceStop {
             cutoff,
             attached: false,
             stopped: false,
+            observations: crate::linux_transaction_trace::TraceWindow::default(),
         };
         trace.control(
             libc::PTRACE_SEIZE,
@@ -503,11 +505,24 @@ impl NativeTraceStop {
     fn next_syscall(&mut self) -> Result<Vec<u8>> {
         let mut signal = 0;
         loop {
+            self.observations
+                .check(Instant::now(), self.cutoff)
+                .map_err(CiError::Message)?;
             self.control(libc::PTRACE_SYSCALL, 0, signal)?;
             self.stopped = false;
             let status = self.wait_stop()?;
+            self.observations
+                .check(Instant::now(), self.cutoff)
+                .map_err(CiError::Message)?;
             if libc::WSTOPSIG(status) == libc::SIGTRAP | 0x80 {
-                return self.syscall_info();
+                let record = self.syscall_info()?;
+                self.observations
+                    .record(&record)
+                    .map_err(CiError::Message)?;
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                return Ok(record);
             }
             if status >> 16 != 0 {
                 return Err(CiError::Message(
@@ -516,6 +531,50 @@ impl NativeTraceStop {
             }
             signal = usize::try_from(libc::WSTOPSIG(status))
                 .map_err(|error| CiError::Message(error.to_string()))?;
+        }
+    }
+    fn trace_context(&self, error: CiError) -> CiError {
+        error.context(format!(
+            "original deadline-bounded native trace: {}",
+            self.observations.diagnostic()
+        ))
+    }
+
+    fn transaction_parent(&self, parent: &crate::linux_transaction_trace::Parent) -> Result<File> {
+        use crate::linux_transaction_trace::Parent;
+        use std::os::unix::ffi::OsStrExt;
+        self.observations
+            .check(Instant::now(), self.cutoff)
+            .map_err(CiError::Message)?;
+        match parent {
+            Parent::Absolute(path) => {
+                let root = File::open(format!("/proc/{}/root", self.process.process_id))?;
+                let relative = path
+                    .strip_prefix(b"/")
+                    .ok_or_else(|| CiError::Message("native absolute parent lacks root".into()))?;
+                let relative = if relative.is_empty() {
+                    std::ffi::OsStr::new(".")
+                } else {
+                    std::ffi::OsStr::from_bytes(relative)
+                };
+                Ok(File::from(
+                    rustix::fs::openat2(
+                        &root,
+                        relative,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                        rustix::fs::ResolveFlags::IN_ROOT | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+                    )
+                    .map_err(std::io::Error::from)?,
+                ))
+            }
+            Parent::Descriptor(fd) => Ok(File::open(if *fd == libc::AT_FDCWD {
+                format!("/proc/{}/cwd", self.process.process_id)
+            } else {
+                format!("/proc/{}/fd/{fd}", self.process.process_id)
+            })?),
         }
     }
     fn pathname(&self, address: u64) -> Result<Vec<u8>> {
@@ -564,67 +623,73 @@ impl NativeTraceStop {
                 "source read gate has no remaining original extent".into(),
             ));
         }
-        for _ in 0..65536 {
-            let entry = self.next_syscall()?;
-            if entry.first() != Some(&1) || entry.len() < 80 {
-                continue;
-            }
-            let architecture =
-                u32::from_ne_bytes(entry[4..8].try_into().expect("bounded syscall info"));
-            let number =
-                u64::from_ne_bytes(entry[24..32].try_into().expect("bounded syscall info"));
-            if !((architecture == 0xc000003e && number == 0)
-                || (architecture == 0xc00000b7 && number == 63))
-            {
-                continue;
-            }
-            let descriptor =
-                u64::from_ne_bytes(entry[32..40].try_into().expect("bounded source descriptor"));
-            let path = format!("/proc/{}/fd/{descriptor}", self.process.process_id);
-            let actual = match std::fs::metadata(&path) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if (actual.dev(), actual.ino()) != (original.dev(), original.ino()) {
-                continue;
-            }
-            let exit = self.next_syscall()?;
-            if exit.first() != Some(&2) || exit.len() < 33 || exit[32] != 0 {
-                return Err(CiError::Message(
-                    "original source read did not reach successful native exit".into(),
-                ));
-            }
-            let count =
-                i64::from_ne_bytes(exit[24..32].try_into().expect("bounded source read result"));
-            if count <= 0 {
-                continue;
-            }
-            let fdinfo = std::fs::read_to_string(format!(
-                "/proc/{}/fdinfo/{descriptor}",
-                self.process.process_id
-            ))?;
-            let positions = fdinfo
-                .lines()
-                .filter_map(|line| line.strip_prefix("pos:"))
-                .collect::<Vec<_>>();
-            if positions.len() != 1 {
-                return Err(CiError::Message(
-                    "original source cursor absent or duplicate".into(),
-                ));
-            }
-            let position = positions[0]
-                .trim()
-                .parse::<u64>()
-                .map_err(|error| CiError::Message(error.to_string()))?;
-            if position > minimum && position < original.len() && ready()? {
-                return Ok(
-                    serde_json::json!({"format":"memcordon.current-source-read-stop","revision":1,"process":{"pid":self.process.process_id,"birth":self.process.birth},"source":{"device":original.dev(),"inode":original.ino(),"uid":original.uid(),"length":original.len()},"descriptor":descriptor,"syscall":number,"architecture":architecture,"read_bytes":count,"position":position,"fdinfo":fdinfo,"stopped_after_native_read":true}),
+        let observed = (|| {
+            loop {
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                let entry = self.next_syscall()?;
+                if entry.first() != Some(&1) || entry.len() < 80 {
+                    continue;
+                }
+                let architecture =
+                    u32::from_ne_bytes(entry[4..8].try_into().expect("bounded syscall info"));
+                let number =
+                    u64::from_ne_bytes(entry[24..32].try_into().expect("bounded syscall info"));
+                if !((architecture == 0xc000003e && number == 0)
+                    || (architecture == 0xc00000b7 && number == 63))
+                {
+                    continue;
+                }
+                let descriptor = u64::from_ne_bytes(
+                    entry[32..40].try_into().expect("bounded source descriptor"),
                 );
+                let path = format!("/proc/{}/fd/{descriptor}", self.process.process_id);
+                let actual = match std::fs::metadata(&path) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if (actual.dev(), actual.ino()) != (original.dev(), original.ino()) {
+                    self.observations.reject("read refers another source inode");
+                    continue;
+                }
+                self.observations.candidate();
+                let exit = self.next_syscall()?;
+                let count = crate::linux_transaction_trace::successful_exit(&exit, architecture)
+                    .map_err(CiError::Message)?;
+                if count <= 0 {
+                    continue;
+                }
+                let fdinfo = std::fs::read_to_string(format!(
+                    "/proc/{}/fdinfo/{descriptor}",
+                    self.process.process_id
+                ))?;
+                let positions = fdinfo
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("pos:"))
+                    .collect::<Vec<_>>();
+                if positions.len() != 1 {
+                    return Err(CiError::Message(
+                        "original source cursor absent or duplicate".into(),
+                    ));
+                }
+                let position = positions[0]
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+                if position > minimum && position < original.len() && ready()? {
+                    self.observations
+                        .check(Instant::now(), self.cutoff)
+                        .map_err(CiError::Message)?;
+                    return Ok(
+                        serde_json::json!({"format":"memcordon.current-source-read-stop","revision":1,"process":{"pid":self.process.process_id,"birth":self.process.birth},"source":{"device":original.dev(),"inode":original.ino(),"uid":original.uid(),"length":original.len()},"descriptor":descriptor,"syscall":number,"architecture":architecture,"read_bytes":count,"position":position,"fdinfo":fdinfo,"stopped_after_native_read":true}),
+                    );
+                }
+                self.observations
+                    .reject("original source position or readiness not selected");
             }
-        }
-        Err(CiError::Message(
-            "original source read boundary was not reached within syscall bound".into(),
-        ))
+        })();
+        observed.map_err(|error| self.trace_context(error))
     }
     pub fn after_rename(
         &mut self,
@@ -666,170 +731,138 @@ impl NativeTraceStop {
                 "syscall transaction directory custody differs".into(),
             ));
         }
-        for _ in 0..4096 {
-            let entry = self.next_syscall()?;
-            if entry[0] != 1 || entry.len() < 80 {
-                continue;
-            }
-            let architecture =
-                u32::from_ne_bytes(entry[4..8].try_into().expect("bounded syscall info"));
-            let number =
-                u64::from_ne_bytes(entry[24..32].try_into().expect("bounded syscall info"));
-            #[cfg(target_arch = "x86_64")]
-            let selected = architecture == 0xc000003e && [82, 264, 316].contains(&number);
-            #[cfg(target_arch = "aarch64")]
-            let selected = architecture == 0xc00000b7 && [38, 276].contains(&number);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let selected = false;
-            if !selected {
-                continue;
-            }
-            let arguments: Vec<u64> = entry[32..80]
-                .chunks_exact(8)
-                .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("fixed register width")))
-                .collect();
-            let (source_address, target_address, source_fd, target_fd) =
-                if architecture == 0xc000003e && number == 82 {
-                    (
-                        arguments[0],
-                        arguments[1],
-                        libc::AT_FDCWD as i64 as u64,
-                        libc::AT_FDCWD as i64 as u64,
-                    )
-                } else {
-                    (arguments[1], arguments[3], arguments[0], arguments[2])
+        let observed = (|| {
+            loop {
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                let entry = self.next_syscall()?;
+                #[cfg(target_arch = "x86_64")]
+                let expected_architecture = 0xc000003e;
+                #[cfg(target_arch = "aarch64")]
+                let expected_architecture = 0xc00000b7;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let expected_architecture = 0;
+                let Some(rename) =
+                    crate::linux_transaction_trace::rename_entry(&entry, expected_architecture)
+                        .map_err(CiError::Message)?
+                else {
+                    continue;
                 };
-            let source = self.pathname(source_address)?;
-            let temporary = std::str::from_utf8(&source)
-                .map_err(|error| CiError::Message(error.to_string()))?;
-            let selected_source = if prefix {
-                Path::new(temporary)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(selector) && name.len() > selector.len())
-            } else {
-                source == selector.as_bytes()
-            };
-            if !selected_source || self.pathname(target_address)? != final_name.as_bytes() {
-                continue;
-            }
-            for (path, descriptor) in [
-                (Path::new(temporary), source_fd),
-                (Path::new(final_name), target_fd),
-            ] {
-                if path.components().any(|part| {
-                    !matches!(
-                        part,
-                        std::path::Component::RootDir | std::path::Component::Normal(_)
-                    )
-                }) {
+                let source = self.pathname(rename.source_address)?;
+                let target = self.pathname(rename.target_address)?;
+                self.observations.operands(&source, &target);
+                let candidate = crate::linux_transaction_trace::select(
+                    &source,
+                    &target,
+                    selector.as_bytes(),
+                    final_name.as_bytes(),
+                    prefix,
+                    rename.source_fd,
+                    rename.target_fd,
+                )
+                .map_err(CiError::Message)?;
+                let Some(candidate) = candidate else {
+                    self.observations.reject("rename leaf selector mismatch");
+                    continue;
+                };
+                self.observations.candidate();
+                let source_parent = self.transaction_parent(&candidate.source.parent)?;
+                let target_parent = self.transaction_parent(&candidate.target.parent)?;
+                let source_identity = source_parent.metadata()?;
+                let target_identity = target_parent.metadata()?;
+                if !source_identity.is_dir() || !target_identity.is_dir() {
+                    self.observations.reject("native parent is not directory");
                     return Err(CiError::Message(
-                        "native transaction pathname is not normalized".into(),
+                        "native rename parent is not directory".into(),
                     ));
                 }
-                let held = if path.is_absolute() {
-                    File::open(path.parent().ok_or_else(|| {
-                        CiError::Message("absolute native transaction parent absent".into())
-                    })?)?
-                } else {
-                    if path.components().count() != 1 {
-                        return Err(CiError::Message(
-                            "relative native transaction must be a direct held-directory leaf"
-                                .into(),
-                        ));
-                    }
-                    let descriptor = i32::try_from(descriptor as i64)
-                        .map_err(|error| CiError::Message(error.to_string()))?;
-                    File::open(if descriptor == libc::AT_FDCWD {
-                        format!("/proc/{}/cwd", self.process.process_id)
-                    } else {
-                        format!("/proc/{}/fd/{descriptor}", self.process.process_id)
-                    })?
-                };
-                let identity = held.metadata()?;
-                if !identity.is_dir()
-                    || (identity.dev(), identity.ino()) != (parent.dev(), parent.ino())
+                if let Err(error) = crate::linux_transaction_trace::require_parents(
+                    (parent.dev(), parent.ino()),
+                    (source_identity.dev(), source_identity.ino()),
+                    (target_identity.dev(), target_identity.ino()),
+                ) {
+                    self.observations
+                        .reject("actual native parent identity mismatch");
+                    return Err(CiError::Message(error));
+                }
+                use std::os::unix::ffi::OsStrExt;
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                let pending = rustix::fs::openat(
+                    directory,
+                    std::ffi::OsStr::from_bytes(&candidate.source.leaf),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let mut pending = File::from(pending);
+                let identity = pending.metadata()?;
+                if !identity.is_file()
+                    || identity.uid() != 0
+                    || identity.nlink() != 1
+                    || identity.mode() & 0o777 != 0o600
+                    || identity.len() > 512 * 1024
                 {
                     return Err(CiError::Message(
-                        "native rename uses another held transaction directory".into(),
+                        "pending native transaction record custody differs".into(),
                     ));
                 }
+                let mut bytes = Vec::new();
+                (&mut pending)
+                    .take(512 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if !predicate(&bytes) {
+                    self.observations
+                        .reject("pending record content predicate refused");
+                    continue;
+                }
+                let exit = self.next_syscall()?;
+                if crate::linux_transaction_trace::successful_exit(&exit, rename.architecture)
+                    .map_err(CiError::Message)?
+                    != 0
+                {
+                    return Err(CiError::Message(
+                        "selected native rename did not succeed at its actual syscall exit".into(),
+                    ));
+                }
+                let published = rustix::fs::openat(
+                    directory,
+                    std::ffi::OsStr::from_bytes(&candidate.target.leaf),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let mut published = File::from(published);
+                let named = published.metadata()?;
+                let mut actual = Vec::new();
+                (&mut published)
+                    .take(512 * 1024 + 1)
+                    .read_to_end(&mut actual)?;
+                if (identity.dev(), identity.ino()) != (named.dev(), named.ino())
+                    || bytes != actual
+                    || named.nlink() != 1
+                    || named.uid() != 0
+                    || named.mode() & 0o777 != 0o600
+                {
+                    return Err(CiError::Message(
+                        "published native transaction differs from the exact pending inode/bytes"
+                            .into(),
+                    ));
+                }
+                let observation = serde_json::json!({"mechanism":"ptrace-native-rename-exit","pid":self.process.process_id,"birth":self.process.birth,"architecture":rename.architecture,"syscall":rename.number,"rename_flags":rename.flags,"source_bytes":source,"destination_bytes":target,"source_leaf":candidate.source.leaf,"destination_leaf":candidate.target.leaf,"directory_device":parent.dev(),"directory_inode":parent.ino(),"device":named.dev(),"inode":named.ino(),"record_bytes":actual,"return_value":0,"worker_stopped_before_userspace":true});
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                return Ok(observation);
             }
-            let pending = rustix::fs::openat(
-                directory,
-                Path::new(temporary).file_name().ok_or_else(|| {
-                    CiError::Message("native pending transaction leaf absent".into())
-                })?,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(std::io::Error::from)?;
-            let mut pending = File::from(pending);
-            let identity = pending.metadata()?;
-            if !identity.is_file()
-                || identity.uid() != 0
-                || identity.nlink() != 1
-                || identity.mode() & 0o777 != 0o600
-                || identity.len() > 512 * 1024
-            {
-                return Err(CiError::Message(
-                    "pending native transaction record custody differs".into(),
-                ));
-            }
-            let mut bytes = Vec::new();
-            (&mut pending)
-                .take(512 * 1024 + 1)
-                .read_to_end(&mut bytes)?;
-            if !predicate(&bytes) {
-                continue;
-            }
-            let exit = self.next_syscall()?;
-            if exit[0] != 2
-                || exit.len() < 33
-                || i64::from_ne_bytes(exit[24..32].try_into().expect("bounded syscall exit")) != 0
-                || exit[32] != 0
-            {
-                return Err(CiError::Message(
-                    "selected native rename did not succeed at its actual syscall exit".into(),
-                ));
-            }
-            let published = rustix::fs::openat(
-                directory,
-                Path::new(final_name).file_name().ok_or_else(|| {
-                    CiError::Message("native published transaction leaf absent".into())
-                })?,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(std::io::Error::from)?;
-            let mut published = File::from(published);
-            let named = published.metadata()?;
-            let mut actual = Vec::new();
-            (&mut published)
-                .take(512 * 1024 + 1)
-                .read_to_end(&mut actual)?;
-            if (identity.dev(), identity.ino()) != (named.dev(), named.ino())
-                || bytes != actual
-                || named.nlink() != 1
-                || named.uid() != 0
-                || named.mode() & 0o777 != 0o600
-            {
-                return Err(CiError::Message(
-                    "published native transaction differs from the exact pending inode/bytes"
-                        .into(),
-                ));
-            }
-            return Ok(
-                serde_json::json!({"mechanism":"ptrace-native-rename-exit","pid":self.process.process_id,"birth":self.process.birth,"architecture":architecture,"syscall":number,"source":temporary,"destination":final_name,"directory_device":parent.dev(),"directory_inode":parent.ino(),"device":named.dev(),"inode":named.ino(),"record_bytes":actual,"return_value":0,"worker_stopped_before_userspace":true}),
-            );
-        }
-        Err(CiError::Message(
-            "native transaction syscall inventory exceeds bound".into(),
-        ))
+        })();
+        observed.map_err(|error| self.trace_context(error))
     }
     pub fn detach(&mut self) -> Result<()> {
         if !self.attached {
