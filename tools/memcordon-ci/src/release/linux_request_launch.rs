@@ -462,6 +462,17 @@ impl RequestLaunch {
             .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
+    /// Share the same retained pidfd owner; never reacquire by numeric identity.
+    pub fn retained_frontend(
+        &mut self,
+        cutoff: Instant,
+    ) -> Result<std::sync::Arc<HeldLinuxProcess>> {
+        self.retain_frontend(cutoff)?;
+        Ok(std::sync::Arc::clone(
+            self.frontend.as_ref().expect("original frontend retained"),
+        ))
+    }
+
     pub fn retain_frontend(&mut self, cutoff: Instant) -> Result<&HeldLinuxProcess> {
         if self.frontend.is_none() {
             let remaining = cutoff

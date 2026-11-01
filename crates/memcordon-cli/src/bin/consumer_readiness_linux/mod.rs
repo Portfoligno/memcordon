@@ -5,6 +5,7 @@ mod binary_streams;
 mod images;
 mod isolation;
 mod path_alias;
+mod relay_streams;
 mod snapshot;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -444,8 +445,10 @@ pub fn run() -> Result<()> {
                     serde_json::json!({"bytes_per_stream":2097152}),
                 )?;
                 wait_release()?;
+                relay_streams::emit()?;
+            } else {
+                binary_streams::large(&mut io::stdout(), &mut io::stderr())?;
             }
-            binary_streams::large(&mut io::stdout(), &mut io::stderr())?;
             Ok(())
         }
         "authority-denial" => {

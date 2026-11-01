@@ -906,8 +906,7 @@ fn run_recipe_inner(
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                let frontend = HeldLinuxProcess::acquire(frontend_identity.0, frontend_identity.1)
-                    .map_err(CiError::Message)?;
+                let frontend = launch.retained_frontend(input.work_cutoff)?;
                 controller["relay_pressure"] = super::linux_current_relay::observe(
                     &frontend,
                     &held[4],
