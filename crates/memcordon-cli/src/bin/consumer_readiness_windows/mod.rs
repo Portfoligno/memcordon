@@ -26,6 +26,7 @@ mod own_thread_deadline_self_check;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
+mod winsock_startup;
 
 use descriptor::{Case, Descriptor};
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,7 @@ fn read_http_header(stream: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 fn tcp_peer(port: u16, challenge: &[u8], output_root: &std::path::Path) -> io::Result<()> {
+    let _winsock = native::winsock_startup()?;
     let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
     let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .map_err(|error| context("connect", error))?;
@@ -220,6 +222,7 @@ fn joint(
     churn: bool,
     control: Option<&mut controller_start_input::Session>,
 ) -> io::Result<()> {
+    let _winsock = native::winsock_startup()?;
     let listener =
         TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(native::tcp_bind_failure)?;
     let address = listener.local_addr()?;

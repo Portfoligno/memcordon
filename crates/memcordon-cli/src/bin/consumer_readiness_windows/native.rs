@@ -25,6 +25,40 @@ fn wide(value: &Path) -> Vec<u16> {
 
 /// Observe the catalog in the original failing child; never load or replace a provider.
 pub fn tcp_bind_failure(original: io::Error) -> io::Error {
+    tcp_failure("listener-bind", original)
+}
+
+pub fn winsock_startup() -> io::Result<super::winsock_startup::Startup<impl FnOnce()>> {
+    use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
+    // SAFETY: WSADATA is a native output structure valid with all scalar/pointer fields zeroed.
+    let mut data: WSADATA = unsafe { std::mem::zeroed() };
+    // SAFETY: initialized native output; this original process/token owns this call.
+    let returned = unsafe { WSAStartup(0x0202, &mut data) };
+    super::winsock_startup::acquire(returned, data.wVersion, || {
+        // SAFETY: this closure owns exactly one successful explicit startup reference.
+        unsafe {
+            WSACleanup();
+        }
+    })
+    .map_err(|error| tcp_failure("startup", error))
+}
+
+#[derive(Debug)]
+struct TcpFailure {
+    original: io::Error,
+    diagnostic: String,
+}
+impl std::fmt::Display for TcpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+impl std::error::Error for TcpFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
+}
+fn tcp_failure(stage: &str, original: io::Error) -> io::Error {
     use windows_sys::Win32::Networking::WinSock::{
         WSAPROTOCOL_INFOW, WSCEnumProtocols, WSCGetProviderPath,
     };
@@ -108,15 +142,19 @@ pub fn tcp_bind_failure(original: io::Error) -> io::Error {
             ));
         }
     }
+    let diagnostic = format!(
+        "native TCP {stage} failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-bytes={bytes}; matching-provider-count={matching_count}; providers-truncated={}; IPv4-TCP-provider-observations={observations:?}",
+        original.raw_os_error(),
+        std::env::var_os("SystemRoot").is_some(),
+        std::env::var_os("windir").is_some(),
+        matching_count > 8,
+    );
     io::Error::new(
         original.kind(),
-        format!(
-            "native TCP listener bind failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-bytes={bytes}; matching-provider-count={matching_count}; providers-truncated={}; IPv4-TCP-provider-observations={observations:?}",
-            original.raw_os_error(),
-            std::env::var_os("SystemRoot").is_some(),
-            std::env::var_os("windir").is_some(),
-            matching_count > 8,
-        ),
+        TcpFailure {
+            original,
+            diagnostic,
+        },
     )
 }
 

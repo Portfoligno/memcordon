@@ -18,6 +18,7 @@ pub mod linux_source_substitution;
 pub mod linux_transaction_trace;
 pub mod snapshot_copy_contract;
 
+pub mod windows_listener_wait;
 pub mod windows_original_gate_failure;
 pub mod windows_status_streams;
 

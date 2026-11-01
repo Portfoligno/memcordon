@@ -4431,31 +4431,58 @@ pub(crate) mod native {
                 if owns_tcp {
                     let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                     let port = loop {
-                        let published = super::live_events(
-                            &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
-                        )
-                        .map_err(io::Error::other)?;
-                        if let Some(listener) = published
-                            .iter()
-                            .find(|event| event.stage == "tcp-listener-owned")
-                        {
-                            if listener.pid != root_pid || listener.value.len() != 2 {
-                                return Err(io::Error::other(
-                                    "native listener observation differs from held root",
-                                ));
-                            }
-                            break u16::from_le_bytes(
-                                listener
-                                    .value
-                                    .as_slice()
-                                    .try_into()
-                                    .expect("checked port length"),
-                            );
-                        }
-                        if Instant::now() >= deadline {
-                            return Err(io::Error::other(
-                                "native listener publication deadline expired",
-                            ));
+                        use crate::windows_listener_wait::{Identity, Owner, Publication};
+                        let port = crate::windows_listener_wait::poll(
+                            Identity {
+                                pid: root_identity.pid,
+                                birth: root_identity.birth,
+                            },
+                            deadline,
+                            Instant::now,
+                            || {
+                                let held = held_family
+                                    .lock()
+                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                if held.len() != 1 {
+                                    return Err(io::Error::other(
+                                        "original listener root ownership differs",
+                                    ));
+                                }
+                                let root = &held[0];
+                                Ok(Owner {
+                                    identity: Identity {
+                                        pid: root.identity.pid,
+                                        birth: root.identity.birth,
+                                    },
+                                    exit_status: root.native_exit_status()?,
+                                })
+                            },
+                            || {
+                                let bytes =
+                                    read(&transcript, 16 * 1024 * 1024).map_err(
+                                        |error| match error {
+                                            CiError::Io(error) => error,
+                                            error => io::Error::other(error),
+                                        },
+                                    );
+                                let Some(bytes) =
+                                    crate::windows_listener_wait::transcript_bytes(bytes)?
+                                else {
+                                    return Ok(None);
+                                };
+                                let events =
+                                    super::live_events(&bytes).map_err(io::Error::other)?;
+                                Ok(events
+                                    .into_iter()
+                                    .find(|event| event.stage == "tcp-listener-owned")
+                                    .map(|event| Publication {
+                                        pid: event.pid,
+                                        value: event.value,
+                                    }))
+                            },
+                        )?;
+                        if let Some(port) = port {
+                            break port;
                         }
                         std::thread::sleep(Duration::from_millis(10));
                     };
