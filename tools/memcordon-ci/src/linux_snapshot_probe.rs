@@ -131,10 +131,10 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     if request.operation.starts_with("hold-") {
         let mut gate = [0u8; 2];
         reader.read_exact(&mut gate)?;
-        if gate != *b"W\n" {
-            return Err(CiError::Message(
-                "snapshot retained alias mutation gate differs".into(),
-            ));
+        if !crate::snapshot_copy_contract::mutation_gate(gate, false)? {
+            let receipt = serde_json::json!({"format":"memcordon.current-snapshot-probe-receipt","revision":1,"request":request,"uid":uid,"gid":gid,"pid":pid,"birth":birth,"opened":opened,"changed":null,"named":null,"restored":null,"aborted":true,"mutation_performed":false});
+            drop(file);
+            return publish_receipt(output, &receipt);
         }
     }
     if request.operation.ends_with("replace") || request.operation == "hold-substitute" {
@@ -213,14 +213,11 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     emit(
         &serde_json::json!({"format":"memcordon.current-snapshot-probe-event","revision":1,"phase":"changed","uid":uid,"gid":gid,"pid":pid,"birth":birth,"file":changed,"named":named}),
     )?;
+    let mut aborted = false;
     if request.operation.starts_with("hold-") {
         let mut gate = [0u8; 2];
         reader.read_exact(&mut gate)?;
-        if gate != *b"D\n" {
-            return Err(CiError::Message(
-                "snapshot retained alias retirement gate differs".into(),
-            ));
-        }
+        aborted = !crate::snapshot_copy_contract::mutation_gate(gate, true)?;
     }
     let restored = if request.operation == "hold-substitute" {
         let backup = request.backup.as_ref().expect("validated source backup");
@@ -250,7 +247,12 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     } else {
         None
     };
-    let receipt = serde_json::json!({"format":"memcordon.current-snapshot-probe-receipt","revision":1,"request":request,"uid":uid,"gid":gid,"pid":pid,"birth":birth,"opened":opened,"changed":changed,"named":named,"restored":restored});
+    let receipt = serde_json::json!({"format":"memcordon.current-snapshot-probe-receipt","revision":1,"request":request,"uid":uid,"gid":gid,"pid":pid,"birth":birth,"opened":opened,"changed":changed,"named":named,"restored":restored,"aborted":aborted,"mutation_performed":true});
+    drop(file);
+    publish_receipt(output, &receipt)
+}
+
+fn publish_receipt(output: &Path, receipt: &serde_json::Value) -> Result<()> {
     let mut target = OpenOptions::new()
         .write(true)
         .create_new(true)

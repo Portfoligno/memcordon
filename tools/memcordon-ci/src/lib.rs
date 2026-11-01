@@ -11,6 +11,7 @@ pub mod linux_relay_sample;
 pub mod linux_result_publication;
 pub mod linux_snapshot_rejection;
 pub mod linux_source_substitution;
+pub mod snapshot_copy_contract;
 
 pub mod windows_original_gate_failure;
 pub mod windows_status_streams;

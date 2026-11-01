@@ -406,6 +406,9 @@ pub struct NativeTraceStop {
     stopped: bool,
 }
 impl NativeTraceStop {
+    pub fn original_exited(&self) -> Result<bool> {
+        self.process.exited().map_err(CiError::Message)
+    }
     pub fn attach(
         process: crate::linux_consumer_readiness::HeldLinuxProcess,
         permission: &mut PermissionStop,
@@ -564,7 +567,7 @@ impl NativeTraceStop {
         &mut self,
         source: &File,
         minimum: u64,
-        ready: impl Fn() -> bool,
+        ready: impl Fn() -> Result<bool>,
     ) -> Result<serde_json::Value> {
         use std::os::unix::fs::MetadataExt;
         let original = source.metadata()?;
@@ -625,7 +628,7 @@ impl NativeTraceStop {
                 .trim()
                 .parse::<u64>()
                 .map_err(|error| CiError::Message(error.to_string()))?;
-            if position > minimum && position < original.len() && ready() {
+            if position > minimum && position < original.len() && ready()? {
                 return Ok(
                     serde_json::json!({"format":"memcordon.current-source-read-stop","revision":1,"process":{"pid":self.process.process_id,"birth":self.process.birth},"source":{"device":original.dev(),"inode":original.ino(),"uid":original.uid(),"length":original.len()},"descriptor":descriptor,"syscall":number,"architecture":architecture,"read_bytes":count,"position":position,"fdinfo":fdinfo,"stopped_after_native_read":true}),
                 );
@@ -937,7 +940,7 @@ struct NamespaceRoot {
     directory: Option<File>,
 }
 
-fn namespace_identity(file: &File) -> Result<(u64, u64, u32, u32)> {
+pub(super) fn namespace_identity(file: &File) -> Result<(u64, u64, u32, u32)> {
     let metadata = file.metadata()?;
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Err(CiError::Message(
@@ -968,7 +971,7 @@ fn namespace_open(parent: &File, name: &std::ffi::OsStr) -> Result<Option<File>>
     }
 }
 
-fn namespace_parent(path: &Path) -> Result<File> {
+pub(super) fn namespace_parent(path: &Path) -> Result<File> {
     if !path.is_absolute() {
         return Err(CiError::Message(
             "native namespace path must be absolute".into(),

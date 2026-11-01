@@ -298,29 +298,47 @@ impl ProbeRun {
             .ok_or_else(|| CiError::Message("source probe already joined".into()))?
             .join()
             .map_err(|_| CiError::Message("source probe supervisor panicked".into()))??;
-        initialization?;
-        let process = self
-            .process
-            .as_ref()
-            .ok_or_else(|| CiError::Message("original source probe query holder absent".into()))?;
-        if !process.exited().map_err(CiError::Message)? {
-            return Err(CiError::Message(
-                "original source probe child not retired".into(),
-            ));
-        }
-        use std::os::unix::process::ExitStatusExt;
-        let wait = json!({"pid":process.process_id,"birth":process.birth,"held_before_input":true,"retired":true,"raw_wait_status":observed.status.into_raw()});
+        let status = crate::command::require_successful_output(
+            "actual ordinary caller snapshot file effect",
+            &observed,
+        );
+        let retirement = (|| -> Result<Value> {
+            let process = self.process.as_ref().ok_or_else(|| {
+                CiError::Message("original source probe query holder absent".into())
+            })?;
+            if !process.exited().map_err(CiError::Message)? {
+                return Err(CiError::Message(
+                    "original source probe child not retired".into(),
+                ));
+            }
+            use std::os::unix::process::ExitStatusExt;
+            let wait = json!({"pid":process.process_id,"birth":process.birth,"held_before_input":true,"retired":true,"raw_wait_status":observed.status.into_raw()});
+            Ok(wait)
+        })();
+        let (wait, retirement) = match retirement {
+            Ok(wait) => (Some(wait), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        crate::linux_relay_sample::combine(
+            crate::linux_relay_sample::combine(status, initialization),
+            retirement,
+        )?;
+        let wait = wait.expect("validated original helper retirement");
         let result = BTreeMap::from([
             ("probe-input.json".into(), self.request.clone()),
             ("probe-stdout.bin".into(), observed.stdout.clone()),
             ("probe-stderr.bin".into(), observed.stderr.clone()),
             ("probe-wait.json".into(), serde_json::to_vec(&wait)?),
-            ("probe-receipt.json".into(), std::fs::read(&self.receipt)?),
+            (
+                "probe-receipt.json".into(),
+                std::fs::read(&self.receipt).map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "successful original source probe receipt read path={}",
+                        self.receipt.display()
+                    ))
+                })?,
+            ),
         ]);
-        crate::command::require_successful_output(
-            "actual ordinary caller snapshot file effect",
-            &observed,
-        )?;
         Ok(result)
     }
 }
@@ -867,6 +885,13 @@ fn run_corruptions(
             replacement: None,
             backup: None,
         };
+        let publication = if scenario == "source-mutation-during-copy" {
+            Some(super::linux_journal_publication::JournalPublication::new(
+                work,
+            )?)
+        } else {
+            None
+        };
         let mut actor = ProbeRun::start(caller, probe, &source, &request, work)?;
         actor.phase("opened")?;
         let gate = if scenario == "source-mutation-during-copy" {
@@ -891,6 +916,8 @@ fn run_corruptions(
         let mut actor = Some(actor);
         let (copy_tx, copy_rx) = mpsc::sync_channel(1);
         let copy_observer: Option<crate::command::AfterReleaseObserver> = if let Some(gate) = gate {
+            let publication =
+                publication.expect("copy watch admitted before source actor/frontend launch");
             let bundle = bundle.try_clone()?;
             let directory = directory.clone();
             let original_actor = actor.take().expect("retained original source actor");
@@ -903,14 +930,20 @@ fn run_corruptions(
                     &directory,
                     work,
                     cleanup,
+                    publication,
                 );
-                let failure = result.as_ref().err().map(ToString::to_string);
-                copy_tx
-                    .send(result.map_err(|error| error.to_string()))
-                    .map_err(|_| CiError::Message("original copy observer receiver lost".into()))?;
-                match failure {
-                    Some(error) => Err(CiError::Message(error)),
-                    None => Ok(()),
+                match result {
+                    Ok(value) => copy_tx.send(Ok(value)).map_err(|_| {
+                        CiError::Message("original copy observer receiver lost".into())
+                    }),
+                    Err(primary) => {
+                        let delivered = copy_tx.send(Err(())).map_err(|_| {
+                            CiError::Message(
+                                "original copy observer failure marker receiver lost".into(),
+                            )
+                        });
+                        crate::linux_relay_sample::combine(Err(primary), delivered)
+                    }
                 }
             }))
         } else {
@@ -976,7 +1009,7 @@ fn run_corruptions(
                 copy_rx
                     .recv_timeout(cleanup.saturating_duration_since(Instant::now()))
                     .map_err(|error| CiError::Message(error.to_string()))?
-                    .map_err(CiError::Message)?
+                    .map_err(|()|CiError::Message("original copy observer failed; typed primary retained by original capture owner".into()))?
             };
             let prepared = observation.join(format!(
                 "{}.prepared.json",
@@ -1069,7 +1102,12 @@ fn run_corruptions(
                     && let Some(actor) = actor.as_mut()
                     && actor.worker.is_some()
                 {
-                    let _ = actor.send(b"D\n");
+                    if let Err(error) = actor.send(b"A\n") {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "corrupt snapshot source abort after unwind: {error}"
+                        );
+                    }
                     match actor.finish(cleanup) {
                         Ok(_) => source_settled = true,
                         Err(error) => {
@@ -1106,7 +1144,12 @@ fn run_corruptions(
                 && let Some(actor) = actor.as_mut()
                 && actor.worker.is_some()
             {
-                let _ = actor.send(b"D\n");
+                if let Err(error) = actor.send(b"A\n") {
+                    failure = CiError::LaneFailures {
+                        primary: Box::new(failure),
+                        secondary: Box::new(error.context("caller source phase-aware abort")),
+                    };
+                }
                 match actor.finish(cleanup) {
                     Ok(_) => source_settled = true,
                     Err(error) => {
@@ -1145,38 +1188,80 @@ fn copy_boundary(
     directory: &Path,
     work: Instant,
     cleanup: Instant,
+    publication: super::linux_journal_publication::JournalPublication,
 ) -> Result<(Value, BTreeMap<String, Vec<u8>>)> {
+    let mut trace = None;
     let execution = (|| -> Result<Value> {
         let birth =
-            crate::linux_consumer_readiness::process_birth(child.id()).map_err(CiError::Message)?;
+            crate::linux_consumer_readiness::process_birth(child.id()).map_err(|error| {
+                CiError::Message(error).context("copy original Child native birth observation")
+            })?;
         let frontend =
-            crate::linux_consumer_readiness::HeldLinuxProcess::acquire(child.id(), birth)
-                .map_err(CiError::Message)?;
-        let mut permission = gate.wait_for(&frontend)?;
+            crate::linux_consumer_readiness::HeldLinuxProcess::acquire(child.id(), birth).map_err(
+                |error| {
+                    CiError::Message(error).context("copy original Child query holder acquisition")
+                },
+            )?;
+        let mut permission = gate
+            .wait_for(&frontend)
+            .map_err(|error| error.context("copy original source permission event"))?;
         if permission.process_id != child.id() {
             return Err(CiError::Message(
                 "copy permission event differs from original Child".into(),
             ));
         }
-        let mut trace = super::linux_current_phase_gate::NativeTraceStop::attach(
-            frontend,
-            &mut permission,
-            work,
-        )?;
+        trace = Some(
+            super::linux_current_phase_gate::NativeTraceStop::attach(
+                frontend,
+                &mut permission,
+                work,
+            )
+            .map_err(|error| error.context("copy original frontend trace attach"))?,
+        );
+        let trace = trace.as_mut().expect("retained original trace");
         let locator_path = directory.join("workload-observation.json");
-        let read = trace.after_source_read(&bundle, 65536, || locator_path.is_file())?;
+        let read = trace
+            .after_source_read(&bundle, 65536, || {
+                locator_path.try_exists().map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "copy assigned locator presence path={}",
+                        locator_path.display()
+                    ))
+                })
+            })
+            .map_err(|error| error.context("copy original source native read/fdinfo boundary"))?;
+        let source = bundle
+            .metadata()
+            .map_err(|error| CiError::from(error).context("copy held source metadata"))?;
+        let request: ProbeInput = serde_json::from_slice(&actor.request)?;
+        if (source.dev(), source.ino()) != (request.device, request.inode) {
+            return Err(CiError::Message(
+                "copy mutation actor does not hold original source identity".into(),
+            ));
+        }
+        crate::snapshot_copy_contract::mutation_extent(
+            read["position"]
+                .as_u64()
+                .ok_or_else(|| CiError::Message("copy original read cursor absent".into()))?,
+            request.offset,
+            request.bytes.len() as u64,
+            source.len(),
+        )?;
         let association: memcordon_core::workload_request::WorkloadAttemptAssociationV1 =
-            serde_json::from_slice(&std::fs::read(&locator_path)?)?;
+            serde_json::from_slice(&std::fs::read(&locator_path).map_err(|error| {
+                CiError::from(error).context(format!(
+                    "copy assigned locator read path={}",
+                    locator_path.display()
+                ))
+            })?)
+            .map_err(|error| CiError::from(error).context("copy assigned locator parse"))?;
         association
             .validate()
             .map_err(|error| CiError::Message(error.to_string()))?;
-        let journal_path = Path::new("/var/lib/memcordon/workload-attempts")
-            .join(hex::encode(association.attempt));
-        let journal = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(journal_path)?;
-        let metadata = journal.metadata()?;
+        let journal=publication.wait_open(&hex::encode(association.attempt),trace).map_err(|error|error.context("copy exact protected journal publication while original frontend remains stopped"))?;
+        let metadata = journal
+            .metadata()
+            .map_err(|error| CiError::from(error).context("copy protected journal metadata"))?;
         if metadata.uid() != 0
             || !metadata.is_file()
             || metadata.nlink() != 1
@@ -1188,35 +1273,64 @@ fn copy_boundary(
             ));
         }
         let mut raw = Vec::new();
-        (&journal).take(512 * 1024 + 1).read_to_end(&mut raw)?;
+        (&journal)
+            .take(512 * 1024 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|error| CiError::from(error).context("copy protected journal bounded read"))?;
+        if raw.len() > 512 * 1024 {
+            return Err(CiError::Message(
+                "copy protected journal exceeded read bound".into(),
+            ));
+        }
         memcordon_core::canonical_json::reject_duplicate_json_keys(&raw)
             .map_err(CiError::Message)?;
-        let record: Value = serde_json::from_slice(&raw)?;
+        let record: Value = serde_json::from_slice(&raw)
+            .map_err(|error| CiError::from(error).context("copy protected journal parse"))?;
+        publication.revalidate()?;
         if record["association"] != serde_json::to_value(&association)?
-            || !record["native"].is_null()
+            || !record.get("native").is_some_and(Value::is_null)
+            || record["release"] != "not-released"
+            || !record.get("outcome").is_some_and(Value::is_null)
+            || !record.get("terminal").is_some_and(Value::is_null)
         {
             return Err(CiError::Message(
                 "source mutation did not hold original pre-execution intake".into(),
             ));
         }
-        actor.send(b"W\n")?;
-        let changed = actor.phase("changed")?;
+        actor
+            .send(b"W\n")
+            .map_err(|error| error.context("copy source actor mutation send"))?;
+        let changed = actor
+            .phase("changed")
+            .map_err(|error| error.context("copy original source actor changed observation"))?;
         let phase = json!({"format":"memcordon.current-snapshot-copy-boundary","revision":1,"permission":permission.observation(),"read":read,"journal":record,"journal_custody":{"uid":metadata.uid(),"mode":metadata.mode(),"device":metadata.dev(),"inode":metadata.ino(),"links":metadata.nlink()},"changed":changed,"original_child_wait_not_started":true});
-        trace.detach()?;
         Ok(phase)
     })();
+    let detached = trace.as_mut().map_or(Ok(()), |trace| {
+        trace
+            .detach()
+            .map_err(|error| error.context("copy original trace explicit detach/continuation"))
+    });
     drop(gate);
-    let release = actor.send(b"D\n");
+    let release = actor
+        .send(if execution.is_ok() { b"D\n" } else { b"A\n" })
+        .map_err(|error| error.context("copy original actor phase-aware release/abort"));
     let settled = actor.finish(cleanup);
-    match execution {
-        Ok(phase) => {
-            release?;
-            Ok((phase, settled?))
+    let cleanup = crate::linux_relay_sample::combine(detached, release);
+    match (execution, settled) {
+        (Ok(phase), Ok(helper)) => {
+            cleanup?;
+            Ok((phase, helper))
         }
-        Err(primary) => Err(CiError::Message(format!(
-            "{primary}; source mutation helper release: {release:?}; settlement: {:?}",
-            settled.as_ref().err()
-        ))),
+        (Ok(_), Err(error)) => {
+            crate::linux_relay_sample::combine(Err(error), cleanup)?;
+            unreachable!()
+        }
+        (Err(primary), settled) => {
+            let secondary = crate::linux_relay_sample::combine(cleanup, settled.map(|_| ()));
+            crate::linux_relay_sample::combine(Err(primary), secondary)?;
+            unreachable!()
+        }
     }
 }
 
@@ -1270,7 +1384,8 @@ fn assert_helper_change(
         .ok_or_else(|| CiError::Message("actual source mutation response absent".into()))?;
     memcordon_core::canonical_json::reject_duplicate_json_keys(bytes).map_err(CiError::Message)?;
     let effect: Value = serde_json::from_slice(bytes)?;
-    if effect["opened"]["sha256"] != super::artifacts::checksum(before)
+    if effect["aborted"] == true
+        || effect["opened"]["sha256"] != super::artifacts::checksum(before)
         || effect["changed"]["sha256"] != super::artifacts::checksum(after)
         || effect["opened"]["device"] != effect["changed"]["device"]
         || effect["opened"]["inode"] != effect["changed"]["inode"]

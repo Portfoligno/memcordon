@@ -24,6 +24,8 @@ pub mod linux_current_provider_state;
 pub mod linux_current_relay;
 #[cfg(target_os = "linux")]
 pub mod linux_installed_tests;
+#[cfg(target_os = "linux")]
+pub mod linux_journal_publication;
 pub mod linux_recovery_owners;
 #[cfg(unix)]
 pub mod linux_request_fixture;
