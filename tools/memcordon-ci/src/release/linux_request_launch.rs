@@ -372,7 +372,10 @@ impl RequestLaunch {
                     Some(supplied) => command.output_quiet_with_creation_and_io_descriptor(
                         extra.as_ref(),
                         observe,
-                        move |_, stdin, _| {
+                        move |_, stdin, snapshot| {
+                            snapshot_sender.send(snapshot).map_err(|_| {
+                                std::io::Error::other("original fixture snapshot controller lost")
+                            })?;
                             let size = supplied.metadata()?.len();
                             if size > 65536 {
                                 return Err(std::io::Error::other(
