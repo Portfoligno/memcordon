@@ -97,7 +97,9 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
     original_call_trace["detours_revision"] = "9764cebcb1a75940e68fa83d6730ffaf0f669401".into();
     original_call_trace["ntdll_version_hash"] =
         "not-collected; already-loaded system module".into();
-    original_call_trace["thread_policy"] = "installation requires two snapshots containing only the current thread; additional threads make setup unavailable".into();
+    original_call_trace["thread_policy"] = "original-owner normal IAT data slots are atomically published without suspending peers or rewriting executable instructions; only the original caller TLS records".into();
+    original_call_trace["detours_use"] =
+        "bounded normal import enumeration only; no inline transaction or trampoline".into();
     let original_call_trace =
         super::gate_call_trace_record::bounded_diagnostic(original_call_trace);
     let mut observation = Observation {

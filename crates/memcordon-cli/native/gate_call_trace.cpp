@@ -1,8 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
-#include <processsnapshot.h>
 #include <intrin.h>
+#include <atomic>
 #include "detours.h"
 #include "gate_call_trace.h"
 
@@ -10,12 +10,13 @@ static_assert(sizeof(void*) == 8 && sizeof(WCHAR) == 2 && sizeof(NTSTATUS) == 4,
 static_assert(sizeof(OBJECT_ATTRIBUTES) == 48 && offsetof(OBJECT_ATTRIBUTES, ObjectName) == 16, "object attributes ABI");
 static_assert(sizeof(UNICODE_STRING) == 16 && offsetof(UNICODE_STRING, Buffer) == 8, "unicode string ABI");
 using Open = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static Open directory_open = nullptr, event_open = nullptr;
+static std::atomic<Open> directory_open{nullptr}, event_open{nullptr};
+static_assert(std::atomic<Open>::is_always_lock_free, "native original publication must be lock-free");
+static const auto original_win32 = &OpenEventW;
 static volatile LONG installation = 0;
 static uint32_t installation_stage = 0, installation_error = 0;
-static uint32_t installation_threads = 0;
 static uint32_t installation_reason = 0, installation_current_thread = 0;
-static SnapshotSummary installation_first = {}, installation_second = {};
+static IatRecord installation_iat = {};
 struct Collector { TracePacket* packet; DWORD thread; };
 // POD static TLS is initialized before user code, never lazily in a hook.
 static __declspec(thread) Collector collector = {nullptr, 0};
@@ -89,13 +90,13 @@ static TraceEntry* enter(uint32_t operation, ACCESS_MASK access) {
 }
 static NTSTATUS NTAPI directory_hook(PHANDLE output, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes) {
     TraceEntry* entry = enter(1, access);
-    const NTSTATUS status = forward(directory_open, output, access, attributes, entry);
+    const NTSTATUS status = forward(directory_open.load(std::memory_order_acquire), output, access, attributes, entry);
     if (entry && (!entry->arguments_readable || !entry->name_readable || entry->name_malformed || entry->name_truncated)) collector.packet->incomplete = 1;
     return status;
 }
 static NTSTATUS NTAPI event_hook(PHANDLE output, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes) {
     TraceEntry* entry = enter(2, access);
-    const NTSTATUS status = forward(event_open, output, access, attributes, entry);
+    const NTSTATUS status = forward(event_open.load(std::memory_order_acquire), output, access, attributes, entry);
     if (entry && (!entry->arguments_readable || !entry->name_readable || entry->name_malformed || entry->name_truncated)) collector.packet->incomplete = 1;
     return status;
 }
@@ -120,162 +121,340 @@ template<class T> static bool load_export(HMODULE module, const char* name, T* t
     *target = reinterpret_cast<T>(address);
     return true;
 }
-struct SnapshotApi {
-    decltype(&PssCaptureSnapshot) capture;
-    decltype(&PssFreeSnapshot) free_snapshot;
-    decltype(&PssWalkMarkerCreate) marker_create;
-    decltype(&PssWalkMarkerFree) marker_free;
-    decltype(&PssWalkSnapshot) walk;
-    bool load(DWORD* error) {
-        const HMODULE module = GetModuleHandleW(L"kernel32.dll");
-        if (!module) { *error = GetLastError(); return false; }
-        return load_export(module, "PssCaptureSnapshot", &capture, error) &&
-            load_export(module, "PssFreeSnapshot", &free_snapshot, error) &&
-            load_export(module, "PssWalkMarkerCreate", &marker_create, error) &&
-            load_export(module, "PssWalkMarkerFree", &marker_free, error) &&
-            load_export(module, "PssWalkSnapshot", &walk, error);
-    }
+struct Image {
+    uintptr_t base, end, imports, imports_end, iat, iat_end;
+    uint32_t size, timestamp;
 };
-struct ThreadIdentity { DWORD id; FILETIME birth; };
-static uint64_t ticks(FILETIME time) {
-    return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+static bool range(uintptr_t first, size_t bytes, uintptr_t begin, uintptr_t end) {
+    return first >= begin && first <= end && bytes <= end - first;
 }
-static DWORD threads(SnapshotApi& api, ThreadIdentity (&entries)[64], uint32_t* count, SnapshotSummary* summary) {
-    HPSS snapshot = nullptr;
-    summary->attempted = 1;
-    DWORD error = api.capture(GetCurrentProcess(), PSS_CAPTURE_THREADS, 0, &snapshot);
-    if (error != ERROR_SUCCESS) { summary->error = error; return error; }
-    summary->captured = 1;
-    HPSSWALK marker = nullptr;
-    error = api.marker_create(nullptr, &marker);
-    if (error == ERROR_SUCCESS) {
-        for (;;) {
-            PSS_THREAD_ENTRY entry = {};
-            error = api.walk(snapshot, PSS_WALK_THREADS, marker, &entry, sizeof(entry));
-            if (error == ERROR_NO_MORE_ITEMS) { summary->walk_completed = 1; error = ERROR_SUCCESS; break; }
-            if (error != ERROR_SUCCESS) break;
-            // Retain only fields already supplied by this same bounded walk.
-            // Raw start addresses are opaque diagnostics, never dereferenced.
-            if (summary->entry_count < 64) {
-                ++summary->entry_count;
-                const uint32_t flags = static_cast<uint32_t>(entry.Flags);
-                const uint32_t terminated = static_cast<uint32_t>(PSS_THREAD_FLAGS_TERMINATED);
-                if (flags & terminated) ++summary->terminated_count;
-                else ++summary->without_terminated_count;
-                if (flags & ~terminated) ++summary->unknown_flags_count;
-                if (summary->detail_count < 8) {
-                    summary->details[summary->detail_count++] = {
-                        ticks(entry.CreateTime), ticks(entry.ExitTime), ticks(entry.CaptureTime),
-                        reinterpret_cast<uintptr_t>(entry.Win32StartAddress),
-                        entry.ProcessId, entry.ThreadId, flags, entry.ExitStatus
-                    };
-                } else summary->detail_truncated = 1;
-            } else summary->detail_truncated = 1;
-            if (entry.ProcessId != GetCurrentProcessId()) { error = ERROR_INVALID_OWNER; break; }
-            if (*count >= 64) { error = ERROR_BUFFER_OVERFLOW; break; }
-            entries[(*count)++] = {entry.ThreadId, entry.CreateTime};
-        }
-        const DWORD freed = api.marker_free(marker);
-        if (error == ERROR_SUCCESS) error = freed;
+static bool readable(uintptr_t first, size_t bytes, const Image& image) {
+    if (!range(first, bytes, image.base, image.end)) return false;
+    MEMORY_BASIC_INFORMATION memory = {};
+    if (VirtualQuery(reinterpret_cast<void*>(first), &memory, sizeof(memory)) != sizeof(memory)) return false;
+    const DWORD protection = memory.Protect;
+    return memory.State == MEM_COMMIT && memory.Type == MEM_IMAGE &&
+        memory.AllocationBase == reinterpret_cast<void*>(image.base) &&
+        !(protection & (PAGE_GUARD | PAGE_NOACCESS)) &&
+        range(first, bytes, reinterpret_cast<uintptr_t>(memory.BaseAddress),
+              reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+}
+static bool same_name(const char* name, const char* expected, const Image& image, bool fold_case = false) {
+    for (size_t index = 0; index < 128; ++index) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(name) + index;
+        if (!readable(address, 1, image)) return false;
+        const auto fold = [](char value) { return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value; };
+        if ((fold_case ? fold(name[index]) : name[index]) != (fold_case ? fold(expected[index]) : expected[index])) return false;
+        if (!expected[index]) return true;
     }
-    const DWORD freed = api.free_snapshot(GetCurrentProcess(), snapshot);
-    const DWORD original_error = error == ERROR_SUCCESS ? freed : error;
-    summary->error = original_error;
-    return original_error;
+    return false;
 }
-static bool equal(FILETIME a, FILETIME b) { return a.dwLowDateTime == b.dwLowDateTime && a.dwHighDateTime == b.dwHighDateTime; }
-
+static bool bounded_name(uintptr_t name, const Image& image) {
+    for (size_t index = 0; index < 128; ++index) {
+        if (!readable(name + index, 1, image)) return false;
+        if (*reinterpret_cast<const char*>(name + index) == '\0') return true;
+    }
+    return false;
+}
+static bool image(HMODULE module, Image* result) {
+    __try {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+        MEMORY_BASIC_INFORMATION mapped = {};
+        if (VirtualQuery(module, &mapped, sizeof(mapped)) != sizeof(mapped) || mapped.State != MEM_COMMIT ||
+            mapped.Type != MEM_IMAGE || mapped.AllocationBase != module || (mapped.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+        const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 1024 * 1024) return false;
+        const auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+            nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+            nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT) return false;
+        const auto size = nt->OptionalHeader.SizeOfImage;
+        if (size == 0 || base > UINTPTR_MAX - size) return false;
+        Image value = {base, base + size, 0, 0, 0, 0, size, nt->FileHeader.TimeDateStamp};
+        if (!readable(reinterpret_cast<uintptr_t>(nt), sizeof(*nt), value)) return false;
+        const auto imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        const auto iat = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+        if (!imports.VirtualAddress || !iat.VirtualAddress || !imports.Size || !iat.Size ||
+            imports.VirtualAddress > size || imports.Size > size - imports.VirtualAddress ||
+            iat.VirtualAddress > size || iat.Size > size - iat.VirtualAddress) return false;
+        value.imports = base + imports.VirtualAddress; value.imports_end = value.imports + imports.Size;
+        value.iat = base + iat.VirtualAddress; value.iat_end = value.iat + iat.Size;
+        *result = value; return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+struct Discovery {
+    Image image;
+    TracePacket* packet;
+    uint64_t frequency;
+    HMODULE ntdll;
+    void* directory_original;
+    void* event_original;
+    void** directory_slot;
+    void** event_slot;
+    DWORD error;
+    bool native_descriptor;
+};
+static bool bounded_imports(Discovery* discovery) {
+    // Validate all normal import descriptors/thunks before the library walks
+    // them. Delay imports and instruction scanning are deliberately excluded.
+    __try {
+        const auto& image = discovery->image;
+        size_t functions = 0;
+        for (size_t descriptor = 0; descriptor < 256; ++descriptor) {
+            if (!clock_live(discovery->packet, discovery->frequency)) { discovery->error = discovery->packet->setup_error; return false; }
+            const uintptr_t address = image.imports + descriptor * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            if (!range(address, sizeof(IMAGE_IMPORT_DESCRIPTOR), image.imports, image.imports_end) || !readable(address, sizeof(IMAGE_IMPORT_DESCRIPTOR), image)) return false;
+            const auto entry = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(address);
+            if (!entry->OriginalFirstThunk) return entry->FirstThunk == 0 && entry->Name == 0 && entry->TimeDateStamp == 0 && entry->ForwarderChain == 0;
+            if (!entry->FirstThunk || !entry->Name || !bounded_name(image.base + entry->Name, image) ||
+                !range(image.base + entry->FirstThunk, sizeof(void*), image.iat, image.iat_end) ||
+                !readable(image.base + entry->FirstThunk, sizeof(void*), image)) return false;
+            for (size_t index = 0; index < 4096; ++index) {
+                if (++functions > 16384) { discovery->error = ERROR_BUFFER_OVERFLOW; discovery->packet->setup_reason = 6; return false; }
+                if (!clock_live(discovery->packet, discovery->frequency)) { discovery->error = discovery->packet->setup_error; return false; }
+                const uintptr_t thunk = image.base + entry->OriginalFirstThunk + index * sizeof(IMAGE_THUNK_DATA64);
+                if (!readable(thunk, sizeof(IMAGE_THUNK_DATA64), image)) return false;
+                const auto name = reinterpret_cast<IMAGE_THUNK_DATA64*>(thunk)->u1.Ordinal;
+                if (!name) break;
+                const uintptr_t slot = image.base + entry->FirstThunk + index * sizeof(void*);
+                if (!range(slot, sizeof(void*), image.iat, image.iat_end) || !readable(slot, sizeof(void*), image)) return false;
+                if (!IMAGE_SNAP_BY_ORDINAL64(name) && (name > UINT32_MAX ||
+                    !readable(image.base + static_cast<uint32_t>(name), sizeof(WORD) + 1, image) ||
+                    !bounded_name(image.base + static_cast<uint32_t>(name) + sizeof(WORD), image))) return false;
+                if (index == 4095) { discovery->error = ERROR_BUFFER_OVERFLOW; discovery->packet->setup_reason = 6; return false; }
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+    discovery->error = ERROR_BUFFER_OVERFLOW; discovery->packet->setup_reason = 6;
+    return false;
+}
+static BOOL CALLBACK import_file(void* context, HMODULE module, LPCSTR name) {
+    auto* state = static_cast<Discovery*>(context);
+    if (!name) { state->packet->iat.discovery_complete = state->error == ERROR_SUCCESS; return FALSE; }
+    if (state->error != ERROR_SUCCESS) return FALSE;
+    if (++state->packet->iat.descriptor_count > 256) { state->error = ERROR_BUFFER_OVERFLOW; state->packet->setup_reason = 6; return FALSE; }
+    if (!clock_live(state->packet, state->frequency)) { state->error = state->packet->setup_error; return FALSE; }
+    state->native_descriptor = same_name(name, "ntdll.dll", state->image, true);
+    if (state->native_descriptor && module != state->ntdll) { state->error = ERROR_INVALID_OWNER; return FALSE; }
+    return TRUE;
+}
+static BOOL CALLBACK import_function(void* context, DWORD, LPCSTR name, void** slot) {
+    auto* state = static_cast<Discovery*>(context);
+    if (!slot) return state->error == ERROR_SUCCESS;
+    if (state->error != ERROR_SUCCESS) return FALSE;
+    if (++state->packet->iat.function_count > 16384) { state->error = ERROR_BUFFER_OVERFLOW; state->packet->setup_reason = 6; return FALSE; }
+    if (!clock_live(state->packet, state->frequency)) { state->error = state->packet->setup_error; return FALSE; }
+    if (!state->native_descriptor || !name) return TRUE;
+    const bool directory = same_name(name, "NtOpenDirectoryObject", state->image);
+    const bool event = same_name(name, "NtOpenEvent", state->image);
+    if (!directory && !event) return TRUE;
+    if (!range(reinterpret_cast<uintptr_t>(slot), sizeof(void*), state->image.iat, state->image.iat_end) ||
+        reinterpret_cast<uintptr_t>(slot) % alignof(void*) != 0) { state->error = ERROR_INVALID_ADDRESS; state->packet->setup_reason = 5; return FALSE; }
+    uint32_t& matches = directory ? state->packet->iat.directory_matches : state->packet->iat.event_matches;
+    if (++matches != 1) { state->error = ERROR_DUP_NAME; state->packet->setup_reason = 3; return FALSE; }
+    const auto expected = directory ? state->directory_original : state->event_original;
+    if (*slot != expected) { state->error = ERROR_INVALID_DATA; state->packet->setup_reason = 4; return FALSE; }
+    if (directory) state->directory_slot = slot; else state->event_slot = slot;
+    return TRUE;
+}
+struct Page { void* base; SIZE_T size; DWORD original; bool writable; };
+static bool data_page(void** slot, const Image& image, Page* page) {
+    MEMORY_BASIC_INFORMATION memory = {};
+    const auto address = reinterpret_cast<uintptr_t>(slot);
+    if (address % alignof(void*) || !range(address, sizeof(void*), image.iat, image.iat_end) ||
+        VirtualQuery(slot, &memory, sizeof(memory)) != sizeof(memory)) return false;
+    SYSTEM_INFO system = {}; GetSystemInfo(&system);
+    const auto size = static_cast<uintptr_t>(system.dwPageSize);
+    if (!size || address / size != (address + sizeof(void*) - 1) / size || memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE ||
+        memory.AllocationBase != reinterpret_cast<void*>(image.base) ||
+        (memory.Protect != PAGE_READONLY && memory.Protect != PAGE_READWRITE && memory.Protect != PAGE_WRITECOPY)) return false;
+    const auto base = address - address % size;
+    if (!range(base, size, image.base, image.end)) return false;
+    *page = {reinterpret_cast<void*>(base), size, memory.Protect, false}; return true;
+}
+static void restore_pages(Page (&pages)[2], size_t count, TracePacket* packet) {
+    auto* record = &packet->iat;
+    for (size_t index = 0; index < count; ++index) {
+        if (!pages[index].writable) continue;
+        DWORD replaced = 0;
+        if (!VirtualProtect(pages[index].base, pages[index].size, pages[index].original, &replaced)) {
+            const DWORD error = GetLastError(); record->protection_error = error;
+            if (!packet->setup_error) packet->setup_error = error;
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        if (replaced != PAGE_READWRITE) {
+            record->protection_error = ERROR_RETRY;
+            if (!packet->setup_error) packet->setup_error = ERROR_RETRY;
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        pages[index].writable = false;
+    }
+    record->protections_restored = 1;
+}
+static DWORD publish(Discovery& state, Page (&pages)[2], size_t page_count) {
+    auto* record = &state.packet->iat;
+    for (size_t index = 0; index < page_count; ++index) {
+        DWORD original = 0;
+        if (!VirtualProtect(pages[index].base, pages[index].size, PAGE_READWRITE, &original)) {
+            const DWORD error = GetLastError(); record->protection_error = error;
+            state.packet->setup_error = error;
+            restore_pages(pages, page_count, state.packet); return error;
+        }
+        pages[index].writable = true;
+        if (original != pages[index].original) {
+            // Restore what VirtualProtect actually replaced, never a stale
+            // preflight value, then refuse the changed protection ownership.
+            pages[index].original = original;
+            record->protection_error = ERROR_RETRY;
+            state.packet->setup_error = ERROR_RETRY;
+            restore_pages(pages, page_count, state.packet); return ERROR_RETRY;
+        }
+    }
+    void* expected[2] = {state.directory_original, state.event_original};
+    void* hooks[2] = {reinterpret_cast<void*>(directory_hook), reinterpret_cast<void*>(event_hook)};
+    void** slots[2] = {state.directory_slot, state.event_slot};
+    DWORD error = ERROR_SUCCESS;
+    size_t installed = 0;
+    for (; installed < 2; ++installed) {
+        state.packet->setup_stage = installed == 0 ? 9 : 10;
+        if (InterlockedCompareExchangePointer(slots[installed], hooks[installed], expected[installed]) != expected[installed]) {
+            error = ERROR_RETRY; state.packet->setup_reason = 7; break;
+        }
+        if (installed == 0) record->published_directory = 1; else record->published_event = 1;
+    }
+    if (error != ERROR_SUCCESS) {
+        state.packet->setup_error = error;
+        while (installed > 0) {
+            --installed;
+            if (InterlockedCompareExchangePointer(slots[installed], expected[installed], hooks[installed]) != hooks[installed]) {
+                record->rollback_error = ERROR_RETRY; __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+            }
+            if (installed == 0) record->published_directory = 0; else record->published_event = 0;
+        }
+    }
+    restore_pages(pages, page_count, state.packet);
+    return error;
+}
+static bool publication_mock() {
+    // CI self-check only: exercise the actual publication/rollback body on
+    // private owned DATA slots. These sentinel values are never called.
+    SYSTEM_INFO system = {}; GetSystemInfo(&system);
+    void* allocation = VirtualAlloc(nullptr, system.dwPageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!allocation) return false;
+    auto slots = static_cast<void**>(allocation);
+    bool valid = true;
+    for (uint32_t test = 0; test < 3 && valid; ++test) {
+        DWORD replaced = 0;
+        if (!VirtualProtect(allocation, system.dwPageSize, PAGE_READWRITE, &replaced)) { valid = false; break; }
+        void* first = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1000));
+        void* second = reinterpret_cast<void*>(static_cast<uintptr_t>(0x2000));
+        void* foreign = reinterpret_cast<void*>(static_cast<uintptr_t>(0x3000));
+        slots[0] = test == 2 ? foreign : first;
+        slots[1] = test == 1 ? foreign : second;
+        if (!VirtualProtect(allocation, system.dwPageSize, PAGE_READONLY, &replaced)) { valid = false; break; }
+        TracePacket packet = {};
+        Discovery state = {}; state.packet = &packet;
+        state.directory_original = first; state.event_original = second;
+        state.directory_slot = &slots[0]; state.event_slot = &slots[1];
+        Page pages[2] = {{allocation, system.dwPageSize, PAGE_READONLY, false}, {}};
+        const DWORD error = publish(state, pages, 1);
+        MEMORY_BASIC_INFORMATION observed = {};
+        valid = VirtualQuery(allocation, &observed, sizeof(observed)) == sizeof(observed) &&
+            observed.Protect == PAGE_READONLY && packet.iat.protections_restored == 1 &&
+            packet.iat.rollback_error == 0 && packet.iat.protection_error == 0;
+        if (test == 0) valid = valid && error == ERROR_SUCCESS &&
+            slots[0] == reinterpret_cast<void*>(directory_hook) && slots[1] == reinterpret_cast<void*>(event_hook) &&
+            packet.iat.published_directory == 1 && packet.iat.published_event == 1;
+        else valid = valid && error == ERROR_RETRY && slots[0] == (test == 2 ? foreign : first) &&
+            slots[1] == (test == 1 ? foreign : second) &&
+            packet.iat.published_directory == 0 && packet.iat.published_event == 0;
+    }
+    return VirtualFree(allocation, 0, MEM_RELEASE) != FALSE && valid;
+}
+static DWORD install(TracePacket* packet, uint64_t frequency) {
+    packet->setup_stage = 3;
+    DWORD error = ERROR_PROC_NOT_FOUND;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return GetLastError();
+    Open directory = nullptr, event = nullptr;
+    if (!load_export(ntdll, "NtOpenDirectoryObject", &directory, &error) || !load_export(ntdll, "NtOpenEvent", &event, &error)) return error;
+    HMODULE pinned_ntdll = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(directory), &pinned_ntdll)) return GetLastError();
+    if (pinned_ntdll != ntdll) return ERROR_INVALID_OWNER;
+    packet->setup_stage = 4;
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (!kernel) return GetLastError();
+    const auto named = GetProcAddress(kernel, "OpenEventW");
+    if (!named) return GetLastError();
+    if (reinterpret_cast<void*>(named) != reinterpret_cast<void*>(original_win32)) { packet->setup_reason = 9; return ERROR_INVALID_ADDRESS; }
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(original_win32), &owner)) return GetLastError();
+    packet->iat.owner_pinned = 1; packet->iat.owner_base = reinterpret_cast<uintptr_t>(owner);
+    packet->iat.original_open_event = reinterpret_cast<uintptr_t>(original_win32);
+    packet->setup_stage = 5;
+    Image mapped = {};
+    if (!image(owner, &mapped)) { packet->setup_reason = 5; return ERROR_BAD_EXE_FORMAT; }
+    packet->iat.owner_size = mapped.size; packet->iat.owner_timestamp = mapped.timestamp;
+    packet->iat.normal_iat_start = mapped.iat; packet->iat.normal_iat_end = mapped.iat_end;
+    Discovery state = {mapped, packet, frequency, ntdll, reinterpret_cast<void*>(directory), reinterpret_cast<void*>(event), nullptr, nullptr, ERROR_SUCCESS, false};
+    packet->setup_stage = 6;
+    if (!bounded_imports(&state)) {
+        packet->iat.callback_error = state.error;
+        if (state.error != ERROR_SUCCESS) return state.error;
+        packet->setup_reason = 5; return ERROR_BAD_EXE_FORMAT;
+    }
+    const BOOL enumerated = DetourEnumerateImportsEx(owner, &state, import_file, import_function);
+    const DWORD enumeration_error = GetLastError();
+    packet->iat.callback_error = state.error;
+    if (!enumerated) return enumeration_error != ERROR_SUCCESS ? enumeration_error : ERROR_INVALID_DATA;
+    if (state.error != ERROR_SUCCESS) return state.error;
+    if (!packet->iat.discovery_complete) { packet->setup_reason = 10; return ERROR_INVALID_DATA; }
+    if (!state.directory_slot || !state.event_slot) { packet->setup_reason = 2; return ERROR_PROC_NOT_FOUND; }
+    if (state.directory_slot == state.event_slot) return ERROR_INVALID_ADDRESS;
+    packet->iat.directory_slot = reinterpret_cast<uintptr_t>(state.directory_slot); packet->iat.event_slot = reinterpret_cast<uintptr_t>(state.event_slot);
+    packet->iat.directory_original = reinterpret_cast<uintptr_t>(directory); packet->iat.event_original = reinterpret_cast<uintptr_t>(event);
+    packet->setup_stage = 7;
+    Page pages[2] = {};
+    if (!data_page(state.directory_slot, mapped, &pages[0]) || !data_page(state.event_slot, mapped, &pages[1])) { packet->setup_reason = 5; return ERROR_INVALID_ADDRESS; }
+    const size_t count = pages[0].base == pages[1].base ? 1 : 2;
+    if (count == 1 && pages[0].original != pages[1].original) return ERROR_RETRY;
+    if (!clock_live(packet, frequency)) return ERROR_TIMEOUT;
+    directory_open.store(directory, std::memory_order_release); event_open.store(event, std::memory_order_release);
+    packet->setup_stage = 8;
+    error = publish(state, pages, count);
+    if (error != ERROR_SUCCESS && packet->iat.protection_error && !packet->setup_reason) packet->setup_reason = 8;
+    if (error == ERROR_SUCCESS && !clock_live(packet, frequency)) return ERROR_TIMEOUT;
+    if (error == ERROR_SUCCESS) packet->setup_stage = 1;
+    return error;
+}
 extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutoff, uint64_t frequency) {
-    packet->version = 2; packet->original_cutoff_qpc = cutoff;
-    packet->thread_limit = 64; packet->lifetime_policy = 1;
+    packet->version = 3; packet->original_cutoff_qpc = cutoff; packet->lifetime_policy = 1;
+    packet->iat.strategy = 1;
     if (!clock_live(packet, frequency)) { packet->incomplete = 1; return; }
     packet->started_qpc = packet->finished_qpc;
     const LONG previous = InterlockedCompareExchange(&installation, 1, 0);
     if (previous != 0) {
         packet->setup_stage = previous == 2 ? 1 : previous == 3 ? installation_stage : 13;
-        packet->setup_error = previous == 2 ? 0 : installation_error;
+        packet->setup_error = previous == 2 ? 0 : previous == 3 ? installation_error : ERROR_BUSY;
         packet->attached_directory = packet->attached_event = previous == 2;
-        packet->thread_count = installation_threads;
         packet->incomplete = previous != 2;
         if (previous == 2 || previous == 3) {
-            packet->setup_reason = installation_reason;
-            packet->original_current_thread_id = installation_current_thread;
-            packet->snapshot_source = 2; // Frozen original installation evidence.
-            packet->first_snapshot = installation_first;
-            packet->second_snapshot = installation_second;
-        } else {
-            packet->setup_reason = 2; // Installation currently busy; evidence unavailable.
-        }
+            packet->setup_reason = installation_reason; packet->original_current_thread_id = installation_current_thread;
+            packet->iat = installation_iat;
+        } else packet->setup_reason = 1;
         return;
     }
-    uint32_t stage = 3;
-    DWORD error = ERROR_PROC_NOT_FOUND;
-    bool transaction = false;
-    SnapshotApi api = {};
-    ThreadIdentity first[64] = {}, second[64] = {};
-    uint32_t first_count = 0, second_count = 0;
-    const DWORD current = GetCurrentThreadId();
-    packet->original_current_thread_id = current;
-    packet->snapshot_source = 1;
-    const HMODULE module = GetModuleHandleW(L"ntdll.dll");
-    if (!module) { error = GetLastError(); goto done; }
-    if (!load_export(module, "NtOpenDirectoryObject", &directory_open, &error) ||
-        !load_export(module, "NtOpenEvent", &event_open, &error)) goto done;
-    stage = 4;
-    if (!api.load(&error)) goto done;
-    stage = 4; error = threads(api, first, &first_count, &packet->first_snapshot);
-    packet->thread_count = first_count;
-    if (error != ERROR_SUCCESS) { if (error == ERROR_BUFFER_OVERFLOW) stage = 5; goto done; }
-    {
-        bool current_seen = false;
-        for (uint32_t index = 0; index < first_count; ++index) {
-            current_seen = current_seen || first[index].id == current;
-            for (uint32_t previous = 0; previous < index; ++previous)
-                if (first[previous].id == first[index].id) { error = ERROR_INVALID_DATA; goto done; }
-        }
-        if (!current_seen) { error = ERROR_INVALID_DATA; goto done; }
-    }
-    // Detours allocates during its transaction. Suspending an arbitrary peer
-    // could strand the process heap lock, so this optional diagnostic refuses
-    // multi-threaded controls instead of guessing a safe suspension point.
-    if (first_count != 1) { packet->setup_reason = 1; stage = 13; error = ERROR_NOT_SUPPORTED; goto done; }
-    stage = 7; error = DetourTransactionBegin();
-    if (error != ERROR_SUCCESS) goto done;
-    transaction = true;
-    stage = 8; error = DetourUpdateThread(GetCurrentThread());
-    if (error != ERROR_SUCCESS) goto done;
-    stage = 9; error = DetourAttach(reinterpret_cast<PVOID*>(&directory_open), reinterpret_cast<PVOID>(directory_hook));
-    if (error != ERROR_SUCCESS) goto done;
-    stage = 10; error = DetourAttach(reinterpret_cast<PVOID*>(&event_open), reinterpret_cast<PVOID>(event_hook));
-    if (error != ERROR_SUCCESS) goto done;
-    stage = 11; error = threads(api, second, &second_count, &packet->second_snapshot);
-    if (error != ERROR_SUCCESS) goto done;
-    if (first_count != second_count) { error = ERROR_RETRY; goto done; }
-    for (uint32_t index = 0; index < second_count; ++index) {
-        bool found = false;
-        for (uint32_t original = 0; original < first_count; ++original)
-            if (first[original].id == second[index].id && equal(first[original].birth, second[index].birth)) found = true;
-        if (!found) { error = ERROR_RETRY; goto done; }
-    }
-    if (!clock_live(packet, frequency)) { stage = 2; error = ERROR_TIMEOUT; goto done; }
-    stage = 12; error = DetourTransactionCommit();
-    transaction = false; // Detours commits or aborts its own transaction.
-    if (error == ERROR_SUCCESS) stage = 1;
-done:
-    // Continuing after an unproved rollback could leave another original
-    // thread suspended or an indeterminate patch. Fail this owned control
-    // child closed; its existing parent remains the sole process wait owner.
-    if (transaction && DetourTransactionAbort() != ERROR_SUCCESS) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    installation_stage = stage; installation_error = error;
-    installation_threads = first_count;
-    installation_reason = packet->setup_reason;
-    installation_current_thread = packet->original_current_thread_id;
-    installation_first = packet->first_snapshot;
-    installation_second = packet->second_snapshot;
-    InterlockedExchange(&installation, stage == 1 ? 2 : 3);
-    packet->setup_stage = stage; packet->setup_error = error;
-    packet->attached_directory = packet->attached_event = stage == 1;
-    packet->incomplete = stage != 1;
+    packet->original_current_thread_id = GetCurrentThreadId();
+    const DWORD observed_error = install(packet, frequency);
+    const DWORD error = observed_error == ERROR_SUCCESS && packet->setup_stage != 1 ? ERROR_INVALID_DATA : observed_error;
+    packet->setup_error = error; packet->incomplete = error != ERROR_SUCCESS;
+    packet->attached_directory = packet->iat.published_directory; packet->attached_event = packet->iat.published_event;
+    installation_stage = packet->setup_stage; installation_error = error;
+    installation_reason = packet->setup_reason; installation_current_thread = packet->original_current_thread_id;
+    installation_iat = packet->iat;
+    InterlockedExchange(&installation, error == ERROR_SUCCESS ? 2 : 3);
 }
 
 extern "C" void* memcordon_gate_trace_call(TracePacket* packet, const uint16_t* name, uint32_t* native_error, uint32_t* called) {
@@ -293,7 +472,7 @@ extern "C" void* memcordon_gate_trace_call(TracePacket* packet, const uint16_t* 
     collector.packet = packet->setup_stage == 1 ? packet : nullptr;
     packet->armed_call_count = collector.packet ? 1 : 0;
     SetLastError(incoming);
-    HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, reinterpret_cast<LPCWSTR>(name));
+    HANDLE event = original_win32(SYNCHRONIZE, FALSE, reinterpret_cast<LPCWSTR>(name));
     const DWORD error = GetLastError(); // Before disarming, clocks, or cleanup.
     collector.packet = nullptr;
     *called = packet->called = 1;
@@ -330,5 +509,5 @@ extern "C" uint32_t memcordon_gate_trace_mock() {
         mock = nullptr;
         if (observed != status || error != 123 || observation.calls != 1 || !observation.same || entry.native_status != status || !entry.returned) return 0;
     }
-    return 1;
+    return publication_mock() ? 1 : 0;
 }

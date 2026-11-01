@@ -90,6 +90,35 @@ impl Default for NativeEntry {
 
 #[repr(C)]
 #[derive(Clone, Debug, Default)]
+pub struct IatRecord {
+    pub owner_base: u64,
+    pub original_open_event: u64,
+    pub normal_iat_start: u64,
+    pub normal_iat_end: u64,
+    pub directory_slot: u64,
+    pub event_slot: u64,
+    pub directory_original: u64,
+    pub event_original: u64,
+    pub strategy: u32,
+    pub owner_pinned: u32,
+    pub owner_size: u32,
+    pub owner_timestamp: u32,
+    pub discovery_complete: u32,
+    pub descriptor_count: u32,
+    pub function_count: u32,
+    pub directory_matches: u32,
+    pub event_matches: u32,
+    pub published_directory: u32,
+    pub published_event: u32,
+    pub protections_restored: u32,
+    pub rollback_error: u32,
+    pub protection_error: u32,
+    pub callback_error: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
 pub struct NativeTrace {
     pub version: u32,
     pub setup_stage: u32,
@@ -116,6 +145,7 @@ pub struct NativeTrace {
     pub original_cutoff_qpc: u64,
     pub first_snapshot: SnapshotSummary,
     pub second_snapshot: SnapshotSummary,
+    pub iat: IatRecord,
     pub entries: [NativeEntry; ENTRY_LIMIT],
 }
 
@@ -126,9 +156,11 @@ const _: () = {
     assert!(std::mem::offset_of!(SnapshotEntry, process_id) == 32);
     assert!(std::mem::size_of::<SnapshotSummary>() == 424);
     assert!(std::mem::offset_of!(SnapshotSummary, details) == 40);
-    assert!(std::mem::size_of::<NativeTrace>() == 5752);
+    assert!(std::mem::size_of::<IatRecord>() == 128);
+    assert!(std::mem::size_of::<NativeTrace>() == 5880);
     assert!(std::mem::offset_of!(NativeTrace, first_snapshot) == 104);
-    assert!(std::mem::offset_of!(NativeTrace, entries) == 952);
+    assert!(std::mem::offset_of!(NativeTrace, iat) == 952);
+    assert!(std::mem::offset_of!(NativeTrace, entries) == 1080);
 };
 
 fn snapshot(summary: &SnapshotSummary) -> (serde_json::Value, bool, bool) {
@@ -185,43 +217,101 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         1 => "ready",
         2 => "original-clock-refused",
         3 => "ntdll-export-unavailable",
-        4 => "thread-snapshot-failed",
-        5 => "thread-bound-exceeded",
-        6 => "thread-open-or-owner-failed",
-        7 => "transaction-begin-failed",
-        8 => "thread-enlist-failed",
-        9 => "directory-attach-failed",
-        10 => "event-attach-failed",
-        11 => "unaccounted-thread",
-        12 => "commit-failed",
+        4 => "original-call-owner-unavailable",
+        5 => "owner-image-invalid",
+        6 => "normal-import-discovery-failed",
+        7 => "import-slot-safety-refused",
+        8 => "data-page-write-protection-failed",
+        9 => "directory-slot-publication-failed",
+        10 => "event-slot-publication-failed",
+        11 => "original-page-protection-restore-failed",
+        12 => "import-slot-rollback-failed",
         13 => "setup-busy-or-unavailable",
         _ => "unknown-recorded-stage",
     };
     let reason = match trace.setup_reason {
         0 => "none-recorded",
-        1 => "first-snapshot-not-single-thread",
-        2 => "installation-busy-original-evidence-unavailable",
+        1 => "installation-busy-original-evidence-unavailable",
+        2 => "required-normal-import-missing",
+        3 => "duplicate-normal-import",
+        4 => "original-import-export-mismatch",
+        5 => "unsafe-owner-image-or-slot",
+        6 => "import-callback-bound-exceeded",
+        7 => "original-import-slot-changed",
+        8 => "page-protection-failed",
+        9 => "original-open-event-owner-address-mismatch",
+        10 => "import-discovery-incomplete",
         _ => "unknown-recorded-reason",
     };
     let source = match trace.snapshot_source {
-        0 => "unavailable-or-not-reached",
+        0 => "not-collected-by-owner-iat-strategy",
         1 => "original-installation-walks",
         2 => "cached-original-installation-walks",
         _ => "unknown-recorded-source",
     };
-    let (first_snapshot, first_invalid, first_inconclusive) = snapshot(&trace.first_snapshot);
-    let (second_snapshot, second_invalid, second_inconclusive) = snapshot(&trace.second_snapshot);
-    let mut invalid = trace.version != 2
+    let (first_snapshot, first_invalid, _) = snapshot(&trace.first_snapshot);
+    let (second_snapshot, second_invalid, _) = snapshot(&trace.second_snapshot);
+    let iat = &trace.iat;
+    let owner_end = iat.owner_base.checked_add(u64::from(iat.owner_size));
+    let slot_valid = |slot: u64| {
+        slot % 8 == 0
+            && slot >= iat.normal_iat_start
+            && slot
+                .checked_add(8)
+                .is_some_and(|end| end <= iat.normal_iat_end)
+            && slot >= iat.owner_base
+            && owner_end
+                .is_some_and(|end| slot.checked_add(8).is_some_and(|slot_end| slot_end <= end))
+    };
+    let iat_invalid = iat.strategy > 1
+        || iat.reserved != 0
+        || iat.descriptor_count > 256
+        || iat.function_count > 16384
+        || [
+            iat.owner_pinned,
+            iat.discovery_complete,
+            iat.published_directory,
+            iat.published_event,
+            iat.protections_restored,
+        ]
+        .into_iter()
+        .any(|flag| flag > 1);
+    let iat_ready = iat.strategy == 1
+        && iat.owner_pinned == 1
+        && iat.discovery_complete == 1
+        && iat.descriptor_count > 0
+        && iat.function_count >= 2
+        && iat.normal_iat_start >= iat.owner_base
+        && iat.normal_iat_start < iat.normal_iat_end
+        && owner_end.is_some_and(|end| iat.normal_iat_end <= end)
+        && iat.directory_matches == 1
+        && iat.event_matches == 1
+        && iat.directory_slot != iat.event_slot
+        && slot_valid(iat.directory_slot)
+        && slot_valid(iat.event_slot)
+        && iat.owner_base != 0
+        && iat.original_open_event >= iat.owner_base
+        && owner_end.is_some_and(|end| iat.original_open_event < end)
+        && iat.directory_original != 0
+        && iat.event_original != 0
+        && iat.published_directory == 1
+        && iat.published_event == 1
+        && iat.protections_restored == 1
+        && iat.rollback_error == 0
+        && iat.protection_error == 0
+        && iat.callback_error == 0;
+    let mut invalid = trace.version != 3
         || trace.count as usize > ENTRY_LIMIT
         || trace.setup_stage > 13
         || trace.lifetime_policy > 1
         || trace.armed_call_count > 1
         || trace.thread_count > trace.thread_limit
-        || trace.setup_reason > 2
+        || trace.setup_reason > 10
         || trace.snapshot_source > 2
         || trace.reserved != 0
         || first_invalid
         || second_invalid;
+    invalid |= iat_invalid;
     let mut inconclusive = trace.count == 0
         || trace.overflow != 0
         || trace.incomplete != 0
@@ -231,9 +321,7 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         || trace.armed_call_count != 1
         || trace.called != 1
         || trace.clock_live != 1
-        || trace.snapshot_source == 0
-        || first_inconclusive
-        || second_inconclusive;
+        || !iat_ready;
     invalid |= [
         trace.attached_directory,
         trace.attached_event,
@@ -278,7 +366,18 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
                 "output_handle_returned":entry.output_handle_returned,"invalid_record":entry_invalid,
                 "coverage_inconclusive":entry_inconclusive})
         }).collect();
-    let value = json!({"context":"pre-handoff-control-child","diagnostic_only":true,
+    let iat_value = json!({
+            "strategy":iat.strategy,"owner_base":iat.owner_base,"original_open_event":iat.original_open_event,
+            "normal_iat_start":iat.normal_iat_start,"normal_iat_end":iat.normal_iat_end,
+            "directory_slot":iat.directory_slot,"event_slot":iat.event_slot,
+            "directory_original":iat.directory_original,"event_original":iat.event_original,
+            "owner_pinned":iat.owner_pinned,"owner_size":iat.owner_size,"owner_timestamp":iat.owner_timestamp,
+            "discovery_complete":iat.discovery_complete,"descriptor_count":iat.descriptor_count,"function_count":iat.function_count,
+            "directory_matches":iat.directory_matches,"event_matches":iat.event_matches,
+            "published_directory":iat.published_directory,"published_event":iat.published_event,
+            "protections_restored":iat.protections_restored,"rollback_error":iat.rollback_error,
+            "protection_error":iat.protection_error,"callback_error":iat.callback_error,"opaque_addresses_not_identity":true});
+    let mut value = json!({"context":"pre-handoff-control-child","diagnostic_only":true,
         "acceptance_authority":false,"target_identity_proved":false,
         "instrumented_context_may_perturb":true,"version":trace.version,
         "setup_stage":trace.setup_stage,"setup_stage_label":setup,"setup_error":trace.setup_error,
@@ -288,7 +387,7 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         "attached_directory":trace.attached_directory,"attached_event":trace.attached_event,
         "armed_call_count":trace.armed_call_count,"reported_count":trace.count,
         "overflow":trace.overflow,"incomplete":trace.incomplete,"invalid_record":invalid,
-        "coverage_inconclusive":inconclusive || invalid,
+        "coverage_inconclusive":true,
         "called":trace.called,"outer_opened":trace.outer_opened,"outer_error":trace.outer_error,
         "thread_count":trace.thread_count,"thread_limit":trace.thread_limit,
         "clock_live":trace.clock_live,"lifetime_policy":trace.lifetime_policy,
@@ -297,6 +396,11 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         "started_qpc":trace.started_qpc,"finished_qpc":trace.finished_qpc,
         "original_cutoff_qpc":trace.original_cutoff_qpc,"entries":entries,
         "empty_or_incomplete_trace_is_inconclusive":true});
+    value["strategy"] = "original-open-event-owner-normal-iat".into();
+    value["iat"] = iat_value;
+    value["observed_entries_complete"] = (!inconclusive && !invalid).into();
+    value["all_native_routes_observed"] = false.into();
+    value["absence_is_not_evidence"] = true.into();
     bounded_diagnostic(value)
 }
 
@@ -316,6 +420,7 @@ pub fn bounded_diagnostic(value: serde_json::Value) -> serde_json::Value {
         json!({"context":"pre-handoff-control-child","diagnostic_only":true,
             "acceptance_authority":false,"target_identity_proved":false,
             "unavailable":"trace serialization exceeds bound","incomplete":true,"coverage_inconclusive":true,
+            "observed_entries_complete":false,"all_native_routes_observed":false,"absence_is_not_evidence":true,
             "setup_stage":value["setup_stage"].as_u64(),"setup_error":value["setup_error"].as_u64(),
             "setup_reason":value["setup_reason"].as_u64(),"original_current_thread_id":value["original_current_thread_id"].as_u64(),
             "snapshot_source":value["snapshot_source"].as_u64(),
