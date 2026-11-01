@@ -70,6 +70,8 @@ pub struct Observation {
     pub attempted: bool,
     pub opened: bool,
     pub native_error: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_call_trace: Option<serde_json::Value>,
     pub token: TokenObservation,
     pub token_envelope: memcordon_core::WindowsCallerTokenEnvelopeV1,
     pub same_original_event_identity_proved: bool,
@@ -94,6 +96,27 @@ impl Observation {
         envelope: &memcordon_core::WindowsCallerTokenEnvelopeV1,
     ) -> Result<(), String> {
         input.validate()?;
+        let trace_invalid = match &self.original_call_trace {
+            None => false,
+            Some(trace) => {
+                serde_json::to_vec(trace)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    > 24 * 1024
+                    || trace["context"] != "pre-handoff-control-child"
+                    || trace["diagnostic_only"] != true
+                    || trace["acceptance_authority"] != false
+                    || trace["target_identity_proved"] != false
+                    || trace["called"].as_u64() != Some(1)
+                    || trace["outer_opened"].as_u64() != Some(u64::from(self.opened))
+                    || self.native_error.is_some_and(|error| {
+                        trace["outer_error"].as_u64() != u64::try_from(error).ok()
+                    })
+            }
+        };
+        if trace_invalid {
+            return Err("optional control trace exceeds its diagnostic contract".into());
+        }
         if self.format != "memcordon.fixture-gate-precondition"
             || self.revision != 1
             || !self.diagnostic_only

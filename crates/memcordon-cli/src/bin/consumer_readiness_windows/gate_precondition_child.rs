@@ -5,10 +5,7 @@ use memcordon_core::WindowsCallerTokenEnvelopeV1;
 use std::io::{self, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
-use windows_sys::Win32::System::{
-    Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
-    Threading::OpenEventW,
-};
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 fn check(input: &Input) -> io::Result<()> {
     let mut frequency = 0_i64;
@@ -33,6 +30,27 @@ fn check(input: &Input) -> io::Result<()> {
     Ok(())
 }
 
+fn observed_token(
+    input: &Input,
+    expected_envelope: &WindowsCallerTokenEnvelopeV1,
+) -> io::Result<(TokenObservation, WindowsCallerTokenEnvelopeV1)> {
+    let token: TokenObservation =
+        serde_json::from_slice(&super::native::token_observation()?).map_err(io::Error::other)?;
+    check(input)?;
+    let current_token = -4_isize as windows_sys::Win32::Foundation::HANDLE;
+    let envelope =
+        memcordon_windows_launch_core::query_token_envelope_bounded(current_token, &mut || {
+            check(input).map_err(|error| error.to_string())
+        })
+        .map_err(io::Error::other)?;
+    if token != input.expected_token || envelope != *expected_envelope {
+        return Err(io::Error::other(
+            "gate control actual caller token differs from retained input",
+        ));
+    }
+    Ok((token, envelope))
+}
+
 pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io::Result<i32> {
     let descriptor = super::read_descriptor(path)?;
     let input = descriptor
@@ -53,33 +71,15 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
     }
     let name_bytes: Vec<u8> = wide.iter().flat_map(|unit| unit.to_le_bytes()).collect();
     wide.push(0);
-    let token: TokenObservation =
-        serde_json::from_slice(&super::native::token_observation()?).map_err(io::Error::other)?;
+    let (token, envelope) = observed_token(input, expected_envelope)?;
+    let mut trace =
+        super::gate_call_trace::Prepared::new(input.work_cutoff_qpc, input.qpc_frequency);
+    observed_token(input, expected_envelope)?;
     check(input)?;
-    // GetCurrentProcessToken's query-only pseudo-handle observes this actual
-    // primary process. It is neither owned nor duplicated into the scenario.
-    let current_token = -4_isize as windows_sys::Win32::Foundation::HANDLE;
-    let envelope =
-        memcordon_windows_launch_core::query_token_envelope_bounded(current_token, &mut || {
-            check(input).map_err(|error| error.to_string())
-        })
-        .map_err(io::Error::other)?;
-    if token != input.expected_token || envelope != *expected_envelope {
-        return Err(io::Error::other(
-            "gate control actual caller token differs from retained input",
-        ));
-    }
-    check(input)?;
-    // SAFETY: exact validated original name, NUL terminated. No event handle is
-    // inherited or substituted; this single request only asks for synchronize.
-    let handle = unsafe { OpenEventW(0x0010_0000, 0, wide.as_ptr()) };
+    let call = trace.call(&wide)?;
+    let handle = call.handle;
     let native_error = if handle.is_null() {
-        // Capture the original failing call before any diagnostic or clock API.
-        Some(
-            io::Error::last_os_error()
-                .raw_os_error()
-                .ok_or_else(|| io::Error::other("gate control native error unavailable"))?,
-        )
+        Some(call.native_error as i32)
     } else {
         // SAFETY: successful OpenEventW transfers this owned reference once.
         // Close without waiting, resetting or signaling the original event.
@@ -87,7 +87,20 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
         None
     };
     check(input)?;
-    let observation = Observation {
+    let readback = observed_token(input, expected_envelope);
+    let mut original_call_trace = trace.diagnostic();
+    original_call_trace["source_before_setup_validated"] = true.into();
+    original_call_trace["source_after_setup_validated"] = true.into();
+    original_call_trace["source_after_call_validated"] = readback.is_ok().into();
+    original_call_trace["source_after_call_error"] =
+        serde_json::json!(readback.as_ref().err().and_then(io::Error::raw_os_error));
+    original_call_trace["detours_revision"] = "e4bfd6b03e50de46b47abfbd1e46b384f0c5f833".into();
+    original_call_trace["ntdll_version_hash"] =
+        "not-collected; already-loaded system module".into();
+    original_call_trace["thread_policy"] = "installation requires two snapshots containing only the current thread; additional threads make setup unavailable".into();
+    let original_call_trace =
+        super::gate_call_trace_record::bounded_diagnostic(original_call_trace);
+    let mut observation = Observation {
         format: "memcordon.fixture-gate-precondition".into(),
         revision: 1,
         diagnostic_only: true,
@@ -99,6 +112,7 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
         attempted: true,
         opened: native_error.is_none(),
         native_error,
+        original_call_trace: Some(original_call_trace),
         token,
         token_envelope: envelope,
         same_original_event_identity_proved: false,
@@ -113,7 +127,31 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
             expected_envelope,
         )
         .map_err(io::Error::other)?;
-    let bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    let mut bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    if bytes.len() > RECORD_BYTES {
+        // Optional telemetry must never displace the original operation/error
+        // or token fields within the unchanged outer publication bound.
+        observation.original_call_trace = Some(serde_json::json!({
+            "context":"pre-handoff-control-child","diagnostic_only":true,
+            "acceptance_authority":false,"target_identity_proved":false,
+            "unavailable":"outer control record budget","coverage_inconclusive":true,
+            "called":1,"outer_opened":u32::from(observation.opened),"outer_error":call.native_error
+        }));
+        bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    }
+    if bytes.len() > RECORD_BYTES {
+        observation.original_call_trace = None;
+        bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    }
+    observation
+        .validate(
+            input,
+            &observation.case,
+            &observation.challenge_sha256,
+            &observation.gate_name_utf16_sha256,
+            expected_envelope,
+        )
+        .map_err(io::Error::other)?;
     if bytes.len() > RECORD_BYTES {
         return Err(io::Error::other("gate control observation exceeds bound"));
     }
@@ -125,6 +163,7 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
     output.write_all(&bytes)?;
     output.sync_all()?;
     check(input)?;
+    readback?;
     // Access denial is a retained diagnostic, never a passing target result.
     Ok(0)
 }

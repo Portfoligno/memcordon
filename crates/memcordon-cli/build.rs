@@ -80,6 +80,8 @@ fn watch_git_identity(manifest: &Path, output_root: Option<&Path>) {
 
 fn main() {
     static_vcruntime::metabuild();
+    #[cfg(feature = "test-fixtures")]
+    build_gate_call_trace();
     println!("cargo::rustc-check-cfg=cfg(memcordon_static_vcruntime)");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo::rustc-cfg=memcordon_static_vcruntime");
@@ -103,4 +105,56 @@ fn main() {
     );
     println!("cargo:rerun-if-changed=build_support/source_identity.rs");
     watch_git_identity(&manifest, output_root.as_deref());
+}
+
+#[cfg(feature = "test-fixtures")]
+fn build_gate_call_trace() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    assert_eq!(
+        std::env::var("CARGO_CFG_TARGET_ENV").as_deref(),
+        Ok("msvc"),
+        "fixture call tracing requires the supported MSVC target"
+    );
+    let vendor = Path::new("vendor/detours/src");
+    let mut detours = cc::Build::new();
+    detours
+        .cpp(true)
+        .static_crt(true)
+        .warnings(false)
+        .include(vendor)
+        .define("WIN32_LEAN_AND_MEAN", None)
+        .define("_WIN32_WINNT", "0x0A00");
+    for name in [
+        "detours.cpp",
+        "modules.cpp",
+        "disasm.cpp",
+        "image.cpp",
+        "creatwth.cpp",
+        "disolx86.cpp",
+        "disolx64.cpp",
+        "disolia64.cpp",
+        "disolarm.cpp",
+        "disolarm64.cpp",
+    ] {
+        let path = vendor.join(name);
+        println!("cargo:rerun-if-changed={}", path.display());
+        detours.file(path);
+    }
+    for name in ["detours.h", "detver.h", "uimports.cpp"] {
+        println!("cargo:rerun-if-changed={}", vendor.join(name).display());
+    }
+    detours.compile("memcordon_fixture_detours");
+    println!("cargo:rerun-if-changed=native/gate_call_trace.cpp");
+    println!("cargo:rerun-if-changed=native/gate_call_trace.h");
+    cc::Build::new()
+        .cpp(true)
+        .static_crt(true)
+        .std("c++17")
+        .include(vendor)
+        .define("_WIN32_WINNT", "0x0A00")
+        .file("native/gate_call_trace.cpp")
+        .compile("memcordon_fixture_gate_call_trace");
+    println!("cargo:rustc-link-lib=kernel32");
 }

@@ -9,6 +9,9 @@ mod controller_gate_token;
 pub mod descriptor;
 mod fixture_default_dacl;
 mod fixture_environment;
+mod gate_call_trace;
+mod gate_call_trace_record;
+mod gate_call_trace_self_check;
 mod gate_precondition_child;
 mod namespace_primary_root;
 mod namespace_primary_worker;
@@ -598,6 +601,12 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         Some("system-restricted-frontend") => return native::system_restricted_frontend(args),
         Some("system-restricted-gate-control-frontend") => {
             return native::system_restricted_gate_control_frontend(args);
+        }
+        Some("gate-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other("trace self-check takes no operands"));
+            }
+            return gate_call_trace_self_check::run();
         }
         Some("gate-precondition-child") => {
             let path = args

@@ -55,6 +55,7 @@ fn observation(opened: bool) -> Observation {
         attempted: true,
         opened,
         native_error: if opened { None } else { Some(5) },
+        original_call_trace: None,
         token: input().expected_token,
         token_envelope: envelope(),
         same_original_event_identity_proved: false,
@@ -70,6 +71,32 @@ fn validate(observation: &Observation) -> Result<(), String> {
         &"e".repeat(64),
         &envelope(),
     )
+}
+
+#[test]
+fn optional_native_trace_never_changes_original_result_or_grants_authority() {
+    let mut actual = observation(false);
+    actual.original_call_trace = Some(serde_json::json!({
+        "context":"pre-handoff-control-child","diagnostic_only":true,
+        "acceptance_authority":false,"target_identity_proved":false,
+        "called":1,"outer_opened":0,"outer_error":5,"coverage_inconclusive":true
+    }));
+    validate(&actual).unwrap();
+    let bytes = serde_json::to_vec(&actual).unwrap();
+    validate(&Observation::parse(&bytes).unwrap()).unwrap();
+    for (field, changed) in [
+        ("acceptance_authority", serde_json::json!(true)),
+        ("target_identity_proved", serde_json::json!(true)),
+        ("outer_opened", serde_json::json!(1)),
+        ("outer_error", serde_json::json!(0)),
+        ("called", serde_json::json!(0)),
+    ] {
+        let mut bad = actual.clone();
+        bad.original_call_trace.as_mut().unwrap()[field] = changed;
+        assert!(validate(&bad).is_err());
+    }
+    actual.original_call_trace.as_mut().unwrap()["extra"] = "x".repeat(24 * 1024).into();
+    assert!(validate(&actual).is_err());
 }
 
 #[test]
