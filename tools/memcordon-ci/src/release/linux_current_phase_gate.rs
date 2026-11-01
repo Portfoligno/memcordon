@@ -136,19 +136,7 @@ impl NativeReadGate {
     }
 
     pub fn on_current_executable(file: &File, cutoff: Instant) -> Result<Self> {
-        let identity = file.metadata()?;
-        let flags = rustix::fs::fcntl_getfl(file).map_err(std::io::Error::from)?;
-        if !identity.is_file()
-            || identity.uid() != 0
-            || identity.mode() & 0o777 != 0o555
-            || identity.nlink() != 1
-            || identity.len() == 0
-            || flags & rustix::fs::OFlags::ACCMODE != rustix::fs::OFlags::RDONLY
-        {
-            return Err(CiError::Message(
-                "current package gate lacks its exact protected readonly executable".into(),
-            ));
-        }
+        let identity = crate::linux_package_executable::inspect(file)?;
         let expected = (identity.dev(), identity.ino());
         Self::start(file.try_clone()?, false, cutoff, move |pid, _| {
             // Ignore the pre-exec open so Command can complete its exec

@@ -660,6 +660,17 @@ fn execute(
         },
     )?;
     let agent = session.admin.path.join("memcordon-sealed-agent");
+    {
+        let executable = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&agent)
+            .map_err(|error| {
+                CiError::from(error).context("protected package executable preflight open")
+            })?;
+        crate::linux_package_executable::inspect(&executable)
+            .map_err(|error| error.context("protected package executable preflight"))?;
+    }
     refuse_opaque_install(session.root, &agent, work)
         .map_err(|error| error.context("installed opaque-install refusal"))?;
     session.installed = true; // Even a partially failed install requires owned removal.
