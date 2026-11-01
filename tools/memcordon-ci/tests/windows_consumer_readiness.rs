@@ -120,6 +120,7 @@ fn descriptor() -> Descriptor {
         sentinel_handles: Vec::new(),
         descendant_gate: None,
         start_gate: Some("Local\\memcordon-readiness-test-start".into()),
+        start_transport: descriptor::StartTransport::NamedEvent,
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,
@@ -153,6 +154,91 @@ fn descriptor() -> Descriptor {
             target: "x86_64-pc-windows-msvc".into(),
         }),
     }
+}
+
+#[test]
+fn restricted_envelopes_select_framed_start_and_wire_requires_original_clock() {
+    use descriptor::StartTransport;
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, TokenObservation, expected_start_transport, validate_descriptor,
+    };
+    let mut input = descriptor();
+    input.case = Case::Envelope;
+    input.toolchain = None;
+    input.cohort_gate = None;
+    input.generation_gate = None;
+    for (family, scenario) in [
+        ("W-ENVELOPE", "restricted"),
+        ("W-BINDING", "restricted-token-preserved"),
+    ] {
+        let key = CaseKey {
+            family: family.into(),
+            scenario: scenario.into(),
+        };
+        input.start_transport = expected_start_transport(&key);
+        assert_eq!(
+            input.start_transport,
+            StartTransport::ControllerStdin { version: 1 }
+        );
+        validate_descriptor(&key, &input).unwrap(); // Declared plan, before clock preparation.
+        assert!(Descriptor::parse(&serde_json::to_vec(&input).unwrap()).is_err());
+        input.gate_precondition = Some(descriptor::gate_precondition::Input {
+            revision: 1,
+            work_cutoff_qpc: 999,
+            qpc_frequency: 10,
+            expected_token: TokenObservation {
+                user_sid: vec![1],
+                restricted: true,
+                integrity_rid: 12288,
+                elevated: true,
+                restricting_sids: vec![vec![2]],
+            },
+        });
+        let bytes = serde_json::to_vec(&input).unwrap();
+        Descriptor::parse(&bytes).unwrap();
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("transport", serde_json::json!("unknown")),
+        ] {
+            let mut value_descriptor = serde_json::to_value(&input).unwrap();
+            value_descriptor["start_transport"][field] = value;
+            assert!(Descriptor::parse(&serde_json::to_vec(&value_descriptor).unwrap()).is_err());
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        let duplicated = text.replacen(
+            "\"start_transport\":",
+            "\"start_transport\":{\"transport\":\"named-event\"},\"start_transport\":",
+            1,
+        );
+        assert!(Descriptor::parse(duplicated.as_bytes()).is_err());
+        let mut wrong = input.clone();
+        wrong.start_transport = StartTransport::NamedEvent;
+        assert!(validate_descriptor(&key, &wrong).is_err());
+        input.gate_precondition = None;
+    }
+    for (family, scenario) in [
+        ("W-ENVELOPE", "ordinary"),
+        ("C-IO", "empty-input"),
+        ("W-BINDING", "ordinary"),
+    ] {
+        assert_eq!(
+            expected_start_transport(&CaseKey {
+                family: family.into(),
+                scenario: scenario.into()
+            }),
+            StartTransport::NamedEvent
+        );
+    }
+    let key = CaseKey {
+        family: "W-ENVELOPE".into(),
+        scenario: "restricted".into(),
+    };
+    input.stdout = vec![0; descriptor::MAX_STREAM_BYTES];
+    input.stderr = vec![0; descriptor::MAX_STREAM_BYTES];
+    input.arguments = vec!["R".repeat(4096); 16];
+    assert!(input.validate().is_err());
+    assert!(serde_json::to_vec(&input).unwrap().len() > descriptor::MAX_DESCRIPTOR_BYTES);
+    assert!(validate_descriptor(&key, &input).is_err());
 }
 
 #[test]
@@ -396,6 +482,25 @@ fn production_fixture_vectors_fit_the_private_wire_bound_and_round_trip_exactly(
         input.stderr = parameters.stderr;
         input.arguments = parameters.arguments;
         input.application_status = parameters.application_status;
+        input.start_transport =
+            memcordon_ci::windows_consumer_readiness::expected_start_transport(&key);
+        if matches!(
+            input.start_transport,
+            descriptor::StartTransport::ControllerStdin { .. }
+        ) {
+            input.gate_precondition = Some(descriptor::gate_precondition::Input {
+                revision: 1,
+                work_cutoff_qpc: 999,
+                qpc_frequency: 10,
+                expected_token: memcordon_ci::windows_consumer_readiness::TokenObservation {
+                    user_sid: vec![1],
+                    restricted: true,
+                    integrity_rid: 12288,
+                    elevated: true,
+                    restricting_sids: vec![vec![2]],
+                },
+            });
+        }
         if matches!(input.case, Case::RootFirst | Case::IntermediateFirst) {
             input.descendant_gate = Some("Local\\memcordon-readiness-portable-descendant".into());
         }

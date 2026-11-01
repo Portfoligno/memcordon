@@ -6,6 +6,7 @@ mod controller_gate_error;
 mod controller_gate_resolution;
 mod controller_gate_thread_control;
 mod controller_gate_token;
+mod controller_start_input;
 pub mod descriptor;
 mod fixture_default_dacl;
 mod fixture_environment;
@@ -80,6 +81,10 @@ impl Transcript {
 }
 
 fn read_descriptor(path: &Path) -> io::Result<Descriptor> {
+    read_descriptor_with_digest(path).map(|(descriptor, _)| descriptor)
+}
+
+fn read_descriptor_with_digest(path: &Path) -> io::Result<(Descriptor, [u8; 32])> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -101,7 +106,10 @@ fn read_descriptor(path: &Path) -> io::Result<Descriptor> {
     Read::by_ref(&mut file)
         .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    Descriptor::parse(&bytes).map_err(io::Error::other)
+    let digest = descriptor::controller_start::descriptor_digest(&bytes);
+    Descriptor::parse(&bytes)
+        .map(|descriptor| (descriptor, digest))
+        .map_err(io::Error::other)
 }
 
 fn child_command() -> io::Result<Command> {
@@ -835,7 +843,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         }
         _ => {}
     }
-    let descriptor = read_descriptor(Path::new(&first))?;
+    let (descriptor, descriptor_digest) = read_descriptor_with_digest(Path::new(&first))?;
     let actual_arguments: Vec<OsString> = args.collect();
     if actual_arguments
         != descriptor
@@ -875,12 +883,25 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
     )?;
     let envelope = native::token_observation()?;
     transcript.event("token-envelope", None, &envelope)?;
-    if let Some(gate) = &descriptor.start_gate {
-        native::wait_controller_gate_for_fixture(
-            std::ffi::OsStr::new(gate),
-            &descriptor,
-            transcript.sequence,
-        )?;
+    let released = match descriptor.start_transport {
+        descriptor::StartTransport::ControllerStdin { .. } => {
+            controller_start_input::receive(&descriptor, descriptor_digest)?;
+            true
+        }
+        descriptor::StartTransport::NamedEvent => {
+            if let Some(gate) = &descriptor.start_gate {
+                native::wait_controller_gate_for_fixture(
+                    std::ffi::OsStr::new(gate),
+                    &descriptor,
+                    transcript.sequence,
+                )?;
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if released {
         transcript
             .event("controller-released", None, &descriptor.challenge)
             .map_err(|error| {

@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[path = "controller_start.rs"]
+pub mod controller_start;
 #[path = "controller_gate_access_input.rs"]
 pub mod gate_access;
 #[path = "gate_precondition_input.rs"]
@@ -153,6 +155,16 @@ pub struct Sentinel {
     pub file_index: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "transport", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum StartTransport {
+    #[default]
+    NamedEvent,
+    ControllerStdin {
+        version: u32,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Descriptor {
@@ -174,6 +186,8 @@ pub struct Descriptor {
     pub sentinel_handles: Vec<Sentinel>,
     pub descendant_gate: Option<String>,
     pub start_gate: Option<String>,
+    #[serde(default)]
+    pub start_transport: StartTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_access_diagnostic: Option<gate_access::Input>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,12 +207,30 @@ impl Descriptor {
         // unlike decoding through a JSON Value first.
         let value: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         value.validate()?;
+        if matches!(
+            value.start_transport,
+            StartTransport::ControllerStdin { .. }
+        ) && value.gate_precondition.is_none()
+        {
+            return Err("wire controller stdin START lacks original work clock".into());
+        }
         Ok(value)
     }
 
     pub fn validate(&self) -> Result<(), String> {
         if self.format != "memcordon.fixture-workload" || self.revision != DESCRIPTOR_REVISION {
             return Err("unsupported fixture workload format/revision".into());
+        }
+        if let StartTransport::ControllerStdin { version } = self.start_transport {
+            if version != controller_start::VERSION
+                || self.case != Case::Envelope
+                || self.start_gate.is_none()
+            {
+                return Err("controller stdin START requires versioned envelope transport and separate diagnostic name".into());
+            }
+            if let Some(input) = &self.gate_precondition {
+                input.validate()?;
+            }
         }
         if let Some(control) = &self.gate_precondition {
             control.validate()?;

@@ -43,6 +43,7 @@ fn workload_request_selection_is_absolute_exclusive_and_shared_by_both_frontends
         sentinel_handles: vec![],
         descendant_gate: None,
         start_gate: None,
+        start_transport: descriptor::StartTransport::NamedEvent,
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,

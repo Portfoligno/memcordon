@@ -487,6 +487,11 @@ pub fn fixture_parameters(key: &CaseKey) -> Result<FixtureParameters> {
 
 /// Validate the actual input once complete, retaining its case and wire-size boundary.
 pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -> Result<()> {
+    if descriptor.start_transport != expected_start_transport(key) {
+        return Err(CiError::Message(
+            "fixture START transport differs from its declared case".into(),
+        ));
+    }
     let bytes = serde_json::to_vec(descriptor).map_err(|error| {
         CiError::Message(format!(
             "Windows fixture {}/{} encoding failed: {error}; limit={}",
@@ -495,6 +500,15 @@ pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -
             descriptor::MAX_DESCRIPTOR_BYTES
         ))
     })?;
+    if bytes.len() > descriptor::MAX_DESCRIPTOR_BYTES {
+        return Err(CiError::Message(format!(
+            "Windows fixture {}/{} descriptor exceeds aggregate wire bound; encoded-bytes={} limit={}",
+            key.family,
+            key.scenario,
+            bytes.len(),
+            descriptor::MAX_DESCRIPTOR_BYTES
+        )));
+    }
     descriptor.validate().map_err(|error| {
         CiError::Message(format!(
             "Windows fixture {}/{} descriptor invalid: {error}; encoded-bytes={} limit={}",
@@ -504,6 +518,19 @@ pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -
             descriptor::MAX_DESCRIPTOR_BYTES
         ))
     })
+}
+
+pub fn expected_start_transport(key: &CaseKey) -> descriptor::StartTransport {
+    if matches!(
+        (key.family.as_str(), key.scenario.as_str()),
+        ("W-ENVELOPE", "restricted") | ("W-BINDING", "restricted-token-preserved")
+    ) {
+        descriptor::StartTransport::ControllerStdin {
+            version: descriptor::controller_start::VERSION,
+        }
+    } else {
+        descriptor::StartTransport::NamedEvent
+    }
 }
 
 fn expected_fixture_case(key: &CaseKey) -> Result<descriptor::Case> {
@@ -2358,6 +2385,7 @@ pub(crate) mod native {
                 sentinel_handles: Vec::new(),
                 descendant_gate,
                 start_gate,
+                start_transport: super::expected_start_transport(&key),
                 gate_access_diagnostic: None,
                 gate_precondition: None,
                 completion_gate: None,
@@ -2523,9 +2551,56 @@ pub(crate) mod native {
 
     const CONTROLLER_GATE_SDDL: &str = super::start_gate_policy::BASE_SDDL;
 
+    #[derive(Debug)]
+    struct StartWriteFailure {
+        primary: io::Error,
+        settlement: String,
+    }
+    impl std::fmt::Display for StartWriteFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{}; original START I/O deadline settlement: {}",
+                self.primary, self.settlement
+            )
+        }
+    }
+    impl std::error::Error for StartWriteFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.primary)
+        }
+    }
+    fn send_controller_start(
+        mut writer: std::process::ChildStdin,
+        binding: &descriptor::controller_start::Binding,
+        work_deadline: Instant,
+    ) -> io::Result<()> {
+        let owner = memcordon_platform::WindowsSynchronousIoDeadline::start(work_deadline)
+            .map_err(io::Error::other)?;
+        let written = descriptor::controller_start::send(&mut writer, binding, || {
+            provision_budget(work_deadline)
+                .map(|_| ())
+                .map_err(io::Error::other)
+        });
+        drop(writer); // Genuine EOF after the one frame; no application payload in Envelope.
+        let settled = owner.finish(); // Join before the calling thread begins any unrelated I/O.
+        match (written, settled) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(secondary)) => Err(io::Error::other(secondary)),
+            (Err(primary), Err(settlement)) => Err(io::Error::new(
+                primary.kind(),
+                StartWriteFailure {
+                    primary,
+                    settlement,
+                },
+            )),
+        }
+    }
+
     struct PreparedGateInput {
         input: CaseInput,
-        gate: Arc<OwnedHandle>,
+        gate: Option<Arc<OwnedHandle>>,
         prelaunch_security: serde_json::Value,
         prelaunch_label: serde_json::Value,
         binding_setup: serde_json::Value,
@@ -2557,8 +2632,16 @@ pub(crate) mod native {
             ));
         }
         provision_budget(work_deadline)?;
-        let (gate, requested_sddl) = start_gate_create(name, &selected.user_sid, work_deadline)?;
-        let gate = Arc::new(gate);
+        let stdin_start = matches!(
+            input.descriptor.start_transport,
+            descriptor::StartTransport::ControllerStdin { .. }
+        );
+        let created = start_gate_create(name, &selected.user_sid, work_deadline);
+        let (gate, requested_sddl, creation_error) = match created {
+            Ok((gate, sddl)) => (Some(Arc::new(gate)), sddl, None),
+            Err(error) if stdin_start => (None, String::new(), Some(error.to_string())),
+            Err(error) => return Err(error),
+        };
         let mut final_input = input.clone();
         // Serialized suite input is a plan, never a substitute descriptor owner.
         final_input.descriptor.gate_access_diagnostic = None;
@@ -2580,66 +2663,78 @@ pub(crate) mod native {
                 work_cutoff_qpc,
                 qpc_frequency,
             });
-            prelaunch_label =
-                gate_query_result(super::workload_diagnostic::gate_mandatory_label_snapshot(
+            if let Some(gate) = gate.as_ref() {
+                prelaunch_label =
+                    gate_query_result(super::workload_diagnostic::gate_mandatory_label_snapshot(
+                        gate.as_ref(),
+                        work_deadline,
+                    ));
+                match super::workload_diagnostic::gate_security_snapshot(
                     gate.as_ref(),
                     work_deadline,
-                ));
-            match super::workload_diagnostic::gate_security_snapshot(gate.as_ref(), work_deadline) {
-                Ok(snapshot) => {
-                    original_descriptor_sha256 = Some(snapshot.descriptor_sha256.clone());
-                    let binding = (|| -> io::Result<descriptor::gate_access::Input> {
-                        let bytes = hex::decode(&snapshot.descriptor_bytes_hex).map_err(|_| {
-                            io::Error::other("original held gate descriptor encoding differs")
-                        })?;
-                        let name: Vec<u16> = name.encode_utf16().collect();
-                        let name_bytes: Vec<u8> =
-                            name.iter().flat_map(|unit| unit.to_le_bytes()).collect();
-                        let (work_cutoff_qpc, qpc_frequency) =
-                            memcordon_testkit::windows_native_work_cutoff(work_deadline)?;
-                        let binding = descriptor::gate_access::Input {
-                            revision: 1,
-                            descriptor: bytes,
-                            descriptor_sha256: snapshot.descriptor_sha256.clone(),
-                            name_utf16_sha256: crate::windows_causal_acceptance::sha256(
-                                &name_bytes,
-                            ),
-                            challenge_sha256: crate::windows_causal_acceptance::sha256(
-                                &input.descriptor.challenge,
-                            ),
-                            work_cutoff_qpc,
-                            qpc_frequency,
-                            namespace: None,
-                        };
-                        binding.validate(&name, &input.descriptor.challenge)?;
-                        Ok(binding)
-                    })();
-                    match binding {
-                        Ok(mut binding) => {
+                ) {
+                    Ok(snapshot) => {
+                        original_descriptor_sha256 = Some(snapshot.descriptor_sha256.clone());
+                        let binding = (|| -> io::Result<descriptor::gate_access::Input> {
+                            let bytes =
+                                hex::decode(&snapshot.descriptor_bytes_hex).map_err(|_| {
+                                    io::Error::other(
+                                        "original held gate descriptor encoding differs",
+                                    )
+                                })?;
                             let name: Vec<u16> = name.encode_utf16().collect();
-                            let discovered = super::gate_namespace::discover(
-                                gate.as_ref(),
-                                &name,
-                                &binding,
-                                || {
-                                    provision_budget(work_deadline)
-                                        .map(|_| ())
-                                        .map_err(io::Error::other)
-                                },
-                            );
-                            binding.namespace = discovered.proof.clone();
-                            namespace = Some(discovered);
-                            final_input.descriptor.gate_access_diagnostic = Some(binding);
-                            binding_setup = serde_json::json!({"state":"observed","source":"same original held event before final descriptor freeze"});
+                            let name_bytes: Vec<u8> =
+                                name.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+                            let (work_cutoff_qpc, qpc_frequency) =
+                                memcordon_testkit::windows_native_work_cutoff(work_deadline)?;
+                            let binding = descriptor::gate_access::Input {
+                                revision: 1,
+                                descriptor: bytes,
+                                descriptor_sha256: snapshot.descriptor_sha256.clone(),
+                                name_utf16_sha256: crate::windows_causal_acceptance::sha256(
+                                    &name_bytes,
+                                ),
+                                challenge_sha256: crate::windows_causal_acceptance::sha256(
+                                    &input.descriptor.challenge,
+                                ),
+                                work_cutoff_qpc,
+                                qpc_frequency,
+                                namespace: None,
+                            };
+                            binding.validate(&name, &input.descriptor.challenge)?;
+                            Ok(binding)
+                        })();
+                        match binding {
+                            Ok(mut binding) => {
+                                let name: Vec<u16> = name.encode_utf16().collect();
+                                let discovered = super::gate_namespace::discover(
+                                    gate.as_ref(),
+                                    &name,
+                                    &binding,
+                                    || {
+                                        provision_budget(work_deadline)
+                                            .map(|_| ())
+                                            .map_err(io::Error::other)
+                                    },
+                                );
+                                binding.namespace = discovered.proof.clone();
+                                namespace = Some(discovered);
+                                final_input.descriptor.gate_access_diagnostic = Some(binding);
+                                binding_setup = serde_json::json!({"state":"observed","source":"same original held event before final descriptor freeze"});
+                            }
+                            Err(error) => binding_setup = gate_query_result::<()>(Err(error)),
                         }
-                        Err(error) => binding_setup = gate_query_result::<()>(Err(error)),
+                        prelaunch_security = gate_query_result(Ok(snapshot));
                     }
-                    prelaunch_security = gate_query_result(Ok(snapshot));
+                    Err(error) => {
+                        prelaunch_security = gate_query_result::<()>(Err(error));
+                        binding_setup = serde_json::json!({"state":"unavailable","reason":"original-snapshot-unavailable"});
+                    }
                 }
-                Err(error) => {
-                    prelaunch_security = gate_query_result::<()>(Err(error));
-                    binding_setup = serde_json::json!({"state":"unavailable","reason":"original-snapshot-unavailable"});
-                }
+            } else {
+                prelaunch_security = serde_json::json!({"state":"unavailable","operation":"CreateEventW-independent-diagnostic","detail":creation_error});
+                prelaunch_label = prelaunch_security.clone();
+                binding_setup = prelaunch_security.clone();
             }
         }
         if final_input
@@ -3777,8 +3872,8 @@ pub(crate) mod native {
         let gate_name = input.descriptor.start_gate.as_ref().ok_or_else(|| {
             CiError::Message("positive input omitted held-root native barrier".into())
         })?;
-        let gate = Arc::clone(&prepared.gate);
-        let callback_gate = Arc::clone(&gate);
+        let gate = prepared.gate.clone();
+        let callback_gate = gate.clone();
         let endpoint_event = (input.descriptor.case == descriptor::Case::EndpointMismatch)
             .then(|| event_create(&format!("{gate_name}-endpoint-observed")))
             .transpose()?;
@@ -3874,11 +3969,13 @@ pub(crate) mod native {
                 descriptor::MAX_DESCRIPTOR_BYTES
             ))
         })?;
-        OpenOptions::new()
+        let mut descriptor_owner = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
-            .open(&input.descriptor_path)?
-            .write_all(&descriptor_bytes)?;
+            .open(&input.descriptor_path)?;
+        descriptor_owner.write_all(&descriptor_bytes)?;
+        descriptor_owner.sync_all()?;
         let challenge_path = report
             .parent()
             .expect("case report has parent")
@@ -3907,7 +4004,10 @@ pub(crate) mod native {
         // Workload inputs are absolute owned paths; ambient controller secrets
         // must never enter the authenticated launch request or its observation.
         command.env_clear();
-        command.stdin(std::process::Stdio::null());
+        command.stdin(match input.descriptor.start_transport {
+            descriptor::StartTransport::NamedEvent => std::process::Stdio::null(),
+            descriptor::StartTransport::ControllerStdin { .. } => std::process::Stdio::piped(),
+        });
         let execution_sha256 = if command.get_program() == config.fixture.path.as_os_str() {
             config.fixture.sha256.clone()
         } else {
@@ -3925,6 +4025,7 @@ pub(crate) mod native {
             "argv_utf16":command.get_args().map(|argument|argument.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
             "cwd_utf16":config.output_directory.as_os_str().encode_wide().collect::<Vec<_>>(),
             "environment_cleared":true,
+            "fixture_start_transport":input.descriptor.start_transport,
         });
         let invocation_bytes = serde_json::to_vec(&invocation)?;
         let invocation_path = report
@@ -3979,8 +4080,9 @@ pub(crate) mod native {
                 "source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,
                 "descriptor_sha256":record.descriptor_sha256,
                 "requested_name_utf16":name_utf16,"requested_name_sha256":crate::windows_causal_acceptance::sha256(&name_bytes),
-                "name_binding":"original exclusive CreateEventW argument; optional controller directory discovery is reported separately",
-                "requested_sddl":prepared.requested_sddl,"fixture_requested_access":0x0010_0000_u32,
+                "name_binding":"independent named diagnostic request; creation and security custody are reported separately",
+                "positive_start_transport":input.descriptor.start_transport,
+                "requested_sddl":prepared.requested_sddl,"independent_named_control_requested_access":0x0010_0000_u32,
                 "actual_security_information":7,
                 "same_held_event_security":prepared.prelaunch_security,
                 "same_held_event_mandatory_label":prepared.prelaunch_label,
@@ -3990,6 +4092,9 @@ pub(crate) mod native {
             })
         });
         let expected_provider = config.provider.clone();
+        let start_transport = input.descriptor.start_transport.clone();
+        let start_challenge = input.descriptor.challenge.clone();
+        let start_descriptor = input.descriptor.clone();
         let barrier_report = public_report.clone();
         let descendant_gate = input.descriptor.descendant_gate.clone();
         let intermediate_first = input.descriptor.case == descriptor::Case::IntermediateFirst;
@@ -4009,7 +4114,7 @@ pub(crate) mod native {
             work_budget,
             4 * 1024 * 1024,
             |mut command| command.spawn(),
-            move |wrapper_pid, _, _| {
+            move |wrapper_pid, mut stdin, _| {
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                 let (held, root_pid) = loop {
                     if barrier_report.try_exists()? {
@@ -4047,6 +4152,11 @@ pub(crate) mod native {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 };
+                let root_identity = held
+                    .first()
+                    .expect("one original held fixture admitted")
+                    .identity
+                    .clone();
                 if capture_gate_diagnostic {
                     let root = held
                         .first()
@@ -4164,6 +4274,17 @@ pub(crate) mod native {
                         "positive native guardian association differs",
                     ));
                 }
+                if matches!(
+                    start_transport,
+                    descriptor::StartTransport::ControllerStdin { .. }
+                ) && observed.live_target_identity.as_ref().is_none_or(|target| {
+                    target.process_id != root_identity.pid
+                        || u128::from(target.creation_time_100ns) != root_identity.birth
+                }) {
+                    return Err(io::Error::other(
+                        "START guardian association does not name the original held target",
+                    ));
+                }
                 let expected = memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
                     provider: observed.association.provider.clone(),
                     attempt_id: observed.association.attempt_id.clone(),
@@ -4206,7 +4327,51 @@ pub(crate) mod native {
                 super::guardian_query::update(&callback_guardian_query, |trace| {
                     trace.stage("association-admitted")
                 });
-                signal(callback_gate.as_ref())?;
+                match start_transport {
+                    descriptor::StartTransport::NamedEvent => {
+                        signal(callback_gate.as_deref().ok_or_else(|| {
+                            io::Error::other("original named START owner unavailable")
+                        })?)?
+                    }
+                    descriptor::StartTransport::ControllerStdin { .. } => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        provision_budget(work_deadline).map_err(io::Error::other)?;
+                        descriptor_owner.seek(SeekFrom::Start(0))?;
+                        let mut actual_bytes = Vec::new();
+                        Read::by_ref(&mut descriptor_owner)
+                            .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
+                            .read_to_end(&mut actual_bytes)?;
+                        let actual = descriptor::Descriptor::parse(&actual_bytes)
+                            .map_err(io::Error::other)?;
+                        // The existing measured frontend changes only its sentinel
+                        // inventory before launching this original target. Bind the
+                        // frame to those final bytes through the same held file.
+                        let mut expected = start_descriptor;
+                        expected.sentinel_handles = actual.sentinel_handles.clone();
+                        if serde_json::to_value(&actual).map_err(io::Error::other)?
+                            != serde_json::to_value(&expected).map_err(io::Error::other)?
+                        {
+                            return Err(io::Error::other(
+                                "original START descriptor changed beyond measured sentinel inventory",
+                            ));
+                        }
+                        let writer = stdin.take().ok_or_else(|| {
+                            io::Error::other("original controller START stdin writer unavailable")
+                        })?;
+                        let binding = descriptor::controller_start::Binding {
+                            challenge: start_challenge,
+                            descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                                &actual_bytes,
+                            ),
+                            pid: root_identity.pid,
+                            birth: u64::try_from(root_identity.birth).map_err(io::Error::other)?,
+                        };
+                        send_controller_start(writer, &binding, work_deadline)?;
+                        super::guardian_query::update(&callback_guardian_query, |trace| {
+                            trace.stage("stdin-start-published")
+                        });
+                    }
+                }
                 if owns_tcp {
                     let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                     let port = loop {
@@ -4932,7 +5097,7 @@ pub(crate) mod native {
             let name: Vec<u16> = gate_name.encode_utf16().chain(Some(0)).collect();
             Some(super::gate_resolution::query(
                 &name,
-                Some(gate.as_ref()),
+                gate.as_deref(),
                 || {
                     provision_budget(work_deadline)
                         .map(|_| ())
@@ -4966,7 +5131,8 @@ pub(crate) mod native {
             diagnostic["controller_native_namespace_final_readback"] = prepared
                 .namespace
                 .as_ref()
-                .map(|value| {
+                .zip(gate.as_ref())
+                .map(|(value, gate)| {
                     value.recheck(gate.as_ref(), || {
                         provision_budget(work_deadline)
                             .map(|_| ())
@@ -4991,8 +5157,16 @@ pub(crate) mod native {
                     "original controller-gate diagnostic retention cutoff elapsed".into(),
                 ));
             }
-            let final_security =
-                super::workload_diagnostic::gate_security_snapshot(gate.as_ref(), deadline);
+            let final_security = gate
+                .as_ref()
+                .map(|gate| {
+                    super::workload_diagnostic::gate_security_snapshot(gate.as_ref(), deadline)
+                })
+                .unwrap_or_else(|| {
+                    Err(io::Error::other(
+                        "independent named diagnostic owner unavailable",
+                    ))
+                });
             let unchanged = prepared
                 .original_descriptor_sha256
                 .as_ref()
@@ -5006,7 +5180,18 @@ pub(crate) mod native {
             });
             diagnostic["final_same_held_event_security"] = gate_query_result(final_security);
             diagnostic["final_same_held_event_mandatory_label"] = gate_query_result(
-                super::workload_diagnostic::gate_mandatory_label_snapshot(gate.as_ref(), deadline),
+                gate.as_ref()
+                    .map(|gate| {
+                        super::workload_diagnostic::gate_mandatory_label_snapshot(
+                            gate.as_ref(),
+                            deadline,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        Err(io::Error::other(
+                            "independent named diagnostic owner unavailable",
+                        ))
+                    }),
             );
             let bytes = serde_json::to_vec(&diagnostic)?;
             if bytes.len() > 8 * super::gate_security::BYTE_BOUND {
@@ -5227,7 +5412,7 @@ pub(crate) mod native {
                         if !bootstrap_refusal && !released_target {
                             return Ok(());
                         }
-                        if released_target {
+                        if let Some(gate) = gate.as_ref().filter(|_| released_target) {
                             let descriptor = super::workload_diagnostic::gate_sddl(gate.as_ref())?;
                             drop(crate::windows_native_files::publish_owned_file(
                                 &report.with_extension("original-gate.sddl"),
