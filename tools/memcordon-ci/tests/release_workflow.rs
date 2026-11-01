@@ -25,6 +25,204 @@ fn unique_step(steps: &[Value], role: &str, predicate: impl Fn(&Value) -> bool) 
     matches[0]
 }
 
+fn earliest_toolchain_consumer(steps: &[Value]) -> usize {
+    steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str().is_some_and(|run| {
+                run.starts_with("rustup run ") || run.starts_with("./.release/tool/memcordon-ci ")
+            })
+        })
+        .expect("required metadata or compilation consumer")
+}
+
+// Independent parsed-graph contract: never ask the authoring helper to certify itself.
+fn logical_acquisition(
+    steps: &[Value],
+    command: &str,
+    before: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    let matching: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| (step["run"].as_str() == Some(command)).then_some(index))
+        .collect();
+    if matching.len() != 3 {
+        return Err("exactly three pinned acquisition attempts required".into());
+    }
+    let start = matching[0];
+    if matching != [start, start + 1, start + 2] || start + 2 >= before {
+        return Err("complete adjacent acquisition must precede earliest consumer".into());
+    }
+    let group = &steps[start..start + 3];
+    let mut ids = std::collections::BTreeSet::new();
+    let mut total = 0;
+    for (index, step) in group.iter().enumerate() {
+        let id = step["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("missing acquisition id")?;
+        if !ids.insert(id)
+            || steps
+                .iter()
+                .filter(|step| step["id"].as_str() == Some(id))
+                .count()
+                != 1
+        {
+            return Err("duplicate acquisition id".into());
+        }
+        for field in ["env", "working-directory", "shell"] {
+            if !step[field].is_null() {
+                return Err(format!("unexpected acquisition context: {field}"));
+            }
+        }
+        if index == 0 {
+            if !step["if"].is_null() {
+                return Err("initial acquisition must be unconditional".into());
+            }
+        } else {
+            let previous = group[index - 1]["id"]
+                .as_str()
+                .ok_or("missing predecessor id")?;
+            let guard = format!("${{{{ !cancelled() && steps.{previous}.outcome == 'failure' }}}}");
+            if step["if"].as_str() != Some(&guard) {
+                return Err("acquisition retry guard differs".into());
+            }
+        }
+        if (index < 2 && step["continue-on-error"] != true)
+            || (index == 2 && !step["continue-on-error"].is_null())
+        {
+            return Err("only first two attempts may be optional".into());
+        }
+        let minutes = step["timeout-minutes"]
+            .as_u64()
+            .ok_or("missing attempt timeout")?;
+        if minutes != 5 {
+            return Err("acquisition attempt must retain five-minute allowance".into());
+        }
+        total += minutes;
+    }
+    if total != 15 {
+        return Err("acquisition configured total must remain fifteen minutes".into());
+    }
+    Ok(start..start + 3)
+}
+
+#[test]
+fn logical_toolchain_acquisition_rejects_each_unsafe_shape_before_any_consumer() {
+    let workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    for (job, command) in [
+        (
+            "assemble-payload",
+            "rustup toolchain install 1.97.1 --profile minimal",
+        ),
+        (
+            "source-checks",
+            "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
+        ),
+    ] {
+        let baseline = workflow["jobs"][job]["steps"].as_sequence().unwrap();
+        let group =
+            logical_acquisition(baseline, command, earliest_toolchain_consumer(baseline)).unwrap();
+        for case in [
+            "remove-first",
+            "remove-second",
+            "remove-third",
+            "remove-all",
+            "duplicate",
+            "separate",
+            "pin",
+            "components",
+            "context",
+            "all-context",
+            "optional-final",
+            "conditional-first",
+            "conclusion",
+            "predecessor",
+            "cancel",
+            "timeout",
+            "duplicate-id",
+            "late-member",
+            "late-group",
+        ] {
+            let mut changed = baseline.clone();
+            let start = group.start;
+            match case {
+                "remove-first" => {
+                    changed.remove(start);
+                }
+                "remove-second" => {
+                    changed.remove(start + 1);
+                }
+                "remove-third" => {
+                    changed.remove(start + 2);
+                }
+                "remove-all" => {
+                    changed.drain(group.clone());
+                }
+                "duplicate" => {
+                    changed.insert(start, changed[start].clone());
+                }
+                "separate" => {
+                    changed.insert(
+                        start + 1,
+                        serde_yaml::from_str("run: echo unrelated").unwrap(),
+                    );
+                }
+                "pin" => changed[start + 1]["run"] = command.replace("1.97.1", "1.97.0").into(),
+                "components" => {
+                    changed[start + 1]["run"] = format!("{command} --component rust-src").into()
+                }
+                "context" => changed[start + 1]["working-directory"] = "elsewhere".into(),
+                "all-context" => {
+                    for step in &mut changed[group.clone()] {
+                        step["working-directory"] = "elsewhere".into();
+                    }
+                }
+                "optional-final" => changed[start + 2]["continue-on-error"] = true.into(),
+                "conditional-first" => changed[start]["if"] = false.into(),
+                "conclusion" => {
+                    let guard = changed[start + 1]["if"]
+                        .as_str()
+                        .unwrap()
+                        .replace(".outcome", ".conclusion");
+                    changed[start + 1]["if"] = guard.into();
+                }
+                "predecessor" => {
+                    changed[start + 2]["if"] =
+                        "${{ !cancelled() && steps.unknown.outcome == 'failure' }}".into()
+                }
+                "cancel" => {
+                    let guard = changed[start + 1]["if"]
+                        .as_str()
+                        .unwrap()
+                        .replace("!cancelled() && ", "");
+                    changed[start + 1]["if"] = guard.into();
+                }
+                "timeout" => changed[start + 2]["timeout-minutes"] = 6.into(),
+                "duplicate-id" => changed[start + 2]["id"] = changed[start]["id"].clone(),
+                "late-member" => {
+                    let member = changed.remove(start + 2);
+                    let consumer = earliest_toolchain_consumer(&changed);
+                    changed.insert(consumer + 1, member);
+                }
+                "late-group" => {
+                    let members: Vec<_> = changed.drain(group.clone()).collect();
+                    let consumer = earliest_toolchain_consumer(&changed);
+                    changed.splice(consumer + 1..consumer + 1, members);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                logical_acquisition(&changed, command, earliest_toolchain_consumer(&changed))
+                    .is_err(),
+                "{job}/{case}"
+            );
+        }
+    }
+}
+
 #[test]
 fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_source() {
     let workflow: Value =
@@ -40,23 +238,13 @@ fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_sou
             )
     });
     let stable = memcordon_ci::config::toolchains(&root()).unwrap().stable;
-    assert!(
-        steps[..assembly].iter().any(|step| {
-            step["run"].as_str().is_some_and(|run| {
-                run.split_whitespace().collect::<Vec<_>>()
-                    == [
-                        "rustup",
-                        "toolchain",
-                        "install",
-                        stable.as_str(),
-                        "--profile",
-                        "minimal",
-                    ]
-            }) && step["if"].is_null()
-                && step["continue-on-error"].is_null()
-        }),
-        "assembly must install the pinned Cargo toolchain before source metadata validation"
-    );
+    let acquisition = logical_acquisition(
+        steps,
+        &format!("rustup toolchain install {stable} --profile minimal"),
+        earliest_toolchain_consumer(steps),
+    )
+    .unwrap();
+    assert!(acquisition.end <= assembly);
     for target in [
         "linux-x64",
         "linux-arm64",
@@ -169,14 +357,13 @@ fn release_quality_installs_required_components_before_running_the_suite() {
         step["run"].as_str()
             == Some("./.release/tool/memcordon-ci ci segment release-quality-compiler")
     });
-    assert!(steps[..quality].iter().any(|step| {
-        step["run"].as_str()
-            == Some(
-                "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
-            )
-            && step["if"].is_null()
-            && step["continue-on-error"].is_null()
-    }));
+    let acquisition = logical_acquisition(
+        steps,
+        "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
+        earliest_toolchain_consumer(steps),
+    )
+    .unwrap();
+    assert!(acquisition.end <= quality);
 }
 
 #[test]
@@ -417,8 +604,9 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
                 };
                 let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
                 let install =
-                    unique_step(steps, case, |step| step["run"].as_str() == Some(command));
-                steps.remove(install);
+                    logical_acquisition(steps, command, earliest_toolchain_consumer(steps))
+                        .unwrap();
+                steps.drain(install);
             }
             "native-budget" => {
                 changed["jobs"]["native-linux-x64"]["timeout-minutes"] = Value::Number(90.into())
