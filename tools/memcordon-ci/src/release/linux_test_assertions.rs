@@ -571,24 +571,14 @@ fn assert_case_inner(
                 operation(&rows, name)?;
             }
             if scenario == "export-concurrent-writer" {
-                let writer = &case.controller["export_writer_native"];
-                let retired = operation(&rows, "export-writer-retired")?;
-                if writer["pidfd_readable_after_stop"] != true
-                    || writer["target_alive_after_writer"] != true
-                    || writer["first"]["bytes"] == writer["second"]["bytes"]
-                    || writer["first"]["inode"] != writer["second"]["inode"]
-                    || writer["first"]["inode"] != writer["final"]["inode"]
-                    || retired["pid"] != writer["writer"]["pid"]
-                    || retired["native_wait_completed"] != true
-                    || retired["raw_wait_status"] != 0
-                    || retired["before_root_release"] != true
-                    || case.outputs.len() != 1
-                    || case.outputs[0].1 != bytes(&writer["final"]["bytes"])?
-                {
-                    return Err(fail(
-                        "live writer mutation, retirement or final exported bytes differ",
-                    ));
-                }
+                crate::linux_export_writer::validate(
+                    &case.controller,
+                    &case.retirement,
+                    &rows,
+                    native,
+                    &case.outputs,
+                )
+                .map_err(CiError::Message)?;
             } else if case.controller["rejected_export_output_empty"] != true
                 || !case.outputs.is_empty()
                 || result["output_delivery"] != "incomplete"

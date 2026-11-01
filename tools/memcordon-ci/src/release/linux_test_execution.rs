@@ -1047,6 +1047,15 @@ fn run_recipe_inner(
                                     CiError::Message("original export writer was not held".into())
                                 })?;
                                 let writer = &held[index];
+                                let namespace_pid = writer
+                                    .namespace_pid
+                                    .filter(|pid| *pid != 0)
+                                    .ok_or_else(|| {
+                                        CiError::Message(
+                                            "original export writer namespace mapping absent"
+                                                .into(),
+                                        )
+                                    })?;
                                 let mut first = root.writer_sample()?;
                                 loop {
                                     let value: Vec<u8> =
@@ -1087,7 +1096,7 @@ fn run_recipe_inner(
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
-                                controller["export_writer_native"] = serde_json::json!({"writer":{"pid":writer.process_id,"birth":writer.birth},"first":first,"second":second,"final":root.writer_sample()?,"pidfd_readable_after_stop":true,"target_alive_after_writer":!held[4].exited().map_err(CiError::Message)?});
+                                controller["export_writer_native"] = serde_json::json!({"writer":{"pid":writer.process_id,"birth":writer.birth,"namespace_pid":namespace_pid},"first":first,"second":second,"final":root.writer_sample()?,"pidfd_readable_after_stop":true,"target_alive_after_writer":!held[4].exited().map_err(CiError::Message)?});
                             }
                             drop(root);
                             launch.send_input(b"R".to_vec())?;
