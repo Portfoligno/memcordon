@@ -1,11 +1,34 @@
 #[path = "../src/bin/consumer_readiness_windows/gate_call_trace_record.rs"]
 mod record;
 
-use record::{NativeEntry, NativeTrace, diagnostic};
+use record::{NativeEntry, NativeTrace, SnapshotEntry, SnapshotSummary, diagnostic};
+
+fn snapshot(count: u32) -> SnapshotSummary {
+    let mut snapshot = SnapshotSummary {
+        attempted: 1,
+        captured: 1,
+        walk_completed: 1,
+        entry_count: count,
+        without_terminated_count: count,
+        detail_count: count.min(8),
+        detail_truncated: u32::from(count > 8),
+        ..SnapshotSummary::default()
+    };
+    for (index, detail) in snapshot.details.iter_mut().take(count as usize).enumerate() {
+        *detail = SnapshotEntry {
+            process_id: 7,
+            thread_id: index as u32 + 19,
+            creation_time: 123,
+            capture_time: 456,
+            ..SnapshotEntry::default()
+        };
+    }
+    snapshot
+}
 
 fn trace() -> NativeTrace {
     let mut trace = NativeTrace {
-        version: 1,
+        version: 2,
         setup_stage: 1,
         thread_count: 1,
         thread_limit: 1,
@@ -16,6 +39,10 @@ fn trace() -> NativeTrace {
         outer_error: 5,
         count: 1,
         clock_live: 1,
+        snapshot_source: 1,
+        original_current_thread_id: 19,
+        first_snapshot: snapshot(1),
+        second_snapshot: snapshot(1),
         ..NativeTrace::default()
     };
     trace.entries[0] = NativeEntry {
@@ -38,6 +65,162 @@ fn trace() -> NativeTrace {
     // Preserve raw UTF-16 including an unpaired surrogate, not a lossy string.
     trace.entries[0].name[..4].copy_from_slice(&[92, 0xd800, 0, 0xffff]);
     trace
+}
+
+#[test]
+fn original_snapshot_states_and_cached_failure_evidence_remain_distinct() {
+    for count in [0, 8, 9, 64] {
+        let mut value = trace();
+        value.setup_stage = 13;
+        value.setup_error = 50;
+        value.setup_reason = 1;
+        value.thread_limit = 64;
+        value.thread_count = count;
+        value.first_snapshot = snapshot(count);
+        value.second_snapshot = SnapshotSummary::default();
+        if count > 0 {
+            value.first_snapshot.details[0].flags = 1;
+            value.first_snapshot.details[0].exit_time = 789;
+            value.first_snapshot.details[0].exit_status = 123;
+            value.first_snapshot.terminated_count = 1;
+            value.first_snapshot.without_terminated_count -= 1;
+        }
+        let original = diagnostic(&value);
+        assert_eq!(
+            original["setup_reason_label"],
+            "first-snapshot-not-single-thread"
+        );
+        assert_eq!(original["setup_error"], 50);
+        assert_eq!(original["first_snapshot"]["entry_count"], count);
+        assert_eq!(
+            original["first_snapshot"]["retained_detail_count"],
+            count.min(8)
+        );
+        assert_eq!(
+            original["first_snapshot"]["detail_truncated"],
+            u32::from(count > 8)
+        );
+        assert_eq!(original["second_snapshot"]["attempted"], 0);
+        assert_eq!(original["coverage_inconclusive"], true);
+        assert_eq!(original["invalid_record"], false);
+        value.snapshot_source = 2;
+        let cached = diagnostic(&value);
+        assert_eq!(cached["first_snapshot"], original["first_snapshot"]);
+        assert_eq!(cached["setup_error"], 50);
+        assert_eq!(
+            cached["snapshot_source_label"],
+            "cached-original-installation-walks"
+        );
+    }
+    let mut busy = trace();
+    busy.setup_stage = 13;
+    busy.setup_reason = 2;
+    busy.snapshot_source = 0;
+    busy.first_snapshot = SnapshotSummary::default();
+    busy.second_snapshot = SnapshotSummary::default();
+    assert_eq!(
+        diagnostic(&busy)["setup_reason_label"],
+        "installation-busy-original-evidence-unavailable"
+    );
+}
+
+#[test]
+fn partial_unknown_and_invalid_snapshot_fields_never_claim_complete_coverage() {
+    for mutation in 0..8 {
+        let mut value = trace();
+        match mutation {
+            0 => {
+                value.first_snapshot.walk_completed = 0;
+                value.first_snapshot.error = 5;
+            }
+            1 => {
+                value.first_snapshot.details[0].flags = 2;
+                value.first_snapshot.unknown_flags_count = 1;
+            }
+            2 => value.first_snapshot.entry_count = 65,
+            3 => value.first_snapshot.detail_count = 9,
+            4 => value.first_snapshot.without_terminated_count = u32::MAX,
+            5 => value.first_snapshot.captured = 0,
+            6 => value.first_snapshot.detail_truncated = 1,
+            _ => value.setup_reason = 99,
+        }
+        let rendered = diagnostic(&value);
+        assert_eq!(
+            rendered["coverage_inconclusive"], true,
+            "mutation {mutation}"
+        );
+        assert_eq!(rendered["outer_error"], 5);
+        if mutation >= 2 {
+            assert_eq!(rendered["invalid_record"], true);
+        }
+    }
+    let mut partial = trace();
+    partial.first_snapshot.walk_completed = 0;
+    partial.first_snapshot.error = 5;
+    let rendered = diagnostic(&partial);
+    assert_eq!(rendered["first_snapshot"]["partial"], true);
+    assert_eq!(rendered["first_snapshot"]["error"], 5);
+}
+
+#[test]
+fn maximum_snapshot_and_call_records_stay_bounded_and_keep_primary_setup_error() {
+    let mut maximum = trace();
+    maximum.first_snapshot = snapshot(64);
+    maximum.second_snapshot = snapshot(64);
+    for summary in [&mut maximum.first_snapshot, &mut maximum.second_snapshot] {
+        for entry in &mut summary.details {
+            entry.creation_time = u64::MAX;
+            entry.exit_time = u64::MAX;
+            entry.capture_time = u64::MAX;
+            entry.raw_start_address = u64::MAX;
+            entry.process_id = u32::MAX;
+            entry.thread_id = u32::MAX;
+            entry.exit_status = u32::MAX;
+        }
+    }
+    maximum.count = 8;
+    maximum.setup_error = 50;
+    maximum.setup_stage = 13;
+    maximum.setup_reason = 1;
+    for (index, entry) in maximum.entries.iter_mut().enumerate() {
+        *entry = NativeEntry {
+            raw_root: u64::MAX,
+            raw_output: u64::MAX,
+            sequence: index as u32 + 1,
+            operation: 2,
+            thread_id: u32::MAX,
+            desired_access: u32::MAX,
+            attributes_length: u32::MAX,
+            attributes_flags: u32::MAX,
+            root_is_null: 1,
+            arguments_readable: 1,
+            name_readable: 1,
+            copied_name_units: 256,
+            reported_name_bytes: 512,
+            name: [u16::MAX; 256],
+            entered: 1,
+            returned: 1,
+            native_status: i32::MIN,
+            output_handle_readable: 1,
+            output_handle_returned: 1,
+            ..NativeEntry::default()
+        };
+    }
+    let rendered = diagnostic(&maximum);
+    assert_eq!(rendered["setup_stage"], 13);
+    assert_eq!(rendered["setup_error"], 50);
+    assert_eq!(rendered["outer_error"], 5);
+    assert_eq!(rendered["first_snapshot"]["retained_detail_count"], 8);
+    assert_eq!(rendered["second_snapshot"]["retained_detail_count"], 8);
+    assert_eq!(rendered["entries"].as_array().unwrap().len(), 8);
+    assert!(serde_json::to_vec(&rendered).unwrap().len() <= record::RECORD_BYTES);
+    let oversized =
+        record::bounded_diagnostic(serde_json::json!({"setup_stage":13,"setup_error":50,
+        "setup_reason":1,"outer_error":5,"extra":"x".repeat(record::RECORD_BYTES+1)}));
+    assert_eq!(oversized["setup_stage"], 13);
+    assert_eq!(oversized["setup_error"], 50);
+    assert_eq!(oversized["setup_reason"], 1);
+    assert_eq!(oversized["outer_error"], 5);
 }
 
 #[test]

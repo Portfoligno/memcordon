@@ -12,15 +12,29 @@ struct TraceEntry {
     uint32_t output_handle_readable, output_handle_returned;
     uint16_t name[256];
 };
+struct SnapshotEntry {
+    uint64_t creation_time, exit_time, capture_time, raw_start_address;
+    uint32_t process_id, thread_id, flags, exit_status;
+};
+struct SnapshotSummary {
+    uint32_t attempted, captured, walk_completed, error;
+    uint32_t entry_count, terminated_count, without_terminated_count, unknown_flags_count;
+    uint32_t detail_count, detail_truncated;
+    SnapshotEntry details[8];
+};
 struct TracePacket {
     uint32_t version, setup_stage, setup_error, attached_directory, attached_event;
     uint32_t armed_call_count, count, overflow, incomplete, called;
     uint32_t outer_opened, outer_error, thread_count, thread_limit, clock_live, lifetime_policy;
+    uint32_t setup_reason, original_current_thread_id, snapshot_source, reserved;
     uint64_t started_qpc, finished_qpc, original_cutoff_qpc;
+    SnapshotSummary first_snapshot, second_snapshot;
     TraceEntry entries[8];
 };
 static_assert(sizeof(TraceEntry) == 600 && offsetof(TraceEntry, name) == 88, "trace entry ABI");
-static_assert(sizeof(TracePacket) == 4888 && offsetof(TracePacket, entries) == 88, "trace packet ABI");
+static_assert(sizeof(SnapshotEntry) == 48 && offsetof(SnapshotEntry, process_id) == 32, "snapshot entry ABI");
+static_assert(sizeof(SnapshotSummary) == 424 && offsetof(SnapshotSummary, details) == 40, "snapshot summary ABI");
+static_assert(sizeof(TracePacket) == 5752 && offsetof(TracePacket, entries) == 952 && offsetof(TracePacket, first_snapshot) == 104, "trace packet ABI v2");
 extern "C" void memcordon_gate_trace_prepare(TracePacket*, uint64_t, uint64_t);
 extern "C" void* memcordon_gate_trace_call(TracePacket*, const uint16_t*, uint32_t*, uint32_t*);
 extern "C" uint32_t memcordon_gate_trace_mock();

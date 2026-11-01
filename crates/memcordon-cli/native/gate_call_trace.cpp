@@ -14,6 +14,8 @@ static Open directory_open = nullptr, event_open = nullptr;
 static volatile LONG installation = 0;
 static uint32_t installation_stage = 0, installation_error = 0;
 static uint32_t installation_threads = 0;
+static uint32_t installation_reason = 0, installation_current_thread = 0;
+static SnapshotSummary installation_first = {}, installation_second = {};
 struct Collector { TracePacket* packet; DWORD thread; };
 // POD static TLS is initialized before user code, never lazily in a hook.
 static __declspec(thread) Collector collector = {nullptr, 0};
@@ -135,18 +137,40 @@ struct SnapshotApi {
     }
 };
 struct ThreadIdentity { DWORD id; FILETIME birth; };
-static DWORD threads(SnapshotApi& api, ThreadIdentity (&entries)[64], uint32_t* count) {
+static uint64_t ticks(FILETIME time) {
+    return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
+static DWORD threads(SnapshotApi& api, ThreadIdentity (&entries)[64], uint32_t* count, SnapshotSummary* summary) {
     HPSS snapshot = nullptr;
+    summary->attempted = 1;
     DWORD error = api.capture(GetCurrentProcess(), PSS_CAPTURE_THREADS, 0, &snapshot);
-    if (error != ERROR_SUCCESS) return error;
+    if (error != ERROR_SUCCESS) { summary->error = error; return error; }
+    summary->captured = 1;
     HPSSWALK marker = nullptr;
     error = api.marker_create(nullptr, &marker);
     if (error == ERROR_SUCCESS) {
         for (;;) {
             PSS_THREAD_ENTRY entry = {};
             error = api.walk(snapshot, PSS_WALK_THREADS, marker, &entry, sizeof(entry));
-            if (error == ERROR_NO_MORE_ITEMS) { error = ERROR_SUCCESS; break; }
+            if (error == ERROR_NO_MORE_ITEMS) { summary->walk_completed = 1; error = ERROR_SUCCESS; break; }
             if (error != ERROR_SUCCESS) break;
+            // Retain only fields already supplied by this same bounded walk.
+            // Raw start addresses are opaque diagnostics, never dereferenced.
+            if (summary->entry_count < 64) {
+                ++summary->entry_count;
+                const uint32_t flags = static_cast<uint32_t>(entry.Flags);
+                const uint32_t terminated = static_cast<uint32_t>(PSS_THREAD_FLAGS_TERMINATED);
+                if (flags & terminated) ++summary->terminated_count;
+                else ++summary->without_terminated_count;
+                if (flags & ~terminated) ++summary->unknown_flags_count;
+                if (summary->detail_count < 8) {
+                    summary->details[summary->detail_count++] = {
+                        ticks(entry.CreateTime), ticks(entry.ExitTime), ticks(entry.CaptureTime),
+                        reinterpret_cast<uintptr_t>(entry.Win32StartAddress),
+                        entry.ProcessId, entry.ThreadId, flags, entry.ExitStatus
+                    };
+                } else summary->detail_truncated = 1;
+            } else summary->detail_truncated = 1;
             if (entry.ProcessId != GetCurrentProcessId()) { error = ERROR_INVALID_OWNER; break; }
             if (*count >= 64) { error = ERROR_BUFFER_OVERFLOW; break; }
             entries[(*count)++] = {entry.ThreadId, entry.CreateTime};
@@ -155,12 +179,14 @@ static DWORD threads(SnapshotApi& api, ThreadIdentity (&entries)[64], uint32_t* 
         if (error == ERROR_SUCCESS) error = freed;
     }
     const DWORD freed = api.free_snapshot(GetCurrentProcess(), snapshot);
-    return error == ERROR_SUCCESS ? freed : error;
+    const DWORD original_error = error == ERROR_SUCCESS ? freed : error;
+    summary->error = original_error;
+    return original_error;
 }
 static bool equal(FILETIME a, FILETIME b) { return a.dwLowDateTime == b.dwLowDateTime && a.dwHighDateTime == b.dwHighDateTime; }
 
 extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutoff, uint64_t frequency) {
-    packet->version = 1; packet->original_cutoff_qpc = cutoff;
+    packet->version = 2; packet->original_cutoff_qpc = cutoff;
     packet->thread_limit = 64; packet->lifetime_policy = 1;
     if (!clock_live(packet, frequency)) { packet->incomplete = 1; return; }
     packet->started_qpc = packet->finished_qpc;
@@ -171,6 +197,15 @@ extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutof
         packet->attached_directory = packet->attached_event = previous == 2;
         packet->thread_count = installation_threads;
         packet->incomplete = previous != 2;
+        if (previous == 2 || previous == 3) {
+            packet->setup_reason = installation_reason;
+            packet->original_current_thread_id = installation_current_thread;
+            packet->snapshot_source = 2; // Frozen original installation evidence.
+            packet->first_snapshot = installation_first;
+            packet->second_snapshot = installation_second;
+        } else {
+            packet->setup_reason = 2; // Installation currently busy; evidence unavailable.
+        }
         return;
     }
     uint32_t stage = 3;
@@ -180,13 +215,15 @@ extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutof
     ThreadIdentity first[64] = {}, second[64] = {};
     uint32_t first_count = 0, second_count = 0;
     const DWORD current = GetCurrentThreadId();
+    packet->original_current_thread_id = current;
+    packet->snapshot_source = 1;
     const HMODULE module = GetModuleHandleW(L"ntdll.dll");
     if (!module) { error = GetLastError(); goto done; }
     if (!load_export(module, "NtOpenDirectoryObject", &directory_open, &error) ||
         !load_export(module, "NtOpenEvent", &event_open, &error)) goto done;
     stage = 4;
     if (!api.load(&error)) goto done;
-    stage = 4; error = threads(api, first, &first_count);
+    stage = 4; error = threads(api, first, &first_count, &packet->first_snapshot);
     packet->thread_count = first_count;
     if (error != ERROR_SUCCESS) { if (error == ERROR_BUFFER_OVERFLOW) stage = 5; goto done; }
     {
@@ -201,7 +238,7 @@ extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutof
     // Detours allocates during its transaction. Suspending an arbitrary peer
     // could strand the process heap lock, so this optional diagnostic refuses
     // multi-threaded controls instead of guessing a safe suspension point.
-    if (first_count != 1) { stage = 13; error = ERROR_NOT_SUPPORTED; goto done; }
+    if (first_count != 1) { packet->setup_reason = 1; stage = 13; error = ERROR_NOT_SUPPORTED; goto done; }
     stage = 7; error = DetourTransactionBegin();
     if (error != ERROR_SUCCESS) goto done;
     transaction = true;
@@ -211,7 +248,7 @@ extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutof
     if (error != ERROR_SUCCESS) goto done;
     stage = 10; error = DetourAttach(reinterpret_cast<PVOID*>(&event_open), reinterpret_cast<PVOID>(event_hook));
     if (error != ERROR_SUCCESS) goto done;
-    stage = 11; error = threads(api, second, &second_count);
+    stage = 11; error = threads(api, second, &second_count, &packet->second_snapshot);
     if (error != ERROR_SUCCESS) goto done;
     if (first_count != second_count) { error = ERROR_RETRY; goto done; }
     for (uint32_t index = 0; index < second_count; ++index) {
@@ -231,6 +268,10 @@ done:
     if (transaction && DetourTransactionAbort() != ERROR_SUCCESS) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     installation_stage = stage; installation_error = error;
     installation_threads = first_count;
+    installation_reason = packet->setup_reason;
+    installation_current_thread = packet->original_current_thread_id;
+    installation_first = packet->first_snapshot;
+    installation_second = packet->second_snapshot;
     InterlockedExchange(&installation, stage == 1 ? 2 : 3);
     packet->setup_stage = stage; packet->setup_error = error;
     packet->attached_directory = packet->attached_event = stage == 1;

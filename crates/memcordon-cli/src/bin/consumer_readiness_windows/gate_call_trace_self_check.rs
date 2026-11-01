@@ -73,7 +73,16 @@ pub(super) fn run() -> io::Result<i32> {
             );
         }
         let trace = prepared.diagnostic();
-        assert_eq!(trace["setup_stage"], 1);
+        assert_eq!(
+            trace["setup_stage"],
+            1,
+            "case={}; bounded_trace={trace}",
+            if should_open {
+                "owned-event"
+            } else {
+                "missing-event"
+            }
+        );
         assert_eq!(trace["attached_directory"], 1);
         assert_eq!(trace["attached_event"], 1);
         assert_eq!(trace["coverage_inconclusive"], false);
