@@ -22,6 +22,7 @@ mod namespace_primary_worker;
 mod native;
 mod native_fixture_default_dacl;
 mod native_gate_precondition;
+mod own_thread_deadline_self_check;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
@@ -618,6 +619,14 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 return Err(io::Error::other("trace self-check takes no operands"));
             }
             return gate_call_trace_self_check::run();
+        }
+        Some("own-thread-deadline-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "own-thread deadline self-check takes no operands",
+                ));
+            }
+            return own_thread_deadline_self_check::run();
         }
         Some("gate-precondition-child") => {
             let path = args

@@ -71,6 +71,35 @@ fn assert_original(error: &CiError, bytes: &[u8]) {
 }
 
 #[test]
+fn preadmission_start_failure_surfaces_bounded_original_stderr_without_inventing_gate_cause() {
+    let stderr=b"memcordon-test-fixture: terminal transport DuplicateHandle own-thread reference: OS Error 5\n".to_vec();
+    let failure = callback_failure(query(stderr.clone(), true, Ok(())), None);
+    assert_original(&failure, &stderr);
+    let text = failure.to_string();
+    assert!(text.contains("original fixture callback failure"));
+    assert!(text.contains("DuplicateHandle own-thread reference"));
+    assert!(!text.contains("original captured gate failure"));
+    let mut large = stderr.clone();
+    large.extend(vec![b'x'; 16 * 1024]);
+    large.extend(b"original terminal tail\xff");
+    let failure = callback_failure(
+        query(
+            large.clone(),
+            false,
+            Err("original cleanup unproved".into()),
+        ),
+        None,
+    );
+    assert_original(&failure, &large);
+    let text = failure.to_string();
+    assert!(text.contains("DuplicateHandle own-thread reference"));
+    assert!(text.contains("original terminal tail"));
+    assert!(text.contains("capture-complete=false"));
+    assert!(text.contains("omitted-bytes="));
+    assert!(text.len() < 4096);
+}
+
+#[test]
 fn bound_original_failure_leads_without_claiming_an_authenticated_target_association() {
     let case = json!("envelope");
     let expected = expected(&case);

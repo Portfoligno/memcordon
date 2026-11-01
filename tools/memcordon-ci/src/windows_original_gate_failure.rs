@@ -8,6 +8,34 @@ const PREFIX: &[u8] = b"original-gate-failure-before-control ";
 const RECORD_BYTES: usize = 2048;
 const CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
+fn retained_stderr(error: &ProcessTestError) -> String {
+    let ProcessTestError::Callback {
+        stderr,
+        capture_complete,
+        ..
+    } = error
+    else {
+        return "original callback stderr unavailable".into();
+    };
+    const EXCERPT_BYTES: usize = 512;
+    if stderr.len() <= EXCERPT_BYTES {
+        format!(
+            "original-stderr-bytes={}; capture-complete={capture_complete}; original-stderr={:?}",
+            stderr.len(),
+            String::from_utf8_lossy(stderr)
+        )
+    } else {
+        let half = EXCERPT_BYTES / 2;
+        format!(
+            "original-stderr-bytes={}; capture-complete={capture_complete}; original-stderr-head={:?}; omitted-bytes={}; original-stderr-tail={:?}",
+            stderr.len(),
+            String::from_utf8_lossy(&stderr[..half]),
+            stderr.len() - EXCERPT_BYTES,
+            String::from_utf8_lossy(&stderr[stderr.len() - half..])
+        )
+    }
+}
+
 pub struct Expected<'a> {
     pub case: &'a Value,
     pub challenge_sha256: &'a str,
@@ -151,9 +179,12 @@ pub fn callback_failure(error: ProcessTestError, expected: Option<&Expected<'_>>
                 secondary: Box::new(CiError::Process(error).context(format!("original callback failure; guardian-query-failed={}; controller-held-guardian={:?}; query-association=unavailable", expected.guardian_query_failed, expected.guardian))),
             }
         }
-        Err(reason) => CiError::Process(error).context(format!(
-            "original target gate diagnostic unavailable: {reason}"
-        )),
+        Err(reason) => {
+            let stderr = retained_stderr(&error);
+            CiError::Process(error).context(format!(
+                "original fixture callback failure; named-gate diagnostic unavailable: {reason}; {stderr}"
+            ))
+        }
     }
 }
 
