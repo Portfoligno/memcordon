@@ -4,7 +4,7 @@ mod plan;
 use std::time::Duration;
 
 #[test]
-fn narrow_commands_select_both_actual_fixture_targets_and_exact_native_tests() {
+fn narrow_commands_select_all_three_actual_fixture_targets_and_exact_native_tests() {
     let compile_budget = Duration::from_secs(25 * 60);
     let execution_budget = Duration::from_secs(30 * 60);
     let [compile, execute] = plan::commands(compile_budget, execution_budget);
@@ -18,6 +18,8 @@ fn narrow_commands_select_both_actual_fixture_targets_and_exact_native_tests() {
         "windows_namespace_primary",
         "--test",
         "windows_gate_call_trace",
+        "--test",
+        "windows_own_thread_deadline",
         "--all-features",
     ];
     assert_eq!(plan::TARGET_DIR, "target/ci/windows-fixture-native");
@@ -29,6 +31,10 @@ fn narrow_commands_select_both_actual_fixture_targets_and_exact_native_tests() {
         plan::TRACE_TEST_SELECTOR,
         "isolated_native_mock_and_owned_event_calls_preserve_original_results"
     );
+    assert_eq!(
+        plan::DEADLINE_TEST_SELECTOR,
+        "restricted_initial_thread_deadline_cancels_only_original_io_and_joins"
+    );
     assert_eq!(compile.arguments, [base.as_slice(), &["--no-run"]].concat());
     assert_eq!(
         execute.arguments,
@@ -39,7 +45,8 @@ fn narrow_commands_select_both_actual_fixture_targets_and_exact_native_tests() {
                 "--exact",
                 "--nocapture",
                 plan::TEST_SELECTOR,
-                plan::TRACE_TEST_SELECTOR
+                plan::TRACE_TEST_SELECTOR,
+                plan::DEADLINE_TEST_SELECTOR
             ]
         ]
         .concat()
@@ -64,22 +71,30 @@ fn passed_output(filtered: usize) -> String {
     [
         passed_harness(plan::TEST_SELECTOR, filtered),
         passed_harness(plan::TRACE_TEST_SELECTOR, 0),
+        passed_harness(plan::DEADLINE_TEST_SELECTOR, 0),
     ]
     .concat()
 }
 
 #[test]
-fn successful_exact_native_execution_requires_both_distinct_selected_tests_in_either_order() {
+fn successful_exact_native_execution_requires_three_distinct_selected_tests_in_every_order() {
     for filtered in [0, 83] {
         let output = passed_output(filtered);
         plan::verify_selected_tests(output.as_bytes()).unwrap();
         plan::verify_selected_tests(output.replace('\n', "\r\n").as_bytes()).unwrap();
-        let reversed = [
-            passed_harness(plan::TRACE_TEST_SELECTOR, 0),
-            passed_harness(plan::TEST_SELECTOR, filtered),
-        ]
-        .concat();
-        plan::verify_selected_tests(reversed.as_bytes()).unwrap();
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let reordered = order
+                .map(|index| passed_harness(plan::TEST_SELECTORS[index], filtered))
+                .concat();
+            plan::verify_selected_tests(reordered.as_bytes()).unwrap();
+        }
     }
 }
 
@@ -103,6 +118,15 @@ fn zero_wrong_duplicate_or_missing_execution_evidence_cannot_pass() {
         valid.replace("running 1 test", "running 1 test\nrunning 0 tests"),
         passed_harness(plan::TEST_SELECTOR, 83),
         passed_harness(plan::TRACE_TEST_SELECTOR, 0),
+        passed_harness(plan::DEADLINE_TEST_SELECTOR, 0),
+        [
+            passed_harness(plan::TEST_SELECTOR, 0),
+            passed_harness(plan::TRACE_TEST_SELECTOR, 0),
+        ]
+        .concat(),
+        valid.replace(plan::DEADLINE_TEST_SELECTOR, plan::TEST_SELECTOR),
+        valid.replace(plan::DEADLINE_TEST_SELECTOR, plan::TRACE_TEST_SELECTOR),
+        valid.replace(&passed_harness(plan::DEADLINE_TEST_SELECTOR, 0), ""),
         valid.replace(plan::TRACE_TEST_SELECTOR, plan::TEST_SELECTOR),
         valid.replace(plan::TEST_SELECTOR, plan::TRACE_TEST_SELECTOR),
         valid.replace(plan::TRACE_TEST_SELECTOR, "unknown_second_test"),
@@ -138,6 +162,10 @@ fn failed_ignored_measured_or_contradictory_counts_cannot_certify_execution() {
         valid.replace(
             &format!("test {} ... ok", plan::TRACE_TEST_SELECTOR),
             &format!("test {} ... ignored", plan::TRACE_TEST_SELECTOR),
+        ),
+        valid.replace(
+            &format!("test {} ... ok", plan::DEADLINE_TEST_SELECTOR),
+            &format!("test {} ... ignored", plan::DEADLINE_TEST_SELECTOR),
         ),
     ] {
         assert!(
