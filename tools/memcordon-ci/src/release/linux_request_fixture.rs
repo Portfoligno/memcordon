@@ -58,6 +58,32 @@ pub struct CallerRequestFixture {
 
 impl CallerSession {
     pub(super) fn command(&self, directory: &Path, cutoff: Instant) -> Result<CommandSpec> {
+        self.command_with_budget(
+            directory,
+            cutoff,
+            crate::caller_command_budget::administrative(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn workload_command(
+        &self,
+        directory: &Path,
+        cutoff: Instant,
+    ) -> Result<CommandSpec> {
+        self.command_with_budget(
+            directory,
+            cutoff,
+            crate::caller_command_budget::workload(Instant::now(), cutoff)?,
+        )
+    }
+
+    fn command_with_budget(
+        &self,
+        directory: &Path,
+        cutoff: Instant,
+        budget: Duration,
+    ) -> Result<CommandSpec> {
         if self.uid == 0 || self.gid == 0 || !self.installed_cli.is_absolute() {
             return Err(CiError::Message(
                 "request fixture caller identity/path invalid".into(),
@@ -65,18 +91,16 @@ impl CallerSession {
         }
         // setpriv reads the actor's real supplementary memberships. The fixture
         // does not add the provider socket group to compensate for denied access.
-        Ok(
-            CommandSpec::new("/usr/bin/setpriv", directory, Duration::from_secs(60))
-                .bounded_until(cutoff)
-                .cleared_environment()
-                .arg("--reuid")
-                .arg(self.uid.to_string())
-                .arg("--regid")
-                .arg(self.gid.to_string())
-                .arg("--init-groups")
-                .arg("--")
-                .arg(&self.installed_cli),
-        )
+        Ok(CommandSpec::new("/usr/bin/setpriv", directory, budget)
+            .bounded_until(cutoff)
+            .cleared_environment()
+            .arg("--reuid")
+            .arg(self.uid.to_string())
+            .arg("--regid")
+            .arg(self.gid.to_string())
+            .arg("--init-groups")
+            .arg("--")
+            .arg(&self.installed_cli))
     }
 }
 

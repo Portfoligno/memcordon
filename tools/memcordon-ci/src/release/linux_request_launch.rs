@@ -49,7 +49,7 @@ pub struct RequestLaunch {
     observer: Receiver<std::result::Result<std::sync::Arc<HeldLinuxProcess>, String>>,
     frontend: Option<std::sync::Arc<HeldLinuxProcess>>,
     capture: Option<JoinHandle<Result<ObservedOutput>>>,
-    observed: Option<ObservedOutput>,
+    terminal: crate::terminal_capture::TerminalCapture<ObservedOutput>,
     input: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     snapshots: Receiver<memcordon_testkit::OutputSnapshot>,
     snapshot: Option<memcordon_testkit::OutputSnapshot>,
@@ -65,7 +65,7 @@ pub struct RecoveryObservation {
 impl RequestLaunch {
     pub fn retire_bundle_exact(&self, fixture: &CallerRequestFixture) -> Result<()> {
         if self.capture.is_some()
-            || self.observed.is_none()
+            || !self.terminal.has_output()
             || self.request != fixture.request_sha256
             || self.bundle_identity != fixture.bundle_identity()?
         {
@@ -159,7 +159,7 @@ impl RequestLaunch {
         }
         let mut command = input
             .caller
-            .command(input.directory, input.work_cutoff)?
+            .workload_command(input.directory, input.work_cutoff)?
             .arg(input.memory)
             .arg(input.deadline)
             .args(crate::linux_request_arguments::wait_arguments(
@@ -417,7 +417,7 @@ impl RequestLaunch {
             observer,
             frontend: None,
             capture: Some(capture),
-            observed: None,
+            terminal: crate::terminal_capture::TerminalCapture::default(),
             input: if interactive {
                 Some(input_sender)
             } else {
@@ -543,22 +543,15 @@ impl RequestLaunch {
             );
         }
         if let Some(worker) = self.capture.take() {
-            let observed = worker.join().map_err(|_| {
-                CiError::Message(
-                    "original frontend supervisor panicked; native cleanup unresolved".into(),
-                )
-            })??;
-            self.observed = Some(observed);
-            let retained = self
-                .observed
-                .as_ref()
-                .expect("actual capture retained before publication");
+            match worker.join() {
+                Ok(result) => self.terminal.complete(result)?,
+                Err(_) => return Err(self.terminal.panicked()),
+            }
+            let retained = self.terminal.output()?;
             write_record(&self.directory, "stdout.bin", &retained.stdout)?;
             write_record(&self.directory, "stderr.bin", &retained.stderr)?;
         }
-        self.observed
-            .as_ref()
-            .ok_or_else(|| CiError::Message("original frontend capture absent".into()))
+        self.terminal.output()
     }
 
     /// Settle the original supervisor after an actor error. This does not claim

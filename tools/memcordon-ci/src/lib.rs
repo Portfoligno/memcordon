@@ -213,6 +213,7 @@ impl CiError {
 
 pub type Result<T> = std::result::Result<T, CiError>;
 pub mod arm32_abi_helper;
+pub mod caller_command_budget;
 pub mod exact_harness;
 pub mod external_consumer;
 pub mod launch_event_wait;
@@ -221,3 +222,4 @@ pub mod linux_snapshot_probe;
 pub mod macos_performance;
 pub mod native_acceptance_catalogue;
 pub mod performance_plan;
+pub mod terminal_capture;
