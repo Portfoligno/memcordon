@@ -595,7 +595,18 @@ fn assert_case_inner(
             {
                 return Err(fail("unsafe export produced caller output"));
             }
-            completed(&result, 0)?;
+            let report = case
+                .result
+                .as_ref()
+                .expect("validated original export report");
+            crate::linux_export_outcome::validate(
+                scenario,
+                &report.outcome,
+                report.output_delivery,
+                report.diagnostics.as_slice(),
+                case.frontend_wait.code(),
+            )
+            .map_err(CiError::Message)?;
         }
         ("C-ADMISSION", "positive") => {
             let bind = operation(&rows, "bind-zero-and-competing-bind")?;

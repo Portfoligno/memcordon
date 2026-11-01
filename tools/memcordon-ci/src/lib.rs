@@ -6,6 +6,7 @@
 pub mod linux_allocation_checkpoint;
 pub mod linux_elf_rpath;
 pub mod linux_execution_order;
+pub mod linux_export_outcome;
 pub mod linux_path_alias;
 pub mod linux_relay_sample;
 pub mod linux_result_publication;
