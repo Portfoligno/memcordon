@@ -8,6 +8,7 @@ mod formatting;
 mod release;
 mod semantics;
 mod source_seed;
+pub mod toolchain_acquisition;
 mod workflow_budget;
 
 use crate::{CiError, Result};
