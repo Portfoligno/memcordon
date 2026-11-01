@@ -3,6 +3,141 @@ mod controller_gate_error;
 #[path = "../src/bin/consumer_readiness_windows/toolchain_diagnostics.rs"]
 mod diagnostics;
 
+// Native CI only. Exercise the actual publisher and retained old readers;
+// portability checks must not simulate native replacement success.
+#[cfg(all(windows, feature = "test-fixtures"))]
+#[test]
+fn native_current_record_replacement_retains_old_readers_and_refuses_foreign_destinations() {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+    let root = tempfile::tempdir().unwrap();
+    let owner =
+        diagnostics::PublicationOwner::new(root.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, json!({"challenge":[7]})).unwrap();
+    publisher
+        .publish(false, "first", &json!({"value":1}))
+        .unwrap();
+    let path = root.path().join("toolchain-current-phase.json");
+    let mut old = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(&path)
+        .unwrap();
+    publisher
+        .publish(false, "second", &json!({"value":2}))
+        .unwrap();
+    let mut previous = Vec::new();
+    old.read_to_end(&mut previous).unwrap();
+    let previous: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(previous["phase"], "first");
+    assert_eq!(current["phase"], "second");
+    assert!(!root.path().join("toolchain-current-phase.pending").exists());
+    let pending = root.path().join("toolchain-current-phase.pending");
+    let current_bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&pending, b"preserve failed stage evidence").unwrap();
+    assert!(
+        publisher
+            .publish(false, "blocked-stage", &json!({}))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&pending).unwrap(),
+        b"preserve failed stage evidence"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), current_bytes);
+    std::fs::remove_file(&pending).unwrap();
+    publisher
+        .publish(false, "after-refusal", &json!({}))
+        .unwrap();
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(current["transition_sequence"], 3);
+    // A second compiler publisher shares the same real destination custody.
+    let next = diagnostics::Publisher::new(&owner, json!({"challenge":[8]})).unwrap();
+    next.publish(false, "next-compiler", &json!({})).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"foreign bytes").unwrap();
+    assert!(next.publish(false, "must-refuse", &json!({})).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"foreign bytes");
+    drop(next);
+    drop(publisher);
+    drop(owner);
+
+    let foreign = tempfile::tempdir().unwrap();
+    std::fs::write(
+        foreign.path().join("toolchain-current-phase.json"),
+        b"foreign",
+    )
+    .unwrap();
+    let owner =
+        diagnostics::PublicationOwner::new(foreign.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, json!({})).unwrap();
+    assert!(publisher.publish(false, "must-refuse", &json!({})).is_err());
+
+    let reparse = tempfile::tempdir().unwrap();
+    let target = reparse.path().join("foreign-target");
+    std::fs::write(&target, b"foreign target").unwrap();
+    std::os::windows::fs::symlink_file(
+        &target,
+        reparse.path().join("toolchain-current-phase.json"),
+    )
+    .unwrap();
+    let owner =
+        diagnostics::PublicationOwner::new(reparse.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, json!({})).unwrap();
+    assert!(
+        publisher
+            .publish(false, "must-refuse-reparse", &json!({}))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"foreign target");
+}
+
+#[cfg(all(windows, feature = "test-fixtures"))]
+#[test]
+fn native_source_substitution_and_expired_publication_never_replace_destination() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let root = tempfile::tempdir().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root.path())
+        .unwrap();
+    let stage = root.path().join("source.pending");
+    std::fs::write(&stage, b"original verified bytes").unwrap();
+    let original = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&stage)
+        .unwrap();
+    std::fs::rename(&stage, root.path().join("original-retained")).unwrap();
+    std::fs::write(&stage, b"substituted bytes").unwrap();
+    assert!(
+        memcordon_platform::test_support::windows_open_synchronous_rename_source(
+            &parent,
+            std::ffi::OsStr::new("source.pending"),
+            &original,
+            deadline,
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&stage).unwrap(), b"substituted bytes");
+    assert!(diagnostics::PublicationOwner::new(root.path(), Instant::now()).is_err());
+    assert!(!root.path().join("toolchain-current-phase.json").exists());
+}
+
 use serde_json::json;
 
 fn creation(pid: u32, birth: u64) -> diagnostics::CreationIdentity {

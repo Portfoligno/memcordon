@@ -11,10 +11,13 @@ fn observed_output(
     root: &Path,
     role: &str,
     challenge: &[u8],
-    creation: Option<&super::descriptor::Toolchain>,
+    creation: Option<(
+        &super::descriptor::Toolchain,
+        &super::toolchain_diagnostics::PublicationOwner,
+    )>,
 ) -> io::Result<Output> {
     let qualified = creation
-        .map(|inputs| qualified_inputs::Qualified::new(inputs, command))
+        .map(|(inputs, _)| qualified_inputs::Qualified::new(inputs, command))
         .transpose()?;
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -62,7 +65,7 @@ fn observed_output(
         .get_args()
         .map(|argument| argument.encode_wide().collect())
         .collect();
-    if let Some(inputs) = creation {
+    if let Some((inputs, publication)) = creation {
         let qualified = qualified
             .as_ref()
             .expect("compiler inputs qualified before native launch");
@@ -74,6 +77,7 @@ fn observed_output(
                 role,
                 challenge,
                 inputs,
+                publication,
                 image: &image,
                 image_sha256: &image_sha256,
                 parent,
@@ -177,6 +181,7 @@ struct CreationInput<'a> {
     role: &'a str,
     challenge: &'a [u8],
     inputs: &'a super::descriptor::Toolchain,
+    publication: &'a super::toolchain_diagnostics::PublicationOwner,
     image: &'a fs::File,
     image_sha256: &'a str,
     parent: memcordon_core::WindowsProcessIdentityV1,
@@ -240,6 +245,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         role,
         challenge,
         inputs,
+        publication,
         image,
         image_sha256,
         parent,
@@ -297,7 +303,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         let held = super::native::retain_child_handle(&child)?;
         let original_identity = super::native::child_identity(&child)?;
         let diagnostics = super::toolchain_diagnostics::Publisher::new(
-            root,
+            publication,
             serde_json::json!({
                 "role":role,"challenge":challenge,"parent":parent,"original_child":original_identity,
                 "selected_image_sha256":image_sha256,
@@ -568,7 +574,10 @@ fn checked(
     root: &Path,
     role: &str,
     challenge: &[u8],
-    creation: Option<&super::descriptor::Toolchain>,
+    creation: Option<(
+        &super::descriptor::Toolchain,
+        &super::toolchain_diagnostics::PublicationOwner,
+    )>,
 ) -> io::Result<()> {
     let output = observed_output(command, root, role, challenge, creation)?;
     if !output.status.success() {
@@ -586,6 +595,7 @@ fn checked(
 
 fn compile(
     inputs: &super::descriptor::Toolchain,
+    publication: &super::toolchain_diagnostics::PublicationOwner,
     source: &Path,
     output: &Path,
     flags: &[&str],
@@ -604,7 +614,7 @@ fn compile(
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::other("owned compiler output role invalid"))?,
         challenge,
-        Some(inputs),
+        Some((inputs, publication)),
     )
 }
 
@@ -642,6 +652,21 @@ pub(super) fn execute(
         .ok_or_else(|| io::Error::other("toolchain inputs missing"))?;
     let root = descriptor.output_root.join("compiled");
     fs::create_dir(&root)?;
+    super::toolchain_debug::validate_clock(
+        inputs.native_work_cutoff_ticks,
+        inputs.native_work_frequency,
+    )?;
+    // Convert the original absolute QPC deadline once, conservatively. Sampling
+    // Instant before QPC prevents conversion work from extending the budget.
+    let sampled = std::time::Instant::now();
+    let remaining = super::toolchain_debug::remaining(
+        inputs.native_work_cutoff_ticks,
+        inputs.native_work_frequency,
+    )?;
+    let deadline = sampled
+        .checked_add(std::time::Duration::from_millis(u64::from(remaining)))
+        .ok_or_else(|| io::Error::other("toolchain publication cutoff overflow"))?;
+    let publication = super::toolchain_diagnostics::PublicationOwner::new(&root, deadline)?;
     for (input, name) in [
         (&inputs.library_source, "library.rs"),
         (&inputs.test_source, "tests.rs"),
@@ -654,6 +679,7 @@ pub(super) fn execute(
     let library = root.join("readiness.rlib");
     compile(
         inputs,
+        &publication,
         &root.join("library.rs"),
         &library,
         &["--crate-type=rlib"],
@@ -662,6 +688,7 @@ pub(super) fn execute(
     let child = root.join("child.exe");
     compile(
         inputs,
+        &publication,
         &root.join("child.rs"),
         &child,
         &[],
@@ -670,6 +697,7 @@ pub(super) fn execute(
     let tests = root.join("tests.exe");
     compile(
         inputs,
+        &publication,
         &root.join("tests.rs"),
         &tests,
         &["--test"],
@@ -678,6 +706,7 @@ pub(super) fn execute(
     let dll = root.join("readiness.dll");
     compile(
         inputs,
+        &publication,
         &root.join("dll.rs"),
         &dll,
         &["--crate-type=cdylib"],
@@ -686,6 +715,7 @@ pub(super) fn execute(
     let loader = root.join("loader.exe");
     compile(
         inputs,
+        &publication,
         &root.join("loader.rs"),
         &loader,
         &[],

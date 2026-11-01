@@ -1,9 +1,13 @@
 //! Bounded diagnostic state; never a compiler retirement or admission receipt.
 use std::io;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 #[path = "toolchain_publication_error.rs"]
 mod publication;
+
+#[cfg(all(windows, feature = "test-fixtures"))]
+#[path = "toolchain_publication_policy.rs"]
+mod publication_policy;
 
 pub const RECORD_BOUND: usize = 128 * 1024;
 pub const INVENTORY_BOUND: usize = 64;
@@ -227,10 +231,10 @@ impl std::error::Error for ObserverGateError {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 use publication::FileObservation as FileIdentity;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 fn file_identity(file: &std::fs::File, directory: bool) -> io::Result<FileIdentity> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::*;
@@ -286,15 +290,28 @@ pub fn inventory<'a, T: serde::Serialize + 'a>(
         "omitted_count":count.saturating_sub(retained.len()),"complete":count==retained.len()})
 }
 
-#[cfg(windows)]
-pub struct Publisher {
+#[cfg(all(windows, feature = "test-fixtures"))]
+struct OwnedCurrent {
+    file: std::fs::File,
+    identity: publication::FileObservation,
+}
+
+#[cfg(all(windows, feature = "test-fixtures"))]
+pub struct PublicationOwner {
     directory: std::fs::File,
     root: std::path::PathBuf,
+    deadline: std::time::Instant,
+    current: std::cell::RefCell<[Option<OwnedCurrent>; 2]>,
+}
+
+#[cfg(all(windows, feature = "test-fixtures"))]
+pub struct Publisher<'a> {
+    owner: &'a PublicationOwner,
     binding: serde_json::Value,
     sequence: std::cell::Cell<u64>,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 fn publication_parent_hash(root: &std::path::Path) -> String {
     use sha2::Digest;
     use std::os::windows::ffi::OsStrExt;
@@ -308,7 +325,7 @@ fn publication_parent_hash(root: &std::path::Path) -> String {
     ))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 fn publication_failure(
     context: &publication::Context,
     stage: publication::Stage,
@@ -332,18 +349,19 @@ fn publication_failure(
     context.failure(stage, original)
 }
 
-#[cfg(windows)]
-impl Publisher {
-    pub fn new(root: &std::path::Path, binding: serde_json::Value) -> io::Result<Self> {
-        Self::retain_parent(root, binding)
-            .map_err(|error| publication_error("retain-parent", error))
-    }
-
-    fn retain_parent(root: &std::path::Path, binding: serde_json::Value) -> io::Result<Self> {
+#[cfg(all(windows, feature = "test-fixtures"))]
+impl PublicationOwner {
+    pub fn new(root: &std::path::Path, deadline: std::time::Instant) -> io::Result<Self> {
         use publication::{Context, Stage};
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::*;
-        let mut context = Context::new("retain-parent", None, 0, &binding);
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "toolchain publication cutoff expired",
+            ));
+        }
+        let mut context = Context::new("retain-parent", None, 0, &serde_json::Value::Null);
         context.parent_path_sha256 = Some(publication_parent_hash(root));
         let directory = std::fs::OpenOptions::new()
             .read(true)
@@ -356,6 +374,28 @@ impl Publisher {
         Ok(Self {
             directory,
             root: root.to_owned(),
+            deadline,
+            current: std::cell::RefCell::new([None, None]),
+        })
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "toolchain publication cutoff expired",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, feature = "test-fixtures"))]
+impl<'a> Publisher<'a> {
+    pub fn new(owner: &'a PublicationOwner, binding: serde_json::Value) -> io::Result<Self> {
+        owner.check()?;
+        Ok(Self {
+            owner,
             binding,
             sequence: std::cell::Cell::new(0),
         })
@@ -374,10 +414,11 @@ impl Publisher {
     ) -> io::Result<()> {
         use publication::{Context, Stage};
         use std::io::{Read, Seek, Write};
-        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+        use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::*;
+        self.owner.check()?;
         let mut context = Context::new(phase, Some(debug), self.sequence.get(), &self.binding);
-        let parent_path_sha256 = Some(publication_parent_hash(&self.root));
+        let parent_path_sha256 = Some(publication_parent_hash(&self.owner.root));
         context.parent_path_sha256 = parent_path_sha256.clone();
         let sequence = self.sequence.get().checked_add(1).ok_or_else(|| {
             context.failure(
@@ -389,14 +430,23 @@ impl Publisher {
         context.parent_path_sha256 = parent_path_sha256;
         let bytes = encode(&self.binding, sequence, phase, state)
             .map_err(|error| context.failure(Stage::Encode, error))?;
-        let original = file_identity(&self.directory, true)
+        macro_rules! live {
+            ($stage:expr) => {
+                self.owner
+                    .check()
+                    .map_err(|error| context.failure($stage, error))?
+            };
+        }
+        live!(Stage::ParentIdentity);
+        let original = file_identity(&self.owner.directory, true)
             .map_err(|error| context.failure(Stage::ParentIdentity, error))?;
         context.parent = Some(original.clone());
+        live!(Stage::ParentOpen);
         let named = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&self.root)
+            .open(&self.owner.root)
             .map_err(|error| context.failure(Stage::ParentOpen, error))?;
         let current = file_identity(&named, true)
             .map_err(|error| context.failure(Stage::NamedParentIdentity, error))?;
@@ -411,11 +461,56 @@ impl Publisher {
         } else {
             "toolchain-current-phase.json"
         };
-        let path = self.root.join(name);
+        let path = self.owner.root.join(name);
         let temporary = path.with_extension("pending");
         context.same_parent_paths = temporary.parent() == path.parent();
+        let slot = usize::from(debug);
+        let prior = self.owner.current.borrow();
+        live!(Stage::DestinationIdentity);
+        let expected = prior[slot]
+            .as_ref()
+            .map(|owned| {
+                let current = file_identity(&owned.file, false)?;
+                if current != owned.identity {
+                    return Err(io::Error::other("original held destination changed"));
+                }
+                Ok(owned.identity.clone())
+            })
+            .transpose()
+            .map_err(|error| context.failure(Stage::DestinationIdentity, error))?;
+        live!(Stage::DestinationOpen);
+        let destination = match std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+        {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(context.failure(Stage::DestinationOpen, error)),
+        };
+        let observed = destination
+            .as_ref()
+            .map(|file| file_identity(file, false))
+            .transpose()
+            .map_err(|error| context.failure(Stage::DestinationIdentity, error))?;
+        context.expected_destination = expected.clone();
+        context.destination_before_stage = observed.clone();
+        let facts = |identity: &publication::FileObservation| publication_policy::Identity {
+            volume: identity.volume,
+            index: identity.index,
+            attributes: identity.attributes,
+            links: identity.links,
+            length: identity.length,
+        };
+        publication_policy::destination(
+            expected.as_ref().map(facts).as_ref(),
+            observed.as_ref().map(facts).as_ref(),
+        )
+        .map_err(|error| context.failure(Stage::DestinationOwnership, io::Error::other(error)))?;
         // The parent is held against deletion. A partial stage remains explicit evidence;
         // it is never mistaken for the complete atomically published current record.
+        live!(Stage::PendingCreate);
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -424,16 +519,20 @@ impl Publisher {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&temporary)
             .map_err(|error| context.failure(Stage::PendingCreate, error))?;
+        live!(Stage::PendingWrite);
         file.write_all(&bytes).map_err(|error| {
             publication_failure(&context, Stage::PendingWrite, error, Some(&file))
         })?;
+        live!(Stage::PendingFlush);
         file.sync_all().map_err(|error| {
             publication_failure(&context, Stage::PendingFlush, error, Some(&file))
         })?;
+        live!(Stage::PendingRewind);
         file.rewind().map_err(|error| {
             publication_failure(&context, Stage::PendingRewind, error, Some(&file))
         })?;
         let mut actual = Vec::new();
+        live!(Stage::PendingReadback);
         (&mut file)
             .take(RECORD_BOUND as u64 + 1)
             .read_to_end(&mut actual)
@@ -449,33 +548,101 @@ impl Publisher {
             ));
         }
         context.readback_verified = true;
-        let source: Vec<_> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: both terminated native paths live through the atomic same-directory move.
-        if unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
+        live!(Stage::ReadbackOpen);
+        let readback = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&temporary)
+            .map_err(|error| context.failure(Stage::ReadbackOpen, error))?;
+        let staged = file_identity(&file, false)
+            .map_err(|error| context.failure(Stage::PendingIdentity, error))?;
+        if file_identity(&readback, false)
+            .map_err(|error| context.failure(Stage::PendingIdentity, error))?
+            != staged
         {
-            let original = io::Error::last_os_error();
-            return Err(publication_failure(
-                &context,
-                Stage::Replace,
-                original,
-                Some(&file),
+            return Err(context.failure(
+                Stage::PendingReadbackVerification,
+                io::Error::other("toolchain diagnostic readback handle differs"),
             ));
         }
-        let held = file_identity(&file, false)
+        // The data writer is closed before the synchronous metadata/DELETE open.
+        // The independently verified original readback remains held throughout.
+        drop(file);
+        let rename = memcordon_platform::test_support::windows_open_synchronous_rename_source(
+            &self.owner.directory,
+            temporary
+                .file_name()
+                .ok_or_else(|| io::Error::other("diagnostic stage name missing"))?,
+            &readback,
+            self.owner.deadline,
+        )
+        .map_err(|error| {
+            publication_failure(&context, Stage::RenameSourceOpen, error, Some(&readback))
+        })?;
+        memcordon_platform::test_support::windows_prepare_persistent_stage(
+            rename.as_file(),
+            self.owner.deadline,
+        )
+        .map_err(|error| {
+            publication_failure(&context, Stage::SourcePreparation, error, Some(&readback))
+        })?;
+        let mut verified = Vec::new();
+        live!(Stage::PendingReadback);
+        (&readback)
+            .take(RECORD_BOUND as u64 + 1)
+            .read_to_end(&mut verified)
+            .map_err(|error| {
+                publication_failure(&context, Stage::PendingReadback, error, Some(&readback))
+            })?;
+        if verified != bytes {
+            return Err(context.failure(
+                Stage::PendingReadbackVerification,
+                io::Error::other("toolchain diagnostic prepared source bytes differ"),
+            ));
+        }
+        // Recheck the actual current name after stage preparation, immediately
+        // before replacing it. The old handles stay pinned across the commit.
+        live!(Stage::DestinationOpen);
+        let current = match std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+        {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(context.failure(Stage::DestinationOpen, error)),
+        };
+        let actual = current
+            .as_ref()
+            .map(|file| file_identity(file, false))
+            .transpose()
+            .map_err(|error| context.failure(Stage::DestinationIdentity, error))?;
+        context.destination_before_commit = actual.clone();
+        publication_policy::destination(
+            expected.as_ref().map(facts).as_ref(),
+            actual.as_ref().map(facts).as_ref(),
+        )
+        .map_err(|error| context.failure(Stage::DestinationOwnership, io::Error::other(error)))?;
+        let committed = rename
+            .rename(std::ffi::OsStr::new(name), self.owner.deadline)
+            .map_err(|error| {
+                publication_failure(&context, Stage::Replace, error, Some(&readback))
+            })?;
+        // No pending-name cleanup exists: after commit that name no longer
+        // denotes our file, even if the following verification fails.
+        committed.verify(self.owner.deadline).map_err(|error| {
+            publication_failure(&context, Stage::CommitVerification, error, Some(&readback))
+        })?;
+        drop(rename);
+        let held = file_identity(&readback, false)
             .map_err(|error| context.failure(Stage::PendingIdentity, error))?;
         context.stage_file = Some(held.clone());
+        live!(Stage::FinalOpen);
         let final_file = std::fs::OpenOptions::new()
             .read(true)
-            // The original stage handle still owns write access. It denies
-            // other writers; this read handle must permit that existing access.
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&path)
             .map_err(|error| context.failure(Stage::FinalOpen, error))?;
@@ -493,6 +660,26 @@ impl Publisher {
                 io::Error::other("toolchain diagnostic final custody differs"),
             ));
         }
+        let mut final_bytes = Vec::new();
+        live!(Stage::FinalVerification);
+        (&final_file)
+            .take(RECORD_BOUND as u64 + 1)
+            .read_to_end(&mut final_bytes)
+            .map_err(|error| context.failure(Stage::FinalVerification, error))?;
+        if final_bytes != bytes {
+            return Err(context.failure(
+                Stage::FinalVerification,
+                io::Error::other("toolchain diagnostic final bytes differ"),
+            ));
+        }
+        self.owner
+            .check()
+            .map_err(|error| context.failure(Stage::CommitVerification, error))?;
+        drop(prior);
+        self.owner.current.borrow_mut()[slot] = Some(OwnedCurrent {
+            file: final_file,
+            identity: final_identity,
+        });
         self.sequence.set(sequence);
         Ok(())
     }

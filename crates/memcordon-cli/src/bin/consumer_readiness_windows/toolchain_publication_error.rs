@@ -22,6 +22,13 @@ pub enum Stage {
     PendingRewind,
     PendingReadback,
     PendingReadbackVerification,
+    DestinationOpen,
+    DestinationIdentity,
+    DestinationOwnership,
+    ReadbackOpen,
+    RenameSourceOpen,
+    SourcePreparation,
+    CommitVerification,
     Replace,
     PendingIdentity,
     FinalOpen,
@@ -55,6 +62,9 @@ pub struct Context {
     binding: serde_json::Value,
     pub parent: Option<FileObservation>,
     pub stage_file: Option<FileObservation>,
+    pub expected_destination: Option<FileObservation>,
+    pub destination_before_stage: Option<FileObservation>,
+    pub destination_before_commit: Option<FileObservation>,
     pub stage_observation_error: Option<ObservationError>,
     pub readback_verified: bool,
     pub same_parent_paths: bool,
@@ -109,6 +119,9 @@ impl Context {
                 "challenge_sha256":challenge.as_deref().map(digest)}),
             parent: None,
             stage_file: None,
+            expected_destination: None,
+            destination_before_stage: None,
+            destination_before_commit: None,
             stage_observation_error: None,
             readback_verified: false,
             same_parent_paths: false,
@@ -125,13 +138,19 @@ impl Context {
                 serde_json::json!({"read":true,"write":true,"create_new":true,"share_flags":5,"no_follow":true}),
             ),
             Stage::FinalOpen => Some(
+                serde_json::json!({"read":true,"write":false,"share_flags":5,"no_follow":true}),
+            ),
+            Stage::DestinationOpen | Stage::ReadbackOpen => Some(
                 serde_json::json!({"read":true,"write":false,"share_flags":7,"no_follow":true}),
             ),
             _ => None,
         };
         let bytes = serde_json::to_vec(&serde_json::json!({"diagnostic_only":true,"operation":stage,"context":self,
-            "configured_open_options":options,"rename_flags":if stage == Stage::Replace {Some(9u32)}else{None},
-            "same_parent_paths":self.same_parent_paths,"destination_identity_security_sharing":"unavailable","acceptance_authority":false}))
+            "configured_open_options":options,"rename_flags":if stage == Stage::Replace {Some(3u32)}else{None},
+            "rename_api":if stage == Stage::Replace {Some("NtSetInformationFile/FileRenameInformationEx")}else{None},
+            "same_parent_paths":self.same_parent_paths,"destination_identity_security_sharing":"unavailable",
+            "destination_snapshots":"earlier-held-observations-not-identity-security-or-sharing-at-failed-native-call",
+            "acceptance_authority":false}))
             .map_err(io::Error::other)?;
         if bytes.len() > DISPLAY_BOUND {
             return Err(io::Error::other("publication error context exceeds bound"));

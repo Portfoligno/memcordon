@@ -40,7 +40,11 @@ fn context_projects_only_original_bounded_binding_and_keeps_unknown_destination_
     assert_eq!(actual["context"]["phase"], "before-debug-run");
     assert_eq!(actual["context"]["record_debug"], false);
     assert_eq!(actual["context"]["sequence"], 1);
-    assert_eq!(actual["rename_flags"], 9);
+    assert_eq!(actual["rename_flags"], 3);
+    assert_eq!(
+        actual["rename_api"],
+        "NtSetInformationFile/FileRenameInformationEx"
+    );
     assert_eq!(
         actual["destination_identity_security_sharing"],
         "unavailable"
@@ -104,6 +108,11 @@ fn metadata_failure_and_readback_observations_never_replace_primary_io_failure()
         length: 1024,
     });
     context.readback_verified = true;
+    context.expected_destination = context.stage_file.clone();
+    context.destination_before_stage = Some(publication::FileObservation {
+        index: 99,
+        ..context.stage_file.clone().unwrap()
+    });
     context.same_parent_paths = true;
     context.parent_path_sha256 = Some("c".repeat(64));
     context.stage_observation_error = Some(publication::ObservationError {
@@ -129,6 +138,9 @@ fn metadata_failure_and_readback_observations_never_replace_primary_io_failure()
         6
     );
     assert_eq!(actual["context"]["stage_file"]["index"], 12);
+    assert_eq!(actual["context"]["expected_destination"]["index"], 12);
+    assert_eq!(actual["context"]["destination_before_stage"]["index"], 99);
+    assert!(actual["context"]["destination_before_commit"].is_null());
     assert_eq!(actual["context"]["stage_file"]["length"], 1024);
     assert_eq!(actual["context"]["parent"]["index"], 11);
     assert_eq!(actual["context"]["readback_verified"], true);
@@ -177,6 +189,13 @@ fn every_publication_boundary_retains_its_exact_stage_and_original_native_error(
         Stage::PendingRewind,
         Stage::PendingReadback,
         Stage::PendingReadbackVerification,
+        Stage::DestinationOpen,
+        Stage::DestinationIdentity,
+        Stage::DestinationOwnership,
+        Stage::ReadbackOpen,
+        Stage::RenameSourceOpen,
+        Stage::SourcePreparation,
+        Stage::CommitVerification,
         Stage::Replace,
         Stage::PendingIdentity,
         Stage::FinalOpen,
