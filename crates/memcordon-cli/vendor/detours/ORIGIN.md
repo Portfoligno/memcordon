@@ -1,12 +1,16 @@
 # Microsoft Detours source
 
-Unmodified core source from Microsoft Detours 4.0.1, immutable commit
-`e4bfd6b03e50de46b47abfbd1e46b384f0c5f833`:
-https://github.com/microsoft/Detours/tree/e4bfd6b03e50de46b47abfbd1e46b384f0c5f833
+Unmodified core source from the Microsoft Detours post-release snapshot still
+carrying version 4.0.1, immutable commit
+`9764cebcb1a75940e68fa83d6730ffaf0f669401`:
+https://github.com/microsoft/Detours/tree/9764cebcb1a75940e68fa83d6730ffaf0f669401
 
-Archive: https://codeload.github.com/microsoft/Detours/tar.gz/e4bfd6b03e50de46b47abfbd1e46b384f0c5f833
+Archive: https://codeload.github.com/microsoft/Detours/tar.gz/9764cebcb1a75940e68fa83d6730ffaf0f669401
 
-Archive SHA256: `d24f5dd1f977c33301ebd9f3be064e938a7908954df15b31235c9ca6691cb356`.
+Archive SHA256: `6c4397d5eab3372af971b18f5a07d61ad7a61ab7abecbcded4ce5381058e8313`.
+
+Archive SHA512: `30f689a7f7dd3d762f1194ad8d7e05517678b754d6c0db297220f946485a8c8ec8a07cf5f3f893aabcc5623f64c81ee358e2a1c3ba23ba1fbd5856f6b3dd9eb7`.
+This immutable revision and SHA512 match Microsoft's vcpkg Detours port.
 
 The complete upstream core source directory and MIT license are retained.
 Its Makefile is reference material and is never invoked. Rust build orchestration

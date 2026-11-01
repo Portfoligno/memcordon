@@ -94,7 +94,7 @@ pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io:
     original_call_trace["source_after_call_validated"] = readback.is_ok().into();
     original_call_trace["source_after_call_error"] =
         serde_json::json!(readback.as_ref().err().and_then(io::Error::raw_os_error));
-    original_call_trace["detours_revision"] = "e4bfd6b03e50de46b47abfbd1e46b384f0c5f833".into();
+    original_call_trace["detours_revision"] = "9764cebcb1a75940e68fa83d6730ffaf0f669401".into();
     original_call_trace["ntdll_version_hash"] =
         "not-collected; already-loaded system module".into();
     original_call_trace["thread_policy"] = "installation requires two snapshots containing only the current thread; additional threads make setup unavailable".into();
