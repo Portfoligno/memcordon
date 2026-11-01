@@ -14,7 +14,7 @@ pub(super) fn monotonic_millis() -> crate::Result<u64> {
 use super::installed_consumer::MaterializedPayload;
 use crate::{CiError, Result, command::CommandSpec};
 use memcordon_core::{
-    BoundedVec, DiagnosticSha256,
+    DiagnosticSha256,
     identifiers::LogicalId,
     workload_bundle::SnapshotManifestV1,
     workload_files::{ImageEntryV1, ImageEntrypointV1, RootRelativePath},
@@ -310,16 +310,6 @@ fn path(value: &Path) -> Result<RootRelativePath> {
             .into(),
     )
     .map_err(CiError::Message)
-}
-
-fn bounded<T, const N: usize>(values: impl IntoIterator<Item = T>) -> Result<BoundedVec<T, N>> {
-    let mut result = BoundedVec::default();
-    for value in values {
-        result.try_push(value).map_err(|_| {
-            CiError::Message("owned image inventory exceeds frozen native bound".into())
-        })?;
-    }
-    Ok(result)
 }
 
 pub fn materialize_until(
