@@ -460,12 +460,14 @@ fn windows_fixture_native(root: &Path, stable: &str) -> Result<()> {
     let execute = commands.next().expect("fixture execute plan");
     let output = cargo_with_deadline(root, stable, "test", execute.arguments, execute.deadline)?;
     settled_validation(|| {
-        memcordon_ci::windows_fixture_native::verify_one_test(&output).map_err(Into::into)
+        memcordon_ci::windows_fixture_native::verify_selected_tests(&output).map_err(Into::into)
     })?;
-    eprintln!(
-        "[ci windows-fixture-native] verified selected-test={}; executed=1; passed=1; failed=0; ignored=0",
-        memcordon_ci::windows_fixture_native::TEST_SELECTOR
-    );
+    for selector in memcordon_ci::windows_fixture_native::TEST_SELECTORS {
+        eprintln!(
+            "[ci windows-fixture-native] verified selected-test={}; executed=1; passed=1; failed=0; ignored=0",
+            selector
+        );
+    }
     Ok(())
 }
 
