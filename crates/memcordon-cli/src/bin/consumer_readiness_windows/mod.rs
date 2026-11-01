@@ -12,6 +12,7 @@ mod fixture_environment;
 mod gate_call_trace;
 mod gate_call_trace_record;
 mod gate_call_trace_self_check;
+mod gate_entry_route;
 mod gate_precondition_child;
 mod namespace_primary_root;
 mod namespace_primary_worker;

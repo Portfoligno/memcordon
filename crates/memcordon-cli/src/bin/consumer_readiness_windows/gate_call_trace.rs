@@ -3,6 +3,34 @@ use super::gate_call_trace_record::{self, NativeTrace};
 use std::ffi::c_void;
 use std::io;
 
+/// The native bridge supplies only its guarded, fixed entry-byte copy.
+///
+/// # Safety
+/// `bytes` must expose `length` readable bytes and `slot` must point to a live,
+/// aligned writable scalar. Both are owned by the private native bridge call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcordon_decode_import_entry(
+    machine: u32,
+    pc: u64,
+    bytes: *const u8,
+    length: usize,
+    slot: *mut u64,
+) -> u32 {
+    if bytes.is_null() || slot.is_null() || length > 16 {
+        return 2;
+    }
+    // SAFETY: private bridge ABI supplies a live fixed array and writable scalar.
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+    match super::gate_entry_route::decode(machine, pc, bytes) {
+        Ok(value) => {
+            // SAFETY: caller owns the checked writable output scalar.
+            unsafe { slot.write(value) };
+            0
+        }
+        Err(error) => error as u32,
+    }
+}
+
 unsafe extern "C" {
     fn memcordon_gate_trace_prepare(packet: *mut NativeTrace, cutoff: u64, frequency: u64);
     fn memcordon_gate_trace_call(

@@ -201,6 +201,16 @@ pub(super) fn run() -> io::Result<i32> {
                     assert_eq!(trace["iat"]["rollback_error"], 0);
                     assert_eq!(trace["iat"]["protection_error"], 0);
                     assert_eq!(trace["iat"]["callback_error"], 0);
+                    assert_eq!(trace["route"]["node_limit"], 2);
+                    assert_eq!(trace["route"]["original_owner_export_equal"], 1);
+                    assert_eq!(trace["route"]["route_revalidated"], 1);
+                    let nodes = trace["route"]["nodes"].as_array().unwrap();
+                    assert!(!nodes.is_empty() && nodes.len() <= 2);
+                    assert_eq!(nodes[0]["entry"], trace["iat"]["original_open_event"]);
+                    assert_eq!(
+                        nodes.last().unwrap()["owner_base"],
+                        trace["iat"]["owner_base"]
+                    );
                     assert_eq!(trace["invalid_record"], false);
                     assert_eq!(trace["overflow"], 0);
                     assert_eq!(trace["incomplete"], 0);

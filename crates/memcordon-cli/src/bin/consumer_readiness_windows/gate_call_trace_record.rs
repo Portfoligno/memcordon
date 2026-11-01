@@ -118,6 +118,104 @@ pub struct IatRecord {
 }
 
 #[repr(C)]
+#[derive(Clone, Debug)]
+pub struct RouteNode {
+    pub owner_base: u64,
+    pub entry: u64,
+    pub delegation_slot: u64,
+    pub delegation_target: u64,
+    pub owner_size: u32,
+    pub owner_timestamp: u32,
+    pub module_name_units: u32,
+    pub module_name_truncated: u32,
+    pub entry_bytes_read: u32,
+    pub entry_byte_count: u32,
+    pub decode_kind: u32,
+    pub decode_error: u32,
+    pub open_event_matches: u32,
+    pub entry_revalidated: u32,
+    pub slot_revalidated: u32,
+    pub directory_name_matches: u32,
+    pub event_name_matches: u32,
+    pub reserved: u32,
+    pub module_name: [u16; 96],
+    pub entry_bytes: [u8; 16],
+}
+
+impl Default for RouteNode {
+    fn default() -> Self {
+        Self {
+            owner_base: 0,
+            entry: 0,
+            delegation_slot: 0,
+            delegation_target: 0,
+            owner_size: 0,
+            owner_timestamp: 0,
+            module_name_units: 0,
+            module_name_truncated: 0,
+            entry_bytes_read: 0,
+            entry_byte_count: 0,
+            decode_kind: 0,
+            decode_error: 0,
+            open_event_matches: 0,
+            entry_revalidated: 0,
+            slot_revalidated: 0,
+            directory_name_matches: 0,
+            event_name_matches: 0,
+            reserved: 0,
+            module_name: [0; 96],
+            entry_bytes: [0; 16],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct RouteRecord {
+    pub node_count: u32,
+    pub node_limit: u32,
+    pub hop_count: u32,
+    pub route_reason: u32,
+    pub callbacks_total_descriptors: u32,
+    pub callbacks_total_functions: u32,
+    pub original_owner_export_equal: u32,
+    pub route_revalidated: u32,
+    pub nodes: [RouteNode; 2],
+    pub directory_descriptor_module: u64,
+    pub event_descriptor_module: u64,
+    pub directory_descriptor: [u8; 64],
+    pub event_descriptor: [u8; 64],
+    pub directory_descriptor_bytes: u32,
+    pub event_descriptor_bytes: u32,
+    pub directory_descriptor_truncated: u32,
+    pub event_descriptor_truncated: u32,
+}
+
+impl Default for RouteRecord {
+    fn default() -> Self {
+        Self {
+            node_count: 0,
+            node_limit: 0,
+            hop_count: 0,
+            route_reason: 0,
+            callbacks_total_descriptors: 0,
+            callbacks_total_functions: 0,
+            original_owner_export_equal: 0,
+            route_revalidated: 0,
+            nodes: std::array::from_fn(|_| RouteNode::default()),
+            directory_descriptor_module: 0,
+            event_descriptor_module: 0,
+            directory_descriptor: [0; 64],
+            event_descriptor: [0; 64],
+            directory_descriptor_bytes: 0,
+            event_descriptor_bytes: 0,
+            directory_descriptor_truncated: 0,
+            event_descriptor_truncated: 0,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Debug, Default)]
 pub struct NativeTrace {
     pub version: u32,
@@ -146,6 +244,7 @@ pub struct NativeTrace {
     pub first_snapshot: SnapshotSummary,
     pub second_snapshot: SnapshotSummary,
     pub iat: IatRecord,
+    pub route: RouteRecord,
     pub entries: [NativeEntry; ENTRY_LIMIT],
 }
 
@@ -157,10 +256,16 @@ const _: () = {
     assert!(std::mem::size_of::<SnapshotSummary>() == 424);
     assert!(std::mem::offset_of!(SnapshotSummary, details) == 40);
     assert!(std::mem::size_of::<IatRecord>() == 128);
-    assert!(std::mem::size_of::<NativeTrace>() == 5880);
+    assert!(std::mem::size_of::<RouteNode>() == 296);
+    assert!(std::mem::offset_of!(RouteNode, module_name) == 88);
+    assert!(std::mem::size_of::<RouteRecord>() == 784);
+    assert!(std::mem::offset_of!(RouteRecord, nodes) == 32);
+    assert!(std::mem::offset_of!(RouteRecord, directory_descriptor_module) == 624);
+    assert!(std::mem::size_of::<NativeTrace>() == 6664);
     assert!(std::mem::offset_of!(NativeTrace, first_snapshot) == 104);
     assert!(std::mem::offset_of!(NativeTrace, iat) == 952);
-    assert!(std::mem::offset_of!(NativeTrace, entries) == 1080);
+    assert!(std::mem::offset_of!(NativeTrace, route) == 1080);
+    assert!(std::mem::offset_of!(NativeTrace, entries) == 1864);
 };
 
 fn snapshot(summary: &SnapshotSummary) -> (serde_json::Value, bool, bool) {
@@ -207,6 +312,70 @@ fn snapshot(summary: &SnapshotSummary) -> (serde_json::Value, bool, bool) {
         invalid,
         inconclusive,
     )
+}
+
+fn route(record: &RouteRecord, iat: &IatRecord) -> (serde_json::Value, bool, bool) {
+    use serde_json::json;
+    let mut invalid = record.node_count > 2
+        || record.node_limit != 2
+        || record.hop_count > 1
+        || record.route_reason > 11
+        || record.original_owner_export_equal > 1
+        || record.route_revalidated > 1
+        || record.callbacks_total_descriptors > 256
+        || record.callbacks_total_functions > 16384
+        || record.directory_descriptor_bytes > 64
+        || record.event_descriptor_bytes > 64
+        || record.directory_descriptor_truncated > 1
+        || record.event_descriptor_truncated > 1;
+    let mut ready = record.node_count > 0
+        && record.node_count <= 2
+        && record.hop_count.checked_add(1) == Some(record.node_count)
+        && record.route_reason == 0
+        && record.original_owner_export_equal == 1
+        && record.route_revalidated == 1;
+    let nodes:Vec<_>=record.nodes.iter().take((record.node_count as usize).min(2)).enumerate().map(|(index,node)| {
+        let flags=[node.module_name_truncated,node.entry_bytes_read,node.entry_revalidated,node.slot_revalidated];
+        let node_invalid=node.reserved!=0 || flags.into_iter().any(|flag|flag>1)
+            || node.module_name_units>96 || node.entry_byte_count>16 || node.decode_kind>2 || node.decode_error>5;
+        invalid|=node_invalid;
+        let owner_end=node.owner_base.checked_add(u64::from(node.owner_size));
+        ready &=node.owner_base!=0 && node.entry>=node.owner_base && owner_end.is_some_and(|end|node.entry<end)
+            && node.entry_bytes_read==1 && node.entry_byte_count>0 && node.entry_revalidated==1;
+        if index==0 {ready &=node.entry==iat.original_open_event;}
+        if index+1<(record.node_count as usize).min(2) {
+            let machine=match node.decode_kind{1=>0x8664,2=>0xaa64,_=>0};
+            let decoded=super::gate_entry_route::decode(machine,node.entry,&node.entry_bytes[..(node.entry_byte_count as usize).min(16)]);
+            let next=&record.nodes[index+1];
+            ready &=node.entry_bytes_read==1 && node.decode_error==0 && node.open_event_matches==1
+                && node.entry_revalidated==1 && node.slot_revalidated==1
+                && decoded==Ok(node.delegation_slot)
+                && node.delegation_slot%8==0 && node.delegation_slot>=node.owner_base
+                && owner_end.is_some_and(|end|node.delegation_slot.checked_add(8).is_some_and(|slot_end|slot_end<=end))
+                && node.delegation_target==next.entry && node.owner_base!=next.owner_base && node.entry!=next.entry;
+        } else {ready &=node.owner_base==iat.owner_base && node.decode_kind==0 && node.decode_error==0;}
+        json!({"owner_base":node.owner_base,"entry":node.entry,"delegation_slot":node.delegation_slot,
+            "delegation_target":node.delegation_target,"owner_size":node.owner_size,"owner_timestamp":node.owner_timestamp,
+            "module_name_units":node.module_name_units,"module_name_truncated":node.module_name_truncated,
+            "module_name_utf16":&node.module_name[..(node.module_name_units as usize).min(96)],
+            "entry_bytes_read":node.entry_bytes_read,"entry_byte_count":node.entry_byte_count,
+            "entry_bytes":&node.entry_bytes[..(node.entry_byte_count as usize).min(16)],
+            "decode_kind":node.decode_kind,"decode_error":node.decode_error,"open_event_matches":node.open_event_matches,
+            "entry_revalidated":node.entry_revalidated,"slot_revalidated":node.slot_revalidated,
+            "directory_name_matches":node.directory_name_matches,"event_name_matches":node.event_name_matches,
+            "opaque_addresses_not_identity":true,"invalid_record":node_invalid})
+    }).collect();
+    let value = json!({"node_count":record.node_count,"node_limit":record.node_limit,"hop_count":record.hop_count,
+        "route_reason":record.route_reason,"callbacks_total_descriptors":record.callbacks_total_descriptors,
+        "callbacks_total_functions":record.callbacks_total_functions,"original_owner_export_equal":record.original_owner_export_equal,
+        "route_revalidated":record.route_revalidated,"nodes":nodes,"invalid_record":invalid,
+        "directory_descriptor_module":record.directory_descriptor_module,"event_descriptor_module":record.event_descriptor_module,
+        "directory_descriptor_bytes":record.directory_descriptor_bytes,"event_descriptor_bytes":record.event_descriptor_bytes,
+        "directory_descriptor_truncated":record.directory_descriptor_truncated,"event_descriptor_truncated":record.event_descriptor_truncated,
+        "directory_descriptor":&record.directory_descriptor[..(record.directory_descriptor_bytes as usize).min(64)],
+        "event_descriptor":&record.event_descriptor[..(record.event_descriptor_bytes as usize).min(64)],
+        "normal_import_only":true,"opaque_addresses_not_identity":true});
+    (value, invalid, ready && !invalid)
 }
 
 /// Render only recorded values, retaining incomplete/invalid observations explicitly.
@@ -290,8 +459,7 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         && slot_valid(iat.directory_slot)
         && slot_valid(iat.event_slot)
         && iat.owner_base != 0
-        && iat.original_open_event >= iat.owner_base
-        && owner_end.is_some_and(|end| iat.original_open_event < end)
+        && iat.original_open_event != 0
         && iat.directory_original != 0
         && iat.event_original != 0
         && iat.published_directory == 1
@@ -300,7 +468,8 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         && iat.rollback_error == 0
         && iat.protection_error == 0
         && iat.callback_error == 0;
-    let mut invalid = trace.version != 3
+    let (route_value, route_invalid, route_ready) = route(&trace.route, iat);
+    let mut invalid = trace.version != 4
         || trace.count as usize > ENTRY_LIMIT
         || trace.setup_stage > 13
         || trace.lifetime_policy > 1
@@ -310,7 +479,8 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         || trace.snapshot_source > 2
         || trace.reserved != 0
         || first_invalid
-        || second_invalid;
+        || second_invalid
+        || route_invalid;
     invalid |= iat_invalid;
     let mut inconclusive = trace.count == 0
         || trace.overflow != 0
@@ -321,7 +491,8 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         || trace.armed_call_count != 1
         || trace.called != 1
         || trace.clock_live != 1
-        || !iat_ready;
+        || !iat_ready
+        || !route_ready;
     invalid |= [
         trace.attached_directory,
         trace.attached_event,
@@ -396,8 +567,9 @@ pub fn diagnostic(trace: &NativeTrace) -> serde_json::Value {
         "started_qpc":trace.started_qpc,"finished_qpc":trace.finished_qpc,
         "original_cutoff_qpc":trace.original_cutoff_qpc,"entries":entries,
         "empty_or_incomplete_trace_is_inconclusive":true});
-    value["strategy"] = "original-open-event-owner-normal-iat".into();
+    value["strategy"] = "validated-open-event-route-owner-normal-iat".into();
     value["iat"] = iat_value;
+    value["route"] = route_value;
     value["observed_entries_complete"] = (!inconclusive && !invalid).into();
     value["all_native_routes_observed"] = false.into();
     value["absence_is_not_evidence"] = true.into();

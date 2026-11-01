@@ -1,7 +1,12 @@
+#[path = "../src/bin/consumer_readiness_windows/gate_entry_route.rs"]
+mod gate_entry_route;
 #[path = "../src/bin/consumer_readiness_windows/gate_call_trace_record.rs"]
 mod record;
 
-use record::{IatRecord, NativeEntry, NativeTrace, SnapshotEntry, SnapshotSummary, diagnostic};
+use record::{
+    IatRecord, NativeEntry, NativeTrace, RouteNode, RouteRecord, SnapshotEntry, SnapshotSummary,
+    diagnostic,
+};
 
 fn snapshot(count: u32) -> SnapshotSummary {
     let mut snapshot = SnapshotSummary {
@@ -28,7 +33,7 @@ fn snapshot(count: u32) -> SnapshotSummary {
 
 fn trace() -> NativeTrace {
     let mut trace = NativeTrace {
-        version: 3,
+        version: 4,
         setup_stage: 1,
         thread_count: 1,
         thread_limit: 1,
@@ -63,6 +68,29 @@ fn trace() -> NativeTrace {
             protections_restored: 1,
             ..IatRecord::default()
         },
+        route: RouteRecord {
+            node_count: 1,
+            node_limit: 2,
+            callbacks_total_descriptors: 1,
+            callbacks_total_functions: 2,
+            original_owner_export_equal: 1,
+            route_revalidated: 1,
+            nodes: [
+                RouteNode {
+                    owner_base: 0x1000,
+                    entry: 0x1100,
+                    owner_size: 0x4000,
+                    entry_bytes_read: 1,
+                    entry_byte_count: 16,
+                    entry_revalidated: 1,
+                    directory_name_matches: 1,
+                    event_name_matches: 1,
+                    ..RouteNode::default()
+                },
+                RouteNode::default(),
+            ],
+            ..RouteRecord::default()
+        },
         ..NativeTrace::default()
     };
     trace.entries[0] = NativeEntry {
@@ -85,6 +113,103 @@ fn trace() -> NativeTrace {
     // Preserve raw UTF-16 including an unpaired surrogate, not a lossy string.
     trace.entries[0].name[..4].copy_from_slice(&[92, 0xd800, 0, 0xffff]);
     trace
+}
+
+fn delegated_trace(arm: bool) -> NativeTrace {
+    let mut value = trace();
+    value.iat.owner_base = 0x5000;
+    value.iat.normal_iat_start = 0x6000;
+    value.iat.normal_iat_end = 0x6100;
+    value.iat.directory_slot = 0x6000;
+    value.iat.event_slot = 0x6008;
+    value.route.node_count = 2;
+    value.route.hop_count = 1;
+    value.route.callbacks_total_descriptors = 2;
+    value.route.callbacks_total_functions = 5;
+    value.route.nodes[1] = RouteNode {
+        owner_base: 0x5000,
+        entry: 0x5100,
+        owner_size: 0x4000,
+        entry_bytes_read: 1,
+        entry_byte_count: 16,
+        entry_revalidated: 1,
+        directory_name_matches: 1,
+        event_name_matches: 1,
+        ..RouteNode::default()
+    };
+    let first = &mut value.route.nodes[0];
+    first.delegation_target = 0x5100;
+    first.open_event_matches = 1;
+    first.slot_revalidated = 1;
+    if arm {
+        first.decode_kind = 2;
+        first.delegation_slot = 0x2028;
+        first.entry_bytes[..12]
+            .copy_from_slice(&[0x10, 0, 0, 0xb0, 0x10, 0x16, 0x40, 0xf9, 0, 2, 0x1f, 0xd6]);
+    } else {
+        first.decode_kind = 1;
+        first.delegation_slot = 0x2100;
+        first.entry_bytes[..6].copy_from_slice(&[0xff, 0x25, 0xfa, 0x0f, 0, 0]);
+    }
+    value
+}
+
+#[test]
+fn direct_and_exact_decoded_delegation_keep_original_and_selected_owners_distinct() {
+    for value in [trace(), delegated_trace(false), delegated_trace(true)] {
+        let rendered = diagnostic(&value);
+        assert_eq!(rendered["observed_entries_complete"], true);
+        assert_eq!(
+            rendered["route"]["nodes"][0]["entry"],
+            value.iat.original_open_event
+        );
+        assert_eq!(rendered["route"]["node_count"], value.route.node_count);
+        assert_eq!(rendered["all_native_routes_observed"], false);
+        assert_eq!(rendered["absence_is_not_evidence"], true);
+    }
+    for mutation in 0..10 {
+        let mut value = delegated_trace(false);
+        match mutation {
+            0 => value.route.nodes[0].delegation_slot += 8,
+            1 => value.route.nodes[0].delegation_target += 8,
+            2 => value.route.nodes[0].open_event_matches = 0,
+            3 => value.route.nodes[0].open_event_matches = 2,
+            4 => value.route.nodes[0].slot_revalidated = 0,
+            5 => value.route.nodes[0].entry_bytes[1] = 0x15,
+            6 => value.route.route_revalidated = 0,
+            7 => value.route.callbacks_total_functions = 16385,
+            8 => value.route.route_reason = 7,
+            _ => {
+                value.route.nodes[1].owner_base = 0x1000;
+                value.route.nodes[1].entry = 0x1200;
+                value.route.nodes[0].delegation_target = 0x1200;
+                value.iat.owner_base = 0x1000;
+                value.iat.normal_iat_start = 0x2000;
+                value.iat.normal_iat_end = 0x2100;
+                value.iat.directory_slot = 0x2000;
+                value.iat.event_slot = 0x2008;
+            }
+        }
+        let rendered = diagnostic(&value);
+        assert_eq!(
+            rendered["observed_entries_complete"], false,
+            "mutation={mutation}"
+        );
+        assert_eq!(rendered["outer_error"], 5);
+    }
+}
+
+#[test]
+fn malformed_route_counts_remain_bounded_without_overflow() {
+    for (nodes, hops) in [(u32::MAX, 1), (1, u32::MAX)] {
+        let mut value = trace();
+        value.route.node_count = nodes;
+        value.route.hop_count = hops;
+        let rendered = diagnostic(&value);
+        assert_eq!(rendered["invalid_record"], true);
+        assert_eq!(rendered["observed_entries_complete"], false);
+        assert!(rendered["route"]["nodes"].as_array().unwrap().len() <= 2);
+    }
 }
 
 #[test]

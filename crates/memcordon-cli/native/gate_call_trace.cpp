@@ -17,6 +17,7 @@ static volatile LONG installation = 0;
 static uint32_t installation_stage = 0, installation_error = 0;
 static uint32_t installation_reason = 0, installation_current_thread = 0;
 static IatRecord installation_iat = {};
+static RouteRecord installation_route = {};
 struct Collector { TracePacket* packet; DWORD thread; };
 // POD static TLS is initialized before user code, never lazily in a hook.
 static __declspec(thread) Collector collector = {nullptr, 0};
@@ -139,12 +140,11 @@ static bool readable(uintptr_t first, size_t bytes, const Image& image) {
         range(first, bytes, reinterpret_cast<uintptr_t>(memory.BaseAddress),
               reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize);
 }
-static bool same_name(const char* name, const char* expected, const Image& image, bool fold_case = false) {
+static bool same_name(const char* name, const char* expected, const Image& image) {
     for (size_t index = 0; index < 128; ++index) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(name) + index;
         if (!readable(address, 1, image)) return false;
-        const auto fold = [](char value) { return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value; };
-        if ((fold_case ? fold(name[index]) : name[index]) != (fold_case ? fold(expected[index]) : expected[index])) return false;
+        if (name[index] != expected[index]) return false;
         if (!expected[index]) return true;
     }
     return false;
@@ -186,13 +186,16 @@ struct Discovery {
     Image image;
     TracePacket* packet;
     uint64_t frequency;
-    HMODULE ntdll;
     void* directory_original;
     void* event_original;
     void** directory_slot;
     void** event_slot;
     DWORD error;
-    bool native_descriptor;
+    RouteNode* node;
+    LPCSTR descriptor_name;
+    HMODULE descriptor_module;
+    void** open_slot;
+    void* open_target;
 };
 static bool bounded_imports(Discovery* discovery) {
     // Validate all normal import descriptors/thunks before the library walks
@@ -232,28 +235,50 @@ static BOOL CALLBACK import_file(void* context, HMODULE module, LPCSTR name) {
     auto* state = static_cast<Discovery*>(context);
     if (!name) { state->packet->iat.discovery_complete = state->error == ERROR_SUCCESS; return FALSE; }
     if (state->error != ERROR_SUCCESS) return FALSE;
-    if (++state->packet->iat.descriptor_count > 256) { state->error = ERROR_BUFFER_OVERFLOW; state->packet->setup_reason = 6; return FALSE; }
+    ++state->packet->iat.descriptor_count;
+    if (++state->packet->route.callbacks_total_descriptors > 256) { state->error = ERROR_BUFFER_OVERFLOW; state->packet->setup_reason = 6; return FALSE; }
     if (!clock_live(state->packet, state->frequency)) { state->error = state->packet->setup_error; return FALSE; }
-    state->native_descriptor = same_name(name, "ntdll.dll", state->image, true);
-    if (state->native_descriptor && module != state->ntdll) { state->error = ERROR_INVALID_OWNER; return FALSE; }
+    state->descriptor_name = name; state->descriptor_module = module;
     return TRUE;
 }
 static BOOL CALLBACK import_function(void* context, DWORD, LPCSTR name, void** slot) {
     auto* state = static_cast<Discovery*>(context);
     if (!slot) return state->error == ERROR_SUCCESS;
     if (state->error != ERROR_SUCCESS) return FALSE;
-    if (++state->packet->iat.function_count > 16384) { state->error = ERROR_BUFFER_OVERFLOW; state->packet->setup_reason = 6; return FALSE; }
+    ++state->packet->iat.function_count;
+    if (++state->packet->route.callbacks_total_functions > 16384) { state->error = ERROR_BUFFER_OVERFLOW; state->packet->setup_reason = 6; return FALSE; }
     if (!clock_live(state->packet, state->frequency)) { state->error = state->packet->setup_error; return FALSE; }
-    if (!state->native_descriptor || !name) return TRUE;
+    if (!name) return TRUE;
+    if (same_name(name, "OpenEventW", state->image)) {
+        ++state->node->open_event_matches;
+        if (!range(reinterpret_cast<uintptr_t>(slot), sizeof(void*), state->image.iat, state->image.iat_end) ||
+            reinterpret_cast<uintptr_t>(slot) % alignof(void*) || !*slot) {
+            state->error = ERROR_INVALID_ADDRESS; return FALSE;
+        }
+        if (state->node->open_event_matches == 1) { state->open_slot = slot; state->open_target = *slot; }
+    }
     const bool directory = same_name(name, "NtOpenDirectoryObject", state->image);
     const bool event = same_name(name, "NtOpenEvent", state->image);
     if (!directory && !event) return TRUE;
+    const uint32_t names = directory ? ++state->node->directory_name_matches : ++state->node->event_name_matches;
+    if (names != 1) { state->error = ERROR_DUP_NAME; state->packet->setup_reason = 3; return FALSE; }
     if (!range(reinterpret_cast<uintptr_t>(slot), sizeof(void*), state->image.iat, state->image.iat_end) ||
         reinterpret_cast<uintptr_t>(slot) % alignof(void*) != 0) { state->error = ERROR_INVALID_ADDRESS; state->packet->setup_reason = 5; return FALSE; }
     uint32_t& matches = directory ? state->packet->iat.directory_matches : state->packet->iat.event_matches;
-    if (++matches != 1) { state->error = ERROR_DUP_NAME; state->packet->setup_reason = 3; return FALSE; }
     const auto expected = directory ? state->directory_original : state->event_original;
     if (*slot != expected) { state->error = ERROR_INVALID_DATA; state->packet->setup_reason = 4; return FALSE; }
+    ++matches;
+    auto* route = &state->packet->route;
+    auto* bytes = directory ? route->directory_descriptor : route->event_descriptor;
+    auto* length = directory ? &route->directory_descriptor_bytes : &route->event_descriptor_bytes;
+    auto* truncated = directory ? &route->directory_descriptor_truncated : &route->event_descriptor_truncated;
+    for (size_t index = 0; index < 64; ++index) {
+        if (!state->descriptor_name[index]) break;
+        bytes[(*length)++] = static_cast<uint8_t>(state->descriptor_name[index]);
+    }
+    *truncated = *length == 64 && state->descriptor_name[64] != '\0';
+    if (directory) route->directory_descriptor_module = reinterpret_cast<uintptr_t>(state->descriptor_module);
+    else route->event_descriptor_module = reinterpret_cast<uintptr_t>(state->descriptor_module);
     if (directory) state->directory_slot = slot; else state->event_slot = slot;
     return TRUE;
 }
@@ -371,6 +396,116 @@ static bool publication_mock() {
     }
     return VirtualFree(allocation, 0, MEM_RELEASE) != FALSE && valid;
 }
+static uint32_t machine() {
+#if defined(_M_ARM64) || defined(__aarch64__)
+    return IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_M_X64) || defined(__x86_64__)
+    return IMAGE_FILE_MACHINE_AMD64;
+#else
+#error Unsupported native entry architecture
+#endif
+}
+static bool entry_bytes(const Image& mapped, RouteNode* node, bool compare) {
+    __try {
+        MEMORY_BASIC_INFORMATION memory = {};
+        const uintptr_t entry = static_cast<uintptr_t>(node->entry);
+        if (!range(entry, 1, mapped.base, mapped.end) ||
+            VirtualQuery(reinterpret_cast<void*>(entry), &memory, sizeof(memory)) != sizeof(memory) ||
+            memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE || memory.AllocationBase != reinterpret_cast<void*>(mapped.base) ||
+            (memory.Protect != PAGE_EXECUTE_READ && memory.Protect != PAGE_EXECUTE_READWRITE && memory.Protect != PAGE_EXECUTE_WRITECOPY)) return false;
+        const auto region = reinterpret_cast<uintptr_t>(memory.BaseAddress);
+        if (memory.RegionSize > UINTPTR_MAX - region) return false;
+        const auto end = region + memory.RegionSize < mapped.end ? region + memory.RegionSize : mapped.end;
+        size_t length = end - entry;
+        if (length > sizeof(node->entry_bytes)) length = sizeof(node->entry_bytes);
+        if (length < (machine() == IMAGE_FILE_MACHINE_ARM64 ? 12u : 6u)) return false;
+        if (compare && length != node->entry_byte_count) return false;
+        for (size_t index = 0; index < length; ++index) {
+            const auto byte = reinterpret_cast<const uint8_t*>(entry)[index];
+            if (compare) { if (byte != node->entry_bytes[index]) return false; }
+            else node->entry_bytes[index] = byte;
+        }
+        if (!compare) { node->entry_bytes_read = 1; node->entry_byte_count = static_cast<uint32_t>(length); }
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool capture_node(HMODULE owner, void* entry, RouteNode* node, Image* mapped) {
+    node->owner_base = reinterpret_cast<uintptr_t>(owner); node->entry = reinterpret_cast<uintptr_t>(entry);
+    if (!image(owner, mapped)) return false;
+    node->owner_size = mapped->size; node->owner_timestamp = mapped->timestamp;
+    WCHAR name[96] = {};
+    const DWORD length = GetModuleFileNameW(owner, name, static_cast<DWORD>(sizeof(name) / sizeof(name[0])));
+    node->module_name_units = length < 96 ? length : 96; node->module_name_truncated = length >= 96;
+    for (size_t index = 0; index < node->module_name_units; ++index) node->module_name[index] = name[index];
+    return entry_bytes(*mapped, node, false);
+}
+static bool route_unchanged(TracePacket* packet) {
+    __try {
+        packet->route.route_revalidated = 0;
+        if (!packet->route.node_count || packet->route.node_count > 2) return false;
+        for (uint32_t index = 0; index < packet->route.node_count; ++index) {
+            auto* node = &packet->route.nodes[index];
+            node->entry_revalidated = 0; node->slot_revalidated = 0;
+            Image mapped = {};
+            if (!image(reinterpret_cast<HMODULE>(static_cast<uintptr_t>(node->owner_base)), &mapped) ||
+                mapped.size != node->owner_size || mapped.timestamp != node->owner_timestamp || !entry_bytes(mapped, node, true)) return false;
+            node->entry_revalidated = 1;
+            if (index + 1 < packet->route.node_count) {
+                const auto slot = static_cast<uintptr_t>(node->delegation_slot);
+                if (slot % alignof(void*) || !range(slot, sizeof(void*), mapped.iat, mapped.iat_end) || !readable(slot, sizeof(void*), mapped) ||
+                    *reinterpret_cast<void**>(slot) != reinterpret_cast<void*>(static_cast<uintptr_t>(node->delegation_target)) ||
+                    node->delegation_target != packet->route.nodes[index + 1].entry) return false;
+                node->slot_revalidated = 1;
+            }
+        }
+        if (packet->iat.published_directory && packet->iat.published_event &&
+            (*reinterpret_cast<void**>(static_cast<uintptr_t>(packet->iat.directory_slot)) != reinterpret_cast<void*>(directory_hook) ||
+             *reinterpret_cast<void**>(static_cast<uintptr_t>(packet->iat.event_slot)) != reinterpret_cast<void*>(event_hook))) return false;
+        packet->route.route_revalidated = 1; return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static uint32_t edge_binding(const Discovery& state, uint64_t decoded) {
+    if (state.node->open_event_matches > 1) return 4;
+    if (state.node->open_event_matches != 1 || !state.open_slot || !state.open_target || decoded != reinterpret_cast<uintptr_t>(state.open_slot)) return 3;
+    const auto slot = reinterpret_cast<uintptr_t>(state.open_slot);
+    return slot % alignof(void*) || !range(slot, sizeof(void*), state.image.iat, state.image.iat_end) ? 9 : 0;
+}
+static bool edge_current(const Discovery& state) {
+    __try { return state.open_slot && *state.open_slot == state.open_target; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static uint32_t target_binding(HMODULE owner, void* entry, HMODULE next, void* target, void* exported) {
+    if (!next || next == owner || !target || target == entry) return 6;
+    return exported != target ? 7 : 0;
+}
+static bool route_mock() {
+    // Exercise the actual decoder and binding predicates with owned scalar
+    // data only; these synthetic facts never substitute for the real route.
+    const uint8_t x64[] = {0xff, 0x25, 0xfa, 0xff, 0xff, 0xff};
+    const uint8_t arm64[] = {0x10, 0x00, 0x00, 0x90, 0x10, 0x06, 0x40, 0xf9, 0x00, 0x02, 0x1f, 0xd6};
+    uint64_t decoded = 0;
+    if (memcordon_decode_import_entry(IMAGE_FILE_MACHINE_AMD64, 0x2000, x64, sizeof(x64), &decoded) || decoded != 0x2000 ||
+        memcordon_decode_import_entry(IMAGE_FILE_MACHINE_ARM64, 0x2000, arm64, sizeof(arm64), &decoded) || decoded != 0x2008 ||
+        memcordon_decode_import_entry(IMAGE_FILE_MACHINE_AMD64, 0x2000, x64, 5, &decoded) != 2) return false;
+    void* value = reinterpret_cast<void*>(static_cast<uintptr_t>(0x5000));
+    RouteNode node = {}; node.open_event_matches = 1;
+    Discovery state = {}; state.node = &node; state.open_slot = &value; state.open_target = value;
+    state.image.iat = reinterpret_cast<uintptr_t>(&value); state.image.iat_end = state.image.iat + sizeof(value);
+    if (edge_binding(state, state.image.iat) || !edge_current(state)) return false;
+    node.open_event_matches = 0; if (edge_binding(state, state.image.iat) != 3) return false;
+    node.open_event_matches = 2; if (edge_binding(state, state.image.iat) != 4) return false;
+    node.open_event_matches = 1; if (edge_binding(state, state.image.iat + 8) != 3) return false;
+    --state.image.iat_end; if (edge_binding(state, state.image.iat) != 9) return false;
+    ++state.image.iat_end; value = nullptr; if (edge_current(state)) return false;
+    const auto owner = reinterpret_cast<HMODULE>(static_cast<uintptr_t>(0x1000));
+    const auto next = reinterpret_cast<HMODULE>(static_cast<uintptr_t>(0x4000));
+    const auto entry = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1100));
+    const auto target = reinterpret_cast<void*>(static_cast<uintptr_t>(0x4100));
+    return target_binding(owner, entry, next, target, target) == 0 &&
+        target_binding(owner, entry, owner, target, target) == 6 &&
+        target_binding(owner, entry, next, entry, entry) == 6 &&
+        target_binding(owner, entry, next, target, entry) == 7;
+}
 static DWORD install(TracePacket* packet, uint64_t frequency) {
     packet->setup_stage = 3;
     DWORD error = ERROR_PROC_NOT_FOUND;
@@ -382,36 +517,70 @@ static DWORD install(TracePacket* packet, uint64_t frequency) {
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(directory), &pinned_ntdll)) return GetLastError();
     if (pinned_ntdll != ntdll) return ERROR_INVALID_OWNER;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(event), &pinned_ntdll)) return GetLastError();
+    if (pinned_ntdll != ntdll) return ERROR_INVALID_OWNER;
     packet->setup_stage = 4;
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     if (!kernel) return GetLastError();
     const auto named = GetProcAddress(kernel, "OpenEventW");
     if (!named) return GetLastError();
     if (reinterpret_cast<void*>(named) != reinterpret_cast<void*>(original_win32)) { packet->setup_reason = 9; return ERROR_INVALID_ADDRESS; }
+    packet->route.original_owner_export_equal = 1;
     HMODULE owner = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(original_win32), &owner)) return GetLastError();
-    packet->iat.owner_pinned = 1; packet->iat.owner_base = reinterpret_cast<uintptr_t>(owner);
-    packet->iat.original_open_event = reinterpret_cast<uintptr_t>(original_win32);
-    packet->setup_stage = 5;
+    void* selected_entry = reinterpret_cast<void*>(original_win32);
+    Discovery state = {};
     Image mapped = {};
-    if (!image(owner, &mapped)) { packet->setup_reason = 5; return ERROR_BAD_EXE_FORMAT; }
-    packet->iat.owner_size = mapped.size; packet->iat.owner_timestamp = mapped.timestamp;
-    packet->iat.normal_iat_start = mapped.iat; packet->iat.normal_iat_end = mapped.iat_end;
-    Discovery state = {mapped, packet, frequency, ntdll, reinterpret_cast<void*>(directory), reinterpret_cast<void*>(event), nullptr, nullptr, ERROR_SUCCESS, false};
-    packet->setup_stage = 6;
-    if (!bounded_imports(&state)) {
-        packet->iat.callback_error = state.error;
+    packet->route.node_limit = 2;
+    for (uint32_t index = 0; index < 2; ++index) {
+        if (!clock_live(packet, frequency)) { packet->route.route_reason = 10; return packet->setup_error; }
+        packet->setup_stage = 5;
+        auto* node = &packet->route.nodes[index]; packet->route.node_count = index + 1;
+        if (!capture_node(owner, selected_entry, node, &mapped)) { packet->route.route_reason = 8; packet->setup_reason = 5; return ERROR_BAD_EXE_FORMAT; }
+        packet->iat = {};
+        packet->iat.strategy = 1; packet->iat.owner_pinned = 1; packet->iat.owner_base = mapped.base;
+        packet->iat.original_open_event = reinterpret_cast<uintptr_t>(original_win32);
+        packet->iat.owner_size = mapped.size; packet->iat.owner_timestamp = mapped.timestamp;
+        packet->iat.normal_iat_start = mapped.iat; packet->iat.normal_iat_end = mapped.iat_end;
+        packet->route.directory_descriptor_module = packet->route.event_descriptor_module = 0;
+        packet->route.directory_descriptor_bytes = packet->route.event_descriptor_bytes = 0;
+        packet->route.directory_descriptor_truncated = packet->route.event_descriptor_truncated = 0;
+        for (size_t byte = 0; byte < 64; ++byte) packet->route.directory_descriptor[byte] = packet->route.event_descriptor[byte] = 0;
+        state = {}; state.image = mapped; state.packet = packet; state.frequency = frequency;
+        state.directory_original = reinterpret_cast<void*>(directory); state.event_original = reinterpret_cast<void*>(event); state.node = node;
+        packet->setup_stage = 6;
+        if (!bounded_imports(&state)) {
+            packet->iat.callback_error = state.error;
+            if (state.error != ERROR_SUCCESS) return state.error;
+            packet->setup_reason = 5; return ERROR_BAD_EXE_FORMAT;
+        }
+        const BOOL enumerated = DetourEnumerateImportsEx(owner, &state, import_file, import_function);
+        const DWORD enumeration_error = GetLastError(); packet->iat.callback_error = state.error;
+        if (!enumerated) return enumeration_error != ERROR_SUCCESS ? enumeration_error : ERROR_INVALID_DATA;
         if (state.error != ERROR_SUCCESS) return state.error;
-        packet->setup_reason = 5; return ERROR_BAD_EXE_FORMAT;
+        if (!packet->iat.discovery_complete) { packet->setup_reason = 10; return ERROR_INVALID_DATA; }
+        if (state.directory_slot && state.event_slot) break;
+        if (index != 0) { packet->route.route_reason = 1; packet->setup_reason = 2; return ERROR_PROC_NOT_FOUND; }
+        uint64_t decoded_slot = 0;
+        node->decode_kind = machine() == IMAGE_FILE_MACHINE_ARM64 ? 2 : 1;
+        node->decode_error = memcordon_decode_import_entry(machine(), node->entry, node->entry_bytes, node->entry_byte_count, &decoded_slot);
+        if (node->decode_error) { packet->route.route_reason = 2; packet->setup_reason = 2; return ERROR_NOT_SUPPORTED; }
+        const auto binding = edge_binding(state, decoded_slot);
+        if (binding) { packet->route.route_reason = binding; packet->setup_reason = 2; return ERROR_INVALID_ADDRESS; }
+        node->delegation_slot = decoded_slot; node->delegation_target = reinterpret_cast<uintptr_t>(state.open_target);
+        if (!edge_current(state)) { packet->route.route_reason = 5; return ERROR_RETRY; }
+        HMODULE next = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(state.open_target), &next)) return GetLastError();
+        if (next == owner || state.open_target == selected_entry) { packet->route.route_reason = 6; return ERROR_INVALID_ADDRESS; }
+        const auto implementation = GetProcAddress(next, "OpenEventW");
+        if (!implementation) { const auto original_error = GetLastError(); packet->route.route_reason = 7; return original_error; }
+        const auto target = target_binding(owner, selected_entry, next, state.open_target, reinterpret_cast<void*>(implementation));
+        if (target) { packet->route.route_reason = target; return ERROR_INVALID_ADDRESS; }
+        owner = next; selected_entry = state.open_target; packet->route.hop_count = 1;
     }
-    const BOOL enumerated = DetourEnumerateImportsEx(owner, &state, import_file, import_function);
-    const DWORD enumeration_error = GetLastError();
-    packet->iat.callback_error = state.error;
-    if (!enumerated) return enumeration_error != ERROR_SUCCESS ? enumeration_error : ERROR_INVALID_DATA;
-    if (state.error != ERROR_SUCCESS) return state.error;
-    if (!packet->iat.discovery_complete) { packet->setup_reason = 10; return ERROR_INVALID_DATA; }
-    if (!state.directory_slot || !state.event_slot) { packet->setup_reason = 2; return ERROR_PROC_NOT_FOUND; }
     if (state.directory_slot == state.event_slot) return ERROR_INVALID_ADDRESS;
     packet->iat.directory_slot = reinterpret_cast<uintptr_t>(state.directory_slot); packet->iat.event_slot = reinterpret_cast<uintptr_t>(state.event_slot);
     packet->iat.directory_original = reinterpret_cast<uintptr_t>(directory); packet->iat.event_original = reinterpret_cast<uintptr_t>(event);
@@ -421,6 +590,7 @@ static DWORD install(TracePacket* packet, uint64_t frequency) {
     const size_t count = pages[0].base == pages[1].base ? 1 : 2;
     if (count == 1 && pages[0].original != pages[1].original) return ERROR_RETRY;
     if (!clock_live(packet, frequency)) return ERROR_TIMEOUT;
+    if (!route_unchanged(packet)) { packet->route.route_revalidated = 0; packet->route.route_reason = 11; return ERROR_RETRY; }
     directory_open.store(directory, std::memory_order_release); event_open.store(event, std::memory_order_release);
     packet->setup_stage = 8;
     error = publish(state, pages, count);
@@ -430,7 +600,7 @@ static DWORD install(TracePacket* packet, uint64_t frequency) {
     return error;
 }
 extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutoff, uint64_t frequency) {
-    packet->version = 3; packet->original_cutoff_qpc = cutoff; packet->lifetime_policy = 1;
+    packet->version = 4; packet->original_cutoff_qpc = cutoff; packet->lifetime_policy = 1;
     packet->iat.strategy = 1;
     if (!clock_live(packet, frequency)) { packet->incomplete = 1; return; }
     packet->started_qpc = packet->finished_qpc;
@@ -443,6 +613,7 @@ extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutof
         if (previous == 2 || previous == 3) {
             packet->setup_reason = installation_reason; packet->original_current_thread_id = installation_current_thread;
             packet->iat = installation_iat;
+            packet->route = installation_route;
         } else packet->setup_reason = 1;
         return;
     }
@@ -454,6 +625,7 @@ extern "C" void memcordon_gate_trace_prepare(TracePacket* packet, uint64_t cutof
     installation_stage = packet->setup_stage; installation_error = error;
     installation_reason = packet->setup_reason; installation_current_thread = packet->original_current_thread_id;
     installation_iat = packet->iat;
+    installation_route = packet->route;
     InterlockedExchange(&installation, error == ERROR_SUCCESS ? 2 : 3);
 }
 
@@ -467,6 +639,19 @@ extern "C" void* memcordon_gate_trace_call(TracePacket* packet, const uint16_t* 
     }
     if (now.QuadPart < 0 || static_cast<uint64_t>(now.QuadPart) >= packet->original_cutoff_qpc) {
         packet->clock_live = 0; packet->incomplete = 1; *called = 0; *native_error = ERROR_TIMEOUT; return nullptr;
+    }
+    if (packet->setup_stage == 1) {
+        if (!route_unchanged(packet)) {
+            packet->route.route_reason = 11; packet->setup_stage = 6;
+            packet->setup_reason = 10; packet->setup_error = ERROR_RETRY; packet->incomplete = 1;
+        }
+        if (!QueryPerformanceCounter(&now)) {
+            const DWORD error = GetLastError();
+            packet->clock_live = 0; packet->incomplete = 1; *called = 0; *native_error = error; return nullptr;
+        }
+        if (now.QuadPart < 0 || static_cast<uint64_t>(now.QuadPart) >= packet->original_cutoff_qpc) {
+            packet->clock_live = 0; packet->incomplete = 1; *called = 0; *native_error = ERROR_TIMEOUT; return nullptr;
+        }
     }
     collector.thread = GetCurrentThreadId();
     collector.packet = packet->setup_stage == 1 ? packet : nullptr;
@@ -509,5 +694,5 @@ extern "C" uint32_t memcordon_gate_trace_mock() {
         mock = nullptr;
         if (observed != status || error != 123 || observation.calls != 1 || !observation.same || entry.native_status != status || !entry.returned) return 0;
     }
-    return publication_mock() ? 1 : 0;
+    return publication_mock() && route_mock() ? 1 : 0;
 }
