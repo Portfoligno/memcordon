@@ -886,428 +886,431 @@ fn fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_
     let cutoff = (counter as u64)
         .checked_add((frequency as u64).checked_mul(30).unwrap())
         .unwrap();
-    let original_thread = thread_identity(deadline)?;
-    let mut primary = std::ptr::null_mut();
-    // SAFETY: source is never adjusted. CreateRestrictedToken preserves handle
-    // access, so the derived-only ACL preparation and primary launch require
-    // ADJUST_DEFAULT and ASSIGN_PRIMARY in addition to QUERY/DUPLICATE.
-    if unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
-            &mut primary,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let primary = owned(primary)?;
-    let parent_before =
-        memcordon_windows_launch_core::query_token_envelope(primary.as_raw_handle())
-            .map_err(io::Error::other)?;
-    let parent_acl_before = default_acl_sha256(primary.as_raw_handle())?;
-    let mut rc = vec![
-        0usize;
-        fixture_default_dacl::RESTRICTED_CODE_SID
-            .len()
-            .div_ceil(size_of::<usize>())
-    ];
-    // SAFETY: aligned storage covers the complete canonical restricted-code SID.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            fixture_default_dacl::RESTRICTED_CODE_SID.as_ptr(),
-            rc.as_mut_ptr().cast(),
-            fixture_default_dacl::RESTRICTED_CODE_SID.len(),
-        )
-    };
-    let restricting = SID_AND_ATTRIBUTES {
-        Sid: rc.as_mut_ptr().cast(),
-        Attributes: 0,
-    };
-    let mut restricted = std::ptr::null_mut();
-    // SAFETY: same installed fixture restriction recipe; source token never adjusted.
-    if unsafe {
-        CreateRestrictedToken(
-            primary.as_raw_handle(),
-            DISABLE_MAX_PRIVILEGE,
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            1,
-            &restricting,
-            &mut restricted,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let restricted = owned(restricted)?;
-    native_fixture_default_dacl::prepare(primary.as_raw_handle(), restricted.as_raw_handle())?;
-    let (expected, parent_prelaunch_token) =
-        memcordon_windows_launch_core::query_token_envelope_with_observation(
-            restricted.as_raw_handle(),
-        )
-        .map_err(io::Error::other)?;
-    let parent_prelaunch_default_acl = token_readback::collect(restricted.as_raw_handle())?;
-    let expected_acl = parent_prelaunch_default_acl.sha256.clone();
-    let mut summaries = Vec::with_capacity(5);
-    for cell in [
-        Cell::Local,
-        Cell::Private,
-        Cell::NamespaceDenied,
-        Cell::EventDenied,
-        Cell::WrongBoundary,
-    ] {
-        live(deadline)?;
-        let temporary = tempfile::Builder::new().prefix("mc-primary-").tempdir()?;
-        let alias = temporary
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        // tempfile supplies the exclusive random nonce; hashing only bounds its encoding.
-        let digest = Sha256::digest(alias.as_bytes());
-        let nonce_bytes = &digest[..size_of::<[u8; 16]>()];
-        let nonce: String = nonce_bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let mut namespace = if cell == Cell::Local {
-            None
-        } else {
-            Some(namespace(
-                &alias,
-                &expected.user_sid,
-                cell != Cell::NamespaceDenied,
-                deadline,
-            )?)
-        };
-        if namespace.is_some() {
-            assert!(namespace_collision(&alias, &expected.user_sid, deadline));
-        }
-        let name = if cell == Cell::Local {
-            format!("Local\\{alias}")
-        } else {
-            format!("{alias}\\self")
-        };
-        let original = event(
-            &name,
-            &expected.user_sid,
-            cell != Cell::EventDenied,
-            deadline,
-        )?;
-        let original_security = event_security(&original, deadline)?;
-        let original_label = event_label(&original, deadline);
-        let wrong = event(
-            &format!("Local\\{nonce}"),
-            &expected.user_sid,
-            true,
-            deadline,
-        )?;
-        let request = Request {
-            revision: protocol::REVISION,
-            nonce: nonce.clone(),
-            cell,
-            alias: alias.clone(),
-            boundary: if cell == Cell::WrongBoundary {
-                nonce.clone()
-            } else {
-                alias.clone()
-            },
-            event: if cell == Cell::Local {
-                alias.clone()
-            } else {
-                "self".into()
-            },
-            user_sid: expected.user_sid.clone(),
-            deadline_qpc: cutoff,
-            qpc_frequency: frequency as u64,
-            expected_token: expected.clone(),
-            expected_default_acl_sha256: expected_acl.clone(),
-        };
-        let (mut child, mut input, mut output) = launch(restricted.as_raw_handle(), deadline)?;
-        let identity = child_identity(&child)?;
-        assert!(identity.0 != 0 && identity.1 != 0);
-        child_source(&child, &request)?;
-        let diagnostic_token = child_diagnostic_token(&child, &request);
-        let frame = protocol::encode_request(&request)?;
-        assert_eq!(protocol::decode_request(&frame)?, request);
-        input.write_all(&frame)?;
-        input.flush()?;
-        let observed = response(&child, &mut output, &request)?;
-        // The mandatory pre-request child_source readback established both
-        // bindings; the worker also validates them before its original API.
-        // Optional replay/diagnostic evidence never classifies this outcome.
-        let outcome = experiment::classify_original(
-            &request,
-            &observed,
-            experiment::Binding {
-                initial_identity: identity,
-                current_identity: child_identity(&child)?,
-                token_matches: true,
-                default_acl_matches: true,
-            },
-        )?;
-        if !observed.success {
-            // Read only the original READ_CONTROL owner after the unchanged
-            // failed native open. Never reopen by name or replace its outcome.
-            let post_failure = if observed.phase == Phase::Event {
-                match event_security(&original, deadline) {
-                    Ok(snapshot) => security_evidence::ReadbackObservation::Present(snapshot),
-                    Err(error) => security_evidence::ReadbackObservation::Unavailable {
-                        raw_error: error.raw_os_error(),
-                        deadline: error.kind() == io::ErrorKind::TimedOut,
-                    },
-                }
-            } else {
-                security_evidence::ReadbackObservation::NotRequested
-            };
-            let native_probe = observed.native_open.as_ref().map(|call| {
-                native_open_probe(&mut child, &mut input, &request, call, &original, &wrong)
-            });
-            // Passive disk provenance is optional and starts only after the
-            // original child has released its diagnostic handles and settled.
-            if child.settled {
-                if let Some(provenance) = observed
-                    .native_open
-                    .as_ref()
-                    .and_then(|call| call.module_provenance.as_ref())
-                {
-                    match module_bundle::capture(
-                        provenance,
-                        &request,
-                        &observed,
-                        std::path::Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
-                        deadline,
-                    ) {
-                        Ok(path) => eprintln!("passive module evidence: {}", path.display()),
-                        Err(error) => eprintln!(
-                            "passive module evidence unavailable: kind={:?}; raw={:?}",
-                            error.kind(),
-                            error.raw_os_error()
-                        ),
-                    }
-                }
-            }
-            let retained = (|| -> io::Result<()> {
-                live(deadline)?;
-                let original_name: Vec<u16> = name.encode_utf16().collect();
-                let association = security_evidence::Association {
-                    request: &request,
-                    response: &observed,
-                    original_name: &original_name,
-                    controller_handle: original.as_raw_handle() as usize as u64,
-                    child_pid: identity.0,
-                    child_birth: identity.1,
-                    parent_prelaunch_token: &parent_prelaunch_token,
-                    parent_default_acl_bytes: &parent_prelaunch_default_acl.bytes,
-                    label: &original_label,
-                    post_failure: &post_failure,
-                };
-                let mut record = security_evidence::failure(&association, &original_security)?;
-                record["native_open_probe"] =
-                    serde_json::to_value(&native_probe).map_err(io::Error::other)?;
-                if observed.phase == Phase::Event {
-                    let access = match (&diagnostic_token, &post_failure) {
-                        (Ok(token), security_evidence::ReadbackObservation::Present(snapshot)) => {
-                            authz_diagnostic::observe(token, &request, snapshot, deadline)
-                        }
-                        (Err(error), _) => {
-                            security_evidence::AuthzObservation::unavailable("source-token", error)
-                        }
-                        _ => security_evidence::AuthzObservation::unavailable(
-                            "descriptor-readback",
-                            &io::Error::other("same-handle descriptor unavailable"),
-                        ),
-                    };
-                    record["authz_descriptor_context"] =
-                        serde_json::to_value(access).map_err(io::Error::other)?;
-                }
-                // Pretty framing preserves one typed record while keeping each
-                // bounded hex chunk below the existing progress-line limit.
-                let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
-                if bytes.len() > security_evidence::RECORD_BOUND {
-                    return Err(io::Error::other(
-                        "event security evidence record exceeds bound",
-                    ));
-                }
-                let mut sink = io::stderr().lock();
-                live(deadline)?;
-                sink.write_all(&bytes)?;
-                sink.write_all(b"\n")?;
-                live(deadline)
-            })();
-            if let Err(error) = retained {
-                // Diagnostic custody/render/sink failures never replace the
-                // original response or bypass its unchanged strict assertions.
-                // This result was already collected before rendering. Retain it
-                // without a fresh live snapshot or another native call.
-                if let Some(probe) = &native_probe {
-                    #[derive(serde::Serialize)]
-                    struct RetainedProbe<'a> {
-                        format: &'static str,
-                        revision: u32,
-                        diagnostic_only: bool,
-                        acceptance_authority: bool,
-                        nonce: &'a str,
-                        original_error: Option<i32>,
-                        probe: &'a serde_json::Value,
-                    }
-                    let record = RetainedProbe {
-                        format: "memcordon.native-probe-settlement",
-                        revision: 1,
-                        diagnostic_only: true,
-                        acceptance_authority: false,
-                        nonce: &request.nonce,
-                        original_error: observed.raw_error,
-                        probe,
-                    };
-                    if let Ok(bytes) = serde_json::to_vec(&record) {
-                        if bytes.len() <= protocol::FRAME_BOUND {
-                            let mut sink = io::stderr().lock();
-                            let _ = sink.write_all(&bytes);
-                            let _ = sink.write_all(b"\n");
-                        }
-                    }
-                }
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "fresh-primary security evidence unavailable: kind={:?}; raw={:?}",
-                    error.kind(),
-                    error.raw_os_error()
-                );
-            }
-            if child.settled && matches!(cell, Cell::Private) {
-                debug_replay::capture(restricted.as_raw_handle(), &request, &observed, deadline);
-            }
-        }
-        let _ = writeln!(
-            io::stderr().lock(),
-            "fresh-primary cell={cell:?} original-pid={} birth={} phase={:?} success={} error={:?}",
-            identity.0,
-            identity.1,
-            observed.phase,
-            observed.success,
-            observed.raw_error
-        );
-        let mut held_verified = false;
-        if outcome == experiment::OriginalOutcome::HeldAwaitingIdentity {
-            assert!(
-                matches!(cell, Cell::Local | Cell::Private),
-                "negative cell admitted original namespace/event"
-            );
-            assert_eq!(observed.modify_denied, Some(true));
-            live(deadline)?;
-            child_source(&child, &request)?;
-            let mut duplicate = std::ptr::null_mut();
-            // SAFETY: remote value comes ONLY from this original child's held live reference;
-            // original creation process handle supplies PROCESS_DUP_HANDLE. No PID reopen.
-            if unsafe {
-                DuplicateHandle(
-                    child.process.as_raw_handle(),
-                    observed.event_handle.unwrap() as usize as HANDLE,
-                    GetCurrentProcess(),
-                    &mut duplicate,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let duplicate = owned(duplicate)?;
-            assert!(
-                unsafe {
-                    CompareObjectHandles(original.as_raw_handle(), duplicate.as_raw_handle())
-                } != 0
-            );
-            assert_eq!(
-                unsafe { CompareObjectHandles(wrong.as_raw_handle(), duplicate.as_raw_handle()) },
-                0
-            );
-            assert_eq!(child_identity(&child)?, identity);
-            child_source(&child, &request)?;
-            live(deadline)?;
-            // SAFETY: only original controller event releases child; no duplicate modify rights.
-            if unsafe { SetEvent(original.as_raw_handle()) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            input.write_all(&protocol::encode_ack(&nonce)?)?;
-            input.flush()?;
-            let completed = response(&child, &mut output, &request)?;
-            assert_eq!(completed.phase, Phase::Completed);
-            assert!(completed.success);
-            held_verified = true;
-        } else {
-            assert!(!observed.success);
-            // Classification accepts only the exact named negative outcomes.
-            // Event denial does not prove the target event DACL was reached.
-            assert!(!matches!(
-                outcome,
-                experiment::OriginalOutcome::HeldAwaitingIdentity
-            ));
-        }
-        // SAFETY: settle original owned process under the same absolute cutoff.
-        assert_eq!(
-            unsafe { WaitForSingleObject(child.process.as_raw_handle(), wait_millis(deadline)?) },
-            WAIT_OBJECT_0
-        );
-        child.settled = true;
-        live(deadline)?;
-        let mut code = 0;
-        if unsafe { GetExitCodeProcess(child.process.as_raw_handle(), &mut code) } == 0 {
+    // Retain only validated, owned protocol metadata, never live capabilities.
+    // Passive disk work must not precede any required cell or settlement proof.
+    let mut passive = Vec::<(Request, Response)>::with_capacity(5);
+    let required = (|| -> io::Result<()> {
+        let original_thread = thread_identity(deadline)?;
+        let mut primary = std::ptr::null_mut();
+        // SAFETY: source is never adjusted. CreateRestrictedToken preserves handle
+        // access, so the derived-only ACL preparation and primary launch require
+        // ADJUST_DEFAULT and ASSIGN_PRIMARY in addition to QUERY/DUPLICATE.
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+                &mut primary,
+            )
+        } == 0
+        {
             return Err(io::Error::last_os_error());
         }
-        assert_eq!(code, 0);
-        assert_eq!(child_identity(&child)?, identity);
-        assert_eq!(event_security(&original, deadline)?, original_security);
-        assert_eq!(thread_identity(deadline)?, original_thread);
-        drop(child);
-        drop(input);
-        drop(output);
-        drop(wrong);
-        drop(original);
-        drop(diagnostic_token);
-        if let Some(namespace) = &mut namespace {
-            namespace.close()?;
-        }
-        drop(namespace);
-        assert_eq!(
+        let primary = owned(primary)?;
+        let parent_before =
             memcordon_windows_launch_core::query_token_envelope(primary.as_raw_handle())
-                .map_err(io::Error::other)?,
-            parent_before
-        );
-        assert_eq!(
-            default_acl_sha256(primary.as_raw_handle())?,
-            parent_acl_before
-        );
-        assert_eq!(
-            memcordon_windows_launch_core::query_token_envelope(restricted.as_raw_handle())
-                .map_err(io::Error::other)?,
-            expected
-        );
-        assert_eq!(
-            default_acl_sha256(restricted.as_raw_handle())?,
-            expected_acl
-        );
-        temporary.close()?;
-        live(deadline)?;
-        let settlement = experiment::Settlement {
-            process_settled: true,
-            exit_zero: true,
-            identity_stable: true,
-            token_and_acl_stable: true,
-            event_sd_stable: true,
-            thread_stable: true,
-            resources_released: true,
-            held_identity_and_release_verified: held_verified,
+                .map_err(io::Error::other)?;
+        let parent_acl_before = default_acl_sha256(primary.as_raw_handle())?;
+        let mut rc = vec![
+            0usize;
+            fixture_default_dacl::RESTRICTED_CODE_SID
+                .len()
+                .div_ceil(size_of::<usize>())
+        ];
+        // SAFETY: aligned storage covers the complete canonical restricted-code SID.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                fixture_default_dacl::RESTRICTED_CODE_SID.as_ptr(),
+                rc.as_mut_ptr().cast(),
+                fixture_default_dacl::RESTRICTED_CODE_SID.len(),
+            )
         };
-        let final_outcome = experiment::complete_cell(outcome, &settlement)?;
-        summaries.push(serde_json::json!({
+        let restricting = SID_AND_ATTRIBUTES {
+            Sid: rc.as_mut_ptr().cast(),
+            Attributes: 0,
+        };
+        let mut restricted = std::ptr::null_mut();
+        // SAFETY: same installed fixture restriction recipe; source token never adjusted.
+        if unsafe {
+            CreateRestrictedToken(
+                primary.as_raw_handle(),
+                DISABLE_MAX_PRIVILEGE,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &restricting,
+                &mut restricted,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let restricted = owned(restricted)?;
+        native_fixture_default_dacl::prepare(primary.as_raw_handle(), restricted.as_raw_handle())?;
+        let (expected, parent_prelaunch_token) =
+            memcordon_windows_launch_core::query_token_envelope_with_observation(
+                restricted.as_raw_handle(),
+            )
+            .map_err(io::Error::other)?;
+        let parent_prelaunch_default_acl = token_readback::collect(restricted.as_raw_handle())?;
+        let expected_acl = parent_prelaunch_default_acl.sha256.clone();
+        let mut summaries = Vec::with_capacity(5);
+        for cell in [
+            Cell::Local,
+            Cell::Private,
+            Cell::NamespaceDenied,
+            Cell::EventDenied,
+            Cell::WrongBoundary,
+        ] {
+            live(deadline)?;
+            let temporary = tempfile::Builder::new().prefix("mc-primary-").tempdir()?;
+            let alias = temporary
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            // tempfile supplies the exclusive random nonce; hashing only bounds its encoding.
+            let digest = Sha256::digest(alias.as_bytes());
+            let nonce_bytes = &digest[..size_of::<[u8; 16]>()];
+            let nonce: String = nonce_bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let mut namespace = if cell == Cell::Local {
+                None
+            } else {
+                Some(namespace(
+                    &alias,
+                    &expected.user_sid,
+                    cell != Cell::NamespaceDenied,
+                    deadline,
+                )?)
+            };
+            if namespace.is_some() {
+                assert!(namespace_collision(&alias, &expected.user_sid, deadline));
+            }
+            let name = if cell == Cell::Local {
+                format!("Local\\{alias}")
+            } else {
+                format!("{alias}\\self")
+            };
+            let original = event(
+                &name,
+                &expected.user_sid,
+                cell != Cell::EventDenied,
+                deadline,
+            )?;
+            let original_security = event_security(&original, deadline)?;
+            let original_label = event_label(&original, deadline);
+            let wrong = event(
+                &format!("Local\\{nonce}"),
+                &expected.user_sid,
+                true,
+                deadline,
+            )?;
+            let request = Request {
+                revision: protocol::REVISION,
+                nonce: nonce.clone(),
+                cell,
+                alias: alias.clone(),
+                boundary: if cell == Cell::WrongBoundary {
+                    nonce.clone()
+                } else {
+                    alias.clone()
+                },
+                event: if cell == Cell::Local {
+                    alias.clone()
+                } else {
+                    "self".into()
+                },
+                user_sid: expected.user_sid.clone(),
+                deadline_qpc: cutoff,
+                qpc_frequency: frequency as u64,
+                expected_token: expected.clone(),
+                expected_default_acl_sha256: expected_acl.clone(),
+            };
+            let (mut child, mut input, mut output) = launch(restricted.as_raw_handle(), deadline)?;
+            let identity = child_identity(&child)?;
+            assert!(identity.0 != 0 && identity.1 != 0);
+            child_source(&child, &request)?;
+            let diagnostic_token = child_diagnostic_token(&child, &request);
+            let frame = protocol::encode_request(&request)?;
+            assert_eq!(protocol::decode_request(&frame)?, request);
+            input.write_all(&frame)?;
+            input.flush()?;
+            let observed = response(&child, &mut output, &request)?;
+            // The mandatory pre-request child_source readback established both
+            // bindings; the worker also validates them before its original API.
+            // Optional replay/diagnostic evidence never classifies this outcome.
+            let outcome = experiment::classify_original(
+                &request,
+                &observed,
+                experiment::Binding {
+                    initial_identity: identity,
+                    current_identity: child_identity(&child)?,
+                    token_matches: true,
+                    default_acl_matches: true,
+                },
+            )?;
+            if !observed.success {
+                // Read only the original READ_CONTROL owner after the unchanged
+                // failed native open. Never reopen by name or replace its outcome.
+                let post_failure = if observed.phase == Phase::Event {
+                    match event_security(&original, deadline) {
+                        Ok(snapshot) => security_evidence::ReadbackObservation::Present(snapshot),
+                        Err(error) => security_evidence::ReadbackObservation::Unavailable {
+                            raw_error: error.raw_os_error(),
+                            deadline: error.kind() == io::ErrorKind::TimedOut,
+                        },
+                    }
+                } else {
+                    security_evidence::ReadbackObservation::NotRequested
+                };
+                let native_probe = observed.native_open.as_ref().map(|call| {
+                    native_open_probe(&mut child, &mut input, &request, call, &original, &wrong)
+                });
+                // Queue bounded metadata only after this original child settled.
+                // Disk/version/symbol acquisition waits for the entire matrix.
+                if child.settled
+                    && observed
+                        .native_open
+                        .as_ref()
+                        .and_then(|call| call.module_provenance.as_ref())
+                        .is_some()
+                {
+                    assert!(passive.len() < 5);
+                    passive.push((request.clone(), observed.clone()));
+                }
+                let retained = (|| -> io::Result<()> {
+                    live(deadline)?;
+                    let original_name: Vec<u16> = name.encode_utf16().collect();
+                    let association = security_evidence::Association {
+                        request: &request,
+                        response: &observed,
+                        original_name: &original_name,
+                        controller_handle: original.as_raw_handle() as usize as u64,
+                        child_pid: identity.0,
+                        child_birth: identity.1,
+                        parent_prelaunch_token: &parent_prelaunch_token,
+                        parent_default_acl_bytes: &parent_prelaunch_default_acl.bytes,
+                        label: &original_label,
+                        post_failure: &post_failure,
+                    };
+                    let mut record = security_evidence::failure(&association, &original_security)?;
+                    record["native_open_probe"] =
+                        serde_json::to_value(&native_probe).map_err(io::Error::other)?;
+                    if observed.phase == Phase::Event {
+                        let access = match (&diagnostic_token, &post_failure) {
+                            (
+                                Ok(token),
+                                security_evidence::ReadbackObservation::Present(snapshot),
+                            ) => authz_diagnostic::observe(token, &request, snapshot, deadline),
+                            (Err(error), _) => security_evidence::AuthzObservation::unavailable(
+                                "source-token",
+                                error,
+                            ),
+                            _ => security_evidence::AuthzObservation::unavailable(
+                                "descriptor-readback",
+                                &io::Error::other("same-handle descriptor unavailable"),
+                            ),
+                        };
+                        record["authz_descriptor_context"] =
+                            serde_json::to_value(access).map_err(io::Error::other)?;
+                    }
+                    // Pretty framing preserves one typed record while keeping each
+                    // bounded hex chunk below the existing progress-line limit.
+                    let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+                    if bytes.len() > security_evidence::RECORD_BOUND {
+                        return Err(io::Error::other(
+                            "event security evidence record exceeds bound",
+                        ));
+                    }
+                    let mut sink = io::stderr().lock();
+                    live(deadline)?;
+                    sink.write_all(&bytes)?;
+                    sink.write_all(b"\n")?;
+                    live(deadline)
+                })();
+                if let Err(error) = retained {
+                    // Diagnostic custody/render/sink failures never replace the
+                    // original response or bypass its unchanged strict assertions.
+                    // This result was already collected before rendering. Retain it
+                    // without a fresh live snapshot or another native call.
+                    if let Some(probe) = &native_probe {
+                        #[derive(serde::Serialize)]
+                        struct RetainedProbe<'a> {
+                            format: &'static str,
+                            revision: u32,
+                            diagnostic_only: bool,
+                            acceptance_authority: bool,
+                            nonce: &'a str,
+                            original_error: Option<i32>,
+                            probe: &'a serde_json::Value,
+                        }
+                        let record = RetainedProbe {
+                            format: "memcordon.native-probe-settlement",
+                            revision: 1,
+                            diagnostic_only: true,
+                            acceptance_authority: false,
+                            nonce: &request.nonce,
+                            original_error: observed.raw_error,
+                            probe,
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&record) {
+                            if bytes.len() <= protocol::FRAME_BOUND {
+                                let mut sink = io::stderr().lock();
+                                let _ = sink.write_all(&bytes);
+                                let _ = sink.write_all(b"\n");
+                            }
+                        }
+                    }
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "fresh-primary security evidence unavailable: kind={:?}; raw={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                }
+                if child.settled && matches!(cell, Cell::Private) {
+                    debug_replay::capture(
+                        restricted.as_raw_handle(),
+                        &request,
+                        &observed,
+                        deadline,
+                    );
+                }
+            }
+            let _ = writeln!(
+                io::stderr().lock(),
+                "fresh-primary cell={cell:?} original-pid={} birth={} phase={:?} success={} error={:?}",
+                identity.0,
+                identity.1,
+                observed.phase,
+                observed.success,
+                observed.raw_error
+            );
+            let mut held_verified = false;
+            if outcome == experiment::OriginalOutcome::HeldAwaitingIdentity {
+                assert!(
+                    matches!(cell, Cell::Local | Cell::Private),
+                    "negative cell admitted original namespace/event"
+                );
+                assert_eq!(observed.modify_denied, Some(true));
+                live(deadline)?;
+                child_source(&child, &request)?;
+                let mut duplicate = std::ptr::null_mut();
+                // SAFETY: remote value comes ONLY from this original child's held live reference;
+                // original creation process handle supplies PROCESS_DUP_HANDLE. No PID reopen.
+                if unsafe {
+                    DuplicateHandle(
+                        child.process.as_raw_handle(),
+                        observed.event_handle.unwrap() as usize as HANDLE,
+                        GetCurrentProcess(),
+                        &mut duplicate,
+                        0,
+                        0,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let duplicate = owned(duplicate)?;
+                assert!(
+                    unsafe {
+                        CompareObjectHandles(original.as_raw_handle(), duplicate.as_raw_handle())
+                    } != 0
+                );
+                assert_eq!(
+                    unsafe {
+                        CompareObjectHandles(wrong.as_raw_handle(), duplicate.as_raw_handle())
+                    },
+                    0
+                );
+                assert_eq!(child_identity(&child)?, identity);
+                child_source(&child, &request)?;
+                live(deadline)?;
+                // SAFETY: only original controller event releases child; no duplicate modify rights.
+                if unsafe { SetEvent(original.as_raw_handle()) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                input.write_all(&protocol::encode_ack(&nonce)?)?;
+                input.flush()?;
+                let completed = response(&child, &mut output, &request)?;
+                assert_eq!(completed.phase, Phase::Completed);
+                assert!(completed.success);
+                held_verified = true;
+            } else {
+                assert!(!observed.success);
+                // Classification accepts only the exact named negative outcomes.
+                // Event denial does not prove the target event DACL was reached.
+                assert!(!matches!(
+                    outcome,
+                    experiment::OriginalOutcome::HeldAwaitingIdentity
+                ));
+            }
+            // SAFETY: settle original owned process under the same absolute cutoff.
+            assert_eq!(
+                unsafe {
+                    WaitForSingleObject(child.process.as_raw_handle(), wait_millis(deadline)?)
+                },
+                WAIT_OBJECT_0
+            );
+            child.settled = true;
+            live(deadline)?;
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(child.process.as_raw_handle(), &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            assert_eq!(code, 0);
+            assert_eq!(child_identity(&child)?, identity);
+            assert_eq!(event_security(&original, deadline)?, original_security);
+            assert_eq!(thread_identity(deadline)?, original_thread);
+            drop(child);
+            drop(input);
+            drop(output);
+            drop(wrong);
+            drop(original);
+            drop(diagnostic_token);
+            if let Some(namespace) = &mut namespace {
+                namespace.close()?;
+            }
+            drop(namespace);
+            assert_eq!(
+                memcordon_windows_launch_core::query_token_envelope(primary.as_raw_handle())
+                    .map_err(io::Error::other)?,
+                parent_before
+            );
+            assert_eq!(
+                default_acl_sha256(primary.as_raw_handle())?,
+                parent_acl_before
+            );
+            assert_eq!(
+                memcordon_windows_launch_core::query_token_envelope(restricted.as_raw_handle())
+                    .map_err(io::Error::other)?,
+                expected
+            );
+            assert_eq!(
+                default_acl_sha256(restricted.as_raw_handle())?,
+                expected_acl
+            );
+            temporary.close()?;
+            live(deadline)?;
+            let settlement = experiment::Settlement {
+                process_settled: true,
+                exit_zero: true,
+                identity_stable: true,
+                token_and_acl_stable: true,
+                event_sd_stable: true,
+                thread_stable: true,
+                resources_released: true,
+                held_identity_and_release_verified: held_verified,
+            };
+            let final_outcome = experiment::complete_cell(outcome, &settlement)?;
+            summaries.push(serde_json::json!({
             "cell":cell,"original_nonce":nonce,"original_pid":identity.0,"original_birth":identity.1,
             "original_phase":observed.phase,"original_success":observed.success,"original_error":observed.raw_error,
             "original_api":if observed.phase==Phase::Namespace {"OpenPrivateNamespaceW"}else{"OpenEventW"},
@@ -1318,24 +1321,58 @@ fn fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_
             "event_modify_denied":observed.modify_denied,"held_release_completed":held_verified,
             "target_event_dacl_denial_cause":"unobserved","settlement":settlement
         }));
-        assert!(summaries.len() <= 5);
+            assert!(summaries.len() <= 5);
+        }
+        assert_eq!(summaries.len(), 5);
+        drop(restricted);
+        drop(primary);
+        let summary = serde_json::json!({"format":"memcordon.namespace-primary-experiment-summary","revision":1,"diagnostic_only":true,"acceptance_authority":false,"harness_integrity_verified":true,"shared_token_handles_released":true,"deadline_qpc":cutoff,"scenario_success_scope":"original event acquisition and live identity verified; every denial remains false","source_binding_scope":"creation-process token/default ACL before request; worker original-call validation; source/derived invariance at settlement","cells":summaries});
+        // Keep each progress line short while retaining one bounded typed record.
+        let bytes = serde_json::to_vec_pretty(&summary).map_err(io::Error::other)?;
+        if bytes.len() > 8 * 1024 {
+            return Err(io::Error::other(
+                "five-cell experiment summary exceeds bound",
+            ));
+        }
+        live(deadline)?;
+        let mut sink = io::stderr().lock();
+        sink.write_all(&bytes)?;
+        sink.write_all(b"\n")?;
+        live(deadline)
+    })();
+    // The mandatory result includes all five cells, releases and the final
+    // original-cutoff check. Optional capture cannot replace that result.
+    for (request, observed) in passive {
+        let captured = live(deadline).and_then(|()| {
+            let provenance = observed
+                .native_open
+                .as_ref()
+                .and_then(|call| call.module_provenance.as_ref())
+                .expect("queued response has module provenance");
+            module_bundle::capture(
+                provenance,
+                &request,
+                &observed,
+                std::path::Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+                deadline,
+            )
+        });
+        let mut sink = io::stderr().lock();
+        match captured {
+            Ok(path) => {
+                let _ = writeln!(sink, "passive module evidence: {}", path.display());
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    sink,
+                    "passive module evidence unavailable: kind={:?}; raw={:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                );
+            }
+        }
     }
-    assert_eq!(summaries.len(), 5);
-    drop(restricted);
-    drop(primary);
-    let summary = serde_json::json!({"format":"memcordon.namespace-primary-experiment-summary","revision":1,"diagnostic_only":true,"acceptance_authority":false,"harness_integrity_verified":true,"shared_token_handles_released":true,"deadline_qpc":cutoff,"scenario_success_scope":"original event acquisition and live identity verified; every denial remains false","source_binding_scope":"creation-process token/default ACL before request; worker original-call validation; source/derived invariance at settlement","cells":summaries});
-    // Keep each progress line short while retaining one bounded typed record.
-    let bytes = serde_json::to_vec_pretty(&summary).map_err(io::Error::other)?;
-    if bytes.len() > 8 * 1024 {
-        return Err(io::Error::other(
-            "five-cell experiment summary exceeds bound",
-        ));
-    }
-    live(deadline)?;
-    let mut sink = io::stderr().lock();
-    sink.write_all(&bytes)?;
-    sink.write_all(b"\n")?;
-    live(deadline)
+    required
 }
 fn namespace_collision(alias: &str, user: &str, deadline: Instant) -> bool {
     namespace(alias, user, true, deadline)
