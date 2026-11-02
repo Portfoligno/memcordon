@@ -107,43 +107,34 @@ fn source_security(root: HKEY, deadline: Instant) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn process_user(deadline: Instant) -> io::Result<Vec<u8>> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::{
-        Security::{
-            GetTokenInformation, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        },
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+enum ReaderToken {
+    CreatorPrimary,
+    RecipientEffective,
+}
+
+fn reader_user(source: ReaderToken, deadline: Instant) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
-    live(deadline)?;
-    let mut token = ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return at(
-            Err(io::Error::last_os_error()),
-            "seal/reader-token",
-            "OpenProcessToken",
-            "Win32",
-            Some(TOKEN_QUERY),
-        );
-    }
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    // These are borrowed query-only, same-thread pseudo handles, never native
+    // owners. The Windows SDK processthreadsapi.h inline accessors return -4
+    // (GetCurrentProcessToken) and -6 (GetCurrentThreadEffectiveToken).
+    // Select the role immediately before synchronous observation; do not cache
+    // the effective token across an impersonation transition or send it away.
+    let (token, phase) = match source {
+        ReaderToken::CreatorPrimary => (-4_isize, "seal/creator-primary-user"),
+        ReaderToken::RecipientEffective => (-6_isize, "seal/recipient-effective-user"),
+    };
+    let token = token as windows_sys::Win32::Foundation::HANDLE;
     live(deadline)?;
     let mut length = 0;
-    let result = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            ptr::null_mut(),
-            0,
-            &mut length,
-        )
-    };
+    let result = unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut length) };
     if result == 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(122) {
             return at(
                 Err(error),
-                "seal/reader-size",
+                phase,
                 "GetTokenInformation(TokenUser)",
                 "Win32",
                 Some(TOKEN_QUERY),
@@ -164,7 +155,7 @@ fn process_user(deadline: Instant) -> io::Result<Vec<u8>> {
     live(deadline)?;
     if unsafe {
         GetTokenInformation(
-            token.as_raw_handle(),
+            token,
             TokenUser,
             storage.as_mut_ptr().cast(),
             provided,
@@ -174,7 +165,7 @@ fn process_user(deadline: Instant) -> io::Result<Vec<u8>> {
     {
         return at(
             Err(io::Error::last_os_error()),
-            "seal/reader-query",
+            phase,
             "GetTokenInformation(TokenUser)",
             "Win32",
             Some(TOKEN_QUERY),
@@ -813,7 +804,7 @@ impl Projection {
             ));
         }
         let declaration = manifest.declaration().map_err(io::Error::other)?;
-        let reader_sid = process_user(deadline)?;
+        let reader_sid = reader_user(ReaderToken::CreatorPrimary, deadline)?;
         // This DACL applies ONLY to each newly created fixture key. RC can read
         // configuration, never mutate it; owner/system retain cleanup custody.
         let sddl = wide("D:P(A;CI;KA;;;SY)(A;CI;KA;;;OW)(A;CI;KR;;;RC)");
@@ -1221,7 +1212,7 @@ impl Mapping {
         declaration: &Declaration,
         deadline: Instant,
     ) -> io::Result<Self> {
-        let reader = process_user(deadline)?;
+        let reader = reader_user(ReaderToken::RecipientEffective, deadline)?;
         at(
             read_seal(key.raw(), &reader, deadline),
             "mapping/intended-reader-seal",
