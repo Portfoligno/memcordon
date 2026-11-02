@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const MAX_KEYS: usize = 256;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_VALUES: usize = 4096;
@@ -22,6 +22,7 @@ pub enum Root {
     Winsock2Parameters,
     WinsockParameters,
     TransportWinsock { service: Vec<u16> },
+    WinsockMigrationProviders,
 }
 impl Root {
     pub const ALL: [Self; 2] = [Self::Winsock2Parameters, Self::WinsockParameters];
@@ -42,6 +43,11 @@ impl Root {
                 path.extend("\\Parameters\\Winsock".encode_utf16());
                 path
             }
+            Self::WinsockMigrationProviders => {
+                "System\\CurrentControlSet\\Services\\Winsock\\Setup Migration\\Providers"
+                    .encode_utf16()
+                    .collect()
+            }
         }
     }
 
@@ -50,6 +56,7 @@ impl Root {
             Self::Winsock2Parameters => 1,
             Self::WinsockParameters => 2,
             Self::TransportWinsock { .. } => 3,
+            Self::WinsockMigrationProviders => 4,
         }
     }
 
@@ -123,7 +130,7 @@ pub fn parse_transports(value: &ValueRecord) -> Result<Vec<Vec<u16>>, String> {
         let service = &units[start..end];
         service_component(service)?;
         services.insert(service.to_vec());
-        if services.len() > MAX_KEYS - Root::ALL.len() {
+        if services.len() > MAX_KEYS - Root::ALL.len() - 1 {
             return Err("transport root inventory exceeds shared key bound".into());
         }
         start = end + 1;
@@ -201,6 +208,7 @@ pub struct Key {
 pub struct Manifest {
     pub version: u32,
     pub view: View,
+    pub migration_providers: TransportPresence,
     pub transports: Vec<TransportRoot>,
     pub keys: Vec<Key>,
 }
@@ -225,7 +233,14 @@ impl Manifest {
         }
         let mut present = BTreeSet::new();
         let mut inventory = BTreeSet::new();
-        let mut absent = 0usize;
+        charge(6)?; // Fixed optional-root tag, presence and native-status slot.
+        let mut absent = match self.migration_providers {
+            TransportPresence::Present => 0,
+            TransportPresence::Absent { lstatus: 2 } => 1,
+            TransportPresence::Absent { .. } => {
+                return Err("unsupported migration provider source absence status".into());
+            }
+        };
         for transport in &self.transports {
             service_component(&transport.service)?;
             if !inventory.insert(transport.service.clone())
@@ -255,6 +270,11 @@ impl Manifest {
             return Err("keys and absent transport roots exceed shared inventory bound".into());
         }
         for key in &self.keys {
+            if key.root == Root::WinsockMigrationProviders
+                && self.migration_providers != TransportPresence::Present
+            {
+                return Err("key belongs to absent migration provider root".into());
+            }
             if let Root::TransportWinsock { service } = &key.root {
                 service_component(service)?;
                 if !present.contains(service) {
@@ -307,6 +327,11 @@ impl Manifest {
                 return Err("Winsock registry required forest root is absent".into());
             }
         }
+        if self.migration_providers == TransportPresence::Present
+            && !paths.contains(&(Root::WinsockMigrationProviders, Vec::new()))
+        {
+            return Err("present migration provider root is absent from captured keys".into());
+        }
         for service in present {
             if !paths.contains(&(Root::TransportWinsock { service }, Vec::new())) {
                 return Err("present transport root is absent from captured keys".into());
@@ -329,6 +354,17 @@ impl Manifest {
         hash.update(self.version.to_le_bytes());
         // The only accepted view is the actual native process view.
         hash.update([1]);
+        hash.update([4]);
+        match self.migration_providers {
+            TransportPresence::Present => {
+                hash.update([1]);
+                hash.update(0u32.to_le_bytes());
+            }
+            TransportPresence::Absent { lstatus } => {
+                hash.update([2]);
+                hash.update(lstatus.to_le_bytes());
+            }
+        }
         let mut transports: Vec<_> = self.transports.iter().collect();
         transports.sort_by(|left, right| left.service.cmp(&right.service));
         hash.update((transports.len() as u32).to_le_bytes());

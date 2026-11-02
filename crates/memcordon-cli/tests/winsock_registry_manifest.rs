@@ -21,6 +21,7 @@ fn fixture() -> Manifest {
     Manifest {
         version: registry::VERSION,
         view: View::Native,
+        migration_providers: TransportPresence::Absent { lstatus: 2 },
         transports: vec![],
         keys: vec![
             Key {
@@ -162,6 +163,7 @@ fn forest() -> Manifest {
     Manifest {
         version: registry::VERSION,
         view: View::Native,
+        migration_providers: TransportPresence::Absent { lstatus: 2 },
         transports: vec![],
         keys: Root::ALL
             .into_iter()
@@ -238,7 +240,9 @@ fn roots_are_digest_bound_and_legacy_single_root_declarations_are_refused() {
     });
     assert_ne!(changed.digest().unwrap(), digest);
     let mut declaration = original.declaration().unwrap();
-    assert_eq!(declaration.version, 3);
+    assert_eq!(declaration.version, 4);
+    declaration.version = 3;
+    assert!(declaration.validate().is_err());
     declaration.version = 2;
     assert!(declaration.validate().is_err());
     declaration.version = 1;
@@ -254,7 +258,7 @@ fn roots_are_digest_bound_and_legacy_single_root_declarations_are_refused() {
 #[test]
 fn forest_key_and_value_limits_are_shared_not_doubled_per_root() {
     let mut keys = forest();
-    for index in 0..registry::MAX_KEYS - Root::ALL.len() {
+    for index in 0..registry::MAX_KEYS - Root::ALL.len() - 1 {
         keys.keys.push(Key {
             root: Root::ALL[index % Root::ALL.len()].clone(),
             path: vec![name(&index.to_string())],
@@ -308,7 +312,7 @@ fn forest_byte_budget_charges_both_roots_and_accepts_only_the_exact_shared_exten
         );
     }
     // Root tags, four payload names and the exact empty Transports value.
-    let metadata = Root::ALL.len() + 4 * size_of::<u16>() + name("Transports").len() * 2 + 2;
+    let metadata = 6 + Root::ALL.len() + 4 * size_of::<u16>() + name("Transports").len() * 2 + 2;
     value.keys[1].values[2]
         .bytes
         .truncate(registry::MAX_VALUE_BYTES - metadata);
@@ -486,7 +490,7 @@ fn canonical_transport_digest_binds_raw_discovery_presence_and_contents() {
 #[test]
 fn absent_transport_inventory_and_memberships_share_existing_limits() {
     let mut value = transport_forest();
-    for index in 0..registry::MAX_KEYS - value.keys.len() - 1 {
+    for index in 0..registry::MAX_KEYS - value.keys.len() - 2 {
         value.keys.push(Key {
             root: Root::Winsock2Parameters,
             path: vec![name(&index.to_string())],
@@ -507,4 +511,81 @@ fn absent_transport_inventory_and_memberships_share_existing_limits() {
         .collect::<Vec<_>>();
     let names = names.iter().map(String::as_str).collect::<Vec<_>>();
     assert!(registry::parse_transports(&transport_value(&names)).is_err());
+}
+
+#[test]
+fn optional_migration_root_requires_explicit_witnessed_presence_and_never_fabricates_keys() {
+    let absent = forest();
+    absent.validate().unwrap();
+    let mut present = absent.clone();
+    present.migration_providers = TransportPresence::Present;
+    assert!(present.validate().is_err());
+    present.keys.push(Key {
+        root: Root::WinsockMigrationProviders,
+        path: vec![],
+        class: vec![0xd800],
+        values: vec![],
+    });
+    present.validate().unwrap();
+    assert_ne!(present.digest().unwrap(), absent.digest().unwrap());
+    let mut contents = present.clone();
+    contents.keys.last_mut().unwrap().values.push(ValueRecord {
+        name: name("actual-native-provider"),
+        kind: 3,
+        bytes: vec![1, 0, 255],
+    });
+    assert_ne!(contents.digest().unwrap(), present.digest().unwrap());
+    let mut reordered = contents.clone();
+    reordered.keys.reverse();
+    assert_eq!(reordered.digest().unwrap(), contents.digest().unwrap());
+    assert_eq!(
+        Root::WinsockMigrationProviders.path(),
+        name("System\\CurrentControlSet\\Services\\Winsock\\Setup Migration\\Providers")
+    );
+    for status in [3, 5, 0] {
+        let mut bad = absent.clone();
+        bad.migration_providers = TransportPresence::Absent { lstatus: status };
+        assert!(bad.validate().is_err());
+    }
+    let mut contradictory = present.clone();
+    contradictory.migration_providers = TransportPresence::Absent { lstatus: 2 };
+    assert!(contradictory.validate().is_err());
+    let mut duplicate = present.clone();
+    duplicate.keys.push(present.keys.last().unwrap().clone());
+    assert!(duplicate.validate().is_err());
+    let mut wire = serde_json::to_value(absent).unwrap();
+    wire.as_object_mut().unwrap().remove("migration_providers");
+    assert!(serde_json::from_value::<Manifest>(wire).is_err());
+}
+
+#[test]
+fn migration_presence_consumes_one_inventory_slot_whether_present_or_absent() {
+    let mut absent = forest();
+    for index in 0..registry::MAX_KEYS - 3 {
+        absent.keys.push(Key {
+            root: Root::Winsock2Parameters,
+            path: vec![name(&index.to_string())],
+            class: vec![],
+            values: vec![],
+        });
+    }
+    absent.validate().unwrap();
+    let mut present = absent.clone();
+    present.migration_providers = TransportPresence::Present;
+    present.keys.push(Key {
+        root: Root::WinsockMigrationProviders,
+        path: vec![],
+        class: vec![],
+        values: vec![],
+    });
+    present.validate().unwrap();
+    for value in [&mut absent, &mut present] {
+        value.keys.push(Key {
+            root: Root::Winsock2Parameters,
+            path: vec![name("one-too-many")],
+            class: vec![],
+            values: vec![],
+        });
+        assert!(value.validate().is_err());
+    }
 }

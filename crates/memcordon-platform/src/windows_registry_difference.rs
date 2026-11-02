@@ -70,6 +70,7 @@ fn location(key: &Key) -> Value {
     let root = match &key.root {
         Root::Winsock2Parameters => json!({"kind":"winsock2-parameters"}),
         Root::WinsockParameters => json!({"kind":"winsock-parameters"}),
+        Root::WinsockMigrationProviders => json!({"kind":"winsock-migration-providers"}),
         Root::TransportWinsock { service } => {
             json!({"kind":"transport-winsock","service":preview(service)})
         }
@@ -91,6 +92,11 @@ fn difference(
     deadline: Instant,
 ) -> Result<Option<Value>, &'static str> {
     live(deadline)?;
+    if expected.migration_providers != actual.migration_providers {
+        return Ok(Some(
+            json!({"category":"migration-providers-presence","expected":expected.migration_providers,"actual":actual.migration_providers}),
+        ));
+    }
     let left = expected
         .transports
         .iter()

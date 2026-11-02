@@ -569,6 +569,7 @@ fn root_at<T>(result: io::Result<T>, root: &Root) -> io::Result<T> {
             Root::Winsock2Parameters => "forest/winsock2-parameters",
             Root::WinsockParameters => "forest/winsock-parameters",
             Root::TransportWinsock { .. } => "forest/transport-winsock",
+            Root::WinsockMigrationProviders => "forest/winsock-migration-providers",
         },
         "registry-forest-root",
         "boundary",
@@ -971,7 +972,39 @@ fn closure_snapshot(parent: HKEY, deadline: Instant) -> io::Result<Snapshot> {
     capture(&sources, &mut state, deadline)?;
     let services = native_transport_services(&state.keys, deadline)?;
     let mut transports = Vec::with_capacity(services.len());
-    let mut additional = Vec::with_capacity(services.len());
+    let mut additional = Vec::with_capacity(services.len() + 1);
+    // This fixed optional input is observed independently in each complete
+    // pass. Never fabricate a key when the original source witnesses absence.
+    let migration_root = Root::WinsockMigrationProviders;
+    let mut migration_providers = TransportPresence::Present;
+    state.bytes = state
+        .bytes
+        .checked_add(migration_root.identity_bytes() + 1 + size_of::<u32>())
+        .ok_or_else(|| io::Error::other("migration presence extent overflow"))?;
+    if state.bytes > MAX_BYTES {
+        return Err(io::Error::other(
+            "migration presence exceeds shared byte bound",
+        ));
+    }
+    match open(parent, &migration_root.path(), KEY_READ, deadline) {
+        Ok(key) => {
+            security.push((
+                migration_root.clone(),
+                root_at(source_security(key.raw(), deadline), &migration_root)?,
+            ));
+            additional.push((migration_root.clone(), key));
+        }
+        Err(error) if error.raw_os_error() == Some(2) => {
+            migration_providers = TransportPresence::Absent { lstatus: 2 };
+            state.absent += 1;
+        }
+        Err(error) => return root_at(Err(error), &migration_root),
+    }
+    if state.keys.len() + additional.len() + state.absent > MAX_KEYS {
+        return Err(io::Error::other(
+            "migration root exceeds shared key inventory",
+        ));
+    }
     for service in services {
         live(deadline)?;
         let root = Root::TransportWinsock {
@@ -1026,6 +1059,7 @@ fn closure_snapshot(parent: HKEY, deadline: Instant) -> io::Result<Snapshot> {
     let manifest = Manifest {
         version: VERSION,
         view: View::Native,
+        migration_providers,
         transports,
         keys: state.keys,
     };
@@ -1624,7 +1658,7 @@ impl Projection {
     }
     pub fn diagnostic(&self) -> serde_json::Value {
         let security = self.source_security.iter().map(|(root, bytes)| serde_json::json!({"root":root,"path_utf16":root.path(),"bytes":bytes,"sha256":hex_digest(bytes)})).collect::<Vec<_>>();
-        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":3,"declaration":self.declaration,"transports":self.manifest.transports,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_roots":security,"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native Winsock roots and configuration-derived transport Winsock inputs, including witnessed absence, projected below one owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
+        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":VERSION,"declaration":self.declaration,"migration_providers":self.manifest.migration_providers,"transports":self.manifest.transports,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_roots":security,"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native Winsock roots, optional migration providers and configuration-derived transport Winsock inputs, including witnessed absence, projected below one owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
     }
     fn transferred(&mut self) {
         self.transferred = true;

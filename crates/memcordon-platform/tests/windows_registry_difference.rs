@@ -10,6 +10,7 @@ fn base() -> Manifest {
     Manifest {
         version: VERSION,
         view: View::Native,
+        migration_providers: TransportPresence::Absent { lstatus: 2 },
         transports: vec![],
         keys: vec![
             Key {
@@ -172,6 +173,37 @@ fn actual_transport_membership_and_witnessed_presence_precede_key_differences() 
     let record = render(&present, &invalid);
     assert_eq!(record["detail_unavailable"], "invalid-actual-manifest");
     assert!(record["difference"].is_null());
+}
+
+#[test]
+fn migration_presence_is_localized_before_transport_and_root_content_changes() {
+    let absent = base();
+    let mut present = absent.clone();
+    present.migration_providers = TransportPresence::Present;
+    present.keys.push(Key {
+        root: Root::WinsockMigrationProviders,
+        path: vec![],
+        class: vec![],
+        values: vec![],
+    });
+    assert_eq!(category(&absent, &present), "migration-providers-presence");
+    assert_eq!(category(&present, &absent), "migration-providers-presence");
+    let mut changed = present.clone();
+    changed.keys.last_mut().unwrap().class = vec![0xd800];
+    let record = render(&present, &changed);
+    assert_eq!(record["difference"]["category"], "key-class");
+    assert_eq!(
+        record["difference"]["location"]["root"]["kind"],
+        "winsock-migration-providers"
+    );
+    assert_eq!(
+        record["difference"]["location"]["key_identity_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(serde_json::to_vec(&record).unwrap().len() <= difference::RECORD_BYTES);
 }
 
 #[test]
