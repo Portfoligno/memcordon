@@ -26,6 +26,7 @@ mod own_thread_deadline_self_check;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
+mod winsock_registry;
 mod winsock_startup;
 mod winsock_trace;
 mod winsock_trace_record;
@@ -157,8 +158,25 @@ fn read_http_header(stream: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn tcp_peer(port: u16, challenge: &[u8], output_root: &std::path::Path) -> io::Result<()> {
+fn tcp_peer(
+    port: u16,
+    challenge: &[u8],
+    output_root: &std::path::Path,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<()> {
+    let check = || {
+        if deadline.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original registry TCP peer work cutoff exhausted",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     let _winsock = native::winsock_startup(None)?;
+    check()?;
     let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
     let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .map_err(|error| context("connect", error))?;
@@ -218,12 +236,212 @@ fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Res
     transcript.event("binary-files", None, &descriptor.challenge)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerRegistryInput {
+    declaration: descriptor::winsock_registry::Declaration,
+    descriptor_sha256: [u8; 32],
+    clock: descriptor::ControlClock,
+}
+
+#[derive(Debug)]
+struct RegistryPeerFailure {
+    primary: io::Error,
+    secondary: io::Error,
+}
+impl std::fmt::Display for RegistryPeerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; independent registry peer cleanup: {}",
+            self.primary, self.secondary
+        )
+    }
+}
+impl std::error::Error for RegistryPeerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+fn peer_failures(primary: io::Error, secondary: io::Error) -> io::Error {
+    io::Error::new(primary.kind(), RegistryPeerFailure { primary, secondary })
+}
+
+fn settle_peer_failure(
+    peer: &mut std::process::Child,
+    primary: io::Error,
+    cutoff: std::time::Instant,
+) -> io::Error {
+    peer.stdin.take();
+    let mut cleanup = peer.kill().err();
+    loop {
+        match peer.try_wait() {
+            Ok(Some(_)) => break,
+            Err(error) => {
+                cleanup = Some(match cleanup {
+                    Some(previous) => peer_failures(previous, error),
+                    None => error,
+                });
+                break;
+            }
+            Ok(None) if std::time::Instant::now() >= cutoff => {
+                let error = io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original registry peer retirement unproved at original cutoff",
+                );
+                cleanup = Some(match cleanup {
+                    Some(previous) => peer_failures(previous, error),
+                    None => error,
+                });
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    match cleanup {
+        Some(secondary) => peer_failures(primary, secondary),
+        None => primary,
+    }
+}
+
+fn send_peer_registry(
+    peer: &mut std::process::Child,
+    registry: &winsock_registry::Mapping,
+    descriptor: &Descriptor,
+    session: &controller_start_input::Session,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::DuplicateHandle,
+        System::{Registry::KEY_READ, Threading::GetCurrentProcess},
+    };
+    let deadline = session.original_deadline();
+    let check = || {
+        if std::time::Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original registry peer handoff cutoff exhausted",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let identity = native::child_identity(peer)?;
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: source is the admitted read-only key; target is this exact owned
+    // Child, never a reopened PID. Its numeric result is target-local only.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            registry.raw(),
+            peer.as_raw_handle(),
+            &mut handle,
+            KEY_READ,
+            0,
+            0,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let binding = descriptor::controller_start::Binding {
+        challenge: descriptor.challenge.clone(),
+        descriptor_sha256: session.original_binding().descriptor_sha256,
+        pid: identity.process_id,
+        birth: identity.creation_time_100ns,
+    };
+    let capability = descriptor::controller_start::Capability {
+        version: 1,
+        handle: handle as usize as u64,
+        manifest_sha256: descriptor
+            .winsock_registry
+            .as_ref()
+            .ok_or_else(|| io::Error::other("peer registry declaration absent"))?
+            .sha256,
+    };
+    let mut sender = descriptor::controller_start::Sender::with_registry(capability, false);
+    let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(deadline)
+        .map_err(io::Error::other)?;
+    let written = match peer.stdin.take() {
+        Some(mut writer) => sender.send(
+            &mut writer,
+            &binding,
+            descriptor::controller_start::Phase::Start,
+            check,
+        ),
+        None => Err(io::Error::other("original registry peer stdin unavailable")),
+    };
+    let stopped = timer.finish().map_err(io::Error::other);
+    match (written, stopped) {
+        (Err(primary), Err(secondary)) => Err(peer_failures(primary, secondary)),
+        (Err(primary), _) => Err(primary),
+        (Ok(()), stopped) => stopped,
+    }
+}
+
 fn joint(
     descriptor: &Descriptor,
     transcript: &mut Transcript,
     churn: bool,
     control: Option<&mut controller_start_input::Session>,
     token_envelope: &[u8],
+) -> io::Result<()> {
+    let registry = match (&descriptor.winsock_registry, control.as_deref()) {
+        (Some(declaration), Some(session)) => {
+            let capability = session.registry_capability().ok_or_else(|| {
+                io::Error::other(
+                    "declared registry input capability was not admitted by original START",
+                )
+            })?;
+            if capability.manifest_sha256 != declaration.sha256 {
+                return Err(io::Error::other(
+                    "registry input capability and descriptor differ",
+                ));
+            }
+            // The completed authenticated frame transfers this one reference;
+            // native type/access/noninheritance and complete data are checked.
+            let key = unsafe {
+                winsock_registry::OwnedKey::from_transferred(
+                    capability.handle,
+                    session.original_deadline(),
+                )
+            }?;
+            Some(winsock_registry::Mapping::install(
+                key,
+                declaration,
+                session.original_deadline(),
+            )?)
+        }
+        (None, _) => None,
+        _ => {
+            return Err(io::Error::other(
+                "declared registry input lacks original control session",
+            ));
+        }
+    };
+    match registry {
+        Some(mapping) => mapping.run(|mapping| {
+            joint_mapped(
+                descriptor,
+                transcript,
+                churn,
+                control,
+                token_envelope,
+                Some(mapping),
+            )
+        }),
+        None => joint_mapped(descriptor, transcript, churn, control, token_envelope, None),
+    }
+}
+
+fn joint_mapped(
+    descriptor: &Descriptor,
+    transcript: &mut Transcript,
+    churn: bool,
+    control: Option<&mut controller_start_input::Session>,
+    token_envelope: &[u8],
+    registry: Option<&winsock_registry::Mapping>,
 ) -> io::Result<()> {
     let trace = match (descriptor.control_clock.as_ref(), control.as_deref()) {
         (Some(clock), Some(session)) => Some(winsock_trace::Context {
@@ -280,14 +498,52 @@ fn joint(
     }
     let challenge_path = descriptor.output_root.join("tcp-challenge.bin");
     fs::write(&challenge_path, &descriptor.challenge)?;
-    let mut peer = child_command()?
+    let mut peer_command = child_command()?;
+    peer_command
         .arg("tcp-peer")
         .arg(address.port().to_string())
         .arg(challenge_path)
         .arg(&descriptor.output_root)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    if registry.is_some() {
+        let session = control
+            .as_deref()
+            .ok_or_else(|| io::Error::other("original registry session absent"))?;
+        let peer_input = PeerRegistryInput {
+            declaration: descriptor
+                .winsock_registry
+                .clone()
+                .ok_or_else(|| io::Error::other("registry declaration absent"))?,
+            descriptor_sha256: session.original_binding().descriptor_sha256,
+            clock: descriptor
+                .control_clock
+                .clone()
+                .ok_or_else(|| io::Error::other("original registry clock absent"))?,
+        };
+        peer_command
+            .arg(serde_json::to_string(&peer_input).map_err(io::Error::other)?)
+            .stdin(Stdio::piped());
+    }
+    let mut peer = peer_command.spawn()?;
+    if let Some(registry) = registry {
+        let handed = send_peer_registry(
+            &mut peer,
+            registry,
+            descriptor,
+            control.as_deref().expect("checked registry control"),
+        );
+        if let Err(primary) = handed {
+            return Err(settle_peer_failure(
+                &mut peer,
+                primary,
+                control
+                    .as_deref()
+                    .expect("checked registry control")
+                    .original_deadline(),
+            ));
+        }
+    }
     transcript.event(
         "tcp-peer-created",
         None,
@@ -689,11 +945,89 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             let output_root = args
                 .next()
                 .ok_or_else(|| io::Error::other("missing peer output root"))?;
+            let registry = args.next();
             if args.next().is_some() {
                 return Err(io::Error::other("extra peer arguments"));
             }
-            tcp_peer(port, &fs::read(path)?, std::path::Path::new(&output_root))?;
+            let challenge = fs::read(path)?;
+            let _registry = match registry {
+                Some(input) => {
+                    let input = input
+                        .to_str()
+                        .filter(|text| text.len() <= 4096)
+                        .ok_or_else(|| {
+                            io::Error::other("peer registry input is not bounded UTF8")
+                        })?;
+                    let input: PeerRegistryInput =
+                        serde_json::from_str(input).map_err(io::Error::other)?;
+                    let identity = native::current_identity()?;
+                    let binding = descriptor::controller_start::Binding {
+                        challenge: challenge.clone(),
+                        descriptor_sha256: input.descriptor_sha256,
+                        pid: identity.process_id,
+                        birth: identity.creation_time_100ns,
+                    };
+                    let mut session = controller_start_input::Session::peer(
+                        &input.clock,
+                        binding,
+                        &input.declaration,
+                    )?;
+                    session.receive(descriptor::controller_start::Phase::Start)?;
+                    let capability = session
+                        .registry_capability()
+                        .ok_or_else(|| io::Error::other("peer registry capability absent"))?;
+                    let key = unsafe {
+                        winsock_registry::OwnedKey::from_transferred(
+                            capability.handle,
+                            session.original_deadline(),
+                        )
+                    }?;
+                    Some((
+                        winsock_registry::Mapping::install(
+                            key,
+                            &input.declaration,
+                            session.original_deadline(),
+                        )?,
+                        session.original_deadline(),
+                    ))
+                }
+                None => None,
+            };
+            match _registry {
+                Some((mapping, deadline)) => mapping.run(|_| {
+                    tcp_peer(
+                        port,
+                        &challenge,
+                        std::path::Path::new(&output_root),
+                        Some(deadline),
+                    )
+                })?,
+                None => tcp_peer(port, &challenge, std::path::Path::new(&output_root), None)?,
+            }
             return Ok(0);
+        }
+        Some("winsock-registry-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other("extra registry selfcheck arguments"));
+            }
+            return winsock_registry::self_check(child_command, settle_peer_failure);
+        }
+        Some("winsock-registry-uninherited-self-check") => {
+            let clock = args
+                .next()
+                .ok_or_else(|| io::Error::other("registry selfcheck child lacks original clock"))?;
+            let clock = clock
+                .to_str()
+                .filter(|value| value.len() <= 4096)
+                .ok_or_else(|| io::Error::other("registry selfcheck clock is not bounded UTF8"))?;
+            let clock: descriptor::ControlClock =
+                serde_json::from_str(clock).map_err(io::Error::other)?;
+            if args.next().is_some() {
+                return Err(io::Error::other("extra registry child selfcheck arguments"));
+            }
+            return winsock_registry::uninherited_self_check(
+                controller_start_input::deadline_from_clock(&clock)?,
+            );
         }
         Some("generation") => {
             let depth = args

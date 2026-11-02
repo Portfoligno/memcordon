@@ -11,11 +11,14 @@ pub const DEADLINE_TEST_SELECTOR: &str =
     "restricted_initial_thread_deadline_cancels_only_original_io_and_joins";
 pub const WINSOCK_TEST_SELECTOR: &str =
     "restricted_owned_winsock_forwarding_preserves_arguments_results_and_tls_scope";
-pub const TEST_SELECTORS: [&str; 4] = [
+pub const REGISTRY_TEST_SELECTOR: &str =
+    "owned_registry_projection_preserves_restricted_reads_and_refuses_mutation";
+pub const TEST_SELECTORS: [&str; 5] = [
     TEST_SELECTOR,
     TRACE_TEST_SELECTOR,
     DEADLINE_TEST_SELECTOR,
     WINSOCK_TEST_SELECTOR,
+    REGISTRY_TEST_SELECTOR,
 ];
 
 pub struct Command {
@@ -38,6 +41,8 @@ pub fn commands(compile: Duration, execute: Duration) -> [Command; 2] {
         "windows_own_thread_deadline",
         "--test",
         "windows_winsock_call_trace",
+        "--test",
+        "windows_winsock_registry",
         "--all-features",
     ];
     let mut compilation = base.clone();

@@ -122,6 +122,7 @@ fn descriptor() -> Descriptor {
         start_gate: Some("Local\\memcordon-readiness-test-start".into()),
         start_transport: descriptor::StartTransport::NamedEvent,
         control_clock: None,
+        winsock_registry: None,
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,
@@ -391,6 +392,66 @@ fn restricted_joint_keeps_native_compiler_observation_with_a_separate_control_cl
     let mut named = input.clone();
     named.start_transport = descriptor::StartTransport::NamedEvent;
     assert!(named.validate().is_err()); // A stdin clock is not another named authority.
+}
+
+#[test]
+fn explicit_native_registry_dependency_requires_bound_version_three_joint_control() {
+    use memcordon_ci::windows_consumer_readiness::{CaseKey, validate_descriptor};
+    for (case, family, scenario) in [
+        (Case::Joint, "W-JOINT", "ordinary"),
+        (Case::Joint, "W-JOINT", "restricted"),
+        (Case::EndpointMismatch, "W-JOINT", "endpoint-mismatch"),
+        (Case::Churn, "W-CHURN", "natural-4096-three-generations"),
+    ] {
+        let mut input = descriptor();
+        input.case = case;
+        if case != Case::Churn {
+            input.cohort_gate = None;
+            input.generation_gate = None;
+        }
+        input.start_transport = descriptor::StartTransport::ControllerStdin {
+            version: descriptor::controller_start::REGISTRY_VERSION,
+        };
+        input.winsock_registry = Some(descriptor::winsock_registry::Declaration {
+            version: 1,
+            view: descriptor::winsock_registry::View::Native,
+            sha256: [42; 32],
+        });
+        let key = CaseKey {
+            family: family.into(),
+            scenario: scenario.into(),
+        };
+        validate_descriptor(&key, &input).unwrap(); // Explicit prepared plan.
+        assert!(Descriptor::parse(&serde_json::to_vec(&input).unwrap()).is_err());
+        input.control_clock = Some(descriptor::ControlClock {
+            revision: 1,
+            work_cutoff_qpc: 999,
+            qpc_frequency: 10,
+        });
+        validate_descriptor(&key, &input).unwrap();
+        Descriptor::parse(&serde_json::to_vec(&input).unwrap()).unwrap();
+        let foreign = CaseKey {
+            family: "W-BINDING".into(),
+            scenario: "restricted-token-preserved".into(),
+        };
+        assert!(validate_descriptor(&foreign, &input).is_err());
+        for mutation in 0..4 {
+            let mut bad = input.clone();
+            match mutation {
+                0 => bad.start_transport = descriptor::StartTransport::NamedEvent,
+                1 => {
+                    bad.start_transport = descriptor::StartTransport::ControllerStdin {
+                        version: descriptor::controller_start::VERSION,
+                    }
+                }
+                2 => bad.winsock_registry.as_mut().unwrap().version = 2,
+                3 => bad.case = Case::Envelope,
+                _ => unreachable!(),
+            }
+            assert!(validate_descriptor(&key, &bad).is_err());
+            assert!(Descriptor::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+    }
 }
 
 #[test]

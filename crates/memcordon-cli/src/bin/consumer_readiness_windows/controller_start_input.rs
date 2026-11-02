@@ -39,6 +39,36 @@ struct Failure {
     original: io::Error,
     deadline: String,
 }
+
+pub(super) fn deadline_from_clock(input: &super::descriptor::ControlClock) -> io::Result<Instant> {
+    input.validate().map_err(io::Error::other)?;
+    let sampled = Instant::now();
+    let mut now = 0_i64;
+    let mut frequency = 0_i64;
+    // SAFETY: initialized native scalar outputs for the original supplied clock.
+    if unsafe { QueryPerformanceCounter(&mut now) } == 0
+        || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if now < 0
+        || frequency <= 0
+        || frequency as u64 != input.qpc_frequency
+        || now as u64 >= input.work_cutoff_qpc
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original START work cutoff expired or clock differs",
+        ));
+    }
+    let nanos = u128::from(input.work_cutoff_qpc - now as u64) * 1_000_000_000
+        / u128::from(input.qpc_frequency);
+    sampled
+        .checked_add(Duration::from_nanos(
+            u64::try_from(nanos).map_err(io::Error::other)?,
+        ))
+        .ok_or_else(|| io::Error::other("original START cutoff cannot be represented"))
+}
 impl std::fmt::Display for Failure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -64,38 +94,18 @@ impl Session {
     pub(super) fn original_binding(&self) -> &controller_start::Binding {
         &self.binding
     }
+    pub(super) fn registry_capability(&self) -> Option<&controller_start::Capability> {
+        self.receiver.registry_capability()
+    }
+    pub(super) fn original_deadline(&self) -> Instant {
+        self.deadline
+    }
     pub(super) fn new(descriptor: &Descriptor, digest: [u8; 32]) -> io::Result<Self> {
         let input = descriptor
             .control_clock
             .as_ref()
             .ok_or_else(|| io::Error::other("controller stdin START lacks original clock input"))?;
-        input.validate().map_err(io::Error::other)?;
-        let sampled = Instant::now();
-        let mut now = 0_i64;
-        let mut frequency = 0_i64;
-        // SAFETY: initialized scalar outputs for the unchanged native clock.
-        if unsafe { QueryPerformanceCounter(&mut now) } == 0
-            || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if now < 0
-            || frequency <= 0
-            || frequency as u64 != input.qpc_frequency
-            || now as u64 >= input.work_cutoff_qpc
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "original START work cutoff expired or clock differs",
-            ));
-        }
-        let nanos = u128::from(input.work_cutoff_qpc - now as u64) * 1_000_000_000
-            / u128::from(input.qpc_frequency);
-        let deadline = sampled
-            .checked_add(Duration::from_nanos(
-                u64::try_from(nanos).map_err(io::Error::other)?,
-            ))
-            .ok_or_else(|| io::Error::other("original START cutoff cannot be represented"))?;
+        let deadline = deadline_from_clock(input)?;
         let identity = super::native::current_identity()?;
         let binding = controller_start::Binding {
             challenge: descriptor.challenge.clone(),
@@ -112,11 +122,45 @@ impl Session {
         }
         Ok(Self {
             binding,
-            receiver: if descriptor.case == super::descriptor::Case::Joint {
+            receiver: if let Some(registry) = &descriptor.winsock_registry {
+                controller_start::Receiver::with_registry(
+                    registry.sha256,
+                    matches!(
+                        descriptor.case,
+                        super::descriptor::Case::Joint | super::descriptor::Case::Churn
+                    ),
+                )
+            } else if descriptor.case == super::descriptor::Case::Joint {
                 controller_start::Receiver::joint()
             } else {
                 controller_start::Receiver::default()
             },
+            handle,
+            deadline,
+        })
+    }
+    pub(super) fn peer(
+        clock: &super::descriptor::ControlClock,
+        binding: controller_start::Binding,
+        declaration: &super::descriptor::winsock_registry::Declaration,
+    ) -> io::Result<Self> {
+        declaration.validate().map_err(io::Error::other)?;
+        let deadline = deadline_from_clock(clock)?;
+        let actual = super::native::current_identity()?;
+        if binding.pid != actual.process_id || binding.birth != actual.creation_time_100ns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry peer original native identity differs",
+            ));
+        }
+        // SAFETY: borrow only this admitted child's existing original stdin.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::other("original registry peer stdin unavailable"));
+        }
+        Ok(Self {
+            binding,
+            receiver: controller_start::Receiver::with_registry(declaration.sha256, false),
             handle,
             deadline,
         })

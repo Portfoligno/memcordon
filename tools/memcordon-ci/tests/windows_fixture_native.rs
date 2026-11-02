@@ -4,7 +4,7 @@ mod plan;
 use std::time::Duration;
 
 #[test]
-fn narrow_commands_select_all_four_actual_fixture_targets_and_exact_native_tests() {
+fn narrow_commands_select_all_five_actual_fixture_targets_and_exact_native_tests() {
     let compile_budget = Duration::from_secs(25 * 60);
     let execution_budget = Duration::from_secs(30 * 60);
     let [compile, execute] = plan::commands(compile_budget, execution_budget);
@@ -22,6 +22,8 @@ fn narrow_commands_select_all_four_actual_fixture_targets_and_exact_native_tests
         "windows_own_thread_deadline",
         "--test",
         "windows_winsock_call_trace",
+        "--test",
+        "windows_winsock_registry",
         "--all-features",
     ];
     assert_eq!(plan::TARGET_DIR, "target/ci/windows-fixture-native");
@@ -41,6 +43,10 @@ fn narrow_commands_select_all_four_actual_fixture_targets_and_exact_native_tests
         plan::WINSOCK_TEST_SELECTOR,
         "restricted_owned_winsock_forwarding_preserves_arguments_results_and_tls_scope"
     );
+    assert_eq!(
+        plan::REGISTRY_TEST_SELECTOR,
+        "owned_registry_projection_preserves_restricted_reads_and_refuses_mutation"
+    );
     assert_eq!(compile.arguments, [base.as_slice(), &["--no-run"]].concat());
     assert_eq!(
         execute.arguments,
@@ -53,7 +59,8 @@ fn narrow_commands_select_all_four_actual_fixture_targets_and_exact_native_tests
                 plan::TEST_SELECTOR,
                 plan::TRACE_TEST_SELECTOR,
                 plan::DEADLINE_TEST_SELECTOR,
-                plan::WINSOCK_TEST_SELECTOR
+                plan::WINSOCK_TEST_SELECTOR,
+                plan::REGISTRY_TEST_SELECTOR
             ]
         ]
         .concat()
@@ -80,12 +87,13 @@ fn passed_output(filtered: usize) -> String {
         passed_harness(plan::TRACE_TEST_SELECTOR, 0),
         passed_harness(plan::DEADLINE_TEST_SELECTOR, 0),
         passed_harness(plan::WINSOCK_TEST_SELECTOR, 0),
+        passed_harness(plan::REGISTRY_TEST_SELECTOR, 0),
     ]
     .concat()
 }
 
 #[test]
-fn successful_exact_native_execution_requires_four_distinct_selected_tests_in_every_order() {
+fn five_distinct_executions_preserve_prior_four_orders_and_each_registry_position() {
     for filtered in [0, 83] {
         let output = passed_output(filtered);
         plan::verify_selected_tests(output.as_bytes()).unwrap();
@@ -100,12 +108,27 @@ fn successful_exact_native_execution_requires_four_distinct_selected_tests_in_ev
                         .find(|index| *index != first && *index != second && *index != third)
                         .unwrap();
                     let order = [first, second, third, fourth];
-                    let reordered = order
-                        .map(|index| passed_harness(plan::TEST_SELECTORS[index], filtered))
-                        .concat();
+                    let reordered = [
+                        order
+                            .map(|index| passed_harness(plan::TEST_SELECTORS[index], filtered))
+                            .concat(),
+                        passed_harness(plan::REGISTRY_TEST_SELECTOR, filtered),
+                    ]
+                    .concat();
                     plan::verify_selected_tests(reordered.as_bytes()).unwrap();
                 }
             }
+        }
+        for offset in 0..plan::TEST_SELECTORS.len() {
+            let reordered: String = (0..plan::TEST_SELECTORS.len())
+                .map(|index| {
+                    passed_harness(
+                        plan::TEST_SELECTORS[(index + offset) % plan::TEST_SELECTORS.len()],
+                        filtered,
+                    )
+                })
+                .collect();
+            plan::verify_selected_tests(reordered.as_bytes()).unwrap();
         }
     }
 }
@@ -132,6 +155,9 @@ fn zero_wrong_duplicate_or_missing_execution_evidence_cannot_pass() {
         passed_harness(plan::TRACE_TEST_SELECTOR, 0),
         passed_harness(plan::DEADLINE_TEST_SELECTOR, 0),
         passed_harness(plan::WINSOCK_TEST_SELECTOR, 0),
+        passed_harness(plan::REGISTRY_TEST_SELECTOR, 0),
+        valid.replace(&passed_harness(plan::REGISTRY_TEST_SELECTOR, 0), ""),
+        valid.replace(plan::REGISTRY_TEST_SELECTOR, plan::WINSOCK_TEST_SELECTOR),
         valid.replace(&passed_harness(plan::WINSOCK_TEST_SELECTOR, 0), ""),
         valid.replace(plan::WINSOCK_TEST_SELECTOR, plan::DEADLINE_TEST_SELECTOR),
         [
@@ -185,6 +211,10 @@ fn failed_ignored_measured_or_contradictory_counts_cannot_certify_execution() {
         valid.replace(
             &format!("test {} ... ok", plan::WINSOCK_TEST_SELECTOR),
             &format!("test {} ... ignored", plan::WINSOCK_TEST_SELECTOR),
+        ),
+        valid.replace(
+            &format!("test {} ... ok", plan::REGISTRY_TEST_SELECTOR),
+            &format!("test {} ... ignored", plan::REGISTRY_TEST_SELECTOR),
         ),
     ] {
         assert!(

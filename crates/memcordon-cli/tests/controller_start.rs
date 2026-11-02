@@ -16,6 +16,213 @@ fn frame(binding: &Binding) -> Vec<u8> {
     start::send(&mut bytes, binding, || Ok(())).unwrap();
     bytes
 }
+
+fn registry() -> start::Capability {
+    start::Capability {
+        version: 1,
+        handle: 0x320,
+        manifest_sha256: start::descriptor_digest(b"captured native registry input"),
+    }
+}
+
+#[test]
+fn registry_two_phase_session_binds_one_target_local_key_without_application_read_ahead() {
+    let binding = binding();
+    let capability = registry();
+    let mut sender = start::Sender::with_registry(capability, true);
+    let mut bytes = Vec::new();
+    sender
+        .send(&mut bytes, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    let first_extent = bytes.len();
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+    sender
+        .send(
+            &mut bytes,
+            &binding,
+            start::Phase::ToolchainObserverRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    assert!(sender.completed());
+    let frame_extent = bytes.len();
+    bytes.extend([0, 255, b'R', 128]);
+    let mut reader = Split {
+        inner: Cursor::new(bytes),
+        maximum: 3,
+    };
+    let mut receiver = Receiver::with_registry(capability.manifest_sha256, true);
+    assert!(receiver.registry_capability().is_none());
+    receiver.receive(&mut reader, &binding, || Ok(())).unwrap();
+    assert_eq!(reader.inner.position(), first_extent as u64);
+    assert_eq!(receiver.registry_capability(), Some(&capability));
+    receiver
+        .receive_phase(
+            &mut reader,
+            &binding,
+            start::Phase::ToolchainObserverRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(reader.inner.position(), frame_extent as u64);
+    let mut application = Vec::new();
+    reader.read_to_end(&mut application).unwrap();
+    assert_eq!(application, [0, 255, b'R', 128]);
+    assert!(receiver.receive(&mut reader, &binding, || Ok(())).is_err());
+}
+
+#[test]
+fn registry_frames_reject_legacy_version_wrong_identity_digest_and_unowned_handle_scalars() {
+    let binding = binding();
+    let capability = registry();
+    let mut bytes = Vec::new();
+    start::Sender::with_registry(capability, false)
+        .send(&mut bytes, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    for offset in [8, 32, 48, 52, 64, 76, 108] {
+        let mut bad = bytes.clone();
+        bad[offset] ^= 1;
+        let mut receiver = Receiver::with_registry(capability.manifest_sha256, false);
+        assert!(
+            receiver
+                .receive(&mut Cursor::new(bad), &binding, || Ok(()))
+                .is_err(),
+            "offset {offset}"
+        );
+        assert!(receiver.registry_capability().is_none());
+        assert!(
+            receiver
+                .receive(&mut Cursor::new(&bytes), &binding, || Ok(()))
+                .is_err()
+        );
+    }
+    // A valid but different scalar is acceptable only in the first bound
+    // capability; native handle readback, not its number, checks key contents.
+    for handle in [0, u64::MAX] {
+        let mut bad = bytes.clone();
+        bad[68..76].copy_from_slice(&handle.to_le_bytes());
+        assert!(
+            Receiver::with_registry(capability.manifest_sha256, false)
+                .receive(&mut Cursor::new(bad), &binding, || Ok(()))
+                .is_err()
+        );
+    }
+    assert!(
+        Receiver::default()
+            .receive(&mut Cursor::new(bytes), &binding, || Ok(()))
+            .is_err()
+    );
+    assert!(
+        Receiver::with_registry(capability.manifest_sha256, false)
+            .receive(&mut Cursor::new(frame(&binding)), &binding, || Ok(()))
+            .is_err()
+    );
+}
+
+#[test]
+fn registry_replay_or_second_phase_capability_substitution_poison_the_original_session() {
+    let binding = binding();
+    let capability = registry();
+    let mut initial = Vec::new();
+    let mut original = start::Sender::with_registry(capability, true);
+    original
+        .send(&mut initial, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    for changed in [
+        start::Capability {
+            handle: capability.handle + 4,
+            ..capability
+        },
+        start::Capability {
+            manifest_sha256: [9; 32],
+            ..capability
+        },
+    ] {
+        let mut receiver = Receiver::with_registry(capability.manifest_sha256, true);
+        receiver
+            .receive(&mut Cursor::new(&initial), &binding, || Ok(()))
+            .unwrap();
+        let mut other = start::Sender::with_registry(changed, true);
+        let mut discard = Vec::new();
+        other
+            .send(&mut discard, &binding, start::Phase::Start, || Ok(()))
+            .unwrap();
+        let mut second = Vec::new();
+        other
+            .send(
+                &mut second,
+                &binding,
+                start::Phase::ToolchainObserverRelease,
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(
+            receiver
+                .receive_phase(
+                    &mut Cursor::new(second),
+                    &binding,
+                    start::Phase::ToolchainObserverRelease,
+                    || Ok(())
+                )
+                .is_err()
+        );
+        assert!(receiver.registry_capability().is_none());
+    }
+    let mut receiver = Receiver::with_registry(capability.manifest_sha256, true);
+    receiver
+        .receive(&mut Cursor::new(&initial), &binding, || Ok(()))
+        .unwrap();
+    assert!(
+        receiver
+            .receive_phase(
+                &mut Cursor::new(&initial),
+                &binding,
+                start::Phase::ToolchainObserverRelease,
+                || Ok(())
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn partial_registry_capabilities_and_original_cutoff_never_admit_a_key() {
+    let binding = binding();
+    let capability = registry();
+    let mut bytes = Vec::new();
+    start::Sender::with_registry(capability, false)
+        .send(&mut bytes, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    for extent in [0, 63, 64, 68, 75, 107, bytes.len() - 1] {
+        let mut receiver = Receiver::with_registry(capability.manifest_sha256, false);
+        assert_eq!(
+            receiver
+                .receive(&mut Cursor::new(&bytes[..extent]), &binding, || Ok(()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(receiver.registry_capability().is_none());
+    }
+    let mut reads = 0;
+    let mut reader = Split {
+        inner: Cursor::new(bytes),
+        maximum: 1,
+    };
+    let mut receiver = Receiver::with_registry(capability.manifest_sha256, false);
+    let error = receiver
+        .receive(&mut reader, &binding, || {
+            reads += 1;
+            if reads > 140 {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "original cutoff"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(reader.inner.position() < 108);
+    assert!(receiver.registry_capability().is_none());
+}
 struct Split<R> {
     inner: R,
     maximum: usize,

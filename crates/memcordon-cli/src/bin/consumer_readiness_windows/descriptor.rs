@@ -12,6 +12,8 @@ pub mod gate_precondition;
 mod stream_bytes;
 #[path = "toolchain_command.rs"]
 pub mod toolchain_command;
+#[path = "winsock_registry_manifest.rs"]
+pub mod winsock_registry;
 
 pub const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 pub const DESCRIPTOR_REVISION: u32 = 2;
@@ -207,6 +209,8 @@ pub struct Descriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_clock: Option<ControlClock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winsock_registry: Option<winsock_registry::Declaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_access_diagnostic: Option<gate_access::Input>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_precondition: Option<gate_precondition::Input>,
@@ -240,8 +244,21 @@ impl Descriptor {
             return Err("unsupported fixture workload format/revision".into());
         }
         if let StartTransport::ControllerStdin { version } = self.start_transport {
-            if version != controller_start::VERSION
-                || !matches!(self.case, Case::Envelope | Case::Joint)
+            let declared = self.winsock_registry.is_some();
+            if version
+                != if declared {
+                    controller_start::REGISTRY_VERSION
+                } else {
+                    controller_start::VERSION
+                }
+                || !(if declared {
+                    matches!(
+                        self.case,
+                        Case::Joint | Case::EndpointMismatch | Case::Churn
+                    )
+                } else {
+                    matches!(self.case, Case::Envelope | Case::Joint)
+                })
                 || self.start_gate.is_none()
             {
                 return Err("controller stdin requires supported versioned Envelope/Joint control and separate diagnostic name".into());
@@ -251,6 +268,19 @@ impl Descriptor {
             }
         } else if self.control_clock.is_some() {
             return Err("named-event START cannot declare a stdin control clock".into());
+        }
+        if let Some(registry) = &self.winsock_registry {
+            registry.validate()?;
+            if !matches!(
+                self.start_transport,
+                StartTransport::ControllerStdin {
+                    version: controller_start::REGISTRY_VERSION
+                }
+            ) {
+                return Err(
+                    "Winsock registry dependency requires explicit version3 owned stdin".into(),
+                );
+            }
         }
         if let Some(control) = &self.gate_precondition {
             control.validate()?;

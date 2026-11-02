@@ -3,9 +3,38 @@
 use std::io::{self, Read, Write};
 
 pub const VERSION: u32 = 2;
+pub const REGISTRY_VERSION: u32 = 3;
 const MAGIC: &[u8; 8] = b"MCSTART\0";
 const HEADER: usize = 8 + 4 + 4 + 32 + 4 + 8 + 4;
 pub const MAX_CHALLENGE: usize = 4096;
+const REGISTRY_EXTENT: usize = 4 + 8 + 32;
+
+/// A target-local, non-inheritable, read-only key handle supplied by the native
+/// owner. The codec binds its scalar; native readback verifies the held key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capability {
+    pub version: u32,
+    pub handle: u64,
+    pub manifest_sha256: [u8; 32],
+}
+impl Capability {
+    fn validate(&self) -> io::Result<()> {
+        if self.version != 1 || self.handle == 0 || self.handle == u64::MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid registry capability version/handle",
+            ));
+        }
+        Ok(())
+    }
+    fn bytes(&self) -> [u8; REGISTRY_EXTENT] {
+        let mut bytes = [0; REGISTRY_EXTENT];
+        bytes[..4].copy_from_slice(&self.version.to_le_bytes());
+        bytes[4..12].copy_from_slice(&self.handle.to_le_bytes());
+        bytes[12..].copy_from_slice(&self.manifest_sha256);
+        bytes
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -150,15 +179,38 @@ pub fn send_phase(
     phase: Phase,
     mut check: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
+    send_bound(writer, binding, phase, None, &mut check)
+}
+
+fn send_bound(
+    writer: &mut impl Write,
+    binding: &Binding,
+    phase: Phase,
+    registry: Option<&Capability>,
+    mut check: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     binding.validate()?;
+    if let Some(input) = registry {
+        input.validate()?;
+    }
     let mut bytes = Vec::with_capacity(HEADER + binding.challenge.len());
     bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(
+        &if registry.is_some() {
+            REGISTRY_VERSION
+        } else {
+            VERSION
+        }
+        .to_le_bytes(),
+    );
     bytes.extend_from_slice(&(binding.challenge.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&binding.descriptor_sha256);
     bytes.extend_from_slice(&binding.pid.to_le_bytes());
     bytes.extend_from_slice(&binding.birth.to_le_bytes());
     bytes.extend_from_slice(&(phase as u32).to_le_bytes());
+    if let Some(input) = registry {
+        bytes.extend_from_slice(&input.bytes());
+    }
     bytes.extend_from_slice(&binding.challenge);
     transfer(
         |part| writer.write(part),
@@ -174,11 +226,23 @@ pub fn send_phase(
 #[derive(Default)]
 pub struct Sender {
     progress: Progress,
+    registry: Option<Capability>,
 }
 impl Sender {
     pub fn joint() -> Self {
         Self {
             progress: Progress::joint(),
+            registry: None,
+        }
+    }
+    pub fn with_registry(registry: Capability, joint: bool) -> Self {
+        Self {
+            progress: if joint {
+                Progress::joint()
+            } else {
+                Progress::default()
+            },
+            registry: Some(registry),
         }
     }
     pub fn completed(&self) -> bool {
@@ -192,10 +256,7 @@ impl Sender {
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<()> {
         self.progress.begin(phase)?;
-        match phase {
-            Phase::Start => send(writer, binding, check)?,
-            Phase::ToolchainObserverRelease => send_phase(writer, binding, phase, check)?,
-        }
+        send_bound(writer, binding, phase, self.registry.as_ref(), check)?;
         self.progress.complete(phase);
         Ok(())
     }
@@ -203,12 +264,33 @@ impl Sender {
 #[derive(Default)]
 pub struct Receiver {
     progress: Progress,
+    expected_registry: Option<[u8; 32]>,
+    registry: Option<Capability>,
 }
 
 impl Receiver {
     pub fn joint() -> Self {
         Self {
             progress: Progress::joint(),
+            ..Self::default()
+        }
+    }
+    pub fn with_registry(expected: [u8; 32], joint: bool) -> Self {
+        Self {
+            progress: if joint {
+                Progress::joint()
+            } else {
+                Progress::default()
+            },
+            expected_registry: Some(expected),
+            registry: None,
+        }
+    }
+    pub fn registry_capability(&self) -> Option<&Capability> {
+        if self.progress.failed {
+            None
+        } else {
+            self.registry.as_ref()
         }
     }
     pub fn receive(
@@ -237,7 +319,14 @@ impl Receiver {
         )?;
         let mut expected = Vec::with_capacity(HEADER);
         expected.extend_from_slice(MAGIC);
-        expected.extend_from_slice(&VERSION.to_le_bytes());
+        expected.extend_from_slice(
+            &if self.expected_registry.is_some() {
+                REGISTRY_VERSION
+            } else {
+                VERSION
+            }
+            .to_le_bytes(),
+        );
         expected.extend_from_slice(&(binding.challenge.len() as u32).to_le_bytes());
         expected.extend_from_slice(&binding.descriptor_sha256);
         expected.extend_from_slice(&binding.pid.to_le_bytes());
@@ -249,6 +338,34 @@ impl Receiver {
                 "START version, extent, descriptor or native identity differs",
             ));
         }
+        let registry = if let Some(expected) = self.expected_registry {
+            let mut bytes = [0; REGISTRY_EXTENT];
+            transfer(
+                |part| reader.read(part),
+                &mut bytes,
+                &mut check,
+                io::ErrorKind::UnexpectedEof,
+            )?;
+            let input = Capability {
+                version: u32::from_le_bytes(
+                    bytes[..4].try_into().expect("fixed capability version"),
+                ),
+                handle: u64::from_le_bytes(bytes[4..12].try_into().expect("fixed target handle")),
+                manifest_sha256: bytes[12..].try_into().expect("fixed manifest digest"),
+            };
+            input.validate()?;
+            if input.manifest_sha256 != expected
+                || (phase != Phase::Start && self.registry != Some(input))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "registry dependency/session binding differs",
+                ));
+            }
+            Some(input)
+        } else {
+            None
+        };
         let mut challenge = vec![0_u8; binding.challenge.len()];
         transfer(
             |part| reader.read(part),
@@ -263,6 +380,7 @@ impl Receiver {
             ));
         }
         check()?;
+        self.registry = registry;
         self.progress.complete(phase);
         Ok(())
     }

@@ -32,6 +32,9 @@ mod start_gate_policy;
 #[cfg(windows)]
 #[path = "windows_toolchain_sampling.rs"]
 mod toolchain_sampling;
+#[cfg(windows)]
+#[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/winsock_registry.rs"]
+pub mod winsock_registry;
 
 pub fn validate_toolchain_inventory(
     toolchain: &descriptor::Toolchain,
@@ -487,7 +490,30 @@ pub fn fixture_parameters(key: &CaseKey) -> Result<FixtureParameters> {
 
 /// Validate the actual input once complete, retaining its case and wire-size boundary.
 pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -> Result<()> {
-    if descriptor.start_transport != expected_start_transport(key) {
+    let explicit_registry = descriptor.winsock_registry.is_some()
+        && matches!(
+            (key.family.as_str(), key.scenario.as_str(), descriptor.case),
+            (
+                "W-JOINT",
+                "ordinary" | "restricted",
+                descriptor::Case::Joint
+            ) | (
+                "W-JOINT",
+                "endpoint-mismatch",
+                descriptor::Case::EndpointMismatch
+            ) | (
+                "W-CHURN",
+                "natural-4096-three-generations",
+                descriptor::Case::Churn
+            )
+        )
+        && matches!(
+            descriptor.start_transport,
+            descriptor::StartTransport::ControllerStdin {
+                version: descriptor::controller_start::REGISTRY_VERSION
+            }
+        );
+    if !explicit_registry && descriptor.start_transport != expected_start_transport(key) {
         return Err(CiError::Message(
             "fixture START transport differs from its declared case".into(),
         ));
@@ -2396,6 +2422,7 @@ pub(crate) mod native {
                 start_gate,
                 start_transport: super::expected_start_transport(&key),
                 control_clock: None,
+                winsock_registry: None,
                 gate_access_diagnostic: None,
                 gate_precondition: None,
                 completion_gate: None,
@@ -3796,6 +3823,7 @@ pub(crate) mod native {
             ExecutionClocks {
                 work: work_deadline,
                 cleanup,
+                registry: None,
             },
         )
     }
@@ -3843,6 +3871,7 @@ pub(crate) mod native {
             ExecutionClocks {
                 work: work_deadline,
                 cleanup: None,
+                registry: None,
             },
         )
     }
@@ -3850,9 +3879,81 @@ pub(crate) mod native {
     struct ExecutionClocks {
         work: Instant,
         cleanup: Option<Instant>,
+        registry: Option<Arc<Mutex<super::winsock_registry::Projection>>>,
     }
 
     fn execute_with_baseline_clocks(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &CaseInput,
+        record: &mut CaseAssessment,
+        baseline: GuardianBaseline,
+        excluded: Vec<GuardianAssociationIdentity>,
+        excluded_fixture: Option<HeldFixtureExclusion>,
+        mut clocks: ExecutionClocks,
+    ) -> Result<()> {
+        let mut declared = input.clone();
+        if matches!(
+            input.descriptor.case,
+            descriptor::Case::Joint | descriptor::Case::EndpointMismatch | descriptor::Case::Churn
+        ) {
+            let projection = super::winsock_registry::Projection::create(
+                &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
+                clocks.work,
+                clocks.cleanup.unwrap_or(clocks.work),
+            )?;
+            declared.descriptor.winsock_registry = Some(projection.declaration().clone());
+            declared.descriptor.start_transport = descriptor::StartTransport::ControllerStdin {
+                version: descriptor::controller_start::REGISTRY_VERSION,
+            };
+            clocks.registry = Some(Arc::new(Mutex::new(projection)));
+        }
+        let registry = clocks.registry.clone();
+        let result = (|| {
+            if let Some(owner) = &registry {
+                provision_budget(clocks.work)?;
+                let bytes = serde_json::to_vec(
+                    &owner
+                        .lock()
+                        .map_err(|_| CiError::Message("registry input ownership poisoned".into()))?
+                        .diagnostic(),
+                )?;
+                drop(crate::windows_native_files::publish_owned_file(
+                    &declared
+                        .descriptor
+                        .output_root
+                        .join("winsock-registry-input.json"),
+                    &bytes,
+                )?);
+                provision_budget(clocks.work)?;
+            }
+            execute_with_registry(
+                config,
+                &declared,
+                record,
+                baseline,
+                excluded,
+                excluded_fixture,
+                clocks,
+            )
+        })();
+        let retired = match registry {
+            Some(owner) => match owner.lock() {
+                Ok(mut owner) => owner.retire_if_safe().map_err(CiError::from),
+                Err(_) => Err(CiError::Message("registry input ownership poisoned".into())),
+            },
+            None => Ok(()),
+        };
+        match (result, retired) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary.context("owned Winsock registry input retirement")),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), retired) => retired,
+        }
+    }
+
+    fn execute_with_registry(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &CaseInput,
         record: &mut CaseAssessment,
@@ -4137,7 +4238,10 @@ pub(crate) mod native {
         let start_transport = input.descriptor.start_transport.clone();
         let start_challenge = input.descriptor.challenge.clone();
         let start_descriptor = input.descriptor.clone();
-        let start_descriptor_case_is_joint = input.descriptor.case == descriptor::Case::Joint;
+        let start_descriptor_case_is_joint = matches!(
+            input.descriptor.case,
+            descriptor::Case::Joint | descriptor::Case::Churn
+        );
         let barrier_report = public_report.clone();
         let descendant_gate = input.descriptor.descendant_gate.clone();
         let intermediate_first = input.descriptor.case == descriptor::Case::IntermediateFirst;
@@ -4146,6 +4250,7 @@ pub(crate) mod native {
             descriptor::Case::Joint | descriptor::Case::Churn | descriptor::Case::EndpointMismatch
         );
         let native_started_utc = std::time::SystemTime::now();
+        let registry_recipient = clocks.registry.clone();
         let work_budget = work_budget.min(work_deadline.saturating_duration_since(Instant::now()));
         if work_budget.is_zero() {
             return Err(CiError::Message(
@@ -4177,8 +4282,13 @@ pub(crate) mod native {
                             ))
                         })?;
                     }
-                    let mut held =
-                        memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?;
+                    let mut held = if registry_recipient.is_some() {
+                        memcordon_testkit::windows_fixture_input_processes_for_image_until(
+                            &fixture, deadline,
+                        )?
+                    } else {
+                        memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?
+                    };
                     if transcript.is_file() && !held.is_empty() {
                         let published = super::live_events(
                             &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
@@ -4411,14 +4521,42 @@ pub(crate) mod native {
                             birth: u64::try_from(root_identity.birth).map_err(io::Error::other)?,
                         };
                         let joint = start_descriptor_case_is_joint;
+                        let sender = if let Some(owner) = &registry_recipient {
+                            let mut owner = owner.lock().map_err(|_| {
+                                io::Error::other("registry input ownership poisoned")
+                            })?;
+                            owner.verify(owner.raw())?;
+                            let held = held_family
+                                .lock()
+                                .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                            if held.len() != 1 || held[0].identity != root_identity {
+                                return Err(io::Error::other(
+                                    "original registry recipient identity differs",
+                                ));
+                            }
+                            // SAFETY: this lock retains the original projection key
+                            // while duplicating into the same admitted live root.
+                            let handle = unsafe {
+                                held[0].duplicate_registry_input(owner.raw(), work_deadline)
+                            }?;
+                            owner.transferred();
+                            descriptor::controller_start::Sender::with_registry(
+                                descriptor::controller_start::Capability {
+                                    version: 1,
+                                    handle,
+                                    manifest_sha256: owner.declaration().sha256,
+                                },
+                                joint,
+                            )
+                        } else if joint {
+                            descriptor::controller_start::Sender::joint()
+                        } else {
+                            descriptor::controller_start::Sender::default()
+                        };
                         let mut session = ControlSession {
                             writer: Some(writer),
                             binding,
-                            sender: if joint {
-                                descriptor::controller_start::Sender::joint()
-                            } else {
-                                descriptor::controller_start::Sender::default()
-                            },
+                            sender,
                             deadline: work_deadline,
                         };
                         session.release(descriptor::controller_start::Phase::Start)?;
@@ -5932,6 +6070,23 @@ pub(crate) mod native {
             }
             Ok(())
         })();
+        let retirement = if retirement.is_ok() {
+            if let Some(owner) = &clocks.registry {
+                match owner.lock() {
+                    Ok(mut owner) => {
+                        owner.recipients_retired();
+                        retirement
+                    }
+                    Err(_) => Err(CiError::Message(
+                        "registry input ownership poisoned after original retirement".into(),
+                    )),
+                }
+            } else {
+                retirement
+            }
+        } else {
+            retirement
+        };
         record.retirement = retirement.as_ref().map(|_| ()).map_err(ToString::to_string);
         let gate_retention = match (gate_retention, query_retention) {
             (Err(original), Err(query)) => Err(CiError::Message(format!(

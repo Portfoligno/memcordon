@@ -985,6 +985,45 @@ fn windows_process_observation_error(
 
 #[cfg(windows)]
 impl WindowsImageProcess {
+    /// Duplicate a retained registry input into this same live original process.
+    /// No numeric PID is reopened and the target reference is non-inheritable.
+    /// # Safety
+    /// `key` must be a live owned registry reference throughout this call.
+    pub unsafe fn duplicate_registry_input(
+        &self,
+        key: windows_sys::Win32::System::Registry::HKEY,
+        deadline: std::time::Instant,
+    ) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::DuplicateHandle,
+            System::{Registry::KEY_READ, Threading::GetCurrentProcess},
+        };
+        if std::time::Instant::now() >= deadline || self.has_exited()? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original registry input recipient unavailable at original cutoff",
+            ));
+        }
+        let mut transferred = std::ptr::null_mut();
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                key,
+                self._handle.as_raw_handle(),
+                &mut transferred,
+                KEY_READ,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // A failed later START owns no substitute recipient: native settlement
+        // closes this target-local reference with the original process.
+        Ok(transferred as usize as u64)
+    }
     /// Diagnostic-only token facts from this original retained process. A
     /// retired process or changed binding is unavailable, never a PID lookup.
     pub fn original_token_envelope(
@@ -1352,7 +1391,7 @@ impl WindowsImageProcess {
 
 #[cfg(windows)]
 pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageProcess>> {
-    windows_processes_for_image_inner(image, None, None)
+    windows_processes_for_image_inner(image, None, None, false)
 }
 
 #[cfg(windows)]
@@ -2081,7 +2120,17 @@ pub fn windows_processes_for_image_until(
     image: &Path,
     deadline: std::time::Instant,
 ) -> io::Result<Vec<WindowsImageProcess>> {
-    windows_processes_for_image_inner(image, Some(deadline), None)
+    windows_processes_for_image_inner(image, Some(deadline), None, false)
+}
+
+/// Capture the original verified fixture once with capability-delivery access.
+/// Ordinary process observations retain their original query-only rights.
+#[cfg(windows)]
+pub fn windows_fixture_input_processes_for_image_until(
+    image: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<Vec<WindowsImageProcess>> {
+    windows_processes_for_image_inner(image, Some(deadline), None, true)
 }
 
 #[cfg(windows)]
@@ -2095,7 +2144,7 @@ impl WindowsImageProcess {
         if self.has_exited()? {
             return Err(io::Error::other("original direct-child root is retired"));
         }
-        let children = windows_processes_for_image_inner(image, Some(deadline), Some(self))?;
+        let children = windows_processes_for_image_inner(image, Some(deadline), Some(self), false)?;
         if self.has_exited()? {
             return Err(io::Error::other(
                 "original direct-child root retired during census",
@@ -2110,6 +2159,7 @@ fn windows_processes_for_image_inner(
     image: &Path,
     deadline: Option<std::time::Instant>,
     root: Option<&WindowsImageProcess>,
+    fixture_input: bool,
 ) -> io::Result<Vec<WindowsImageProcess>> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
@@ -2179,7 +2229,13 @@ fn windows_processes_for_image_inner(
             // SAFETY: query-only access to an enumerated PID.
             let raw = unsafe {
                 OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    PROCESS_QUERY_LIMITED_INFORMATION
+                        | PROCESS_SYNCHRONIZE
+                        | if fixture_input {
+                            windows_sys::Win32::System::Threading::PROCESS_DUP_HANDLE
+                        } else {
+                            0
+                        },
                     0,
                     entry.th32ProcessID,
                 )
