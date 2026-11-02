@@ -3905,34 +3905,15 @@ pub(crate) mod native {
             clocks.registry = Some(Arc::new(Mutex::new(projection)));
         }
         let registry = clocks.registry.clone();
-        let result = (|| {
-            if let Some(owner) = &registry {
-                provision_budget(clocks.work)?;
-                let bytes = serde_json::to_vec(
-                    &owner
-                        .lock()
-                        .map_err(|_| CiError::Message("registry input ownership poisoned".into()))?
-                        .diagnostic(),
-                )?;
-                drop(crate::windows_native_files::publish_owned_file(
-                    &declared
-                        .descriptor
-                        .output_root
-                        .join("winsock-registry-input.json"),
-                    &bytes,
-                )?);
-                provision_budget(clocks.work)?;
-            }
-            execute_with_registry(
-                config,
-                &declared,
-                record,
-                baseline,
-                excluded,
-                excluded_fixture,
-                clocks,
-            )
-        })();
+        let result = execute_with_registry(
+            config,
+            &declared,
+            record,
+            baseline,
+            excluded,
+            excluded_fixture,
+            clocks,
+        );
         let retired = match registry {
             Some(owner) => match owner.lock() {
                 Ok(mut owner) => owner.retire_if_safe().map_err(CiError::from),
@@ -4097,7 +4078,37 @@ pub(crate) mod native {
                 "positive case cannot reuse old report/input/transcript paths".into(),
             ));
         }
-        fs::create_dir_all(&input.descriptor.output_root)?;
+        provision_budget(work_deadline)?;
+        fs::create_dir_all(&input.descriptor.output_root).map_err(|error| {
+            CiError::from(error).context(format!(
+                "prepare candidate case output directory {}",
+                input.descriptor.output_root.display()
+            ))
+        })?;
+        if let Some(owner) = &clocks.registry {
+            provision_budget(work_deadline)?;
+            let bytes = serde_json::to_vec(
+                &owner
+                    .lock()
+                    .map_err(|_| CiError::Message("registry input ownership poisoned".into()))?
+                    .diagnostic(),
+            )?;
+            let path = input
+                .descriptor
+                .output_root
+                .join("winsock-registry-input.json");
+            drop(
+                crate::windows_native_files::publish_owned_file(&path, &bytes).map_err(
+                    |error| {
+                        CiError::from(error).context(format!(
+                            "publish owned Winsock registry input diagnostic {}",
+                            path.display()
+                        ))
+                    },
+                )?,
+            );
+            provision_budget(work_deadline)?;
+        }
         let descriptor_bytes = serde_json::to_vec(&input.descriptor)?;
         validate_descriptor(&input.key, &input.descriptor)?;
         descriptor::Descriptor::parse(&descriptor_bytes).map_err(|error| {
