@@ -55,6 +55,31 @@ fn ready() -> Packet {
     };
     value
 }
+#[test]
+fn returned_route_repeated_api_slots_do_not_weaken_standalone_validation() {
+    let mut value = ready();
+    value.slot_count = 2;
+    value.slots[1] = Slot {
+        slot: value.slots[0].slot + 8,
+        ..value.slots[0]
+    };
+    assert_eq!(diagnostic(&value)["invalid_packet"], true);
+    assert_eq!(
+        record::returned_module_diagnostic(&value)["invalid_packet"],
+        false
+    );
+    value.slots[1].original += 8;
+    assert_eq!(
+        record::returned_module_diagnostic(&value)["invalid_packet"],
+        true
+    );
+    value.slots[1].original -= 8;
+    value.slots[1].slot = value.slots[0].slot;
+    assert_eq!(
+        record::returned_module_diagnostic(&value)["invalid_packet"],
+        true
+    );
+}
 fn event(operation: u32, sequence: u64) -> Entry {
     let mut entry = Entry {
         operation,

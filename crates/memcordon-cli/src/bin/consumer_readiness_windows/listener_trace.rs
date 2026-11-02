@@ -301,6 +301,7 @@ fn summary(packet: &record::Packet) -> serde_json::Value {
         "called":packet.called,"aggregate_outcome":packet.callback_outcome,"aggregate_raw_error":(packet.callback_raw_error_present==1).then_some(packet.callback_raw_error),
         "setup_stage":packet.setup_stage,"setup_error":packet.setup_error,"installed_mask":packet.published_mask,"entered_mask":packet.entered_mask,"returned_mask":packet.returned_mask,
         "calls":packet.total_calls,"failures":packet.total_failures,"dropped":packet.dropped,"overflow":packet.overflow,"incomplete":packet.incomplete,
+        "returned_module":{"selected":packet.returned_module.selected,"armed":packet.returned_module.armed,"setup_stage":packet.returned_module.setup_stage,"setup_error":packet.returned_module.setup_error,"setup_reason":packet.returned_module.setup_reason,"calls":packet.returned_module.dependencies.total_calls,"failures":packet.returned_module.dependencies.total_failures,"incomplete":packet.returned_module.incomplete},
         "first_observed_failure":{"present":packet.first_failure_present,"operation":name,"result":first.result,"domain":first.error_domain,"win32_error":first.outgoing_win32,"wsa_error":first.outgoing_wsa},
         "first_observed_failure_is_decisive_cause":false,"full_record":"listener-call-trace.json"})
 }

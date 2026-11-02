@@ -9,7 +9,7 @@ use serde_json::json;
 
 fn base() -> Packet {
     let mut value = Packet {
-        version: 1,
+        version: 2,
         setup_stage: 1,
         called: 1,
         callback_outcome: 1,
@@ -31,6 +31,11 @@ fn base() -> Packet {
         slot_count: 7,
         ..Packet::default()
     };
+    value.returned_module.version = 1;
+    value.returned_module.dependencies.version = 1;
+    value.returned_module.dependencies.original_thread = value.original_thread;
+    value.returned_module.dependencies.cutoff_qpc = value.cutoff_qpc;
+    value.returned_module.dependencies.frequency = value.frequency;
     value.owner = winsock_trace_record::Node {
         owner_base: 0x1000,
         entry: 0x1100,
@@ -50,6 +55,250 @@ fn base() -> Packet {
         };
     }
     value
+}
+
+fn returned_scope() -> Packet {
+    let mut value = base();
+    install(&mut value, &[call(2, 1, 8, 42)]);
+    value.dependencies.version = 1;
+    value.dependencies.original_thread = 7;
+    value.dependencies.total_calls = 1;
+    value.dependencies.record_count = 1;
+    value.dependencies.entries[0] = winsock_trace_record::Entry {
+        sequence: 1,
+        operation: 12,
+        thread_id: 7,
+        entered: 1,
+        returned: 1,
+        raw_output: 0x8000,
+        output_flags: 3,
+        scalar_flags: 4,
+        ..Default::default()
+    };
+    value.dependency_link_count = 1;
+    value.dependency_links[0] = record::DependencyLink {
+        dependency_sequence: 1,
+        timeline_sequence: 2,
+        parent_listener_sequence: 1,
+    };
+    let scope = &mut value.returned_module;
+    scope.selected = 1;
+    scope.armed = 1;
+    scope.setup_stage = 1;
+    scope.scope_flags = 1;
+    scope.selection_count = 1;
+    scope.returned_module = 0x8000;
+    scope.parent_listener_sequence = 1;
+    scope.loader_dependency_sequence = 1;
+    scope.loader_timeline_sequence = 2;
+    scope.link_count = 1;
+    scope.links[0] = record::DependencyLink {
+        dependency_sequence: 1,
+        timeline_sequence: 4,
+        parent_listener_sequence: 1,
+    };
+    scope.first_failure_link = scope.links[0];
+    let events = &mut scope.dependencies;
+    events.version = 1;
+    events.setup_stage = 1;
+    events.armed = 1;
+    events.owner_pinned = 1;
+    events.callbacks_complete = 1;
+    events.protections_restored = 1;
+    events.original_thread = 7;
+    events.frequency = 10;
+    events.cutoff_qpc = 100;
+    events.total_calls = 1;
+    events.total_failures = 1;
+    events.record_count = 1;
+    events.first_failure_present = 1;
+    events.node_count = 1;
+    events.slot_count = 1;
+    events.slots[0] = winsock_trace_record::Slot {
+        slot: 0x8800,
+        operation: 10,
+        original: 0xa000,
+        hook: 0xb000,
+        descriptor_module: 0xc000,
+        published: 1,
+        ..Default::default()
+    };
+    events.nodes[0] = winsock_trace_record::Node {
+        owner_base: 0x8000,
+        owner_size: 0x1000,
+        machine: 0xaa64,
+        ..Default::default()
+    };
+    events.entries[0] = winsock_trace_record::Entry {
+        sequence: 1,
+        operation: 10,
+        thread_id: 7,
+        entered: 1,
+        returned: 1,
+        native_status: 2,
+        ..Default::default()
+    };
+    events.first_failure = events.entries[0];
+    value
+}
+
+#[test]
+fn appended_abi_and_historical_json_are_explicit_without_v1_reinterpretation() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<Packet>(), 28352);
+    assert_eq!(size_of::<record::ReturnedModule>(), 12136);
+    assert_eq!(offset_of!(Packet, returned_module), 16216);
+    let mut value = base();
+    value.version = 1;
+    assert_eq!(diagnostic(&value)["invalid_packet"], true);
+    let historical = json!({"format":"memcordon.original-rust-listener-trace","revision":1,"trace":{"format":"memcordon.fixture-original-rust-listener","revision":1,"aggregate":{"called":1,"outcome":2,"raw_io_error":2}}});
+    let bytes = serde_json::to_vec(&historical).unwrap();
+    let parsed = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(record::bounded(parsed), historical);
+}
+
+#[test]
+fn returned_owner_scope_has_its_own_sequences_and_exact_loader_binding() {
+    let value = returned_scope();
+    let rendered = diagnostic(&value);
+    assert_eq!(rendered["invalid_packet"], false, "{rendered}");
+    assert_eq!(rendered["dependency_links"][0]["dependency_sequence"], 1);
+    assert_eq!(
+        rendered["returned_module"]["links"][0]["dependency_sequence"],
+        1
+    );
+    assert_eq!(
+        rendered["returned_module"]["dependencies"]["original_startup_invoked"],
+        false
+    );
+    assert_eq!(
+        rendered["returned_module"]["WSPStartup_invocation_observed"],
+        false
+    );
+    assert_eq!(
+        rendered["returned_module"]["dependencies"]["owner_entrypoint_unobserved"],
+        true
+    );
+    let mut later_capacity = returned_scope();
+    later_capacity.returned_module.setup_stage = 9;
+    later_capacity.returned_module.setup_error = 50;
+    later_capacity.returned_module.setup_reason = 4;
+    later_capacity.returned_module.incomplete = 1;
+    assert_eq!(
+        diagnostic(&later_capacity)["invalid_packet"],
+        false,
+        "a later skipped owner does not erase the first armed route"
+    );
+    for mutation in 0..15 {
+        let mut value = returned_scope();
+        match mutation {
+            0 => value.returned_module.returned_module = 0x9000,
+            1 => value.returned_module.parent_listener_sequence = 99,
+            2 => value.returned_module.loader_dependency_sequence = 99,
+            3 => value.returned_module.loader_timeline_sequence = 3,
+            4 => value.returned_module.links[0].timeline_sequence = 2,
+            5 => value.returned_module.links[0].timeline_sequence = 9,
+            6 => value.returned_module.dependencies.original_thread = 8,
+            7 => value.returned_module.dependencies.called = 1,
+            8 => value.returned_module.dependencies.cutoff_qpc = 101,
+            9 => value.returned_module.dependencies.entries[0].thread_id = 8,
+            10 => {
+                value.returned_module.link_count = 2;
+                value.returned_module.links[1] = value.returned_module.links[0];
+            }
+            11 => value.dependencies.entries[0].native_status = 1,
+            12 => value.returned_module.first_failure_link.timeline_sequence = 5,
+            13 => value.returned_module.dependencies.descriptor_count = 257,
+            14 => value.returned_module.dependencies.function_count = 16385,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            diagnostic(&value)["invalid_packet"],
+            true,
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn returned_duplicate_api_slots_require_distinct_addresses_and_identical_targets() {
+    let mut value = returned_scope();
+    let events = &mut value.returned_module.dependencies;
+    events.slot_count = 2;
+    for (index, slot) in events.slots[..2].iter_mut().enumerate() {
+        *slot = winsock_trace_record::Slot {
+            slot: 0x8800 + index as u64 * 8,
+            operation: 10,
+            original: 0xa000,
+            hook: 0xb000,
+            descriptor_module: 0xc000,
+            published: 1,
+            ..Default::default()
+        };
+    }
+    assert_eq!(diagnostic(&value)["invalid_packet"], false);
+    assert_eq!(
+        winsock_trace_record::diagnostic(&value.returned_module.dependencies)["invalid_packet"],
+        true,
+        "standalone startup remains strict"
+    );
+    value.returned_module.dependencies.slots[1].original += 1;
+    assert_eq!(diagnostic(&value)["invalid_packet"], true);
+    value.returned_module.dependencies.slots[1].original -= 1;
+    value.returned_module.dependencies.slots[1].slot = 0x8800;
+    assert_eq!(diagnostic(&value)["invalid_packet"], true);
+}
+
+#[test]
+fn bounded_provider_failure_retains_namespace_binding_counters_and_saturation() {
+    let mut value = returned_scope();
+    value.returned_module.selection_count = u32::MAX;
+    value.returned_module.skipped_count = u32::MAX - 1;
+    value.returned_module.links_dropped = u32::MAX;
+    value.returned_module.setup_stage = 9;
+    value.returned_module.setup_error = 50;
+    value.returned_module.setup_reason = 4;
+    value.returned_module.dependencies.first_failure.name = [0xffff; 256];
+    value
+        .returned_module
+        .dependencies
+        .first_failure
+        .copied_name_units = 256;
+    value
+        .returned_module
+        .dependencies
+        .first_failure
+        .reported_name_bytes = 512;
+    value.returned_module.dependencies.first_failure.name_flags = 5;
+    value.returned_module.dependencies.entries[0] =
+        value.returned_module.dependencies.first_failure;
+    let trace = diagnostic(&value);
+    let rendered = record::bounded(
+        json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":{"pid":123,"descriptor_sha256":[1,2,3]},"trace":trace,"oversized":"\\\"\n".repeat(100000)}),
+    );
+    assert!(serde_json::to_vec(&rendered).unwrap().len() <= record::RECORD_BYTES);
+    assert_eq!(rendered["original_binding"]["pid"], 123);
+    assert_eq!(
+        rendered["trace"]["returned_module"]["selection_count"],
+        u32::MAX
+    );
+    assert_eq!(
+        rendered["trace"]["returned_module"]["first_observed_failure"]["native_status_or_adapter_marker"],
+        2
+    );
+    assert_eq!(
+        rendered["trace"]["returned_module"]["acceptance_authority"],
+        false
+    );
+    assert_eq!(rendered["trace"]["returned_module"]["setup_stage"], 9);
+    assert_eq!(
+        rendered["trace"]["returned_module"]["dependencies"]["setup_stage"],
+        1
+    );
+    assert_eq!(
+        rendered["trace"]["returned_module"]["dependencies"]["total_calls"],
+        1
+    );
 }
 fn call(operation: u32, sequence: u64, completion: u64, result: u64) -> Entry {
     Entry {

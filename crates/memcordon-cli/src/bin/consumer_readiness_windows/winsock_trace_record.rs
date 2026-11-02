@@ -230,6 +230,16 @@ fn entry(entry: &Entry, thread: u32) -> (Value, bool, bool) {
 }
 
 pub fn diagnostic(packet: &Packet) -> Value {
+    diagnostic_slots(packet, false)
+}
+
+/// Returned-module routes can contain distinct imports of the same typed API.
+/// This changes data validation only; no recorded slot conveys authority.
+pub fn returned_module_diagnostic(packet: &Packet) -> Value {
+    diagnostic_slots(packet, true)
+}
+
+fn diagnostic_slots(packet: &Packet, repeated_operations: bool) -> Value {
     let flags = [
         packet.called,
         packet.armed,
@@ -335,8 +345,12 @@ pub fn diagnostic(packet: &Packet) -> Value {
     }
     let mut published = true;
     let mut operations = std::collections::BTreeSet::new();
+    let mut slot_addresses = std::collections::BTreeSet::new();
+    let mut original_targets = std::collections::BTreeMap::new();
     let slots:Vec<_>=packet.slots[..(packet.slot_count as usize).min(16)].iter().map(|slot|{
-        invalid|=operation(slot.operation).is_none()||!operations.insert(slot.operation)||slot.published>1||slot.restored>1||slot.reserved!=0;
+        let repeated = !operations.insert(slot.operation);
+        invalid|=operation(slot.operation).is_none()||(!repeated_operations&&repeated)||!slot_addresses.insert(slot.slot)||slot.published>1||slot.restored>1||slot.reserved!=0;
+        if let Some(original) = original_targets.insert(slot.operation, (slot.original, slot.hook)) { invalid |= original != (slot.original, slot.hook); }
         let slot_range=packet.nodes[..(packet.node_count as usize).min(2)].last().is_some_and(|node|
             slot.slot>=node.owner_base && node.owner_base.checked_add(u64::from(node.owner_size)).is_some_and(|end|slot.slot.checked_add(8).is_some_and(|last|last<=end)));
         invalid|=slot.published==1&&(slot.slot==0||slot.slot%8!=0||slot.original==0||slot.hook==0||slot.original==slot.hook||slot.descriptor_module==0||!slot_range);

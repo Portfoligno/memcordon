@@ -59,6 +59,30 @@ pub struct DependencyLink {
 
 #[repr(C)]
 #[derive(Default)]
+pub struct ReturnedModule {
+    pub version: u32,
+    pub setup_stage: u32,
+    pub setup_error: u32,
+    pub setup_reason: u32,
+    pub selected: u32,
+    pub armed: u32,
+    pub scope_flags: u32,
+    pub incomplete: u32,
+    pub link_count: u32,
+    pub links_dropped: u32,
+    pub selection_count: u32,
+    pub skipped_count: u32,
+    pub parent_listener_sequence: u64,
+    pub loader_dependency_sequence: u64,
+    pub loader_timeline_sequence: u64,
+    pub returned_module: u64,
+    pub dependencies: DependencyPacket,
+    pub first_failure_link: DependencyLink,
+    pub links: [DependencyLink; 16],
+}
+
+#[repr(C)]
+#[derive(Default)]
 pub struct Packet {
     pub version: u32,
     pub setup_stage: u32,
@@ -113,6 +137,7 @@ pub struct Packet {
     pub first_dependency_failure_link: DependencyLink,
     pub dependency_links: [DependencyLink; 16],
     pub dependencies: DependencyPacket,
+    pub returned_module: ReturnedModule,
 }
 
 const _: () = {
@@ -123,7 +148,11 @@ const _: () = {
     assert!(offset_of!(Entry, completion_sequence) == 128);
     assert!(offset_of!(Entry, input_prefix) == 136);
     assert!(size_of::<DependencyLink>() == 24);
-    assert!(size_of::<Packet>() == 16216);
+    assert!(size_of::<ReturnedModule>() == 12136);
+    assert!(offset_of!(ReturnedModule, dependencies) == 80);
+    assert!(offset_of!(ReturnedModule, first_failure_link) == 11728);
+    assert!(offset_of!(ReturnedModule, links) == 11752);
+    assert!(size_of::<Packet>() == 28352);
     assert!(offset_of!(Packet, owner) == 208);
     assert!(offset_of!(Packet, slots) == 400);
     assert!(offset_of!(Packet, first_failure) == 1168);
@@ -131,6 +160,7 @@ const _: () = {
     assert!(offset_of!(Packet, first_dependency_failure_link) == 4160);
     assert!(offset_of!(Packet, dependency_links) == 4184);
     assert!(offset_of!(Packet, dependencies) == 4568);
+    assert!(offset_of!(Packet, returned_module) == 16216);
 };
 
 fn signature(operation: u32) -> Option<(&'static str, u32, usize)> {
@@ -252,7 +282,10 @@ fn entry(value: &Entry, packet: &Packet) -> (Value, bool, bool) {
 }
 
 fn dependencies(packet: &DependencyPacket) -> Value {
-    let mut value = super::winsock_trace_record::diagnostic(packet);
+    dependency_projection(super::winsock_trace_record::diagnostic(packet))
+}
+
+fn dependency_projection(mut value: Value) -> Value {
     let object = value.as_object_mut().expect("dependency diagnostic object");
     for key in [
         "called",
@@ -273,6 +306,154 @@ fn dependencies(packet: &DependencyPacket) -> Value {
     value
 }
 
+fn returned_module(packet: &Packet, ordinals: &mut BTreeSet<u64>) -> (Value, bool, bool) {
+    let scope = &packet.returned_module;
+    let events = &scope.dependencies;
+    let mut invalid = scope.version != 1
+        || scope.setup_stage > 9
+        || scope.setup_stage == 8
+        || scope.setup_reason > 8
+        || [scope.selected, scope.armed, scope.incomplete]
+            .iter()
+            .any(|flag| *flag > 1)
+        || scope.scope_flags & !3 != 0
+        || scope.link_count > 16
+        || scope.skipped_count > scope.selection_count
+        || events.called != 0
+        || events.requested_version != 0
+        || events.negotiated_version != 0
+        || events.original_return != 0
+        || events.node_count > 1
+        || events.descriptor_count > 256
+        || events.function_count > 16384
+        || events.hop_count != 0
+        || (scope.selected == 0
+            && (scope.armed != 0
+                || scope.returned_module != 0
+                || scope.link_count != 0
+                || events.record_count != 0));
+    let mut incomplete = scope.incomplete != 0
+        || scope.scope_flags & 2 != 0
+        || scope.links_dropped != 0
+        || scope.link_count != events.record_count;
+    let recent = &packet.entries[..(packet.record_count as usize).min(16)];
+    if scope.selected == 1 {
+        invalid |= scope.returned_module == 0
+            || scope.selection_count == 0
+            || scope.parent_listener_sequence == 0
+            || scope.loader_dependency_sequence == 0
+            || scope.loader_timeline_sequence <= scope.parent_listener_sequence
+            || scope.loader_timeline_sequence > packet.next_sequence;
+        if let Some(parent) = recent
+            .iter()
+            .find(|entry| entry.sequence == scope.parent_listener_sequence)
+        {
+            invalid |= parent.operation != 2
+                || (parent.returned == 1
+                    && scope.loader_timeline_sequence >= parent.completion_sequence);
+        } else if packet.dropped == 0 {
+            invalid = true;
+        } else {
+            incomplete = true;
+        }
+        let loader = packet.dependencies.entries
+            [..(packet.dependencies.record_count as usize).min(16)]
+            .iter()
+            .find(|entry| entry.sequence == scope.loader_dependency_sequence);
+        if let Some(loader) = loader {
+            invalid |= loader.operation != 12
+                || loader.thread_id != packet.original_thread
+                || loader.returned != 1
+                || loader.native_status != 0
+                || loader.raw_output != scope.returned_module
+                || loader.output_flags != 3
+                || loader.raw_root != 0
+                || loader.flags != 0;
+        } else if packet.dependencies.dropped == 0 {
+            invalid = true;
+        } else {
+            incomplete = true;
+        }
+        let linked = packet.dependency_links[..(packet.dependency_link_count as usize).min(16)]
+            .iter()
+            .any(|link| {
+                link.dependency_sequence == scope.loader_dependency_sequence
+                    && link.timeline_sequence == scope.loader_timeline_sequence
+                    && link.parent_listener_sequence == scope.parent_listener_sequence
+            });
+        if !linked {
+            if packet.dependency_links_dropped == 0 {
+                invalid = true;
+            } else {
+                incomplete = true;
+            }
+        }
+    }
+    if scope.armed == 1 {
+        invalid |= scope.selected != 1
+            || events.armed != 1
+            || events.owner_pinned != 1
+            || events.callbacks_complete != 1
+            || events.protections_restored != 1
+            || events.original_thread != packet.original_thread
+            || events.cutoff_qpc != packet.cutoff_qpc
+            || events.frequency != packet.frequency
+            || events.nodes[0].owner_base != scope.returned_module
+            || events.node_count != 1;
+    }
+    let mut sequences = BTreeSet::new();
+    let links = scope.links[..(scope.link_count as usize).min(16)].iter().map(|link| {
+        let event = events.entries[..(events.record_count as usize).min(16)].iter().find(|entry| entry.sequence == link.dependency_sequence);
+        invalid |= link.dependency_sequence == 0 || !sequences.insert(link.dependency_sequence)
+            || link.timeline_sequence <= scope.loader_timeline_sequence || link.timeline_sequence > packet.next_sequence
+            || !ordinals.insert(link.timeline_sequence) || event.is_none()
+            || event.is_some_and(|entry| entry.thread_id != packet.original_thread)
+            || link.parent_listener_sequence >= link.timeline_sequence;
+        if let Some(parent) = recent.iter().find(|entry| entry.sequence == link.parent_listener_sequence) {
+            invalid |= parent.returned == 1 && link.timeline_sequence >= parent.completion_sequence;
+        } else if packet.dropped == 0 { invalid = true; } else { incomplete = true; }
+        json!({"namespace":"returned_module","dependency_sequence":link.dependency_sequence,"timeline_sequence":link.timeline_sequence,"timeline_domain":"ENTER","parent_listener_sequence":link.parent_listener_sequence})
+    }).collect::<Vec<_>>();
+    let first = if events.first_failure_present == 1 {
+        let link = &scope.first_failure_link;
+        invalid |= link.dependency_sequence != events.first_failure.sequence
+            || link.timeline_sequence <= scope.loader_timeline_sequence
+            || link.timeline_sequence > packet.next_sequence
+            || link.parent_listener_sequence >= link.timeline_sequence;
+        if let Some(recent) = scope.links[..(scope.link_count as usize).min(16)]
+            .iter()
+            .find(|recent| recent.dependency_sequence == link.dependency_sequence)
+        {
+            invalid |= recent.timeline_sequence != link.timeline_sequence
+                || recent.parent_listener_sequence != link.parent_listener_sequence;
+        } else {
+            invalid |= events.dropped == 0 || !ordinals.insert(link.timeline_sequence);
+        }
+        Some(
+            json!({"namespace":"returned_module","dependency_sequence":link.dependency_sequence,"timeline_sequence":link.timeline_sequence,"timeline_domain":"ENTER","parent_listener_sequence":link.parent_listener_sequence}),
+        )
+    } else {
+        None
+    };
+    let mut dependency = dependency_projection(
+        super::winsock_trace_record::returned_module_diagnostic(events),
+    );
+    dependency["scope"] = json!(
+        "one actual successful loader-return module normal imports after that load returned; loader initialization, dynamic exports and later modules are outside scope"
+    );
+    invalid |= scope.armed == 1 && dependency["invalid_packet"] == true;
+    // No entrypoint was observed for this owner; zero entry/bytes are honest.
+    if scope.armed == 1 && events.nodes[0].entry == 0 {
+        dependency["owner_entrypoint_unobserved"] = json!(true);
+        dependency["observed_entries_complete"] = json!(false);
+    }
+    (
+        json!({"version":scope.version,"setup_stage":scope.setup_stage,"setup_error":scope.setup_error,"setup_reason":scope.setup_reason,"selected":scope.selected,"armed":scope.armed,"scope_flags":scope.scope_flags,"incomplete":scope.incomplete,"selection_count":scope.selection_count,"skipped_count":scope.skipped_count,"links_dropped":scope.links_dropped,"parent_listener_sequence":scope.parent_listener_sequence,"loader_dependency_sequence":scope.loader_dependency_sequence,"loader_timeline_sequence":scope.loader_timeline_sequence,"returned_module":scope.returned_module,"invalid_scope":invalid,"observation_incomplete":incomplete,"acceptance_authority":false,"provider_ready_proved":false,"WSPStartup_invocation_observed":false,"global_routes_complete":false,"original_startup_invoked":false,"links":links,"first_failure_link":first,"dependencies":dependency}),
+        invalid,
+        incomplete,
+    )
+}
+
 pub fn diagnostic(packet: &Packet) -> Value {
     let flags = [
         packet.called,
@@ -287,7 +468,7 @@ pub fn diagnostic(packet: &Packet) -> Value {
         packet.dependency_scope_armed,
         packet.callback_raw_error_present,
     ];
-    let mut invalid = packet.version != 1
+    let mut invalid = packet.version != 2
         || packet.setup_stage > 9
         || packet.setup_stage == 8
         || flags.iter().any(|flag| *flag > 1)
@@ -440,6 +621,9 @@ pub fn diagnostic(packet: &Packet) -> Value {
     };
     let dependency = dependencies(&packet.dependencies);
     invalid |= packet.dependency_scope_armed == 1 && dependency["invalid_packet"] == true;
+    let (returned, returned_invalid, returned_incomplete) = returned_module(packet, &mut ordinals);
+    invalid |= returned_invalid;
+    incomplete |= returned_incomplete;
     let complete = !invalid
         && !incomplete
         && packet.called == 1
@@ -480,6 +664,8 @@ pub fn diagnostic(packet: &Packet) -> Value {
     value["dependency_links"] = json!(links);
     value["first_dependency_failure_link"] = json!(first_dependency_link);
     value["dependencies"] = dependency;
+    value["packet_version"] = json!(packet.version);
+    value["returned_module"] = returned;
     bounded(value)
 }
 
@@ -551,6 +737,82 @@ pub fn bounded(value: Value) -> Value {
             .and_then(|dependency| dependency.get("first_observed_failure")),
         8192,
     );
+    let mut dependency_summary = json!({"record_omitted_for_bound":true,"original_startup_invoked":false,"global_routes_complete":false});
+    for key in [
+        "setup_stage",
+        "setup_error",
+        "total_calls",
+        "total_failures",
+        "dropped",
+        "overflow",
+        "reported_record_count",
+        "slot_count",
+        "descriptor_count",
+        "function_count",
+        "owner_pinned",
+        "protections_restored",
+        "rollback_error",
+    ] {
+        dependency_summary[key] = small(
+            trace
+                .get("dependencies")
+                .and_then(|dependency| dependency.get(key)),
+            64,
+        );
+    }
+    summary["dependencies"] = dependency_summary;
+    let returned = trace.get("returned_module");
+    let mut returned_summary = json!({"record_omitted_for_bound":true,"observation_incomplete":true,"acceptance_authority":false,"provider_ready_proved":false,"global_routes_complete":false});
+    for key in [
+        "version",
+        "setup_stage",
+        "setup_error",
+        "setup_reason",
+        "selected",
+        "armed",
+        "scope_flags",
+        "incomplete",
+        "selection_count",
+        "skipped_count",
+        "links_dropped",
+        "parent_listener_sequence",
+        "loader_dependency_sequence",
+        "loader_timeline_sequence",
+        "returned_module",
+        "invalid_scope",
+        "first_failure_link",
+    ] {
+        returned_summary[key] = small(returned.and_then(|scope| scope.get(key)), 512);
+    }
+    let returned_dependency = returned.and_then(|scope| scope.get("dependencies"));
+    returned_summary["first_observed_failure"] = small(
+        returned_dependency.and_then(|dependency| dependency.get("first_observed_failure")),
+        8192,
+    );
+    let mut returned_counters =
+        json!({"record_omitted_for_bound":true,"original_startup_invoked":false});
+    for key in [
+        "setup_stage",
+        "setup_error",
+        "total_calls",
+        "total_failures",
+        "dropped",
+        "overflow",
+        "reported_record_count",
+        "slot_count",
+        "descriptor_count",
+        "function_count",
+        "owner_pinned",
+        "protections_restored",
+        "rollback_error",
+    ] {
+        returned_counters[key] = small(
+            returned_dependency.and_then(|dependency| dependency.get(key)),
+            64,
+        );
+    }
+    returned_summary["dependencies"] = returned_counters;
+    summary["returned_module"] = returned_summary;
     if value.get("trace").is_some() {
         json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":small(value.get("original_binding"),16*1024),"binding_omitted_if_oversize":!value.get("original_binding").is_some_and(|binding|fits(binding,16*1024)),"trace":summary,"record_omitted_for_envelope_bound":true,"acceptance_authority":false})
     } else {

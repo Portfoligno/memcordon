@@ -13,6 +13,9 @@ static_assert(sizeof(void*)==8 && sizeof(WCHAR)==2 && sizeof(NTSTATUS)==4,"WSA t
 static_assert(sizeof(OBJECT_ATTRIBUTES)==48 && offsetof(OBJECT_ATTRIBUTES,ObjectName)==16,"WSA native object attributes ABI");
 static_assert(sizeof(UNICODE_STRING)==16 && offsetof(UNICODE_STRING,Buffer)==8,"WSA native counted string ABI");
 static std::atomic<void*> originals[16] = {};
+static std::atomic<void*> returned_originals[16]={};
+struct DependencyPrivateRoute {void* targets[16];};
+static std::atomic<const DependencyPrivateRoute*> dependency_private_routes[2]={};
 static_assert(std::atomic<void*>::is_always_lock_free,"forwarding publication is lock-free");
 static volatile LONG installed=0;
 // Published once, before installed=2. No call/event/error-state data is retained.
@@ -22,7 +25,8 @@ struct DependencyRoute {
     uint32_t callbacks_complete,owner_pinned,protections_restored,scope_flags,incomplete;
 };
 static DependencyRoute dependency_route={};
-static void save_dependency_route(const WsaPacket* packet){
+static void save_dependency_route(const WsaPacket* packet,DependencyRoute* destination=&dependency_route){
+    auto& dependency_route=*destination;
     for(size_t index=0;index<2;++index)dependency_route.nodes[index]=packet->nodes[index];
     for(size_t index=0;index<16;++index)dependency_route.slots[index]=packet->slots[index];
     dependency_route.node_count=packet->node_count;dependency_route.hop_count=packet->hop_count;
@@ -31,7 +35,8 @@ static void save_dependency_route(const WsaPacket* packet){
     dependency_route.owner_pinned=packet->owner_pinned;dependency_route.protections_restored=packet->protections_restored;
     dependency_route.scope_flags=packet->scope_flags;dependency_route.incomplete=packet->incomplete;
 }
-static void copy_dependency_route(WsaPacket* packet){
+static void copy_dependency_route(WsaPacket* packet,const DependencyRoute* source=&dependency_route){
+    const auto& dependency_route=*source;
     for(size_t index=0;index<2;++index)packet->nodes[index]=dependency_route.nodes[index];
     for(size_t index=0;index<16;++index)packet->slots[index]=dependency_route.slots[index];
     packet->node_count=dependency_route.node_count;packet->hop_count=dependency_route.hop_count;
@@ -43,19 +48,28 @@ static void copy_dependency_route(WsaPacket* packet){
 struct ErrorPair {DWORD win32;int wsa;};
 static ErrorPair errors(){const DWORD win32=GetLastError();const int wsa=WSAGetLastError();return {win32,wsa};}
 static void errors_restore(ErrorPair saved){WSASetLastError(saved.wsa);SetLastError(saved.win32);}
-struct ListenerCollector {ListenerPacket* packet;bool inside;uint32_t depth;uint64_t parents[16];};
+struct ListenerCollector {ListenerPacket* packet;bool inside;uint32_t depth;uint64_t parents[16];uint32_t operations[16];};
 static __declspec(thread) ListenerCollector listener_collector={};
+static __declspec(thread) bool observer_setup_active=false;
+struct ObserverSetup {
+    bool previous;
+    ObserverSetup():previous(observer_setup_active){observer_setup_active=true;}
+    ~ObserverSetup(){observer_setup_active=previous;}
+};
 struct Collector {
     WsaPacket* packet;bool inside;ListenerPacket* timeline;
     uint32_t pending_count;ListenerDependencyLink pending[16];
 };
 static __declspec(thread) Collector collector={};
-struct DependencyErrors {
+static __declspec(thread) Collector returned_collector={};
+template<bool Returned> static Collector& dependency_collector(){if constexpr(Returned)return returned_collector;else return collector;}
+template<bool Returned=false> struct DependencyErrors {
+    Collector& scope;
     bool dual;ErrorPair incoming,outgoing;
-    DependencyErrors():dual(collector.timeline!=nullptr),incoming{},outgoing{}{
+    DependencyErrors():scope(dependency_collector<Returned>()),dual(Returned||scope.timeline!=nullptr),incoming{},outgoing{}{
         incoming.win32=GetLastError();if(dual)incoming.wsa=WSAGetLastError();
     }
-    void forward(bool active){if(active)collector.inside=false;if(dual)errors_restore(incoming);else SetLastError(incoming.win32);}
+    void forward(bool active){if(active)scope.inside=false;if(dual)errors_restore(incoming);else SetLastError(incoming.win32);}
     DWORD returned(){outgoing.win32=GetLastError();if(dual)outgoing.wsa=WSAGetLastError();return outgoing.win32;}
     ~DependencyErrors(){if(dual)errors_restore(outgoing);}
 };
@@ -67,11 +81,13 @@ static uint64_t listener_parent(){return listener_collector.depth?listener_colle
 static uint64_t timeline_enter(ListenerPacket* packet){
     const uint64_t listeners=listener_collector.packet==packet?listener_collector.depth:0;
     const uint64_t dependencies=collector.timeline==packet?collector.pending_count:0;
+    const uint64_t returned=returned_collector.timeline==packet?returned_collector.pending_count:0;
     // Leave a RETURN ordinal for every already-active frame and this entry.
-    if(UINT64_MAX-packet->next_sequence<listeners+dependencies+2){packet->overflow=1;packet->incomplete=1;return 0;}
+    if(UINT64_MAX-packet->next_sequence<listeners+dependencies+returned+2){packet->overflow=1;packet->incomplete=1;return 0;}
     return timeline_next(packet);
 }
-static void dependency_link_finish(const WsaEntry* entry,bool first){
+template<bool Returned=false> static void dependency_link_finish(const WsaEntry* entry,bool first){
+    auto& collector=dependency_collector<Returned>();
     auto* packet=collector.timeline;if(!packet)return;
     ListenerDependencyLink link={};
     for(uint32_t index=0;index<collector.pending_count;++index){
@@ -82,12 +98,17 @@ static void dependency_link_finish(const WsaEntry* entry,bool first){
     }
     timeline_next(packet); // RETURN consumes the same clock as listener ENTER/RETURN.
     if(!link.timeline_sequence){packet->incomplete=1;return;}
-    if(first)packet->first_dependency_failure_link=link;
-    if(packet->dependency_link_count<16)packet->dependency_links[packet->dependency_link_count++]=link;
+    auto* first_link=Returned?&packet->returned_module.first_failure_link:&packet->first_dependency_failure_link;
+    auto* links=Returned?packet->returned_module.links:packet->dependency_links;
+    auto* count=Returned?&packet->returned_module.link_count:&packet->dependency_link_count;
+    auto* dropped=Returned?&packet->returned_module.links_dropped:&packet->dependency_links_dropped;
+    if(first)*first_link=link;
+    if(*count<16)links[(*count)++]=link;
     else {
-        for(size_t index=1;index<16;++index)packet->dependency_links[index-1]=packet->dependency_links[index];
-        packet->dependency_links[15]=link;
-        if(packet->dependency_links_dropped!=UINT32_MAX)++packet->dependency_links_dropped;
+        for(size_t index=1;index<16;++index)links[index-1]=links[index];
+        links[15]=link;
+        if(*dropped!=UINT32_MAX)++*dropped;
+        if constexpr(Returned)packet->returned_module.incomplete=1;
         packet->overflow=1;packet->incomplete=1;
     }
 }
@@ -105,10 +126,11 @@ static bool live(WsaPacket* packet) {
     if (!packet->clock_live && !packet->setup_error) {packet->setup_error=valid?ERROR_TIMEOUT:ERROR_INVALID_DATA;packet->setup_stage=2;}
     return packet->clock_live!=0;
 }
-static bool begin(WsaEntry* entry,uint32_t operation,DWORD incoming) {
+template<bool Returned=false> static bool begin(WsaEntry* entry,uint32_t operation,DWORD incoming) {
+    auto& collector=dependency_collector<Returned>();
     auto* packet=collector.packet;
     if (!packet) return false;
-    if (collector.inside||listener_collector.inside) {packet->incomplete=1;return false;}
+    if (observer_setup_active||collector.inside||dependency_collector<!Returned>().inside||listener_collector.inside) {packet->incomplete=1;return false;}
     collector.inside=true;
     if (!live(packet)) {packet->incomplete=1;collector.packet=nullptr;collector.inside=false;return false;}
     if(packet->total_calls==UINT32_MAX){packet->overflow=1;packet->incomplete=1;collector.packet=nullptr;collector.inside=false;return false;}
@@ -157,23 +179,27 @@ static void attributes(WsaEntry* entry,POBJECT_ATTRIBUTES value) {
         unicode(entry,value->ObjectName);
     } __except(EXCEPTION_EXECUTE_HANDLER) {entry->name_flags|=2;}
 }
-static void output(WsaEntry* entry,void** value) {
+template<bool Returned=false> static void output(WsaEntry* entry,void** value) {
+    auto& collector=dependency_collector<Returned>();
     const bool inside=collector.inside;collector.inside=true;
     __try {if(value){entry->raw_output=reinterpret_cast<uintptr_t>(*value);entry->output_flags=1|(*value?2:0);}}
     __except(EXCEPTION_EXECUTE_HANDLER) {entry->output_flags=0;}
     collector.inside=inside;
 }
-static uint64_t size_input(const SIZE_T* value,WsaEntry* entry,uint32_t bit) {
+template<bool Returned=false> static uint64_t size_input(const SIZE_T* value,WsaEntry* entry,uint32_t bit) {
+    auto& collector=dependency_collector<Returned>();
     const bool inside=collector.inside;collector.inside=true;uint64_t result=0;
     __try {if(value){result=*value;entry->scalar_flags|=bit;}} __except(EXCEPTION_EXECUTE_HANDLER) {}
     collector.inside=inside;return result;
 }
-static uint32_t dword_input(const DWORD* value,WsaEntry* entry,uint32_t bit) {
+template<bool Returned=false> static uint32_t dword_input(const DWORD* value,WsaEntry* entry,uint32_t bit) {
+    auto& collector=dependency_collector<Returned>();
     const bool inside=collector.inside;collector.inside=true;uint32_t result=0;
     __try {if(value){result=*value;entry->scalar_flags|=bit;}} __except(EXCEPTION_EXECUTE_HANDLER) {}
     collector.inside=inside;return result;
 }
-static void finish(WsaEntry* entry,bool active,int32_t status,DWORD outgoing,bool failed) {
+template<bool Returned=false> static void finish(WsaEntry* entry,bool active,int32_t status,DWORD outgoing,bool failed) {
+    auto& collector=dependency_collector<Returned>();
     auto* packet=collector.packet;
     if (!active || !packet) return;
     collector.inside=true;entry->returned=1;entry->native_status=status;entry->outgoing_error=outgoing;
@@ -183,7 +209,7 @@ static void finish(WsaEntry* entry,bool active,int32_t status,DWORD outgoing,boo
     }
     const bool first=failed&&!packet->first_failure_present;
     if(first){packet->first_failure=*entry;packet->first_failure_present=1;}
-    dependency_link_finish(entry,first);
+    dependency_link_finish<Returned>(entry,first);
     if(packet->record_count<16) packet->entries[packet->record_count++]=*entry;
     else {
         for(size_t index=1;index<16;++index) packet->entries[index-1]=packet->entries[index];
@@ -191,120 +217,151 @@ static void finish(WsaEntry* entry,bool active,int32_t status,DWORD outgoing,boo
     }
     collector.inside=false;
 }
-template<class T> static T original(size_t operation){return reinterpret_cast<T>(originals[operation-1].load(std::memory_order_acquire));}
+template<class T,bool Returned=false> static T original(size_t operation){
+    const auto* mock=dependency_private_routes[Returned?1:0].load(std::memory_order_acquire);
+    return reinterpret_cast<T>(mock?mock->targets[operation-1]:(Returned?returned_originals:originals)[operation-1].load(std::memory_order_acquire));
+}
+static void returned_module_loaded(const WsaEntry*,bool,HMODULE,HANDLE,DWORD);
 using NtOpen=NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES);
-static NTSTATUS NTAPI open_key(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,1,incoming);
+template<bool Returned=false> static NTSTATUS NTAPI open_key(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtOpen,Returned>(1)(out,access,attr);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,1,incoming);
     if(active){entry.desired_access=access;attributes(&entry,attr);}saved.forward(active);
-    const auto result=original<NtOpen>(1)(out,access,attr);const DWORD error=saved.returned();
-    if(active&&result>=0)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+    const auto result=original<NtOpen,Returned>(1)(out,access,attr);const DWORD error=saved.returned();
+    if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using NtOpenEx=NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,ULONG);
-static NTSTATUS NTAPI open_key_ex(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr,ULONG options){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,2,incoming);
+template<bool Returned=false> static NTSTATUS NTAPI open_key_ex(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr,ULONG options){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtOpenEx,Returned>(2)(out,access,attr,options);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,2,incoming);
     if(active){entry.desired_access=access;entry.secondary_size=options;entry.scalar_flags=2;attributes(&entry,attr);}saved.forward(active);
-    const auto result=original<NtOpenEx>(2)(out,access,attr,options);const DWORD error=saved.returned();
-    if(active&&result>=0)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+    const auto result=original<NtOpenEx,Returned>(2)(out,access,attr,options);const DWORD error=saved.returned();
+    if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using NtQuery=NTSTATUS(NTAPI*)(HANDLE,PUNICODE_STRING,ULONG,PVOID,ULONG,PULONG);
-static NTSTATUS NTAPI query_value(HANDLE key,PUNICODE_STRING value,ULONG type,PVOID buffer,ULONG length,PULONG required){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,3,incoming);
+template<bool Returned=false> static NTSTATUS NTAPI query_value(HANDLE key,PUNICODE_STRING value,ULONG type,PVOID buffer,ULONG length,PULONG required){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtQuery,Returned>(3)(key,value,type,buffer,length,required);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,3,incoming);
     if(active){entry.raw_root=reinterpret_cast<uintptr_t>(key);entry.requested_size=length;entry.secondary_size=type;entry.scalar_flags=3;unicode(&entry,value);}saved.forward(active);
-    const auto result=original<NtQuery>(3)(key,value,type,buffer,length,required);const DWORD error=saved.returned();
-    finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+    const auto result=original<NtQuery,Returned>(3)(key,value,type,buffer,length,required);const DWORD error=saved.returned();
+    finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using Load=NTSTATUS(NTAPI*)(PWSTR,PULONG,PUNICODE_STRING,PHANDLE);
-static NTSTATUS NTAPI load_dll(PWSTR search,PULONG flags,PUNICODE_STRING value,PHANDLE out){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,4,incoming);
-    if(active){unicode(&entry,value);entry.flags=dword_input(flags,&entry,4);}saved.forward(active);
-    const auto result=original<Load>(4)(search,flags,value,out);const DWORD error=saved.returned();
-    if(active&&result>=0)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+template<bool Returned=false> static NTSTATUS NTAPI load_dll(PWSTR search,PULONG flags,PUNICODE_STRING value,PHANDLE out){
+    if constexpr(Returned){if(!returned_collector.packet)return original<Load,Returned>(4)(search,flags,value,out);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,4,incoming);
+    if(active){unicode(&entry,value);entry.flags=dword_input<Returned>(flags,&entry,4);}saved.forward(active);
+    const auto result=original<Load,Returned>(4)(search,flags,value,out);const DWORD error=saved.returned();
+    if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using NtCreate=NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,ULONG,BOOLEAN);
-static NTSTATUS NTAPI create_event(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr,ULONG type,BOOLEAN state){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,5,incoming);
+template<bool Returned=false> static NTSTATUS NTAPI create_event(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr,ULONG type,BOOLEAN state){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtCreate,Returned>(5)(out,access,attr,type,state);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,5,incoming);
     if(active){entry.desired_access=access;entry.requested_size=type;entry.secondary_size=state;entry.scalar_flags=3;attributes(&entry,attr);}saved.forward(active);
-    const auto result=original<NtCreate>(5)(out,access,attr,type,state);const DWORD error=saved.returned();
-    if(active&&result>=0)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+    const auto result=original<NtCreate,Returned>(5)(out,access,attr,type,state);const DWORD error=saved.returned();
+    if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
-static NTSTATUS NTAPI open_event(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,6,incoming);
+template<bool Returned=false> static NTSTATUS NTAPI open_event(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtOpen,Returned>(6)(out,access,attr);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,6,incoming);
     if(active){entry.desired_access=access;attributes(&entry,attr);}saved.forward(active);
-    const auto result=original<NtOpen>(6)(out,access,attr);const DWORD error=saved.returned();
-    if(active&&result>=0)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+    const auto result=original<NtOpen,Returned>(6)(out,access,attr);const DWORD error=saved.returned();
+    if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
-static NTSTATUS NTAPI open_directory(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,7,incoming);
+template<bool Returned=false> static NTSTATUS NTAPI open_directory(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtOpen,Returned>(7)(out,access,attr);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,7,incoming);
     if(active){entry.desired_access=access;attributes(&entry,attr);}saved.forward(active);
-    const auto result=original<NtOpen>(7)(out,access,attr);const DWORD error=saved.returned();
-    if(active&&result>=0)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+    const auto result=original<NtOpen,Returned>(7)(out,access,attr);const DWORD error=saved.returned();
+    if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using NtAllocate=NTSTATUS(NTAPI*)(HANDLE,PVOID*,ULONG_PTR,PSIZE_T,ULONG,ULONG);
-static NTSTATUS NTAPI allocate(HANDLE process,PVOID* base,ULONG_PTR zero,PSIZE_T size,ULONG type,ULONG protection){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,8,incoming);
-    if(active){entry.raw_root=reinterpret_cast<uintptr_t>(process);entry.requested_size=size_input(size,&entry,1);entry.flags=type;entry.scalar_flags|=4;entry.desired_access=protection;}saved.forward(active);
-    const auto result=original<NtAllocate>(8)(process,base,zero,size,type,protection);const DWORD error=saved.returned();
-    if(active&&result>=0){output(&entry,base);entry.secondary_size=size_input(size,&entry,2);}finish(&entry,active,result,error,result<0);SetLastError(error);return result;
+template<bool Returned=false> static NTSTATUS NTAPI allocate(HANDLE process,PVOID* base,ULONG_PTR zero,PSIZE_T size,ULONG type,ULONG protection){
+    if constexpr(Returned){if(!returned_collector.packet)return original<NtAllocate,Returned>(8)(process,base,zero,size,type,protection);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,8,incoming);
+    if(active){entry.raw_root=reinterpret_cast<uintptr_t>(process);entry.requested_size=size_input<Returned>(size,&entry,1);entry.flags=type;entry.scalar_flags|=4;entry.desired_access=protection;}saved.forward(active);
+    const auto result=original<NtAllocate,Returned>(8)(process,base,zero,size,type,protection);const DWORD error=saved.returned();
+    if(active&&result>=0){output<Returned>(&entry,base);entry.secondary_size=size_input<Returned>(size,&entry,2);}finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using Heap=void*(NTAPI*)(void*,ULONG,SIZE_T);
-static void* NTAPI heap(void* handle,ULONG flags,SIZE_T size){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,9,incoming);
+template<bool Returned=false> static void* NTAPI heap(void* handle,ULONG flags,SIZE_T size){
+    if constexpr(Returned){if(!returned_collector.packet)return original<Heap,Returned>(9)(handle,flags,size);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,9,incoming);
     if(active){entry.raw_root=reinterpret_cast<uintptr_t>(handle);entry.requested_size=size;entry.scalar_flags=5;entry.flags=flags;}saved.forward(active);
-    void* result=original<Heap>(9)(handle,flags,size);const DWORD error=saved.returned();
-    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
+    void* result=original<Heap,Returned>(9)(handle,flags,size);const DWORD error=saved.returned();
+    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
 }
-static LSTATUS WINAPI reg_open(HKEY key,LPCWSTR value,DWORD options,REGSAM access,PHKEY out){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,10,incoming);
+template<bool Returned=false> static LSTATUS WINAPI reg_open(HKEY key,LPCWSTR value,DWORD options,REGSAM access,PHKEY out){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&RegOpenKeyExW),Returned>(10)(key,value,options,access,out);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,10,incoming);
     if(active){entry.raw_root=reinterpret_cast<uintptr_t>(key);entry.desired_access=access;entry.flags=options;entry.scalar_flags=4;name(&entry,value,0,true);}saved.forward(active);
-    const auto result=original<decltype(&RegOpenKeyExW)>(10)(key,value,options,access,out);const DWORD error=saved.returned();
-    if(active&&result==ERROR_SUCCESS)output(&entry,reinterpret_cast<void**>(out));finish(&entry,active,result,error,result!=ERROR_SUCCESS);SetLastError(error);return result;
+    const auto result=original<decltype(&RegOpenKeyExW),Returned>(10)(key,value,options,access,out);const DWORD error=saved.returned();
+    if(active&&result==ERROR_SUCCESS)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result!=ERROR_SUCCESS);SetLastError(error);return result;
 }
-static LSTATUS WINAPI reg_query(HKEY key,LPCWSTR value,LPDWORD reserved,LPDWORD type,LPBYTE data,LPDWORD length){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,11,incoming);
-    if(active){entry.raw_root=reinterpret_cast<uintptr_t>(key);entry.requested_size=dword_input(length,&entry,1);name(&entry,value,0,true);}saved.forward(active);
-    const auto result=original<decltype(&RegQueryValueExW)>(11)(key,value,reserved,type,data,length);const DWORD error=saved.returned();
-    finish(&entry,active,result,error,result!=ERROR_SUCCESS);SetLastError(error);return result;
+template<bool Returned=false> static LSTATUS WINAPI reg_query(HKEY key,LPCWSTR value,LPDWORD reserved,LPDWORD type,LPBYTE data,LPDWORD length){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&RegQueryValueExW),Returned>(11)(key,value,reserved,type,data,length);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,11,incoming);
+    if(active){entry.raw_root=reinterpret_cast<uintptr_t>(key);entry.requested_size=dword_input<Returned>(length,&entry,1);name(&entry,value,0,true);}saved.forward(active);
+    const auto result=original<decltype(&RegQueryValueExW),Returned>(11)(key,value,reserved,type,data,length);const DWORD error=saved.returned();
+    finish<Returned>(&entry,active,result,error,result!=ERROR_SUCCESS);SetLastError(error);return result;
 }
-static HMODULE WINAPI load_library(LPCWSTR value,HANDLE file,DWORD flags){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,12,incoming);
+template<bool Returned=false> static HMODULE WINAPI load_library(LPCWSTR value,HANDLE file,DWORD flags){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&LoadLibraryExW),Returned>(12)(value,file,flags);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,12,incoming);
     if(active){entry.raw_root=reinterpret_cast<uintptr_t>(file);entry.flags=flags;entry.scalar_flags=4;name(&entry,value,0,true);}saved.forward(active);
-    const auto result=original<decltype(&LoadLibraryExW)>(12)(value,file,flags);const DWORD error=saved.returned();
-    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
+    const auto result=original<decltype(&LoadLibraryExW),Returned>(12)(value,file,flags);const DWORD error=saved.returned();
+    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);if constexpr(!Returned)returned_module_loaded(&entry,active,result,file,flags);SetLastError(error);return result;
 }
-static HANDLE WINAPI create_event_w(LPSECURITY_ATTRIBUTES security,BOOL reset,BOOL state,LPCWSTR value){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,13,incoming);
+template<bool Returned=false> static HANDLE WINAPI create_event_w(LPSECURITY_ATTRIBUTES security,BOOL reset,BOOL state,LPCWSTR value){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&CreateEventW),Returned>(13)(security,reset,state,value);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,13,incoming);
     if(active){entry.requested_size=reset;entry.secondary_size=state;entry.scalar_flags=3;name(&entry,value,0,true);}saved.forward(active);
-    const auto result=original<decltype(&CreateEventW)>(13)(security,reset,state,value);const DWORD error=saved.returned();
-    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
+    const auto result=original<decltype(&CreateEventW),Returned>(13)(security,reset,state,value);const DWORD error=saved.returned();
+    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
 }
-static HANDLE WINAPI open_event_w(DWORD access,BOOL inherit,LPCWSTR value){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,14,incoming);
+template<bool Returned=false> static HANDLE WINAPI open_event_w(DWORD access,BOOL inherit,LPCWSTR value){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&OpenEventW),Returned>(14)(access,inherit,value);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,14,incoming);
     if(active){entry.desired_access=access;entry.flags=inherit;entry.scalar_flags=4;name(&entry,value,0,true);}saved.forward(active);
-    const auto result=original<decltype(&OpenEventW)>(14)(access,inherit,value);const DWORD error=saved.returned();
-    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
+    const auto result=original<decltype(&OpenEventW),Returned>(14)(access,inherit,value);const DWORD error=saved.returned();
+    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
 }
-static void* WINAPI heap_alloc(HANDLE handle,DWORD flags,SIZE_T size){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,15,incoming);
+template<bool Returned=false> static void* WINAPI heap_alloc(HANDLE handle,DWORD flags,SIZE_T size){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&HeapAlloc),Returned>(15)(handle,flags,size);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,15,incoming);
     if(active){entry.raw_root=reinterpret_cast<uintptr_t>(handle);entry.flags=flags;entry.requested_size=size;entry.scalar_flags=5;}saved.forward(active);
-    const auto result=original<decltype(&HeapAlloc)>(15)(handle,flags,size);const DWORD error=saved.returned();
-    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
+    const auto result=original<decltype(&HeapAlloc),Returned>(15)(handle,flags,size);const DWORD error=saved.returned();
+    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
 }
-static void* WINAPI virtual_alloc(LPVOID base,SIZE_T size,DWORD type,DWORD protection){
-    DependencyErrors saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin(&entry,16,incoming);
+template<bool Returned=false> static void* WINAPI virtual_alloc(LPVOID base,SIZE_T size,DWORD type,DWORD protection){
+    if constexpr(Returned){if(!returned_collector.packet)return original<decltype(&VirtualAlloc),Returned>(16)(base,size,type,protection);}
+    DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,16,incoming);
     if(active){entry.raw_root=reinterpret_cast<uintptr_t>(base);entry.flags=type;entry.desired_access=protection;entry.scalar_flags=5;}saved.forward(active);
-    const auto result=original<decltype(&VirtualAlloc)>(16)(base,size,type,protection);const DWORD error=saved.returned();
-    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
+    const auto result=original<decltype(&VirtualAlloc),Returned>(16)(base,size,type,protection);const DWORD error=saved.returned();
+    entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);SetLastError(error);return result;
 }
 struct Hook {const char* name;void* target;};
 static const Hook hooks[16]={
-    {"NtOpenKey",reinterpret_cast<void*>(open_key)},{"NtOpenKeyEx",reinterpret_cast<void*>(open_key_ex)},
-    {"NtQueryValueKey",reinterpret_cast<void*>(query_value)},{"LdrLoadDll",reinterpret_cast<void*>(load_dll)},
-    {"NtCreateEvent",reinterpret_cast<void*>(create_event)},{"NtOpenEvent",reinterpret_cast<void*>(open_event)},
-    {"NtOpenDirectoryObject",reinterpret_cast<void*>(open_directory)},{"NtAllocateVirtualMemory",reinterpret_cast<void*>(allocate)},
-    {"RtlAllocateHeap",reinterpret_cast<void*>(heap)},{"RegOpenKeyExW",reinterpret_cast<void*>(reg_open)},
-    {"RegQueryValueExW",reinterpret_cast<void*>(reg_query)},{"LoadLibraryExW",reinterpret_cast<void*>(load_library)},
-    {"CreateEventW",reinterpret_cast<void*>(create_event_w)},{"OpenEventW",reinterpret_cast<void*>(open_event_w)},
-    {"HeapAlloc",reinterpret_cast<void*>(heap_alloc)},{"VirtualAlloc",reinterpret_cast<void*>(virtual_alloc)}
+    {"NtOpenKey",reinterpret_cast<void*>(open_key<false>)},{"NtOpenKeyEx",reinterpret_cast<void*>(open_key_ex<false>)},
+    {"NtQueryValueKey",reinterpret_cast<void*>(query_value<false>)},{"LdrLoadDll",reinterpret_cast<void*>(load_dll<false>)},
+    {"NtCreateEvent",reinterpret_cast<void*>(create_event<false>)},{"NtOpenEvent",reinterpret_cast<void*>(open_event<false>)},
+    {"NtOpenDirectoryObject",reinterpret_cast<void*>(open_directory<false>)},{"NtAllocateVirtualMemory",reinterpret_cast<void*>(allocate<false>)},
+    {"RtlAllocateHeap",reinterpret_cast<void*>(heap<false>)},{"RegOpenKeyExW",reinterpret_cast<void*>(reg_open<false>)},
+    {"RegQueryValueExW",reinterpret_cast<void*>(reg_query<false>)},{"LoadLibraryExW",reinterpret_cast<void*>(load_library<false>)},
+    {"CreateEventW",reinterpret_cast<void*>(create_event_w<false>)},{"OpenEventW",reinterpret_cast<void*>(open_event_w<false>)},
+    {"HeapAlloc",reinterpret_cast<void*>(heap_alloc<false>)},{"VirtualAlloc",reinterpret_cast<void*>(virtual_alloc<false>)}
+};
+
+static const Hook returned_hooks[16]={
+    {"NtOpenKey",reinterpret_cast<void*>(open_key<true>)},{"NtOpenKeyEx",reinterpret_cast<void*>(open_key_ex<true>)},
+    {"NtQueryValueKey",reinterpret_cast<void*>(query_value<true>)},{"LdrLoadDll",reinterpret_cast<void*>(load_dll<true>)},
+    {"NtCreateEvent",reinterpret_cast<void*>(create_event<true>)},{"NtOpenEvent",reinterpret_cast<void*>(open_event<true>)},
+    {"NtOpenDirectoryObject",reinterpret_cast<void*>(open_directory<true>)},{"NtAllocateVirtualMemory",reinterpret_cast<void*>(allocate<true>)},
+    {"RtlAllocateHeap",reinterpret_cast<void*>(heap<true>)},{"RegOpenKeyExW",reinterpret_cast<void*>(reg_open<true>)},
+    {"RegQueryValueExW",reinterpret_cast<void*>(reg_query<true>)},{"LoadLibraryExW",reinterpret_cast<void*>(load_library<true>)},
+    {"CreateEventW",reinterpret_cast<void*>(create_event_w<true>)},{"OpenEventW",reinterpret_cast<void*>(open_event_w<true>)},
+    {"HeapAlloc",reinterpret_cast<void*>(heap_alloc<true>)},{"VirtualAlloc",reinterpret_cast<void*>(virtual_alloc<true>)}
 };
 
 struct Image {uintptr_t base,end,imports,imports_end,iat,iat_end;uint32_t size,timestamp,machine;};
@@ -326,7 +383,7 @@ static uint32_t machine(){
 #error Unsupported WSA trace architecture
 #endif
 }
-static bool image(HMODULE module,Image* result){
+static bool image(HMODULE module,Image* result,bool imports_required=true){
     __try {
         const auto base=reinterpret_cast<uintptr_t>(module);MEMORY_BASIC_INFORMATION memory={};
         if(VirtualQuery(module,&memory,sizeof(memory))!=sizeof(memory)||memory.State!=MEM_COMMIT||memory.Type!=MEM_IMAGE||memory.AllocationBase!=module||(memory.Protect&(PAGE_GUARD|PAGE_NOACCESS)))return false;
@@ -341,6 +398,7 @@ static bool image(HMODULE module,Image* result){
         if(!readable(reinterpret_cast<uintptr_t>(nt),sizeof(*nt),value))return false;
         const auto imports=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         const auto iat=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+        if(!imports_required&&!imports.VirtualAddress&&!imports.Size&&!iat.VirtualAddress&&!iat.Size){*result=value;return true;}
         if(!imports.VirtualAddress||!imports.Size||!iat.VirtualAddress||!iat.Size||imports.VirtualAddress>size||imports.Size>size-imports.VirtualAddress||iat.VirtualAddress>size||iat.Size>size-iat.VirtualAddress)return false;
         value.imports=base+imports.VirtualAddress;value.imports_end=value.imports+imports.Size;
         value.iat=base+iat.VirtualAddress;value.iat_end=value.iat+iat.Size;*result=value;return true;
@@ -357,8 +415,8 @@ static bool executable(void* entry,HMODULE owner){
     return VirtualQuery(entry,&memory,sizeof(memory))==sizeof(memory)&&memory.State==MEM_COMMIT&&memory.Type==MEM_IMAGE&&memory.AllocationBase==owner&&
         (memory.Protect==PAGE_EXECUTE_READ||memory.Protect==PAGE_EXECUTE_READWRITE||memory.Protect==PAGE_EXECUTE_WRITECOPY);
 }
-static bool capture_node_data(HMODULE module,void* entry,WsaNode* node,Image* mapped,uint32_t* incomplete){
-    if(!image(module,mapped)||!executable(entry,module))return false;
+static bool capture_node_data(HMODULE module,void* entry,WsaNode* node,Image* mapped,uint32_t* incomplete,bool imports_required=true){
+    if(!image(module,mapped,imports_required)||!executable(entry,module))return false;
     node->owner_base=reinterpret_cast<uintptr_t>(module);node->entry=reinterpret_cast<uintptr_t>(entry);
     node->owner_size=mapped->size;node->timestamp=mapped->timestamp;node->machine=mapped->machine;
     const DWORD name_units=GetModuleFileNameW(module,reinterpret_cast<WCHAR*>(node->module_name),64);
@@ -631,7 +689,7 @@ static bool listener_live(ListenerPacket* packet,bool admission=false){
 static bool listener_capture(){
     auto* packet=listener_collector.packet;
     if(!packet)return false;
-    if(listener_collector.inside||collector.inside){packet->incomplete=1;return false;}
+    if(observer_setup_active||listener_collector.inside||collector.inside||returned_collector.inside){packet->incomplete=1;return false;}
     return true;
 }
 static bool listener_begin(ListenerEntry* entry,uint32_t operation,ErrorPair incoming){
@@ -646,6 +704,7 @@ static bool listener_begin(ListenerEntry* entry,uint32_t operation,ErrorPair inc
     entry->operation=operation;entry->depth=listener_collector.depth;entry->thread_id=GetCurrentThreadId();
     entry->incoming_win32=incoming.win32;entry->incoming_wsa=incoming.wsa;entry->entered=1;
     entry->error_domain=operation==1?1:operation==3?3:2;
+    listener_collector.operations[listener_collector.depth]=operation;
     listener_collector.parents[listener_collector.depth++]=sequence;
     ++packet->total_calls;packet->entered_mask|=1u<<(operation-1);return true;
 }
@@ -668,7 +727,7 @@ static void listener_finish(ListenerEntry* entry,bool active,uint64_t result,Err
         packet->entries[15]=*entry;packet->dropped=increment(packet->dropped);packet->overflow=1;packet->incomplete=1;
     }
     if(!listener_collector.depth||listener_collector.parents[listener_collector.depth-1]!=entry->sequence)__fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    listener_collector.parents[--listener_collector.depth]=0;listener_collector.inside=false;
+    listener_collector.parents[--listener_collector.depth]=0;listener_collector.operations[listener_collector.depth]=0;listener_collector.inside=false;
 }
 static void listener_input(ListenerEntry* entry,const sockaddr* address,int length){
     if(length<0){entry->input_flags=2;return;}
@@ -759,16 +818,17 @@ struct ListenerDiscovery {
 };
 // An ordinal is only a representation of an already typed, uniquely identified
 // SDK export. Neither the ordinal number nor a matching address alone admits it.
-static size_t listener_ordinal_operation(void* resolved,void* target,void* const* exports){
+static size_t typed_ordinal_operation(void* resolved,void* target,void* const* exports,size_t count){
     if(!resolved||resolved!=target)return 0;
     size_t selected=0;
-    for(size_t operation=0;operation<7;++operation){
+    for(size_t operation=0;operation<count;++operation){
         if(!exports[operation]||exports[operation]!=resolved)continue;
-        if(selected)return 8;
+        if(selected)return count+1;
         selected=operation+1;
     }
     return selected;
 }
+static size_t listener_ordinal_operation(void* resolved,void* target,void* const* exports){return typed_ordinal_operation(resolved,target,exports,7);}
 static bool listener_bounded_imports(ListenerDiscovery* state){
     __try {
         const auto& mapped=state->image;size_t functions=0;
@@ -1016,6 +1076,227 @@ static bool dependency_route_live(const WsaPacket* packet){
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
+
+static volatile LONG returned_installed=0;
+static DependencyRoute returned_route={};
+static WsaNode returned_target_proofs[16]={};
+struct ReturnedDiscovery {
+    Image image;WsaPacket* packet;HMODULE descriptor;DWORD error;
+    uintptr_t original_thunk,first_thunk;size_t thunk_index;
+    uint32_t unsupported_mask;WsaNode targets[16];
+};
+static bool returned_bounded_imports(ReturnedDiscovery* state){
+    __try {
+        const auto& mapped=state->image;size_t functions=0;
+        for(size_t index=0;index<256;++index){
+            if(!live(state->packet))return false;
+            const auto address=mapped.imports+index*sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            if(!range(address,sizeof(IMAGE_IMPORT_DESCRIPTOR),mapped.imports,mapped.imports_end)||!readable(address,sizeof(IMAGE_IMPORT_DESCRIPTOR),mapped))return false;
+            const auto* declared=reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(address);
+            if(!declared->OriginalFirstThunk)return !declared->FirstThunk&&!declared->Name&&!declared->TimeDateStamp&&!declared->ForwarderChain;
+            if(!declared->FirstThunk||!declared->Name||!bounded_name(reinterpret_cast<const char*>(mapped.base+declared->Name),mapped))return false;
+            for(size_t thunk=0;thunk<4096;++thunk){
+                if(++functions>16384||!live(state->packet))return false;
+                const auto address=mapped.base+declared->OriginalFirstThunk+thunk*sizeof(IMAGE_THUNK_DATA64);
+                if(!readable(address,sizeof(IMAGE_THUNK_DATA64),mapped))return false;
+                const auto value=reinterpret_cast<const IMAGE_THUNK_DATA64*>(address)->u1.Ordinal;if(!value)break;
+                const auto slot=mapped.base+declared->FirstThunk+thunk*sizeof(void*);
+                if(!range(slot,sizeof(void*),mapped.iat,mapped.iat_end)||!readable(slot,sizeof(void*),mapped))return false;
+                if(!IMAGE_SNAP_BY_ORDINAL64(value)&&(value>UINT32_MAX||!readable(mapped.base+static_cast<uint32_t>(value),sizeof(WORD)+1,mapped)||!bounded_name(reinterpret_cast<const char*>(mapped.base+static_cast<uint32_t>(value)+sizeof(WORD)),mapped)))return false;
+                if(thunk==4095)return false;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    return false;
+}
+static BOOL CALLBACK returned_import_file(void* context,HMODULE,LPCSTR name){
+    auto* state=static_cast<ReturnedDiscovery*>(context);auto* packet=state->packet;
+    if(!name){packet->callbacks_complete=state->error==ERROR_SUCCESS;return FALSE;}
+    if(state->error)return FALSE;
+    if(++packet->descriptor_count>256||!live(packet)){state->error=packet->setup_error?packet->setup_error:ERROR_BUFFER_OVERFLOW;return FALSE;}
+    __try {
+        const auto address=state->image.imports+(packet->descriptor_count-1)*sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if(!range(address,sizeof(IMAGE_IMPORT_DESCRIPTOR),state->image.imports,state->image.imports_end)||!readable(address,sizeof(IMAGE_IMPORT_DESCRIPTOR),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        const auto* declared=reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(address);
+        if(!declared->OriginalFirstThunk||!declared->FirstThunk||!declared->Name||reinterpret_cast<uintptr_t>(name)!=state->image.base+declared->Name||!bounded_name(name,state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        state->descriptor=GetModuleHandleA(name);HMODULE pinned=nullptr;
+        if(state->descriptor&&(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(state->descriptor),&pinned)||pinned!=state->descriptor))state->descriptor=nullptr;
+        state->original_thunk=state->image.base+declared->OriginalFirstThunk;
+        state->first_thunk=state->image.base+declared->FirstThunk;state->thunk_index=0;return TRUE;
+    } __except(EXCEPTION_EXECUTE_HANDLER){state->error=ERROR_INVALID_ADDRESS;packet->incomplete=1;return FALSE;}
+}
+static BOOL CALLBACK returned_import_function(void* context,DWORD ordinal,LPCSTR name,void** slot){
+    auto* state=static_cast<ReturnedDiscovery*>(context);auto* packet=state->packet;
+    __try {
+        if(state->error)return FALSE;
+        if(state->thunk_index>=4096){state->error=ERROR_BUFFER_OVERFLOW;return FALSE;}
+        const auto address=state->original_thunk+state->thunk_index*sizeof(IMAGE_THUNK_DATA64);
+        if(!readable(address,sizeof(IMAGE_THUNK_DATA64),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        const auto thunk=reinterpret_cast<const IMAGE_THUNK_DATA64*>(address)->u1.Ordinal;
+        if(!slot){if(thunk||ordinal||name)state->error=ERROR_INVALID_DATA;return state->error==ERROR_SUCCESS;}
+        if(++packet->function_count>16384||!live(packet)){state->error=packet->setup_error?packet->setup_error:ERROR_BUFFER_OVERFLOW;return FALSE;}
+        const auto slot_address=reinterpret_cast<uintptr_t>(slot);
+        if(!thunk||slot_address!=state->first_thunk+state->thunk_index*sizeof(void*)||!range(slot_address,sizeof(void*),state->image.iat,state->image.iat_end)||!readable(slot_address,sizeof(void*),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        ++state->thunk_index;size_t ordinal_operation=0;
+        if(IMAGE_SNAP_BY_ORDINAL64(thunk)){
+            if(name||!ordinal||ordinal>UINT16_MAX||IMAGE_ORDINAL64(thunk)!=ordinal||(thunk&~(IMAGE_ORDINAL_FLAG64|UINT64_C(0xffff)))){state->error=ERROR_INVALID_DATA;return FALSE;}
+            if(state->descriptor){
+                void* exports[16]={};for(size_t operation=0;operation<16;++operation)exports[operation]=reinterpret_cast<void*>(GetProcAddress(state->descriptor,returned_hooks[operation].name));
+                void* resolved=reinterpret_cast<void*>(GetProcAddress(state->descriptor,MAKEINTRESOURCEA(static_cast<WORD>(ordinal))));
+                ordinal_operation=typed_ordinal_operation(resolved,*slot,exports,16);
+                if(!resolved||resolved!=*slot){packet->incomplete=1;packet->scope_flags|=2;}
+            }else{packet->incomplete=1;packet->scope_flags|=2;}
+            if(ordinal_operation>16){state->error=ERROR_DUP_NAME;return FALSE;}
+            if(!ordinal_operation)return TRUE;
+        }else if(ordinal||!name||thunk>UINT32_MAX||reinterpret_cast<uintptr_t>(name)!=state->image.base+static_cast<uint32_t>(thunk)+sizeof(WORD)||!bounded_name(name,state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        for(size_t operation=0;operation<16;++operation){
+            if(ordinal_operation?ordinal_operation!=operation+1:!equals(name,returned_hooks[operation].name,state->image))continue;
+            if(packet->slot_count==16){state->error=ERROR_BUFFER_OVERFLOW;return FALSE;}
+            for(size_t index=0;index<packet->slot_count;++index)if(packet->slots[index].slot==slot_address){state->error=ERROR_DUP_NAME;return FALSE;}
+            auto& selected=packet->slots[packet->slot_count++];selected.slot=slot_address;selected.operation=static_cast<uint32_t>(operation+1);selected.descriptor_module=reinterpret_cast<uintptr_t>(state->descriptor);
+            selected.original=reinterpret_cast<uintptr_t>(*slot);Page page={};HMODULE owner=nullptr;Image target_image={};const uint32_t bit=1u<<operation;
+            if(!data_page(slot,state->image,&page)||!state->descriptor||GetProcAddress(state->descriptor,returned_hooks[operation].name)!=reinterpret_cast<FARPROC>(*slot)||
+                !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(*slot),&owner)||!executable(*slot,owner)){
+                state->unsupported_mask|=bit;packet->scope_flags|=2;packet->incomplete=1;continue;
+            }
+            auto& proof=state->targets[operation];
+            if((proof.entry&&proof.entry!=selected.original)||(!proof.entry&&!capture_node_data(owner,*slot,&proof,&target_image,&packet->incomplete,false))){state->unsupported_mask|=bit;packet->scope_flags|=2;packet->incomplete=1;continue;}
+            selected.hook=reinterpret_cast<uintptr_t>(returned_hooks[operation].target);
+        }
+        return TRUE;
+    } __except(EXCEPTION_EXECUTE_HANDLER){state->error=ERROR_INVALID_ADDRESS;packet->incomplete=1;return FALSE;}
+}
+static bool returned_owner(HMODULE module,WsaNode* owner,Image* mapped,uint32_t* incomplete){
+    __try {
+        if(!image(module,mapped))return false;
+        const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+        const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(mapped->base+dos->e_lfanew);
+        if((nt->FileHeader.Characteristics&(IMAGE_FILE_DLL|IMAGE_FILE_EXECUTABLE_IMAGE))!=(IMAGE_FILE_DLL|IMAGE_FILE_EXECUTABLE_IMAGE))return false;
+        owner->owner_base=mapped->base;owner->owner_size=mapped->size;owner->timestamp=mapped->timestamp;owner->machine=mapped->machine;
+        const DWORD length=GetModuleFileNameW(module,reinterpret_cast<WCHAR*>(owner->module_name),64);
+        if(!length||length>=64)*incomplete=1;
+        // No provider entrypoint was observed; entry and entry_len stay zero.
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+static bool returned_route_live(const WsaPacket* packet,const WsaNode* targets){
+    __try {
+        if(packet->node_count!=1||packet->hop_count||packet->slot_count>16)return false;
+        const auto& owner=packet->nodes[0];Image mapped={};WsaNode checked={};uint32_t incomplete=0;
+        if(!returned_owner(reinterpret_cast<HMODULE>(owner.owner_base),&checked,&mapped,&incomplete)||checked.owner_size!=owner.owner_size||checked.timestamp!=owner.timestamp||checked.machine!=owner.machine||owner.entry||owner.entry_len)return false;
+        for(size_t index=0;index<packet->slot_count;++index){
+            const auto& selected=packet->slots[index];if(!selected.hook)continue;
+            if(!selected.operation||selected.operation>16)return false;
+            const auto& proof=targets[selected.operation-1];Image target_image={};Page page={};
+            if(!proof.entry||!image(reinterpret_cast<HMODULE>(proof.owner_base),&target_image,false)||target_image.size!=proof.owner_size||target_image.timestamp!=proof.timestamp||target_image.machine!=proof.machine||!executable(reinterpret_cast<void*>(proof.entry),reinterpret_cast<HMODULE>(proof.owner_base))||!proof.entry_len||proof.entry_len>16||!readable(proof.entry,proof.entry_len,target_image))return false;
+            for(size_t byte=0;byte<proof.entry_len;++byte)if(reinterpret_cast<const uint8_t*>(proof.entry)[byte]!=proof.entry_bytes[byte])return false;
+            if(!data_page(reinterpret_cast<void**>(selected.slot),mapped,&page)||!readable(selected.slot,sizeof(void*),mapped)||*reinterpret_cast<void**>(selected.slot)!=reinterpret_cast<void*>(selected.published?selected.hook:selected.original)||selected.original!=proof.entry||GetProcAddress(reinterpret_cast<HMODULE>(selected.descriptor_module),returned_hooks[selected.operation-1].name)!=reinterpret_cast<FARPROC>(selected.original))return false;
+        }
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+static void returned_rollback(WsaPacket* packet){
+    for(size_t index=packet->slot_count;index>0;--index){
+        auto& selected=packet->slots[index-1];if(!selected.published)continue;
+        if(swap(reinterpret_cast<void**>(selected.slot),reinterpret_cast<void*>(selected.original),reinterpret_cast<void*>(selected.hook))!=reinterpret_cast<void*>(selected.hook)){packet->rollback_error=ERROR_RETRY;__fastfail(FAST_FAIL_FATAL_APP_EXIT);}
+        selected.published=0;selected.restored=1;
+    }
+}
+static bool returned_publish(WsaPacket* packet,const Image& mapped,const WsaNode* targets){
+    Page pages[16]={};size_t count=0;
+    for(size_t index=0;index<packet->slot_count;++index){
+        const auto& selected=packet->slots[index];if(!selected.hook)continue;Page page={};
+        if(!data_page(reinterpret_cast<void**>(selected.slot),mapped,&page)){failure(packet,5,ERROR_INVALID_ADDRESS);return false;}
+        bool present=false;for(size_t previous=0;previous<count;++previous)if(pages[previous].base==page.base)present=true;if(!present)pages[count++]=page;
+        void* expected=nullptr;void* target=reinterpret_cast<void*>(selected.original);
+        if(!returned_originals[selected.operation-1].compare_exchange_strong(expected,target,std::memory_order_acq_rel,std::memory_order_acquire)&&expected!=target){failure(packet,6,ERROR_RETRY);return false;}
+    }
+    if(!writable(pages,count,packet))return false;
+    bool success=returned_route_live(packet,targets);if(!success)failure(packet,6,ERROR_RETRY);
+    for(size_t index=0;success&&index<packet->slot_count;++index){
+        auto& selected=packet->slots[index];if(!selected.hook)continue;
+        if(!live(packet)||swap(reinterpret_cast<void**>(selected.slot),reinterpret_cast<void*>(selected.hook),reinterpret_cast<void*>(selected.original))!=reinterpret_cast<void*>(selected.original)){failure(packet,6,packet->setup_error?packet->setup_error:ERROR_RETRY);success=false;break;}
+        selected.published=1;
+    }
+    if(!success)returned_rollback(packet);
+    restore(pages,count,packet);return success;
+}
+static void returned_failure(ListenerReturnedModule* section,uint32_t stage,DWORD error,uint32_t reason){
+    section->setup_stage=stage;section->setup_error=error?error:ERROR_INVALID_DATA;section->setup_reason=reason;
+    section->scope_flags|=2;section->incomplete=1;
+}
+static void returned_skipped(ListenerReturnedModule* section){section->skipped_count=increment(section->skipped_count);if(section->skipped_count==UINT32_MAX)section->incomplete=1;}
+static bool returned_prepare(ListenerPacket* listener,HMODULE module){
+    auto* section=&listener->returned_module;auto* packet=&section->dependencies;
+    packet->version=1;packet->cutoff_qpc=listener->cutoff_qpc;packet->frequency=listener->frequency;packet->original_thread=listener->original_thread;packet->scope_flags=1;
+    if(!live(packet)){returned_failure(section,2,packet->setup_error,7);return false;}
+    LARGE_INTEGER started={};const BOOL started_clock=QueryPerformanceCounter(&started);
+    if(!started_clock){const DWORD error=GetLastError();returned_failure(section,2,error,7);return false;}
+    if(started.QuadPart<0){returned_failure(section,2,ERROR_INVALID_DATA,7);return false;}
+    if(static_cast<uint64_t>(started.QuadPart)>=packet->cutoff_qpc){returned_failure(section,2,ERROR_TIMEOUT,7);return false;}
+    packet->started_qpc=static_cast<uint64_t>(started.QuadPart);
+    const LONG state=InterlockedCompareExchange(&returned_installed,1,0);
+    if(state==2){
+        if(returned_route.nodes[0].owner_base!=reinterpret_cast<uintptr_t>(module)){returned_failure(section,9,ERROR_NOT_SUPPORTED,4);return false;}
+        copy_dependency_route(packet,&returned_route);
+        if(!returned_route_live(packet,returned_target_proofs)){returned_failure(section,6,ERROR_RETRY,8);return false;}
+        packet->setup_stage=1;section->setup_stage=1;section->setup_error=0;section->setup_reason=0;
+        if(!live(packet)){returned_failure(section,2,packet->setup_error,7);return false;}
+        return true;
+    }
+    if(state!=0){returned_failure(section,9,state==1?ERROR_BUSY:ERROR_NOT_SUPPORTED,5);return false;}
+    HMODULE pinned=nullptr;Image mapped={};bool success=false;
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(module),&pinned)||pinned!=module||!returned_owner(module,&packet->nodes[0],&mapped,&packet->incomplete))returned_failure(section,3,ERROR_INVALID_DATA,6);
+    else {
+        packet->owner_pinned=1;packet->node_count=1;
+        ReturnedDiscovery discovery={};discovery.image=mapped;discovery.packet=packet;
+        bool complete=returned_bounded_imports(&discovery);
+        if(complete){SetLastError(ERROR_SUCCESS);complete=DetourEnumerateImportsEx(module,&discovery,returned_import_file,returned_import_function)!=FALSE;const auto error=GetLastError();if(!complete&&!discovery.error)discovery.error=error?error:ERROR_INVALID_DATA;}
+        for(size_t index=0;index<packet->slot_count;++index)if(discovery.unsupported_mask&(1u<<(packet->slots[index].operation-1)))packet->slots[index].hook=0;
+        if(!complete||!packet->callbacks_complete||discovery.error||!verified(packet))returned_failure(section,4,packet->setup_error?packet->setup_error:discovery.error?discovery.error:ERROR_PROC_NOT_FOUND,7);
+        else if(returned_route_live(packet,discovery.targets)){
+            success=returned_publish(packet,mapped,discovery.targets);
+            if(success){
+                packet->setup_stage=1;packet->setup_error=0;save_dependency_route(packet,&returned_route);
+                for(size_t index=0;index<16;++index)returned_target_proofs[index]=discovery.targets[index];
+                section->setup_stage=1;section->setup_error=0;section->setup_reason=0;
+            }else returned_failure(section,packet->setup_stage,packet->setup_error,7);
+        }else returned_failure(section,6,ERROR_RETRY,8);
+    }
+    InterlockedExchange(&returned_installed,success?2:3);
+    if(success&&!live(packet)){returned_failure(section,2,packet->setup_error,7);return false;}
+    return success;
+}
+static void returned_module_loaded(const WsaEntry* entry,bool active,HMODULE module,HANDLE file,DWORD flags){
+    auto* listener=collector.timeline;
+    if(!listener||observer_setup_active||!listener_collector.depth||listener_collector.operations[listener_collector.depth-1]!=2)return;
+    auto* section=&listener->returned_module;section->selection_count=increment(section->selection_count);
+    if(section->selection_count==UINT32_MAX)section->incomplete=1;
+    if(!module||file||flags){
+        returned_skipped(section);
+        if(!section->selected)returned_failure(section,4,!module?ERROR_MOD_NOT_FOUND:ERROR_NOT_SUPPORTED,!module?1:2);
+        return;
+    }
+    if(section->selected){
+        returned_skipped(section);
+        if(section->returned_module!=reinterpret_cast<uintptr_t>(module))returned_failure(section,9,ERROR_NOT_SUPPORTED,4);
+        return;
+    }
+    ListenerDependencyLink link={};
+    if(active)for(size_t index=0;index<listener->dependency_link_count;++index)if(listener->dependency_links[index].dependency_sequence==entry->sequence)link=listener->dependency_links[index];
+    if(!active||!link.timeline_sequence||link.parent_listener_sequence!=listener_parent()){
+        returned_skipped(section);returned_failure(section,4,ERROR_NOT_SUPPORTED,3);return;
+    }
+    section->selected=1;section->returned_module=reinterpret_cast<uintptr_t>(module);section->scope_flags=1;
+    section->parent_listener_sequence=link.parent_listener_sequence;section->loader_dependency_sequence=link.dependency_sequence;section->loader_timeline_sequence=link.timeline_sequence;
+    section->dependencies.incoming_error=entry->outgoing_error;
+    ObserverSetup setup;
+    if(returned_prepare(listener,module)){
+        section->armed=1;section->dependencies.armed=1;
+        returned_collector={};returned_collector.packet=&section->dependencies;returned_collector.timeline=listener;
+    }else returned_skipped(section);
+    section->scope_flags|=section->dependencies.scope_flags;section->incomplete|=section->dependencies.incomplete;
+}
 static void begin_listener_dependencies(ListenerPacket* packet){
     auto* dependencies=&packet->dependencies;*dependencies={};
     dependencies->version=1;dependencies->cutoff_qpc=packet->cutoff_qpc;dependencies->frequency=packet->frequency;
@@ -1033,19 +1314,27 @@ static void end_listener_dependencies(ListenerPacket* packet){
         if(collector.pending_count){packet->incomplete=1;packet->dependencies.incomplete=1;}
         collector={};
     }
+    if(returned_collector.timeline==packet){
+        if(returned_collector.pending_count){packet->returned_module.incomplete=1;packet->returned_module.dependencies.incomplete=1;}
+        returned_collector={};
+    }
+    packet->returned_module.incomplete|=packet->returned_module.dependencies.incomplete;
+    if(packet->returned_module.incomplete)packet->incomplete=1;
     if(packet->dependencies.incomplete)packet->incomplete=1;
 }
 static void listener_invoke(ListenerPacket* packet,const ListenerRequest* request,ListenerInvoke callback,void* opaque,bool ready){
     // Admission is the same original-work QPC cutoff; observation unavailability
     // never supplies a second reason to suppress or retry the Rust aggregate.
     if(!listener_live(packet,true)){errors_restore({request->incoming_win32,request->incoming_wsa});return;}
-    const ListenerCollector previous_listener=listener_collector;const Collector previous_dependencies=collector;
-    const bool occupied=previous_listener.packet||previous_dependencies.packet;
-    listener_collector={};collector={};
+    const ListenerCollector previous_listener=listener_collector;const Collector previous_dependencies=collector,previous_returned=returned_collector;
+    const bool occupied=previous_listener.packet||previous_dependencies.packet||previous_returned.packet;
+    listener_collector={};collector={};returned_collector={};
     if(occupied){
         if(previous_listener.packet)previous_listener.packet->incomplete=1;
         if(previous_dependencies.packet)previous_dependencies.packet->incomplete=1;
         if(previous_dependencies.timeline)previous_dependencies.timeline->incomplete=1;
+        if(previous_returned.packet)previous_returned.packet->incomplete=1;
+        if(previous_returned.timeline)previous_returned.timeline->incomplete=1;
         listener_failure(packet,9,ERROR_BUSY);ready=false;packet->dependency_scope_error=ERROR_BUSY;
     }
     else {
@@ -1058,7 +1347,7 @@ static void listener_invoke(ListenerPacket* packet,const ListenerRequest* reques
         const DWORD error=!clock?GetLastError():started.QuadPart<0?ERROR_INVALID_DATA:ERROR_TIMEOUT;
         packet->setup_stage=2;packet->setup_error=error?error:ERROR_INVALID_DATA;packet->incomplete=1;
         packet->clock_live=0;packet->dependency_scope_armed=0;packet->dependencies.armed=0;
-        listener_collector=previous_listener;collector=previous_dependencies;
+        listener_collector=previous_listener;collector=previous_dependencies;returned_collector=previous_returned;
         errors_restore({request->incoming_win32,request->incoming_wsa});return;
     }
     packet->started_qpc=static_cast<uint64_t>(started.QuadPart);
@@ -1071,12 +1360,14 @@ static void listener_invoke(ListenerPacket* packet,const ListenerRequest* reques
     callback(opaque,&outcome);
     const auto outgoing=errors(); // Before disarm, clocks or scalar projection.
     listener_collector={};end_listener_dependencies(packet);
-    listener_collector=previous_listener;collector=previous_dependencies;
+    listener_collector=previous_listener;collector=previous_dependencies;returned_collector=previous_returned;
     packet->outgoing_win32=outgoing.win32;packet->outgoing_wsa=outgoing.wsa;
     packet->dependencies.outgoing_error=outgoing.win32;
+    if(packet->returned_module.armed)packet->returned_module.dependencies.outgoing_error=outgoing.win32;
     LARGE_INTEGER finished={};
     if(QueryPerformanceCounter(&finished)&&finished.QuadPart>=0)packet->finished_qpc=static_cast<uint64_t>(finished.QuadPart);else packet->incomplete=1;
     packet->dependencies.finished_qpc=packet->finished_qpc;
+    if(packet->returned_module.armed)packet->returned_module.dependencies.finished_qpc=packet->finished_qpc;
     if(!outcome.kind||outcome.kind>3||outcome.raw_error_present>1||outcome.reserved)__fastfail(FAST_FAIL_FATAL_APP_EXIT);
     packet->callback_outcome=outcome.kind;packet->callback_raw_error_present=outcome.raw_error_present;packet->callback_raw_error=outcome.raw_error;
     if(outcome.kind==3)packet->incomplete=1;
@@ -1085,11 +1376,13 @@ static void listener_invoke(ListenerPacket* packet,const ListenerRequest* reques
 }
 extern "C" void memcordon_listener_trace_call(ListenerPacket* packet,const ListenerRequest* request,ListenerInvoke callback,void* opaque){
     if(!packet||!request||!callback)__fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    *packet={};packet->version=1;packet->scope_flags=1;
+    *packet={};packet->version=2;packet->returned_module.version=1;packet->scope_flags=1;
     packet->cutoff_qpc=request->cutoff_qpc;packet->frequency=request->frequency;
     packet->incoming_win32=request->incoming_win32;packet->incoming_wsa=request->incoming_wsa;
     packet->original_thread=GetCurrentThreadId();packet->listener_owner_anchor=reinterpret_cast<uintptr_t>(callback);
-    const bool ready=listener_install(packet,reinterpret_cast<void*>(callback));
+    packet->returned_module.dependencies.version=1;packet->returned_module.dependencies.cutoff_qpc=packet->cutoff_qpc;
+    packet->returned_module.dependencies.frequency=packet->frequency;packet->returned_module.dependencies.original_thread=packet->original_thread;
+    bool ready=false;{ObserverSetup setup;ready=listener_install(packet,reinterpret_cast<void*>(callback));}
     listener_invoke(packet,request,callback,opaque,ready);
 }
 
@@ -1161,9 +1454,9 @@ extern "C" uint32_t memcordon_wsa_trace_mock(uint64_t cutoff,uint64_t frequency)
     Page page={memory,system.dwPageSize,PAGE_READONLY,false};Image invalid={reinterpret_cast<uintptr_t>(memory),reinterpret_cast<uintptr_t>(memory)+system.dwPageSize,0,0,reinterpret_cast<uintptr_t>(memory),reinterpret_cast<uintptr_t>(memory)+sizeof(void*),system.dwPageSize,0,machine()};Page refused={};
     if(data_page(slot,invalid,&refused)){VirtualFree(memory,0,MEM_RELEASE);return 10;}
     if(!writable(&page,1,&packet)){VirtualFree(memory,0,MEM_RELEASE);return 11;}
-    bool good=swap(slot,reinterpret_cast<void*>(open_key),reinterpret_cast<void*>(mock_open))==reinterpret_cast<void*>(mock_open)&&*slot==reinterpret_cast<void*>(open_key);
-    good=good&&swap(slot,reinterpret_cast<void*>(mock_open),reinterpret_cast<void*>(open_key))==reinterpret_cast<void*>(open_key);
-    good=good&&swap(slot,reinterpret_cast<void*>(open_key),reinterpret_cast<void*>(mock_heap))==reinterpret_cast<void*>(mock_open)&&*slot==reinterpret_cast<void*>(mock_open);
+    bool good=swap(slot,reinterpret_cast<void*>(open_key<false>),reinterpret_cast<void*>(mock_open))==reinterpret_cast<void*>(mock_open)&&*slot==reinterpret_cast<void*>(open_key<false>);
+    good=good&&swap(slot,reinterpret_cast<void*>(mock_open),reinterpret_cast<void*>(open_key<false>))==reinterpret_cast<void*>(open_key<false>);
+    good=good&&swap(slot,reinterpret_cast<void*>(open_key<false>),reinterpret_cast<void*>(mock_heap))==reinterpret_cast<void*>(mock_open)&&*slot==reinterpret_cast<void*>(mock_open);
     restore(&page,1,&packet);MEMORY_BASIC_INFORMATION restored={};
     good=good&&VirtualQuery(memory,&restored,sizeof(restored))==sizeof(restored)&&restored.Protect==PAGE_READONLY;
     const BOOL freed=VirtualFree(memory,0,MEM_RELEASE);if(!good||!freed)return 12;
@@ -1180,8 +1473,9 @@ extern "C" uint32_t memcordon_wsa_trace_mock(uint64_t cutoff,uint64_t frequency)
 struct ListenerMock {
     std::atomic<uint32_t> calls[7];std::atomic<bool> same;
     ErrorPair incoming,outgoing;LPWSADATA data;LPWSAPROTOCOL_INFOW info;
-    const sockaddr* address;int length;bool fail[7];bool nested,dependency;
+    const sockaddr* address;int length;bool fail[7];bool nested,dependency,route_dependencies;
 };
+static void returned_mock_nested_work();
 static std::atomic<ListenerMock*> listener_mock{nullptr};
 static constexpr SOCKET listener_mock_socket=static_cast<SOCKET>(UINT64_C(0xfedcba9876543210));
 static HANDLE listener_mock_handle(){return reinterpret_cast<HANDLE>(UINT64_C(0x8877665544332211));}
@@ -1202,6 +1496,7 @@ static int WSAAPI listener_mock_startup(WORD version,LPWSADATA data){
 static SOCKET WSAAPI listener_mock_socket_call(int af,int type,int protocol,LPWSAPROTOCOL_INFOW info,GROUP group,DWORD flags){
     auto* state=listener_mock_enter(2);
     if(af!=-2||type!=3||protocol!=-4||info!=state->info||group!=0xfedcba98||flags!=0x80000001)state->same=false;
+    if(state->route_dependencies)returned_mock_nested_work();
     listener_mock_return(state);return state->fail[1]?INVALID_SOCKET:listener_mock_socket;
 }
 static BOOL WINAPI listener_mock_handle_call(HANDLE handle,DWORD mask,DWORD flags){
@@ -1231,17 +1526,18 @@ static int WSAAPI listener_mock_cleanup_call(){
     auto* state=listener_mock_enter(7);listener_mock_return(state);return state->fail[6]?SOCKET_ERROR:0;
 }
 struct ListenerMockScope {
-    ListenerCollector previous_listener;Collector previous_dependencies;
+    ListenerCollector previous_listener;Collector previous_dependencies,previous_returned;
     ~ListenerMockScope(){
-        listener_collector=previous_listener;collector=previous_dependencies;
+        listener_collector=previous_listener;collector=previous_dependencies;returned_collector=previous_returned;
         listener_private_route.store(nullptr,std::memory_order_release);listener_mock.store(nullptr,std::memory_order_release);
         // No real route was published, and permanent originals were never set.
         InterlockedExchange(&listener_installed,0);
     }
 };
 static void listener_mock_packet(ListenerPacket* packet,uint64_t cutoff,uint64_t frequency){
-    *packet={};packet->version=1;packet->cutoff_qpc=cutoff;packet->frequency=frequency;packet->original_thread=GetCurrentThreadId();
-    listener_collector={};listener_collector.packet=packet;collector={};
+    *packet={};packet->version=2;packet->returned_module.version=1;packet->cutoff_qpc=cutoff;packet->frequency=frequency;packet->original_thread=GetCurrentThreadId();
+    packet->returned_module.dependencies.version=1;packet->returned_module.dependencies.cutoff_qpc=cutoff;packet->returned_module.dependencies.frequency=frequency;packet->returned_module.dependencies.original_thread=packet->original_thread;
+    listener_collector={};listener_collector.packet=packet;collector={};returned_collector={};
 }
 static void listener_mock_dependencies(ListenerPacket* packet){
     packet->dependencies={};packet->dependencies.version=1;
@@ -1258,9 +1554,171 @@ static void listener_mock_callback(void* opaque,ListenerOutcome* outcome){
     if(listener_close(listener_mock_socket)!=(state->fail[5]?SOCKET_ERROR:0))state->same=false;
     *outcome={2,1,2,0};
 }
+struct ReturnedMock {
+    std::atomic<uint32_t> ws2_calls,provider_calls,loader_calls;
+    std::atomic<bool> same;ErrorPair incoming,outgoing;bool nested,fail;
+    LPCWSTR path;HMODULE module;
+};
+static std::atomic<ReturnedMock*> returned_mock{nullptr};
+static ReturnedMock* returned_mock_enter(void* handle,ULONG flags,SIZE_T size){
+    const auto incoming=errors();auto* state=returned_mock.load(std::memory_order_acquire);
+    if(!state)__fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    if(handle!=reinterpret_cast<void*>(0x3210)||flags!=0x1234||size!=(UINT64_C(1)<<40)||!same_errors(incoming,state->incoming))state->same=false;
+    return state;
+}
+static void* NTAPI returned_mock_provider_heap(void* handle,ULONG flags,SIZE_T size){
+    auto* state=returned_mock_enter(handle,flags,size);++state->provider_calls;
+    errors_restore(state->outgoing);return state->fail?nullptr:reinterpret_cast<void*>(0x2222);
+}
+static void* NTAPI returned_mock_ws2_heap(void* handle,ULONG flags,SIZE_T size){
+    auto* state=returned_mock_enter(handle,flags,size);++state->ws2_calls;
+    if(state->nested&&heap<true>(handle,flags,size)!=reinterpret_cast<void*>(0x2222))state->same=false;
+    errors_restore(state->outgoing);return reinterpret_cast<void*>(0x1111);
+}
+static HMODULE WINAPI returned_mock_loader(LPCWSTR path,HANDLE file,DWORD flags){
+    const auto incoming=errors();auto* state=returned_mock.load(std::memory_order_acquire);++state->loader_calls;
+    if(path!=state->path||file||flags||!same_errors(incoming,state->incoming))state->same=false;
+    errors_restore(state->outgoing);return state->module;
+}
+static void returned_mock_nested_work(){
+    auto* state=returned_mock.load(std::memory_order_acquire);
+    if(heap<false>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40)!=reinterpret_cast<void*>(0x1111))state->same=false;
+}
+struct ReturnedMockScope {
+    ListenerCollector previous_listener;Collector previous_ws2,previous_returned;bool previous_setup;
+    bool owns_ws2,owns_returned;
+    ~ReturnedMockScope(){
+        dependency_private_routes[0].store(nullptr,std::memory_order_release);dependency_private_routes[1].store(nullptr,std::memory_order_release);returned_mock.store(nullptr,std::memory_order_release);
+        listener_collector=previous_listener;collector=previous_ws2;returned_collector=previous_returned;observer_setup_active=previous_setup;
+        // These states protected private mocks only; no live route was installed
+        // and neither permanent original table was written or cleared.
+        if(owns_returned)InterlockedExchange(&returned_installed,0);
+        if(owns_ws2)InterlockedExchange(&installed,0);
+    }
+};
+static void returned_mock_packets(ListenerPacket* packet,uint64_t cutoff,uint64_t frequency){
+    listener_mock_packet(packet,cutoff,frequency);listener_mock_dependencies(packet);
+    auto* section=&packet->returned_module;section->dependencies.version=1;
+    section->dependencies.cutoff_qpc=cutoff;section->dependencies.frequency=frequency;section->dependencies.original_thread=packet->original_thread;
+    returned_collector={};returned_collector.packet=&section->dependencies;returned_collector.timeline=packet;
+}
+static DWORD WINAPI returned_mock_thread(void*){
+    auto* state=returned_mock.load(std::memory_order_acquire);errors_restore(state->incoming);
+    const auto result=heap<true>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40);const auto outgoing=errors();
+    return result==reinterpret_cast<void*>(0x2222)&&same_errors(outgoing,state->outgoing)&&!returned_collector.packet&&!collector.packet&&!listener_collector.packet?0:1;
+}
+struct ReturnedMockCallback {ListenerPacket* packet;ReturnedMock* state;uint32_t kind,calls;};
+static void returned_mock_callback(void* opaque,ListenerOutcome* outcome){
+    auto* invocation=static_cast<ReturnedMockCallback*>(opaque);++invocation->calls;
+    // Private collector injection verifies the real callback exit/disarm path;
+    // it neither installs a route nor invokes a Rust constructor or startup.
+    collector={};collector.packet=&invocation->packet->dependencies;collector.timeline=invocation->packet;
+    returned_collector={};returned_collector.packet=&invocation->packet->returned_module.dependencies;returned_collector.timeline=invocation->packet;
+    if(heap<true>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40)!=reinterpret_cast<void*>(0x2222))invocation->state->same=false;
+    *outcome={invocation->kind,invocation->kind==2?1u:0u,invocation->kind==2?2:0,0};
+    errors_restore(invocation->state->outgoing);
+}
+static uint32_t returned_native_mock(ListenerPacket* packet,ListenerMock* listener,uint64_t cutoff,uint64_t frequency){
+    ReturnedMockScope scope={listener_collector,collector,returned_collector,observer_setup_active,false,false};
+    if(InterlockedCompareExchange(&installed,1,0)!=0)return 17;scope.owns_ws2=true;
+    if(InterlockedCompareExchange(&returned_installed,1,0)!=0)return 17;scope.owns_returned=true;
+    for(const auto& target:returned_originals)if(target.load(std::memory_order_acquire))return 17;
+    ReturnedMock state={};state.same=true;state.incoming=listener->incoming;state.outgoing=listener->outgoing;
+    const WCHAR path[]={L'p',L'r',L'i',L'v',L'a',L't',L'e',0};state.path=path;state.module=reinterpret_cast<HMODULE>(UINT64_C(0x1234567887650000));
+    DependencyPrivateRoute ws2={},provider={};ws2.targets[8]=reinterpret_cast<void*>(returned_mock_ws2_heap);provider.targets[8]=reinterpret_cast<void*>(returned_mock_provider_heap);
+    ws2.targets[11]=reinterpret_cast<void*>(returned_mock_loader);provider.targets[11]=reinterpret_cast<void*>(returned_mock_loader);
+    returned_mock.store(&state,std::memory_order_release);dependency_private_routes[0].store(&ws2,std::memory_order_release);dependency_private_routes[1].store(&provider,std::memory_order_release);
+    returned_mock_packets(packet,cutoff,frequency);state.nested=true;listener->route_dependencies=true;
+    errors_restore(state.incoming);const auto socket=listener_socket(-2,3,-4,listener->info,0xfedcba98,0x80000001);const auto outgoing=errors();listener->route_dependencies=false;
+    if(socket!=INVALID_SOCKET||!same_errors(outgoing,state.outgoing)||!state.same||state.ws2_calls!=1||state.provider_calls!=1||packet->next_sequence!=6||packet->dependencies.total_calls!=1||packet->returned_module.dependencies.total_calls!=1||packet->dependency_links[0].dependency_sequence!=1||packet->dependency_links[0].timeline_sequence!=2||packet->returned_module.links[0].dependency_sequence!=1||packet->returned_module.links[0].timeline_sequence!=3||packet->dependency_links[0].parent_listener_sequence!=1||packet->returned_module.links[0].parent_listener_sequence!=1||packet->entries[0].completion_sequence!=6)return 18;
+    if(packet->dependencies.entries[0].raw_output!=0x1111||packet->returned_module.dependencies.entries[0].raw_output!=0x2222)return 18;
+    state.nested=false;
+    // All three namespaces suppress setup-caused reentry without suppressing
+    // the exact typed originals or changing either reachable error channel.
+    returned_mock_packets(packet,cutoff,frequency);const auto before_ws2=state.ws2_calls.load(),before_provider=state.provider_calls.load(),before_listener=listener->calls[5].load();
+    observer_setup_active=true;
+    errors_restore(state.incoming);const auto ws2_value=heap<false>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40);const auto ws2_errors=errors();
+    errors_restore(state.incoming);const auto provider_value=heap<true>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40);const auto provider_errors=errors();
+    errors_restore(state.incoming);const auto closed=listener_close(listener_mock_socket);const auto close_errors=errors();
+    errors_restore(state.incoming);const auto loaded=load_library<false>(state.path,nullptr,0);const auto loader_errors=errors();observer_setup_active=false;
+    if(ws2_value!=reinterpret_cast<void*>(0x1111)||provider_value!=reinterpret_cast<void*>(0x2222)||closed!=SOCKET_ERROR||loaded!=state.module||!same_errors(ws2_errors,state.outgoing)||!same_errors(provider_errors,state.outgoing)||!same_errors(close_errors,state.outgoing)||!same_errors(loader_errors,state.outgoing)||state.ws2_calls!=before_ws2+1||state.provider_calls!=before_provider+1||listener->calls[5]!=before_listener+1||state.loader_calls!=1||packet->total_calls||packet->dependencies.total_calls||packet->returned_module.dependencies.total_calls||packet->returned_module.selection_count||packet->next_sequence)return 19;
+    // A provider loader is recorded in its own namespace but never nominates
+    // another returned module, even while the active parent is WSASocketW.
+    listener_collector.depth=1;listener_collector.operations[0]=2;listener_collector.parents[0]=1;packet->next_sequence=1;
+    errors_restore(state.incoming);if(load_library<true>(state.path,nullptr,0)!=state.module||packet->returned_module.selection_count||packet->returned_module.dependencies.entries[0].raw_output!=reinterpret_cast<uintptr_t>(state.module))return 20;
+    // Unsupported/missing-link/capacity cases use the same selection helper.
+    returned_mock_packets(packet,cutoff,frequency);listener_collector.depth=1;listener_collector.operations[0]=2;listener_collector.parents[0]=1;
+    WsaEntry loader={};loader.sequence=1;
+    returned_module_loaded(&loader,false,nullptr,nullptr,0);
+    if(packet->returned_module.selected||packet->returned_module.setup_reason!=1||packet->returned_module.selection_count!=1||packet->returned_module.skipped_count!=1)return 20;
+    returned_module_loaded(&loader,false,state.module,reinterpret_cast<HANDLE>(1),0);
+    if(packet->returned_module.selected||packet->returned_module.setup_reason!=2)return 20;
+    returned_module_loaded(&loader,false,state.module,nullptr,0);
+    if(packet->returned_module.selected||packet->returned_module.setup_reason!=3||packet->returned_module.returned_module)return 20;
+    packet->returned_module.selected=1;packet->returned_module.returned_module=reinterpret_cast<uintptr_t>(state.module);
+    returned_module_loaded(&loader,true,reinterpret_cast<HMODULE>(0x9999),nullptr,0);
+    if(packet->returned_module.setup_reason!=4||packet->returned_module.returned_module!=reinterpret_cast<uintptr_t>(state.module))return 20;
+    // A captured successful original loader remains unchanged when its optional
+    // observer preparation has no time. No module pin/load is attempted here.
+    returned_mock_packets(packet,0,frequency);listener_collector.depth=1;listener_collector.operations[0]=2;listener_collector.parents[0]=1;
+    packet->next_sequence=3;packet->dependency_link_count=1;packet->dependency_links[0]={1,2,1};
+    loader.operation=12;loader.entered=1;loader.returned=1;loader.thread_id=packet->original_thread;loader.raw_output=reinterpret_cast<uintptr_t>(state.module);loader.output_flags=3;loader.scalar_flags=4;
+    returned_module_loaded(&loader,true,state.module,nullptr,0);
+    if(packet->returned_module.selected!=1||packet->returned_module.armed||packet->returned_module.setup_stage!=2||packet->returned_module.setup_error!=ERROR_TIMEOUT||packet->returned_module.loader_dependency_sequence!=1||packet->returned_module.loader_timeline_sequence!=2||packet->returned_module.parent_listener_sequence!=1||packet->returned_module.dependencies.called)return 21;
+    // Expired recording and foreign-thread cold forwarding still use this
+    // route's own immutable-typed mock target once, without a record.
+    errors_restore(state.incoming);const auto expired=heap<true>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40);const auto expired_errors=errors();
+    if(expired!=reinterpret_cast<void*>(0x2222)||!same_errors(expired_errors,state.outgoing)||packet->returned_module.dependencies.total_calls)return 21;
+    // Keep the original thread armed: the new thread must have independent
+    // empty TLS, rather than merely inherit a process-wide disabled observer.
+    returned_mock_packets(packet,cutoff,frequency);
+    HANDLE thread=CreateThread(nullptr,0,returned_mock_thread,nullptr,0,nullptr);if(!thread)return 22;
+    LARGE_INTEGER now={};if(!QueryPerformanceCounter(&now)||now.QuadPart<0||static_cast<uint64_t>(now.QuadPart)>=cutoff||!frequency){CloseHandle(thread);__fastfail(FAST_FAIL_FATAL_APP_EXIT);}
+    const auto ticks=cutoff-static_cast<uint64_t>(now.QuadPart);if(ticks>UINT64_MAX/1000){CloseHandle(thread);__fastfail(FAST_FAIL_FATAL_APP_EXIT);}
+    const auto remaining=ticks*1000/frequency;
+    if(WaitForSingleObject(thread,remaining>MAXDWORD-1?MAXDWORD-1:static_cast<DWORD>(remaining))!=WAIT_OBJECT_0){CloseHandle(thread);__fastfail(FAST_FAIL_FATAL_APP_EXIT);}
+    DWORD status=1;const BOOL queried=GetExitCodeThread(thread,&status);CloseHandle(thread);if(!queried||status||!state.same||returned_collector.packet!=&packet->returned_module.dependencies||packet->returned_module.dependencies.total_calls||packet->dependencies.total_calls||packet->next_sequence)return 22;
+    // Ordinal resolution requires unique typed identity, not fixed ordinals or
+    // merely a non-null current target. All16 candidate exports are bounded.
+    void* exports[16]={};exports[8]=provider.targets[8];
+    if(typed_ordinal_operation(nullptr,provider.targets[8],exports,16)||typed_ordinal_operation(provider.targets[8],ws2.targets[8],exports,16)||typed_ordinal_operation(provider.targets[8],provider.targets[8],exports,16)!=9)return 23;
+    exports[9]=exports[8];if(typed_ordinal_operation(provider.targets[8],provider.targets[8],exports,16)!=17)return 23;
+    // Link eviction remains aligned with the returned packet's local ring.
+    returned_mock_packets(packet,cutoff,frequency);state.fail=true;
+    for(size_t index=0;index<20;++index){errors_restore(state.incoming);if(heap<true>(reinterpret_cast<void*>(0x3210),0x1234,UINT64_C(1)<<40))return 24;}
+    if(packet->returned_module.link_count!=16||packet->returned_module.links_dropped!=4||packet->returned_module.dependencies.record_count!=16||packet->returned_module.dependencies.dropped!=4||packet->returned_module.dependencies.total_failures!=20||packet->returned_module.first_failure_link.dependency_sequence!=1||packet->returned_module.first_failure_link.timeline_sequence!=1||packet->returned_module.dependencies.first_failure.sequence!=1)return 24;
+    for(size_t index=0;index<16;++index)if(packet->returned_module.links[index].dependency_sequence!=packet->returned_module.dependencies.entries[index].sequence||packet->returned_module.links[index].timeline_sequence!=index*2+9)return 24;
+    end_listener_dependencies(packet);if(collector.packet||returned_collector.packet||collector.timeline||returned_collector.timeline)return 24;
+    state.fail=false;listener_collector={};
+    // Exercise the actual returned-route owned-slot rollback and page restore
+    // helpers on a private data page, including an untouched foreign conflict.
+    SYSTEM_INFO system={};GetSystemInfo(&system);void* memory=VirtualAlloc(nullptr,system.dwPageSize,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);if(!memory)return 25;
+    auto** slots=static_cast<void**>(memory);slots[0]=provider.targets[8];slots[1]=ws2.targets[8];DWORD previous=0;
+    if(!VirtualProtect(memory,system.dwPageSize,PAGE_READONLY,&previous)){VirtualFree(memory,0,MEM_RELEASE);return 25;}
+    WsaPacket rollback={};rollback.cutoff_qpc=cutoff;rollback.frequency=frequency;Page page={memory,system.dwPageSize,PAGE_READONLY,false};
+    if(!writable(&page,1,&rollback)){VirtualFree(memory,0,MEM_RELEASE);return 25;}
+    bool good=swap(&slots[0],returned_hooks[8].target,provider.targets[8])==provider.targets[8];
+    rollback.slot_count=2;rollback.slots[0]={reinterpret_cast<uintptr_t>(&slots[0]),reinterpret_cast<uintptr_t>(provider.targets[8]),reinterpret_cast<uintptr_t>(returned_hooks[8].target),0,9,1,0,0};
+    rollback.slots[1]={reinterpret_cast<uintptr_t>(&slots[1]),reinterpret_cast<uintptr_t>(provider.targets[8]),reinterpret_cast<uintptr_t>(returned_hooks[8].target),0,9,0,0,0};
+    good=good&&swap(&slots[1],returned_hooks[8].target,provider.targets[8])==ws2.targets[8]&&slots[1]==ws2.targets[8];returned_rollback(&rollback);
+    good=good&&slots[0]==provider.targets[8]&&slots[1]==ws2.targets[8]&&!rollback.slots[0].published&&rollback.slots[0].restored&&!rollback.slots[1].restored;
+    restore(&page,1,&rollback);MEMORY_BASIC_INFORMATION restored={};good=good&&VirtualQuery(memory,&restored,sizeof(restored))==sizeof(restored)&&restored.Protect==PAGE_READONLY;
+    const BOOL freed=VirtualFree(memory,0,MEM_RELEASE);if(!good||!freed||!rollback.protections_restored)return 25;
+    // Scalar caught-panic and ordinary-error exits both detach the independent
+    // collectors and invoke their original opaque callback once.
+    for(uint32_t kind=2;kind<=3;++kind){
+        listener_mock_packet(packet,cutoff,frequency);listener_collector={};
+        packet->dependencies.version=1;packet->dependencies.cutoff_qpc=cutoff;packet->dependencies.frequency=frequency;
+        const ListenerRequest request={cutoff,frequency,state.incoming.win32,state.incoming.wsa};ReturnedMockCallback callback={packet,&state,kind,0};
+        listener_invoke(packet,&request,returned_mock_callback,&callback,false);const auto returned=errors();
+        if(callback.calls!=1||packet->called!=1||packet->callback_outcome!=kind||!same_errors(returned,state.outgoing)||collector.packet||returned_collector.packet||listener_collector.packet||!state.same)return 26;
+    }
+    for(const auto& target:returned_originals)if(target.load(std::memory_order_acquire))return 24;
+    return 0;
+}
 extern "C" uint32_t memcordon_listener_trace_mock(uint64_t cutoff,uint64_t frequency){
     if(InterlockedCompareExchange(&listener_installed,1,0)!=0)return 1;
-    ListenerMockScope scope={listener_collector,collector};
+    ListenerMockScope scope={listener_collector,collector,returned_collector};
     for(const auto& original:listener_originals)if(original.load(std::memory_order_acquire))return 1;
     ListenerPacket packet={};listener_mock_packet(&packet,cutoff,frequency);if(!listener_live(&packet))return 2;
     ListenerMock state={};state.same=true;WSADATA data={};uint8_t address[40]={};
@@ -1390,5 +1848,6 @@ extern "C" uint32_t memcordon_listener_trace_mock(uint64_t cutoff,uint64_t frequ
     listener_invoke(&stopped,&expired,listener_mock_callback,&state,false);const auto stopped_errors=errors();
     if(stopped.called||stopped.callback_outcome||stopped.callback_raw_error_present||stopped.setup_stage!=2||stopped.setup_error!=ERROR_TIMEOUT||state.calls[5]!=before+1||!same_errors(stopped_errors,state.incoming))return 16;
     for(const auto& original:listener_originals)if(original.load(std::memory_order_acquire))return 14;
+    const auto returned_failed=returned_native_mock(&packet,&state,cutoff,frequency);if(returned_failed)return returned_failed;
     return 0;
 }
