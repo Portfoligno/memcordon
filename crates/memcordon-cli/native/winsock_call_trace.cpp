@@ -755,8 +755,20 @@ struct ListenerRoute {
 static ListenerRoute listener_route={};
 struct ListenerDiscovery {
     Image image;ListenerPacket* packet;HMODULE descriptor;DWORD error;
-    WsaNode targets[7];uint32_t unsupported_mask;
+    WsaNode targets[7];uint32_t unsupported_mask;uintptr_t original_thunk,first_thunk;size_t thunk_index;
 };
+// An ordinal is only a representation of an already typed, uniquely identified
+// SDK export. Neither the ordinal number nor a matching address alone admits it.
+static size_t listener_ordinal_operation(void* resolved,void* target,void* const* exports){
+    if(!resolved||resolved!=target)return 0;
+    size_t selected=0;
+    for(size_t operation=0;operation<7;++operation){
+        if(!exports[operation]||exports[operation]!=resolved)continue;
+        if(selected)return 8;
+        selected=operation+1;
+    }
+    return selected;
+}
 static bool listener_bounded_imports(ListenerDiscovery* state){
     __try {
         const auto& mapped=state->image;size_t functions=0;
@@ -781,25 +793,54 @@ static bool listener_bounded_imports(ListenerDiscovery* state){
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
     return false;
 }
-static BOOL CALLBACK listener_import_file(void* context,HMODULE module,LPCSTR name){
+static BOOL CALLBACK listener_import_file(void* context,HMODULE,LPCSTR name){
     auto* state=static_cast<ListenerDiscovery*>(context);
     if(!name){state->packet->callbacks_complete=state->error==ERROR_SUCCESS;return FALSE;}
     if(state->error)return FALSE;
     if(++state->packet->descriptor_count>256||!listener_live(state->packet)){state->error=state->packet->setup_error?state->packet->setup_error:ERROR_BUFFER_OVERFLOW;return FALSE;}
-    state->descriptor=module;return TRUE;
+    __try {
+        const auto address=state->image.imports+(state->packet->descriptor_count-1)*sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if(!range(address,sizeof(IMAGE_IMPORT_DESCRIPTOR),state->image.imports,state->image.imports_end)||!readable(address,sizeof(IMAGE_IMPORT_DESCRIPTOR),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        const auto* declared=reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(address);
+        if(!declared->OriginalFirstThunk||!declared->FirstThunk||!declared->Name||reinterpret_cast<uintptr_t>(name)!=state->image.base+declared->Name||!bounded_name(name,state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        // Detours supplies the owner of the first resolved target, which can
+        // differ from the declared DLL when that first export is forwarded.
+        // Resolve only this existing declared module; never load another DLL.
+        state->descriptor=GetModuleHandleA(name);HMODULE pinned=nullptr;
+        if(state->descriptor&&(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(state->descriptor),&pinned)||pinned!=state->descriptor))state->descriptor=nullptr;
+        state->original_thunk=state->image.base+declared->OriginalFirstThunk;
+        state->first_thunk=state->image.base+declared->FirstThunk;state->thunk_index=0;
+        return TRUE;
+    } __except(EXCEPTION_EXECUTE_HANDLER){state->error=ERROR_INVALID_ADDRESS;state->packet->incomplete=1;return FALSE;}
 }
-static BOOL CALLBACK listener_import_function(void* context,DWORD,LPCSTR name,void** slot){
+static BOOL CALLBACK listener_import_function(void* context,DWORD ordinal,LPCSTR name,void** slot){
     auto* state=static_cast<ListenerDiscovery*>(context);auto* packet=state->packet;
     __try {
-    if(!slot)return state->error==ERROR_SUCCESS;
     if(state->error)return FALSE;
+    if(state->thunk_index>=4096){state->error=ERROR_BUFFER_OVERFLOW;return FALSE;}
+    const auto thunk_address=state->original_thunk+state->thunk_index*sizeof(IMAGE_THUNK_DATA64);
+    if(!readable(thunk_address,sizeof(IMAGE_THUNK_DATA64),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+    const auto thunk=reinterpret_cast<const IMAGE_THUNK_DATA64*>(thunk_address)->u1.Ordinal;
+    if(!slot){if(thunk||ordinal||name)state->error=ERROR_INVALID_DATA;return state->error==ERROR_SUCCESS;}
     if(++packet->function_count>16384||!listener_live(packet)){state->error=packet->setup_error?packet->setup_error:ERROR_BUFFER_OVERFLOW;return FALSE;}
-    if(!name)return TRUE;
-    if(!bounded_name(name,state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+    const auto address=reinterpret_cast<uintptr_t>(slot);
+    if(!thunk||address!=state->first_thunk+state->thunk_index*sizeof(void*)||!range(address,sizeof(void*),state->image.iat,state->image.iat_end)||!readable(address,sizeof(void*),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+    ++state->thunk_index;
+    size_t ordinal_operation=0;
+    if(IMAGE_SNAP_BY_ORDINAL64(thunk)){
+        if(name||!ordinal||ordinal>UINT16_MAX||IMAGE_ORDINAL64(thunk)!=ordinal||(thunk&~(IMAGE_ORDINAL_FLAG64|UINT64_C(0xffff)))){state->error=ERROR_INVALID_DATA;return FALSE;}
+        if(state->descriptor){
+            void* exports[7]={};for(size_t operation=0;operation<7;++operation)exports[operation]=reinterpret_cast<void*>(GetProcAddress(state->descriptor,listener_hooks[operation].name));
+            void* resolved=reinterpret_cast<void*>(GetProcAddress(state->descriptor,MAKEINTRESOURCEA(static_cast<WORD>(ordinal))));
+            ordinal_operation=listener_ordinal_operation(resolved,*slot,exports);
+            if(!resolved||resolved!=*slot){packet->incomplete=1;packet->scope_flags|=2;}
+        }else{packet->incomplete=1;packet->scope_flags|=2;}
+        if(ordinal_operation>7){packet->incomplete=1;packet->scope_flags|=2;return TRUE;}
+        if(!ordinal_operation)return TRUE;
+    }else if(ordinal||!name||thunk>UINT32_MAX||reinterpret_cast<uintptr_t>(name)!=state->image.base+static_cast<uint32_t>(thunk)+sizeof(WORD)||!bounded_name(name,state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
     for(size_t operation=0;operation<7;++operation){
-        if(!equals(name,listener_hooks[operation].name,state->image))continue;
+        if(ordinal_operation?ordinal_operation!=operation+1:!equals(name,listener_hooks[operation].name,state->image))continue;
         const uint32_t bit=1u<<operation;packet->discovered_mask|=bit;
-        const auto address=reinterpret_cast<uintptr_t>(slot);
         if(packet->slot_count==16){state->error=ERROR_BUFFER_OVERFLOW;return FALSE;}
         auto& selected=packet->slots[packet->slot_count++];selected.slot=address;selected.operation=static_cast<uint32_t>(operation+1);selected.descriptor_module=reinterpret_cast<uintptr_t>(state->descriptor);
         Page page={};
@@ -1227,6 +1268,17 @@ extern "C" uint32_t memcordon_listener_trace_mock(uint64_t cutoff,uint64_t frequ
     state.data=&data;state.info=reinterpret_cast<LPWSAPROTOCOL_INFOW>(0x1234);state.address=reinterpret_cast<const sockaddr*>(address);state.length=sizeof(address);
     state.incoming=seed_listener_error(0x4321);state.outgoing=seed_listener_error(0x5678);
     const ListenerPrivateRoute private_route={{reinterpret_cast<void*>(listener_mock_startup),reinterpret_cast<void*>(listener_mock_socket_call),reinterpret_cast<void*>(listener_mock_handle_call),reinterpret_cast<void*>(listener_mock_bind_call),reinterpret_cast<void*>(listener_mock_listen_call),reinterpret_cast<void*>(listener_mock_close_call),reinterpret_cast<void*>(listener_mock_cleanup_call)}};
+    // Exercise the production ordinal-to-typed-export join without publishing
+    // any slot. A wrong resolution/slot/module export set or ambiguous alias
+    // must never select a forwarder, even when one address happens to match.
+    void* exports[7]={};for(size_t operation=0;operation<7;++operation)exports[operation]=private_route.targets[operation];
+    for(size_t operation=0;operation<7;++operation){
+        if(listener_ordinal_operation(exports[operation],exports[operation],exports)!=operation+1)return 17;
+        if(listener_ordinal_operation(exports[operation],exports[(operation+1)%7],exports))return 17;
+    }
+    if(listener_ordinal_operation(nullptr,exports[0],exports))return 17;
+    void* foreign[7]={};if(listener_ordinal_operation(exports[0],exports[0],foreign))return 17;
+    exports[1]=exports[0];if(listener_ordinal_operation(exports[0],exports[0],exports)!=8)return 17;
     listener_mock.store(&state,std::memory_order_release);listener_private_route.store(&private_route,std::memory_order_release);
     errors_restore(state.incoming);const int startup=listener_startup(0x202,&data);const auto startup_errors=errors();
     errors_restore(state.incoming);const SOCKET socket=listener_socket(-2,3,-4,state.info,0xfedcba98,0x80000001);const auto socket_errors=errors();
