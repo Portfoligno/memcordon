@@ -32,6 +32,7 @@ tempfile.workspace = true
 memcordon-windows-launch-core = { path = "../memcordon-windows-launch-core", version = "=0.5.8-dev", optional = true }
 windows-sys = { workspace = true, features = [
     "Wdk_Foundation",
+    "Wdk_System_Registry",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",

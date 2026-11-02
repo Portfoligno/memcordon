@@ -21,6 +21,68 @@ const MAX_KEYS: usize = 256;
 const MAX_VALUES: usize = 4096;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
+fn set_value_exact(key: HKEY, value: &ValueRecord, deadline: Instant) -> io::Result<()> {
+    use windows_sys::{Wdk::System::Registry::NtSetValueKey, Win32::Foundation::UNICODE_STRING};
+    let name_bytes = value
+        .name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "counted registry value name exceeds native extent",
+            )
+        })?;
+    if value.name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "counted registry value name contains NUL",
+        ));
+    }
+    let data_bytes = u32::try_from(value.bytes.len()).map_err(io::Error::other)?;
+    let mut name = value.name.clone();
+    let counted = UNICODE_STRING {
+        Length: name_bytes,
+        MaximumLength: name_bytes,
+        Buffer: if name.is_empty() {
+            ptr::null_mut()
+        } else {
+            name.as_mut_ptr()
+        },
+    };
+    live(deadline)?;
+    // SAFETY: the private caller retains this newly owned setup key. Both
+    // counted buffers remain live for this synchronous input-only native call.
+    let status = unsafe {
+        NtSetValueKey(
+            key,
+            &counted,
+            0,
+            value.kind,
+            if value.bytes.is_empty() {
+                ptr::null()
+            } else {
+                value.bytes.as_ptr().cast()
+            },
+            data_bytes,
+        )
+    };
+    let written = if status < 0 {
+        Err(io::Error::other(format!(
+            "phase=projection/value-copy; api=NtSetValueKey; native-error-domain=NTSTATUS; native-code={status} ({status:#010x}); requested-mask={KEY_SET_VALUE}; name-bytes={name_bytes}; data-bytes={data_bytes}"
+        )))
+    } else {
+        Ok(())
+    };
+    match (written, live(deadline)) {
+        (Err(primary), Err(secondary)) => Err(failures(primary, secondary)),
+        (Err(primary), _) => Err(primary),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
@@ -1017,6 +1079,14 @@ impl Projection {
         self.root.raw()
     }
     pub fn create(unique: &str, deadline: Instant, cleanup_deadline: Instant) -> io::Result<Self> {
+        Self::create_with_roundtrip(unique, deadline, cleanup_deadline, false)
+    }
+    fn create_with_roundtrip(
+        unique: &str,
+        deadline: Instant,
+        cleanup_deadline: Instant,
+        native_roundtrip: bool,
+    ) -> io::Result<Self> {
         live(deadline)?;
         if cleanup_deadline < deadline {
             return Err(io::Error::other(
@@ -1118,7 +1188,12 @@ impl Projection {
             root_security: Vec::new(),
         };
         let populated = at(
-            projection.populate(&mut attributes),
+            (if native_roundtrip {
+                projection.exact_value_self_check()
+            } else {
+                Ok(())
+            })
+            .and_then(|()| projection.populate(&mut attributes)),
             "projection/populate-seal",
             "populate",
             "boundary",
@@ -1199,22 +1274,11 @@ impl Projection {
                 self.nodes.push(key);
             }
             for value in &entry.values {
-                live(self.deadline)?;
-                let mut name = value.name.clone();
-                name.push(0);
-                status_at(
-                    unsafe {
-                        RegSetValueExW(
-                            parent,
-                            name.as_ptr(),
-                            0,
-                            value.kind,
-                            value.bytes.as_ptr(),
-                            value.bytes.len() as u32,
-                        )
-                    },
+                at(
+                    set_value_exact(parent, value, self.deadline),
                     "projection/value-copy",
-                    "RegSetValueExW",
+                    "NtSetValueKey",
+                    "NTSTATUS",
                     Some(KEY_SET_VALUE),
                 )?;
             }
@@ -1278,6 +1342,212 @@ impl Projection {
             LocalFree(sd);
         }
         sealed
+    }
+    fn exact_value_self_check(&mut self) -> io::Result<()> {
+        if self.sealed {
+            return Err(io::Error::other(
+                "native value-copy probe requires an unsealed owned parent",
+            ));
+        }
+        // The native-only constructor calls this while the fresh parent is
+        // still mutable, before population or sealing. Retain the disposable
+        // child in held cleanup before any fallible write/readback work.
+        let reader = sid_text(&self.reader_sid, self.deadline)?;
+        let sddl = wide(&format!("D:P(A;;KA;;;SY)(A;;KA;;;OW)(A;;KA;;;{reader})"));
+        let mut descriptor = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return at(
+                Err(io::Error::last_os_error()),
+                "selfcheck/value-copy-security",
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                "Win32",
+                None,
+            );
+        }
+        struct Security(*mut std::ffi::c_void);
+        impl Drop for Security {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        let descriptor = Security(descriptor);
+        if descriptor.0.is_null() {
+            return Err(io::Error::other(
+                "native value-copy probe security descriptor is null",
+            ));
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let mut raw = ptr::null_mut();
+        let mut disposition = 0;
+        live(self.deadline)?;
+        status_at(
+            unsafe {
+                RegCreateKeyExW(
+                    self.root.raw(),
+                    wide("value-copy-native-self-check").as_ptr(),
+                    0,
+                    ptr::null(),
+                    REG_OPTION_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    &attributes,
+                    &mut raw,
+                    &mut disposition,
+                )
+            },
+            "selfcheck/value-copy-key-create",
+            "RegCreateKeyExW",
+            Some(KEY_ALL_ACCESS),
+        )?;
+        let owned = OwnedKey(raw);
+        if disposition != REG_CREATED_NEW_KEY {
+            return Err(io::Error::other(
+                "native value-copy probe unexpectedly existed",
+            ));
+        }
+        self.nodes.push(owned);
+        let key = self
+            .nodes
+            .last()
+            .expect("new value-copy key is retained")
+            .raw();
+        let tested = (|| -> io::Result<()> {
+            let bytes = |units: &[u16]| {
+                units
+                    .iter()
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>()
+            };
+            let unterminated = "counted native value".encode_utf16().collect::<Vec<_>>();
+            let mut terminated = unterminated.clone();
+            terminated.push(0);
+            let values = [
+                ValueRecord {
+                    name: "expand-unterminated".encode_utf16().collect(),
+                    kind: REG_EXPAND_SZ,
+                    bytes: bytes(&unterminated),
+                },
+                ValueRecord {
+                    name: "expand-terminated".encode_utf16().collect(),
+                    kind: REG_EXPAND_SZ,
+                    bytes: bytes(&terminated),
+                },
+                ValueRecord {
+                    name: "string".encode_utf16().collect(),
+                    kind: REG_SZ,
+                    bytes: bytes(&terminated),
+                },
+                ValueRecord {
+                    name: "multi-string".encode_utf16().collect(),
+                    kind: REG_MULTI_SZ,
+                    bytes: bytes(&[b'a' as u16, 0, b'b' as u16, 0, 0]),
+                },
+                ValueRecord {
+                    name: "empty-binary".encode_utf16().collect(),
+                    kind: REG_BINARY,
+                    bytes: Vec::new(),
+                },
+                ValueRecord {
+                    name: Vec::new(),
+                    kind: REG_BINARY,
+                    bytes: vec![1, 0, 255],
+                },
+            ];
+            for (index, value) in values.iter().enumerate() {
+                set_value_exact(key, value, self.deadline)?;
+                let mut name = value.name.clone();
+                name.push(0);
+                let (mut kind, mut length) = (0, 0);
+                live(self.deadline)?;
+                status_at(
+                    unsafe {
+                        RegQueryValueExW(
+                            key,
+                            name.as_ptr(),
+                            ptr::null(),
+                            &mut kind,
+                            ptr::null_mut(),
+                            &mut length,
+                        )
+                    },
+                    "selfcheck/value-copy-readback-size",
+                    "RegQueryValueExW",
+                    Some(KEY_QUERY_VALUE),
+                )?;
+                if kind != value.kind || length as usize != value.bytes.len() {
+                    return Err(io::Error::other(format!(
+                        "native value-copy roundtrip extent differs; case={index}; expected-type={}; actual-type={kind}; expected-bytes={}; actual-bytes={length}",
+                        value.kind,
+                        value.bytes.len()
+                    )));
+                }
+                let mut actual = vec![0; length as usize];
+                live(self.deadline)?;
+                status_at(
+                    unsafe {
+                        RegQueryValueExW(
+                            key,
+                            name.as_ptr(),
+                            ptr::null(),
+                            &mut kind,
+                            if actual.is_empty() {
+                                ptr::null_mut()
+                            } else {
+                                actual.as_mut_ptr()
+                            },
+                            &mut length,
+                        )
+                    },
+                    "selfcheck/value-copy-readback-data",
+                    "RegQueryValueExW",
+                    Some(KEY_QUERY_VALUE),
+                )?;
+                if kind != value.kind
+                    || length as usize != value.bytes.len()
+                    || actual != value.bytes
+                {
+                    return Err(io::Error::other(format!(
+                        "native value-copy roundtrip data differs; case={index}"
+                    )));
+                }
+                live(self.deadline)?;
+            }
+            Ok(())
+        })();
+        let removed = (|| -> io::Result<()> {
+            live(self.cleanup_deadline)?;
+            let status = unsafe { windows_sys::Wdk::System::Registry::NtDeleteKey(key) };
+            if status < 0 {
+                return Err(io::Error::other(format!(
+                    "phase=selfcheck/value-copy-key-retire; api=NtDeleteKey; native-error-domain=NTSTATUS; native-code={status} ({status:#010x})"
+                )));
+            }
+            drop(
+                self.nodes
+                    .pop()
+                    .expect("value-copy probe remains the last held node"),
+            );
+            live(self.cleanup_deadline)
+        })();
+        match (tested, removed) {
+            (Err(primary), Err(secondary)) => Err(failures(primary, secondary)),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
     pub fn verify_owned(&self) -> io::Result<()> {
         if self.sealed {
@@ -1805,7 +2075,7 @@ pub fn self_check(
         .as_bytes(),
     );
     let mut projection = at(
-        Projection::create(&nonce, deadline, deadline),
+        Projection::create_with_roundtrip(&nonce, deadline, deadline, true),
         "selfcheck/projection-create-seal",
         "Projection::create",
         "boundary",
