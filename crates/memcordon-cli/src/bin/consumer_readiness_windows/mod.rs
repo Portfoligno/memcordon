@@ -272,10 +272,24 @@ fn settle_peer_failure(
     primary: io::Error,
     cutoff: std::time::Instant,
 ) -> io::Error {
+    use memcordon_platform::windows_registry_error::at;
     peer.stdin.take();
-    let mut cleanup = peer.kill().err();
+    let mut cleanup = at(
+        peer.kill(),
+        "peer/cleanup-kill",
+        "Child::kill",
+        "Win32",
+        None,
+    )
+    .err();
     loop {
-        match peer.try_wait() {
+        match at(
+            peer.try_wait(),
+            "peer/cleanup-wait",
+            "Child::try_wait",
+            "Win32",
+            None,
+        ) {
             Ok(Some(_)) => break,
             Err(error) => {
                 cleanup = Some(match cleanup {
@@ -310,6 +324,7 @@ fn send_peer_registry(
     descriptor: &Descriptor,
     session: &controller_start_input::Session,
 ) -> io::Result<()> {
+    use memcordon_platform::windows_registry_error::at;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
         Foundation::DuplicateHandle,
@@ -327,7 +342,13 @@ fn send_peer_registry(
         }
     };
     check()?;
-    let identity = native::child_identity(peer)?;
+    let identity = at(
+        native::child_identity(peer),
+        "peer/original-identity",
+        "child_identity",
+        "boundary",
+        None,
+    )?;
     let mut handle = std::ptr::null_mut();
     // SAFETY: source is the admitted read-only key; target is this exact owned
     // Child, never a reopened PID. Its numeric result is target-local only.
@@ -343,7 +364,13 @@ fn send_peer_registry(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return at(
+            Err(io::Error::last_os_error()),
+            "peer/readonly-key-duplicate",
+            "DuplicateHandle",
+            "Win32",
+            Some(KEY_READ),
+        );
     }
     let binding = descriptor::controller_start::Binding {
         challenge: descriptor.challenge.clone(),

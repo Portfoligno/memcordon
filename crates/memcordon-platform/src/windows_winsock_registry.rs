@@ -1,4 +1,5 @@
 //! Explicit native Winsock configuration input; never host policy mutation.
+use crate::windows_registry_error::{at, failures, require_access_denied};
 use crate::windows_registry_manifest::{Declaration, Key, Manifest, ValueRecord, View};
 use std::{io, ptr, time::Instant};
 use windows_sys::Win32::{
@@ -7,6 +8,7 @@ use windows_sys::Win32::{
         Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
         DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
     },
+    Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
     System::Registry::*,
 };
 
@@ -25,6 +27,32 @@ fn status(value: u32) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(value as i32))
     }
 }
+fn status_at(
+    value: u32,
+    phase: &'static str,
+    api: &'static str,
+    access: Option<u32>,
+) -> io::Result<()> {
+    at(status(value), phase, api, "LSTATUS", access)
+}
+fn denied_status(
+    value: u32,
+    phase: &'static str,
+    api: &'static str,
+    access: Option<u32>,
+) -> io::Result<()> {
+    if value == 5 {
+        return Ok(());
+    }
+    // Preserve the assertion's original Other kind while retaining an actual
+    // unexpected LSTATUS as a typed source. Successful mutation is still fatal.
+    let error = if value == 0 {
+        io::Error::other("sealed registry input mutation unexpectedly succeeded")
+    } else {
+        io::Error::other(io::Error::from_raw_os_error(value as i32))
+    };
+    at(Err(error), phase, api, "LSTATUS", access)
+}
 fn live(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
         Err(io::Error::new(
@@ -36,28 +64,6 @@ fn live(deadline: Instant) -> io::Result<()> {
     }
 }
 
-#[derive(Debug)]
-struct Failures {
-    primary: io::Error,
-    secondary: io::Error,
-}
-impl std::fmt::Display for Failures {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}; independent owned registry cleanup: {}",
-            self.primary, self.secondary
-        )
-    }
-}
-impl std::error::Error for Failures {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.primary)
-    }
-}
-fn failures(primary: io::Error, secondary: io::Error) -> io::Error {
-    io::Error::new(primary.kind(), Failures { primary, secondary })
-}
 fn hex_digest(bytes: &[u8]) -> String {
     use {sha2::Digest, std::fmt::Write};
     let mut text = String::new();
@@ -72,7 +78,12 @@ fn source_security(root: HKEY, deadline: Instant) -> io::Result<Vec<u8>> {
     let mut length = 0;
     let result = unsafe { RegGetKeySecurity(root, 7, ptr::null_mut(), &mut length) };
     if result != 122 {
-        status(result)?;
+        status_at(
+            result,
+            "security/size-probe",
+            "RegGetKeySecurity",
+            Some(READ_CONTROL),
+        )?;
     }
     if length == 0 || length > 64 * 1024 {
         return Err(io::Error::other(
@@ -80,7 +91,12 @@ fn source_security(root: HKEY, deadline: Instant) -> io::Result<Vec<u8>> {
         ));
     }
     let mut bytes = vec![0; length as usize];
-    status(unsafe { RegGetKeySecurity(root, 7, bytes.as_mut_ptr().cast(), &mut length) })?;
+    status_at(
+        unsafe { RegGetKeySecurity(root, 7, bytes.as_mut_ptr().cast(), &mut length) },
+        "security/read",
+        "RegGetKeySecurity",
+        Some(READ_CONTROL),
+    )?;
     if length as usize != bytes.len() {
         return Err(io::Error::other(
             "source registry security descriptor changed extent",
@@ -119,7 +135,13 @@ impl OwnedKey {
         live(deadline)?;
         let mut flags = 0;
         if unsafe { windows_sys::Win32::Foundation::GetHandleInformation(raw, &mut flags) } == 0 {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "adopt/handle-flags",
+                "GetHandleInformation",
+                "Win32",
+                None,
+            );
         }
         if flags & windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT != 0 {
             return Err(io::Error::other("registry input reference is inheritable"));
@@ -145,7 +167,7 @@ impl OwnedKey {
         };
         if result < 0 {
             return Err(io::Error::other(format!(
-                "registry input granted-access query failed: operation=NtQueryObject; class=ObjectBasicInformation({ObjectBasicInformation}); NTSTATUS={result} ({result:#010x}); provided-bytes={provided}; returned-bytes={returned}; failed-output-not-authoritative=true"
+                "registry input granted-access query failed: phase=adopt/object-basic; operation=NtQueryObject; native-error-domain=NTSTATUS; class=ObjectBasicInformation({ObjectBasicInformation}); NTSTATUS={result} ({result:#010x}); provided-bytes={provided}; returned-bytes={returned}; failed-output-not-authoritative=true"
             )));
         }
         if returned != provided {
@@ -181,6 +203,21 @@ fn open(parent: HKEY, name: &[u16], access: u32, deadline: Instant) -> io::Resul
     live(deadline)?;
     Ok(key)
 }
+fn open_at(
+    parent: HKEY,
+    name: &[u16],
+    access: u32,
+    deadline: Instant,
+    phase: &'static str,
+) -> io::Result<OwnedKey> {
+    at(
+        open(parent, name, access, deadline),
+        phase,
+        "RegOpenKeyExW",
+        "LSTATUS",
+        Some(access),
+    )
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct Stamp {
@@ -206,22 +243,27 @@ fn capture(root: HKEY, deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> 
         let (mut subkeys, mut values, mut modified) = (0, 0, FILETIME::default());
         let mut class = vec![0u16; 256];
         let mut class_length = class.len() as u32;
-        status(unsafe {
-            RegQueryInfoKeyW(
-                raw,
-                class.as_mut_ptr(),
-                &mut class_length,
-                ptr::null(),
-                &mut subkeys,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut values,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut modified,
-            )
-        })?;
+        status_at(
+            unsafe {
+                RegQueryInfoKeyW(
+                    raw,
+                    class.as_mut_ptr(),
+                    &mut class_length,
+                    ptr::null(),
+                    &mut subkeys,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut values,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut modified,
+                )
+            },
+            "capture/key-metadata",
+            "RegQueryInfoKeyW",
+            Some(KEY_READ),
+        )?;
         class.truncate(class_length as usize);
         byte_count = byte_count
             .checked_add(class.len() * 2)
@@ -246,18 +288,23 @@ fn capture(root: HKEY, deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> 
             let mut name = vec![0u16; 16384];
             let mut length = name.len() as u32;
             let (mut kind, mut bytes) = (0, 0);
-            status(unsafe {
-                RegEnumValueW(
-                    raw,
-                    index,
-                    name.as_mut_ptr(),
-                    &mut length,
-                    ptr::null(),
-                    &mut kind,
-                    ptr::null_mut(),
-                    &mut bytes,
-                )
-            })?;
+            status_at(
+                unsafe {
+                    RegEnumValueW(
+                        raw,
+                        index,
+                        name.as_mut_ptr(),
+                        &mut length,
+                        ptr::null(),
+                        &mut kind,
+                        ptr::null_mut(),
+                        &mut bytes,
+                    )
+                },
+                "capture/value-size",
+                "RegEnumValueW",
+                Some(KEY_READ),
+            )?;
             if bytes as usize > 1024 * 1024 {
                 return Err(io::Error::other(
                     "registry input single value exceeds bound",
@@ -268,18 +315,23 @@ fn capture(root: HKEY, deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> 
             let mut second_length = second_name.len() as u32;
             let mut second_kind = 0;
             live(deadline)?;
-            status(unsafe {
-                RegEnumValueW(
-                    raw,
-                    index,
-                    second_name.as_mut_ptr(),
-                    &mut second_length,
-                    ptr::null(),
-                    &mut second_kind,
-                    data.as_mut_ptr(),
-                    &mut bytes,
-                )
-            })?;
+            status_at(
+                unsafe {
+                    RegEnumValueW(
+                        raw,
+                        index,
+                        second_name.as_mut_ptr(),
+                        &mut second_length,
+                        ptr::null(),
+                        &mut second_kind,
+                        data.as_mut_ptr(),
+                        &mut bytes,
+                    )
+                },
+                "capture/value-data",
+                "RegEnumValueW",
+                Some(KEY_READ),
+            )?;
             name.truncate(length as usize);
             second_name.truncate(second_length as usize);
             if name != second_name || kind != second_kind || bytes as usize != data.len() {
@@ -324,28 +376,42 @@ fn capture(root: HKEY, deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> 
             )
         };
         if end != ERROR_NO_MORE_ITEMS {
-            return Err(io::Error::other(format!(
-                "registry value enumeration did not end at observed count: {end}"
-            )));
+            let error = if end == 0 {
+                io::Error::other("registry value enumeration exceeded observed count")
+            } else {
+                io::Error::other(io::Error::from_raw_os_error(end as i32))
+            };
+            return at(
+                Err(error),
+                "capture/value-end",
+                "RegEnumValueW",
+                "LSTATUS",
+                Some(KEY_READ),
+            );
         }
         for index in 0..subkeys {
             live(deadline)?;
             let mut name = vec![0u16; 256];
             let mut length = name.len() as u32;
-            status(unsafe {
-                RegEnumKeyExW(
-                    raw,
-                    index,
-                    name.as_mut_ptr(),
-                    &mut length,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
-            })?;
+            status_at(
+                unsafe {
+                    RegEnumKeyExW(
+                        raw,
+                        index,
+                        name.as_mut_ptr(),
+                        &mut length,
+                        ptr::null(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    )
+                },
+                "capture/subkey-name",
+                "RegEnumKeyExW",
+                Some(KEY_READ),
+            )?;
             name.truncate(length as usize);
-            let child = open(raw, &name, KEY_READ, deadline)?;
+            let child = open_at(raw, &name, KEY_READ, deadline, "capture/subkey-open")?;
             let mut child_path = path.clone();
             child_path.push(name);
             byte_count = byte_count
@@ -379,9 +445,18 @@ fn capture(root: HKEY, deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> 
             )
         };
         if end != ERROR_NO_MORE_ITEMS {
-            return Err(io::Error::other(format!(
-                "registry key enumeration did not end at observed count: {end}"
-            )));
+            let error = if end == 0 {
+                io::Error::other("registry key enumeration exceeded observed count")
+            } else {
+                io::Error::other(io::Error::from_raw_os_error(end as i32))
+            };
+            return at(
+                Err(error),
+                "capture/key-end",
+                "RegEnumKeyExW",
+                "LSTATUS",
+                Some(KEY_READ),
+            );
         }
         stamps.push(Stamp {
             path: path.clone(),
@@ -451,15 +526,35 @@ impl Projection {
         {
             return Err(io::Error::other("invalid owned registry namespace nonce"));
         }
-        let source = open(
+        let source = open_at(
             HKEY_LOCAL_MACHINE,
             &PARAMETERS.encode_utf16().collect::<Vec<_>>(),
             KEY_READ,
             deadline,
+            "projection/source-open",
         )?;
-        let security_before = source_security(source.raw(), deadline)?;
-        let manifest = coherent(source.raw(), deadline)?;
-        if source_security(source.raw(), deadline)? != security_before {
+        let security_before = at(
+            source_security(source.raw(), deadline),
+            "projection/source-security-before",
+            "RegGetKeySecurity",
+            "boundary",
+            Some(READ_CONTROL),
+        )?;
+        let manifest = at(
+            coherent(source.raw(), deadline),
+            "projection/source-snapshot",
+            "coherent",
+            "boundary",
+            Some(KEY_READ),
+        )?;
+        if at(
+            source_security(source.raw(), deadline),
+            "projection/source-security-after",
+            "RegGetKeySecurity",
+            "boundary",
+            Some(READ_CONTROL),
+        )? != security_before
+        {
             return Err(io::Error::other(
                 "source registry security changed during capture",
             ));
@@ -478,7 +573,13 @@ impl Projection {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "projection/setup-security",
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                "Win32",
+                None,
+            );
         }
         struct Security(*mut std::ffi::c_void);
         impl Drop for Security {
@@ -500,19 +601,24 @@ impl Projection {
         let name = wide(&namespace);
         let mut root = ptr::null_mut();
         let mut disposition = 0;
-        status(unsafe {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                name.as_ptr(),
-                0,
-                ptr::null(),
-                REG_OPTION_VOLATILE,
-                KEY_ALL_ACCESS,
-                &attributes,
-                &mut root,
-                &mut disposition,
-            )
-        })?;
+        status_at(
+            unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    name.as_ptr(),
+                    0,
+                    ptr::null(),
+                    REG_OPTION_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    &attributes,
+                    &mut root,
+                    &mut disposition,
+                )
+            },
+            "projection/root-create",
+            "RegCreateKeyExW",
+            Some(KEY_ALL_ACCESS),
+        )?;
         if disposition != REG_CREATED_NEW_KEY {
             unsafe {
                 RegCloseKey(root);
@@ -532,9 +638,21 @@ impl Projection {
             namespace,
             cleanup_deadline,
         };
-        let populated = projection.populate(&mut attributes);
+        let populated = at(
+            projection.populate(&mut attributes),
+            "projection/populate-seal",
+            "populate",
+            "boundary",
+            None,
+        );
         if let Err(primary) = populated {
-            return match projection.retire() {
+            return match at(
+                projection.retire(),
+                "projection/failure-retire",
+                "Projection::retire",
+                "boundary",
+                None,
+            ) {
                 Ok(()) => Err(primary),
                 Err(cleanup) => Err(failures(primary, cleanup)),
             };
@@ -572,19 +690,24 @@ impl Projection {
                 let mut raw = ptr::null_mut();
                 let mut disposition = 0;
                 live(self.deadline)?;
-                status(unsafe {
-                    RegCreateKeyExW(
-                        parent,
-                        name.as_ptr(),
-                        0,
-                        class.as_ptr(),
-                        REG_OPTION_VOLATILE,
-                        KEY_ALL_ACCESS,
-                        attributes,
-                        &mut raw,
-                        &mut disposition,
-                    )
-                })?;
+                status_at(
+                    unsafe {
+                        RegCreateKeyExW(
+                            parent,
+                            name.as_ptr(),
+                            0,
+                            class.as_ptr(),
+                            REG_OPTION_VOLATILE,
+                            KEY_ALL_ACCESS,
+                            attributes,
+                            &mut raw,
+                            &mut disposition,
+                        )
+                    },
+                    "projection/descendant-create",
+                    "RegCreateKeyExW",
+                    Some(KEY_ALL_ACCESS),
+                )?;
                 let key = OwnedKey(raw);
                 if disposition != REG_CREATED_NEW_KEY {
                     return Err(io::Error::other(
@@ -599,19 +722,30 @@ impl Projection {
                 live(self.deadline)?;
                 let mut name = value.name.clone();
                 name.push(0);
-                status(unsafe {
-                    RegSetValueExW(
-                        parent,
-                        name.as_ptr(),
-                        0,
-                        value.kind,
-                        value.bytes.as_ptr(),
-                        value.bytes.len() as u32,
-                    )
-                })?;
+                status_at(
+                    unsafe {
+                        RegSetValueExW(
+                            parent,
+                            name.as_ptr(),
+                            0,
+                            value.kind,
+                            value.bytes.as_ptr(),
+                            value.bytes.len() as u32,
+                        )
+                    },
+                    "projection/value-copy",
+                    "RegSetValueExW",
+                    Some(KEY_SET_VALUE),
+                )?;
             }
         }
-        self.verify_owned()?;
+        at(
+            self.verify_owned(),
+            "projection/copied-readback",
+            "verify_owned",
+            "boundary",
+            Some(KEY_READ),
+        )?;
         // Retain only controller-owned pre-seal setup references. All future
         // opens, including an ordinary same-owner workload, are read-only;
         // OWNER_RIGHTS explicitly removes implicit owner WRITE_DAC authority.
@@ -626,14 +760,31 @@ impl Projection {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "projection/seal-security",
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                "Win32",
+                None,
+            );
         }
         let sealed = (|| {
             for key in self.nodes.iter().chain(std::iter::once(&self.root)) {
                 live(self.deadline)?;
-                status(unsafe { RegSetKeySecurity(key.raw(), DACL_SECURITY_INFORMATION, sd) })?;
+                status_at(
+                    unsafe { RegSetKeySecurity(key.raw(), DACL_SECURITY_INFORMATION, sd) },
+                    "projection/seal-dacl",
+                    "RegSetKeySecurity",
+                    Some(WRITE_DAC),
+                )?;
             }
-            self.verify_owned()
+            at(
+                self.verify_owned(),
+                "projection/sealed-readback",
+                "verify_owned",
+                "boundary",
+                Some(KEY_READ),
+            )
         })();
         unsafe {
             LocalFree(sd);
@@ -641,7 +792,13 @@ impl Projection {
         sealed
     }
     pub fn verify_owned(&self) -> io::Result<()> {
-        verify(self.root.raw(), &self.declaration, self.deadline)
+        at(
+            verify(self.root.raw(), &self.declaration, self.deadline),
+            "projection/owned-verify",
+            "verify",
+            "boundary",
+            Some(KEY_READ),
+        )
     }
     /// Deliver this sealed owned dependency only to the same retained process.
     /// The returned scalar is target-local wire data, never an adoption API.
@@ -659,7 +816,13 @@ impl Projection {
         self.verify_owned()?;
         // SAFETY: this exclusive owner retains the live registry reference
         // through the native duplicate; target retains its original process.
-        let handle = unsafe { target.duplicate_registry_input(self.root.raw(), deadline) }?;
+        let handle = at(
+            unsafe { target.duplicate_registry_input(self.root.raw(), deadline) },
+            "projection/held-root-duplicate",
+            "DuplicateHandle",
+            "Win32",
+            Some(KEY_READ),
+        )?;
         self.transferred = true;
         live(deadline)?;
         Ok(handle)
@@ -679,7 +842,13 @@ impl Projection {
                 "registry input retained: original recipient retirement is unproved",
             ));
         }
-        self.retire()
+        at(
+            self.retire(),
+            "retire/owned-keys",
+            "Projection::retire",
+            "boundary",
+            None,
+        )
     }
     /// Call only after all admitted original roots/descendants have settled.
     pub fn retire(&mut self) -> io::Result<()> {
@@ -699,7 +868,7 @@ impl Projection {
             let result = unsafe { NtDeleteKey(key.raw()) };
             if result < 0 {
                 return Err(io::Error::other(format!(
-                    "NtDeleteKey original fixture descendant failed: {result:#x}"
+                    "phase=retire/held-descendant; api=NtDeleteKey; native-error-domain=NTSTATUS; native-code={result} ({result:#010x})"
                 )));
             }
             self.nodes.pop();
@@ -708,7 +877,7 @@ impl Projection {
         let result = unsafe { NtDeleteKey(self.root.raw()) };
         if result < 0 {
             return Err(io::Error::other(format!(
-                "NtDeleteKey original fixture root failed: {result:#x}"
+                "phase=retire/held-root; api=NtDeleteKey; native-error-domain=NTSTATUS; native-code={result} ({result:#010x})"
             )));
         }
         self.retired = true;
@@ -735,11 +904,12 @@ fn verified_manifest(
     deadline: Instant,
 ) -> io::Result<Manifest> {
     declaration.validate().map_err(io::Error::other)?;
-    let parameters = open(
+    let parameters = open_at(
         root,
         &PARAMETERS.encode_utf16().collect::<Vec<_>>(),
         KEY_READ,
         deadline,
+        "verify/parameters-open",
     )?;
     let actual = coherent(parameters.raw(), deadline)?;
     if actual.digest().map_err(io::Error::other)? != declaration.sha256 {
@@ -760,10 +930,27 @@ impl Mapping {
         declaration: &Declaration,
         deadline: Instant,
     ) -> io::Result<Self> {
-        let manifest = verified_manifest(key.raw(), declaration, deadline)?;
-        immutable(key.raw(), &manifest, deadline)?;
+        let manifest = at(
+            verified_manifest(key.raw(), declaration, deadline),
+            "mapping/manifest-readback",
+            "verified_manifest",
+            "boundary",
+            Some(KEY_READ),
+        )?;
+        at(
+            immutable(key.raw(), &manifest, deadline),
+            "mapping/immutability",
+            "immutable",
+            "boundary",
+            Some(KEY_READ),
+        )?;
         live(deadline)?;
-        status(unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, key.raw()) })?;
+        status_at(
+            unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, key.raw()) },
+            "mapping/install",
+            "RegOverridePredefKey",
+            Some(KEY_READ),
+        )?;
         Ok(Self {
             key,
             active: true,
@@ -778,17 +965,46 @@ impl Mapping {
             return Ok(());
         }
         self.active = false;
-        status(unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, ptr::null_mut()) })
+        status_at(
+            unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, ptr::null_mut()) },
+            "mapping/restore",
+            "RegOverridePredefKey",
+            None,
+        )
     }
     pub fn run<T>(mut self, operation: impl FnOnce(&Self) -> io::Result<T>) -> io::Result<T> {
-        let result = live(self.deadline).and_then(|()| operation(&self));
-        let result = match (result, live(self.deadline)) {
+        let result = at(
+            live(self.deadline),
+            "mapping/pre-operation-cutoff",
+            "Instant",
+            "deadline",
+            None,
+        )
+        .and_then(|()| operation(&self));
+        let result = match (
+            result,
+            at(
+                live(self.deadline),
+                "mapping/post-operation-cutoff",
+                "Instant",
+                "deadline",
+                None,
+            ),
+        ) {
             (Err(primary), Err(secondary)) => Err(failures(primary, secondary)),
             (Err(primary), _) => Err(primary),
             (Ok(_), Err(error)) => Err(error),
             (Ok(value), Ok(())) => Ok(value),
         };
-        let restored = self.restore().and_then(|()| live(self.deadline));
+        let restored = self.restore().and_then(|()| {
+            at(
+                live(self.deadline),
+                "mapping/post-restore-cutoff",
+                "Instant",
+                "deadline",
+                None,
+            )
+        });
         match (result, restored) {
             (Err(primary), Err(secondary)) => Err(failures(primary, secondary)),
             (Err(primary), _) => Err(primary),
@@ -801,15 +1017,12 @@ impl Mapping {
 fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<()> {
     live(deadline)?;
     for access in [KEY_SET_VALUE, KEY_CREATE_SUB_KEY, 0x0001_0000, 0x0004_0000] {
-        match open(root, &[], access, deadline) {
-            Err(error) if error.raw_os_error() == Some(5) => {}
-            Err(error) => return Err(error),
-            Ok(_) => {
-                return Err(io::Error::other(
-                    "sealed registry input permits mutation access",
-                ));
-            }
-        }
+        require_access_denied(
+            open(root, &[], access, deadline),
+            "immutable/mutation-open",
+            "RegOpenKeyExW",
+            Some(access),
+        )?;
         live(deadline)?;
     }
     let name = wide("memcordon-immutable-denial-probe");
@@ -834,18 +1047,20 @@ fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<(
             RegCloseKey(created);
         }
     }
-    if result != 5 {
-        return Err(io::Error::other(format!(
-            "sealed registry input create was not denied: LSTATUS={result}"
-        )));
-    }
+    denied_status(
+        result,
+        "immutable/create",
+        "RegCreateKeyExW",
+        Some(KEY_READ),
+    )?;
     live(deadline)?;
     let result = unsafe { RegSetValueExW(root, name.as_ptr(), 0, REG_BINARY, [1u8].as_ptr(), 1) };
-    if result != 5 {
-        return Err(io::Error::other(format!(
-            "sealed registry input write was not denied: LSTATUS={result}"
-        )));
-    }
+    denied_status(
+        result,
+        "immutable/write",
+        "RegSetValueExW",
+        Some(KEY_SET_VALUE),
+    )?;
     let leaf = manifest
         .keys
         .iter()
@@ -859,12 +1074,19 @@ fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<(
     leaf_path.push(0);
     live(deadline)?;
     let result = unsafe { RegDeleteKeyExW(root, leaf_path.as_ptr(), 0, 0) };
-    if result != 5 {
-        return Err(io::Error::other(format!(
-            "sealed registry input delete was not denied: LSTATUS={result}"
-        )));
-    }
-    let mut security = source_security(root, deadline)?;
+    denied_status(
+        result,
+        "immutable/delete-leaf",
+        "RegDeleteKeyExW",
+        Some(0x0001_0000),
+    )?;
+    let mut security = at(
+        source_security(root, deadline),
+        "immutable/dacl-readback",
+        "RegGetKeySecurity",
+        "boundary",
+        Some(READ_CONTROL),
+    )?;
     live(deadline)?;
     let result = unsafe {
         RegSetKeySecurity(
@@ -873,11 +1095,12 @@ fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<(
             security.as_mut_ptr().cast(),
         )
     };
-    if result != 5 {
-        return Err(io::Error::other(format!(
-            "sealed registry input DACL change was not denied: LSTATUS={result}"
-        )));
-    }
+    denied_status(
+        result,
+        "immutable/dacl-change",
+        "RegSetKeySecurity",
+        Some(WRITE_DAC),
+    )?;
     live(deadline)
 }
 
@@ -906,7 +1129,8 @@ fn key_name(root: HKEY, deadline: Instant) -> io::Result<Vec<u16>> {
     };
     if result < 0 {
         return Err(io::Error::other(format!(
-            "registry key name query failed: {result:#x}"
+            "phase=mapping/native-name; api=NtQueryKey; class=KeyNameInformation(3); native-error-domain=NTSTATUS; native-code={result} ({result:#010x}); provided-bytes={}; returned-bytes={returned}",
+            std::mem::size_of_val(&bytes)
         )));
     }
     let raw = unsafe {
@@ -929,11 +1153,12 @@ fn key_name(root: HKEY, deadline: Instant) -> io::Result<Vec<u16>> {
 
 /// CI-only child proves process-local HKLM mappings are not inherited.
 pub fn uninherited_self_check(deadline: Instant) -> io::Result<i32> {
-    let root = open(
+    let root = open_at(
         HKEY_LOCAL_MACHINE,
         &"System".encode_utf16().collect::<Vec<_>>(),
         KEY_READ,
         deadline,
+        "selfcheck/uninherited-system-open",
     )?;
     if !String::from_utf16(&key_name(root.raw(), deadline)?)
         .map_err(io::Error::other)?
@@ -973,18 +1198,37 @@ pub fn self_check(
         )
         .as_bytes(),
     );
-    let mut projection = Projection::create(&nonce, deadline, deadline)?;
+    let mut projection = at(
+        Projection::create(&nonce, deadline, deadline),
+        "selfcheck/projection-create-seal",
+        "Projection::create",
+        "boundary",
+        None,
+    )?;
     let tested = (|| -> io::Result<()> {
-        let source = open(
+        let source = open_at(
             HKEY_LOCAL_MACHINE,
             &PARAMETERS.encode_utf16().collect::<Vec<_>>(),
             KEY_READ,
             deadline,
+            "selfcheck/source-open",
         )?;
-        let source_before = coherent(source.raw(), deadline)?
-            .digest()
-            .map_err(io::Error::other)?;
-        let source_sd = source_security(source.raw(), deadline)?;
+        let source_before = at(
+            coherent(source.raw(), deadline),
+            "selfcheck/source-snapshot-before",
+            "coherent",
+            "boundary",
+            Some(KEY_READ),
+        )?
+        .digest()
+        .map_err(io::Error::other)?;
+        let source_sd = at(
+            source_security(source.raw(), deadline),
+            "selfcheck/source-security-before",
+            "RegGetKeySecurity",
+            "boundary",
+            Some(READ_CONTROL),
+        )?;
         let declaration = projection.declaration().clone();
         let mut mismatch = declaration.clone();
         mismatch.sha256[0] ^= 1;
@@ -1009,15 +1253,32 @@ pub fn self_check(
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "selfcheck/original-token-open",
+                "OpenProcessToken",
+                "Win32",
+                Some(TOKEN_QUERY | TOKEN_DUPLICATE),
+            );
         }
         let original = unsafe { OwnedHandle::from_raw_handle(original) };
-        let original_before =
+        let original_before = at(
             memcordon_windows_launch_core::query_token_envelope(original.as_raw_handle())
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other),
+            "selfcheck/original-token-before",
+            "query_token_envelope",
+            "boundary",
+            Some(TOKEN_QUERY),
+        )?;
         let mut sid = ptr::null_mut();
         if unsafe { ConvertStringSidToSidW(wide("S-1-5-12").as_ptr(), &mut sid) } == 0 {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "selfcheck/restricting-sid",
+                "ConvertStringSidToSidW",
+                "Win32",
+                None,
+            );
         }
         let restricting = SID_AND_ATTRIBUTES {
             Sid: sid,
@@ -1046,12 +1307,23 @@ pub fn self_check(
             LocalFree(sid);
         }
         if let Some(error) = creation_error {
-            return Err(error);
+            return at(
+                Err(error),
+                "selfcheck/restricted-token-create",
+                "CreateRestrictedToken",
+                "Win32",
+                None,
+            );
         }
         let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
-        let before =
+        let before = at(
             memcordon_windows_launch_core::query_token_envelope(restricted.as_raw_handle())
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other),
+            "selfcheck/restricted-token-before",
+            "query_token_envelope",
+            "boundary",
+            Some(TOKEN_QUERY),
+        )?;
         let mut duplicate = ptr::null_mut();
         if unsafe {
             DuplicateHandle(
@@ -1065,28 +1337,71 @@ pub fn self_check(
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "selfcheck/readonly-key-duplicate",
+                "DuplicateHandle",
+                "Win32",
+                Some(KEY_READ),
+            );
         }
-        let key = unsafe { OwnedKey::from_transferred(duplicate as usize as u64, deadline) }?;
+        let key = at(
+            unsafe { OwnedKey::from_transferred(duplicate as usize as u64, deadline) },
+            "selfcheck/readonly-key-adopt",
+            "OwnedKey::from_transferred",
+            "boundary",
+            Some(KEY_READ),
+        )?;
         live(deadline)?;
         if unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) } == 0 {
-            return Err(io::Error::last_os_error());
+            return at(
+                Err(io::Error::last_os_error()),
+                "selfcheck/restricted-impersonation",
+                "ImpersonateLoggedOnUser",
+                "Win32",
+                None,
+            );
         }
         struct Impersonation;
         impl Drop for Impersonation {
             fn drop(&mut self) {
                 if unsafe { RevertToSelf() } == 0 {
+                    let error = io::Error::last_os_error();
+                    use std::io::Write;
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "registry phase=selfcheck/mandatory-revert; api=RevertToSelf; native-error-domain=Win32; native-code={:?}; {error}",
+                        error.raw_os_error()
+                    );
                     std::process::abort();
                 }
             }
         }
         let impersonation = Impersonation;
         let mapped = (|| -> io::Result<()> {
-            let mapping = Mapping::install(key, &declaration, deadline)?;
+            let mapping = at(
+                Mapping::install(key, &declaration, deadline),
+                "selfcheck/mapping-install",
+                "Mapping::install",
+                "boundary",
+                Some(KEY_READ),
+            )?;
             mapping.run(|mapping| {
                 let system = "System".encode_utf16().collect::<Vec<_>>();
-                let mapped_system = open(HKEY_LOCAL_MACHINE, &system, KEY_READ, deadline)?;
-                let held_system = open(mapping.raw(), &system, KEY_READ, deadline)?;
+                let mapped_system = open_at(
+                    HKEY_LOCAL_MACHINE,
+                    &system,
+                    KEY_READ,
+                    deadline,
+                    "selfcheck/mapped-system-open",
+                )?;
+                let held_system = open_at(
+                    mapping.raw(),
+                    &system,
+                    KEY_READ,
+                    deadline,
+                    "selfcheck/held-system-open",
+                )?;
                 // Independent opens may create distinct KEY objects for one key.
                 // Full native names check mapping readback, never reference identity;
                 // RegOverridePredefKey receives the original admitted held key.
@@ -1098,31 +1413,63 @@ pub fn self_check(
                     ));
                 }
                 live(deadline)?;
-                let mut command = child_command(deadline)?;
+                let mut command = at(
+                    child_command(deadline),
+                    "selfcheck/uninherited-child-prepare",
+                    "child_command",
+                    "boundary",
+                    None,
+                )?;
                 live(deadline)?;
-                let mut child = command
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()?;
+                let mut child = at(
+                    command
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::inherit())
+                        .spawn(),
+                    "selfcheck/uninherited-child-spawn",
+                    "Command::spawn",
+                    "Win32",
+                    None,
+                )?;
                 loop {
-                    match child.try_wait() {
+                    match at(
+                        child.try_wait(),
+                        "selfcheck/uninherited-child-wait",
+                        "Child::try_wait",
+                        "Win32",
+                        None,
+                    ) {
                         Ok(Some(status)) if status.success() => break,
                         Ok(Some(status)) => {
                             return Err(io::Error::other(format!(
                                 "registry mapping child failed: {status}"
                             )));
                         }
-                        Err(error) => return Err(settle_child(&mut child, error, deadline)),
+                        Err(error) => {
+                            return at(
+                                Err(settle_child(&mut child, error, deadline)),
+                                "selfcheck/uninherited-child-settle",
+                                "settle_child",
+                                "boundary",
+                                None,
+                            );
+                        }
                         Ok(None) if Instant::now() >= deadline => {
-                            return Err(settle_child(
-                                &mut child,
-                                io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "original registry selfcheck cutoff exhausted",
-                                ),
-                                deadline,
-                            ));
+                            return at(
+                                Err(settle_child(
+                                    &mut child,
+                                    io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "original registry selfcheck cutoff exhausted",
+                                    ),
+                                    deadline,
+                                )),
+                                "selfcheck/uninherited-child-settle",
+                                "settle_child",
+                                "boundary",
+                                None,
+                            );
                         }
                         Ok(None) => std::thread::sleep(Duration::from_millis(1)),
                     }
@@ -1132,35 +1479,76 @@ pub fn self_check(
                 Ok(())
             })
         })();
+        if let Err(original) = &mapped {
+            use std::io::Write;
+            let _ = writeln!(
+                io::stderr().lock(),
+                "registry original operation before mandatory RevertToSelf: {original}"
+            );
+        }
         drop(impersonation);
         mapped?;
-        if memcordon_windows_launch_core::query_token_envelope(restricted.as_raw_handle())
-            .map_err(io::Error::other)?
-            != before
-            || memcordon_windows_launch_core::query_token_envelope(original.as_raw_handle())
-                .map_err(io::Error::other)?
-                != original_before
+        if at(
+            memcordon_windows_launch_core::query_token_envelope(restricted.as_raw_handle())
+                .map_err(io::Error::other),
+            "selfcheck/restricted-token-after",
+            "query_token_envelope",
+            "boundary",
+            Some(TOKEN_QUERY),
+        )? != before
+            || at(
+                memcordon_windows_launch_core::query_token_envelope(original.as_raw_handle())
+                    .map_err(io::Error::other),
+                "selfcheck/original-token-after",
+                "query_token_envelope",
+                "boundary",
+                Some(TOKEN_QUERY),
+            )? != original_before
         {
             return Err(io::Error::other(
                 "registry dependency changed the original token",
             ));
         }
-        if coherent(source.raw(), deadline)?
-            .digest()
-            .map_err(io::Error::other)?
+        if at(
+            coherent(source.raw(), deadline),
+            "selfcheck/source-snapshot-after",
+            "coherent",
+            "boundary",
+            Some(KEY_READ),
+        )?
+        .digest()
+        .map_err(io::Error::other)?
             != source_before
-            || source_security(source.raw(), deadline)? != source_sd
+            || at(
+                source_security(source.raw(), deadline),
+                "selfcheck/source-security-after",
+                "RegGetKeySecurity",
+                "boundary",
+                Some(READ_CONTROL),
+            )? != source_sd
         {
             return Err(io::Error::other(
                 "native source data/security changed during owned registry test",
             ));
         }
-        uninherited_self_check(deadline)?; // This process restored its own default HKLM.
+        at(
+            uninherited_self_check(deadline),
+            "selfcheck/restored-hklm-readback",
+            "uninherited_self_check",
+            "boundary",
+            Some(KEY_READ),
+        )?;
         projection.transferred();
         projection.recipients_retired();
         live(deadline)
     })();
-    let retired = projection.retire_if_safe();
+    let retired = at(
+        projection.retire_if_safe(),
+        "selfcheck/owned-projection-retire",
+        "Projection::retire_if_safe",
+        "boundary",
+        None,
+    );
     match (tested, retired) {
         (Err(primary), Err(secondary)) => Err(failures(primary, secondary)),
         (Err(primary), _) => Err(primary),
