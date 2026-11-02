@@ -488,22 +488,7 @@ pub fn fixture_parameters(key: &CaseKey) -> Result<FixtureParameters> {
 /// Validate the actual input once complete, retaining its case and wire-size boundary.
 pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -> Result<()> {
     let explicit_registry = descriptor.winsock_registry.is_some()
-        && matches!(
-            (key.family.as_str(), key.scenario.as_str(), descriptor.case),
-            (
-                "W-JOINT",
-                "ordinary" | "restricted",
-                descriptor::Case::Joint
-            ) | (
-                "W-JOINT",
-                "endpoint-mismatch",
-                descriptor::Case::EndpointMismatch
-            ) | (
-                "W-CHURN",
-                "natural-4096-three-generations",
-                descriptor::Case::Churn
-            )
-        )
+        && needs_registry_input(key, descriptor.case)
         && matches!(
             descriptor.start_transport,
             descriptor::StartTransport::ControllerStdin {
@@ -563,6 +548,20 @@ pub fn needs_toolchain_observer(case: descriptor::Case) -> bool {
         case,
         descriptor::Case::Toolchain | descriptor::Case::Joint | descriptor::Case::Churn
     )
+}
+
+/// Registry input belongs only to a catalog key with its expected fixture kind.
+pub fn needs_registry_input(key: &CaseKey, case: descriptor::Case) -> bool {
+    positive_keys().contains(key)
+        && expected_fixture_case(key).is_ok_and(|expected| {
+            expected == case
+                && matches!(
+                    case,
+                    descriptor::Case::Joint
+                        | descriptor::Case::EndpointMismatch
+                        | descriptor::Case::Churn
+                )
+        })
 }
 
 fn expected_fixture_case(key: &CaseKey) -> Result<descriptor::Case> {
@@ -3889,10 +3888,7 @@ pub(crate) mod native {
         mut clocks: ExecutionClocks,
     ) -> Result<()> {
         let mut declared = input.clone();
-        if matches!(
-            input.descriptor.case,
-            descriptor::Case::Joint | descriptor::Case::EndpointMismatch | descriptor::Case::Churn
-        ) {
+        if needs_registry_input(&input.key, input.descriptor.case) {
             let projection = memcordon_testkit::WindowsWinsockRegistryProjection::create(
                 &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
                 clocks.work,

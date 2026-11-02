@@ -396,19 +396,44 @@ fn restricted_joint_keeps_native_compiler_observation_with_a_separate_control_cl
 
 #[test]
 fn explicit_native_registry_dependency_requires_bound_version_three_joint_control() {
-    use memcordon_ci::windows_consumer_readiness::{CaseKey, validate_descriptor};
-    for (case, family, scenario) in [
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, expected_start_transport, fixture_parameters, needs_registry_input,
+        validate_descriptor,
+    };
+    let rows = [
+        (Case::Joint, "C-IO", "empty-message"),
+        (Case::Joint, "W-IO", "empty-message"),
         (Case::Joint, "W-JOINT", "ordinary"),
         (Case::Joint, "W-JOINT", "restricted"),
         (Case::EndpointMismatch, "W-JOINT", "endpoint-mismatch"),
         (Case::Churn, "W-CHURN", "natural-4096-three-generations"),
-    ] {
+    ];
+    let eligible = positive_keys()
+        .into_iter()
+        .filter(|key| needs_registry_input(key, fixture_parameters(key).unwrap().case))
+        .collect::<std::collections::BTreeSet<_>>();
+    let intended = rows
+        .iter()
+        .map(|(_, family, scenario)| CaseKey {
+            family: (*family).into(),
+            scenario: (*scenario).into(),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(eligible, intended);
+    for (case, family, scenario) in rows {
         let mut input = descriptor();
         input.case = case;
         if case != Case::Churn {
             input.cohort_gate = None;
             input.generation_gate = None;
         }
+        let key = CaseKey {
+            family: family.into(),
+            scenario: scenario.into(),
+        };
+        input.start_transport = expected_start_transport(&key);
+        validate_descriptor(&key, &input).unwrap(); // Original unprepared plan.
+        assert!(needs_registry_input(&key, case));
         input.start_transport = descriptor::StartTransport::ControllerStdin {
             version: descriptor::controller_start::REGISTRY_VERSION,
         };
@@ -417,10 +442,6 @@ fn explicit_native_registry_dependency_requires_bound_version_three_joint_contro
             view: descriptor::winsock_registry::View::Native,
             sha256: [42; 32],
         });
-        let key = CaseKey {
-            family: family.into(),
-            scenario: scenario.into(),
-        };
         validate_descriptor(&key, &input).unwrap(); // Explicit prepared plan.
         assert!(Descriptor::parse(&serde_json::to_vec(&input).unwrap()).is_err());
         input.control_clock = Some(descriptor::ControlClock {
@@ -435,6 +456,37 @@ fn explicit_native_registry_dependency_requires_bound_version_three_joint_contro
             scenario: "restricted-token-preserved".into(),
         };
         assert!(validate_descriptor(&foreign, &input).is_err());
+        for (family, scenario, claimed) in [
+            ("W-JOINT", "not-in-the-positive-catalog", Case::Joint),
+            ("W-CHURN", "not-in-the-positive-catalog", Case::Churn),
+        ] {
+            let unknown = CaseKey {
+                family: family.into(),
+                scenario: scenario.into(),
+            };
+            assert!(!needs_registry_input(&unknown, claimed));
+            assert!(validate_descriptor(&unknown, &input).is_err());
+        }
+        for other in [Case::Joint, Case::EndpointMismatch, Case::Churn] {
+            if other == case {
+                continue;
+            }
+            let mut substituted = input.clone();
+            substituted.case = other;
+            if other == Case::Churn {
+                let churn = descriptor();
+                substituted.cohort_gate = churn.cohort_gate;
+                substituted.generation_gate = churn.generation_gate;
+            } else {
+                substituted.cohort_gate = None;
+                substituted.generation_gate = None;
+            }
+            // Wire has no case key: a structurally valid registry kind is not
+            // sufficient for admission under a different catalog key.
+            Descriptor::parse(&serde_json::to_vec(&substituted).unwrap()).unwrap();
+            assert!(!needs_registry_input(&key, other));
+            assert!(validate_descriptor(&key, &substituted).is_err());
+        }
         for mutation in 0..4 {
             let mut bad = input.clone();
             match mutation {
