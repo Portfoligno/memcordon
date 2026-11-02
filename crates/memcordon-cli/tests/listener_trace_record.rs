@@ -9,7 +9,7 @@ use serde_json::json;
 
 fn base() -> Packet {
     let mut value = Packet {
-        version: 2,
+        version: 3,
         setup_stage: 1,
         called: 1,
         callback_outcome: 1,
@@ -36,6 +36,11 @@ fn base() -> Packet {
     value.returned_module.dependencies.original_thread = value.original_thread;
     value.returned_module.dependencies.cutoff_qpc = value.cutoff_qpc;
     value.returned_module.dependencies.frequency = value.frequency;
+    value.loader_owner.version = 1;
+    value.loader_owner.dependencies.version = 1;
+    value.loader_owner.dependencies.original_thread = value.original_thread;
+    value.loader_owner.dependencies.cutoff_qpc = value.cutoff_qpc;
+    value.loader_owner.dependencies.frequency = value.frequency;
     value.owner = winsock_trace_record::Node {
         owner_base: 0x1000,
         entry: 0x1100,
@@ -142,14 +147,265 @@ fn returned_scope() -> Packet {
     value
 }
 
+fn loader_scope() -> Packet {
+    let mut value = returned_scope();
+    value.returned_module = record::ReturnedModule::default();
+    value.returned_module.version = 1;
+    value.returned_module.dependencies.version = 1;
+    value.dependency_scope_armed = 1;
+    let startup = &mut value.dependencies;
+    startup.armed = 1;
+    startup.setup_stage = 1;
+    startup.owner_pinned = 1;
+    startup.callbacks_complete = 1;
+    startup.protections_restored = 1;
+    startup.cutoff_qpc = 100;
+    startup.frequency = 10;
+    startup.node_count = 1;
+    startup.nodes[0] = winsock_trace_record::Node {
+        owner_base: 0x9000,
+        entry: 0x9100,
+        owner_size: 0x4000,
+        machine: 0xaa64,
+        ..Default::default()
+    };
+    startup.slot_count = 1;
+    startup.slots[0] = winsock_trace_record::Slot {
+        slot: 0x9800,
+        operation: 12,
+        original: 0xa100,
+        hook: 0xb100,
+        descriptor_module: 0xc000,
+        published: 1,
+        ..Default::default()
+    };
+    startup.entries[0].native_status = 1;
+    startup.entries[0].raw_output = 0;
+    startup.entries[0].output_flags = 1;
+    startup.entries[0].outgoing_error = 5;
+    startup.total_failures = 1;
+    startup.first_failure_present = 1;
+    startup.first_failure = startup.entries[0];
+    value.first_dependency_failure_link = value.dependency_links[0];
+    let scope = &mut value.loader_owner;
+    scope.selected = 1;
+    scope.armed = 1;
+    scope.setup_stage = 1;
+    scope.scope_flags = 1;
+    scope.attempt_count = 1;
+    scope.loader_target = 0xa100;
+    scope.owner_base = 0xa000;
+    scope.link_count = 1;
+    scope.links[0] = record::LoaderLink {
+        dependency_sequence: 1,
+        timeline_sequence: 3,
+        parent_listener_sequence: 1,
+        loader_dependency_sequence: 1,
+        loader_timeline_sequence: 2,
+    };
+    scope.first_failure_link = scope.links[0];
+    let events = &mut scope.dependencies;
+    events.setup_stage = 1;
+    events.armed = 1;
+    events.owner_pinned = 1;
+    events.callbacks_complete = 1;
+    events.protections_restored = 1;
+    events.node_count = 1;
+    events.nodes[0] = winsock_trace_record::Node {
+        owner_base: 0xa000,
+        entry: 0xa100,
+        owner_size: 0x2000,
+        machine: 0xaa64,
+        ..Default::default()
+    };
+    events.slot_count = 1;
+    events.slots[0] = winsock_trace_record::Slot {
+        slot: 0xa800,
+        operation: 4,
+        original: 0xd000,
+        hook: 0xe000,
+        descriptor_module: 0xf000,
+        published: 1,
+        ..Default::default()
+    };
+    events.total_calls = 1;
+    events.total_failures = 1;
+    events.record_count = 1;
+    events.first_failure_present = 1;
+    events.entries[0] = winsock_trace_record::Entry {
+        sequence: 1,
+        operation: 4,
+        thread_id: 7,
+        entered: 1,
+        returned: 1,
+        native_status: 0xc000_0022u32 as i32,
+        ..Default::default()
+    };
+    events.first_failure = events.entries[0];
+    value
+}
+
+#[test]
+fn loader_owner_records_are_bound_to_both_original_call_namespaces() {
+    let value = loader_scope();
+    let rendered = diagnostic(&value);
+    assert_eq!(rendered["invalid_packet"], false, "{rendered}");
+    assert_eq!(
+        rendered["loader_owner"]["dependencies"]["LdrLoadDll_normal_import_published"],
+        true
+    );
+    let mut other_route = loader_scope();
+    other_route.loader_owner.dependencies.slots[0].operation = 9;
+    other_route.loader_owner.dependencies.entries[0].operation = 9;
+    other_route.loader_owner.dependencies.entries[0].native_status = 1;
+    other_route.loader_owner.dependencies.entries[0].output_flags = 1;
+    other_route.loader_owner.dependencies.first_failure =
+        other_route.loader_owner.dependencies.entries[0];
+    let other = diagnostic(&other_route);
+    assert_eq!(other["invalid_packet"], false, "{other}");
+    assert_eq!(
+        other["loader_owner"]["dependencies"]["LdrLoadDll_normal_import_published"],
+        false
+    );
+    assert_eq!(other["loader_owner"]["observation_incomplete"], true);
+    assert_eq!(
+        other["loader_owner"]["armed"], 1,
+        "other valid routes remain useful"
+    );
+    assert_eq!(
+        rendered["loader_owner"]["links"][0]["loader_parent_namespace"],
+        "startup"
+    );
+    assert_eq!(
+        rendered["loader_owner"]["links"][0]["loader_dependency_sequence"],
+        1
+    );
+    assert_eq!(
+        rendered["loader_owner"]["dependencies"]["original_startup_invoked"],
+        false
+    );
+    assert!(
+        rendered["loader_owner"]["dependencies"]
+            .get("original_startup_return")
+            .is_none()
+    );
+    assert_eq!(
+        rendered["loader_owner"]["cross_namespace_failure_return_order_proved"],
+        false
+    );
+    for mutation in 0..16 {
+        let mut bad = loader_scope();
+        match mutation {
+            0 => bad.loader_owner.owner_base = 0,
+            1 => bad.loader_owner.loader_target = 0x20000,
+            2 => bad.loader_owner.dependencies.nodes[0].owner_base += 8,
+            3 => bad.loader_owner.attempt_count = 0,
+            4 => bad.dependencies.slots[0].original += 8,
+            5 => bad.loader_owner.scope_flags = 4,
+            6 => bad.loader_owner.dependencies.hop_count = 1,
+            7 => bad.loader_owner.dependencies.record_count = 17,
+            8 => bad.loader_owner.links[0].dependency_sequence = 2,
+            9 => bad.loader_owner.links[0].timeline_sequence = 2,
+            10 => bad.loader_owner.links[0].parent_listener_sequence = 2,
+            11 => bad.loader_owner.links[0].loader_dependency_sequence = 2,
+            12 => bad.loader_owner.links[0].loader_timeline_sequence = 3,
+            13 => bad.dependencies.entries[0].operation = 9,
+            14 => bad.loader_owner.dependencies.entries[0].thread_id = 8,
+            15 => bad.loader_owner.dependencies.cutoff_qpc += 1,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            diagnostic(&bad)["invalid_packet"],
+            true,
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn evicted_loader_or_socket_parents_are_incomplete_rather_than_invented() {
+    for which in 0..2 {
+        let mut value = loader_scope();
+        if which == 0 {
+            value.dependencies.record_count = 0;
+            value.dependencies.dropped = 1;
+            value.dependencies.total_failures = 0;
+            value.dependencies.first_failure_present = 0;
+            value.dependency_link_count = 0;
+            value.dependency_links_dropped = 1;
+        } else {
+            value.record_count = 0;
+            value.first_failure_present = 0;
+            value.total_failures = 0;
+            value.failure_mask = 0;
+            value.dropped = 1;
+        }
+        let rendered = diagnostic(&value);
+        assert_eq!(
+            rendered["invalid_packet"], false,
+            "which={which}; {rendered}"
+        );
+        assert_eq!(rendered["loader_owner"]["observation_incomplete"], true);
+        if which == 0 {
+            value.dependencies.dropped = 0;
+            value.dependency_links_dropped = 0;
+        } else {
+            value.dropped = 0;
+        }
+        assert_eq!(diagnostic(&value)["invalid_packet"], true);
+    }
+}
+
+#[test]
+fn loader_observer_setup_errors_do_not_replace_original_failed_loader_errors() {
+    let mut value = loader_scope();
+    value.loader_owner.setup_stage = 9;
+    value.loader_owner.setup_error = 126;
+    value.loader_owner.setup_reason = 5;
+    value.loader_owner.incomplete = 1;
+    let rendered = diagnostic(&value);
+    assert_eq!(rendered["invalid_packet"], false, "{rendered}");
+    assert_eq!(rendered["loader_owner"]["setup_error"], 126);
+    assert_eq!(
+        rendered["dependencies"]["first_observed_failure"]["outgoing_last_error"],
+        5
+    );
+    assert_eq!(
+        rendered["loader_owner"]["first_observed_failure_is_decisive_cause"],
+        false
+    );
+    let bounded = record::bounded(
+        json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":{"pid":123},"trace":rendered,"extra":"\\\"".repeat(100000)}),
+    );
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= record::RECORD_BYTES);
+    assert_eq!(bounded["original_binding"]["pid"], 123);
+    assert_eq!(bounded["trace"]["loader_owner"]["setup_error"], 126);
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["first_observed_failure"]["native_status_or_adapter_marker"],
+        0xc000_0022u32 as i32
+    );
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["acceptance_authority"],
+        false
+    );
+}
+
 #[test]
 fn appended_abi_and_historical_json_are_explicit_without_v1_reinterpretation() {
     use std::mem::{offset_of, size_of};
-    assert_eq!(size_of::<Packet>(), 28352);
+    assert_eq!(size_of::<Packet>(), 40744);
     assert_eq!(size_of::<record::ReturnedModule>(), 12136);
     assert_eq!(offset_of!(Packet, returned_module), 16216);
+    assert_eq!(size_of::<record::LoaderLink>(), 40);
+    assert_eq!(size_of::<record::LoaderOwner>(), 12392);
+    assert_eq!(offset_of!(Packet, loader_owner), 28352);
+    assert_eq!(offset_of!(record::LoaderOwner, dependencies), 64);
+    assert_eq!(offset_of!(record::LoaderOwner, first_failure_link), 11712);
+    assert_eq!(offset_of!(record::LoaderOwner, links), 11752);
     let mut value = base();
     value.version = 1;
+    assert_eq!(diagnostic(&value)["invalid_packet"], true);
+    value.version = 2;
     assert_eq!(diagnostic(&value)["invalid_packet"], true);
     let historical = json!({"format":"memcordon.original-rust-listener-trace","revision":1,"trace":{"format":"memcordon.fixture-original-rust-listener","revision":1,"aggregate":{"called":1,"outcome":2,"raw_io_error":2}}});
     let bytes = serde_json::to_vec(&historical).unwrap();
