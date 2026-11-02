@@ -1,6 +1,7 @@
 //! Explicit native Winsock configuration input; never host policy mutation.
 use crate::windows_registry_error::{at, failures, require_access_denied};
 use crate::windows_registry_manifest::{Declaration, Key, Manifest, ValueRecord, View};
+use crate::windows_registry_seal::{ReadAce, read_trustees, validate_read_acl, validate_sid};
 use std::{io, ptr, time::Instant};
 use windows_sys::Win32::{
     Foundation::{ERROR_NO_MORE_ITEMS, FILETIME, LocalFree},
@@ -102,6 +103,255 @@ fn source_security(root: HKEY, deadline: Instant) -> io::Result<Vec<u8>> {
             "source registry security descriptor changed extent",
         ));
     }
+    live(deadline)?;
+    Ok(bytes)
+}
+
+fn process_user(deadline: Instant) -> io::Result<Vec<u8>> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Security::{
+            GetTokenInformation, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    live(deadline)?;
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return at(
+            Err(io::Error::last_os_error()),
+            "seal/reader-token",
+            "OpenProcessToken",
+            "Win32",
+            Some(TOKEN_QUERY),
+        );
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    live(deadline)?;
+    let mut length = 0;
+    let result = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            ptr::null_mut(),
+            0,
+            &mut length,
+        )
+    };
+    if result == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(122) {
+            return at(
+                Err(error),
+                "seal/reader-size",
+                "GetTokenInformation(TokenUser)",
+                "Win32",
+                Some(TOKEN_QUERY),
+            );
+        }
+    }
+    let bound = std::mem::size_of::<TOKEN_USER>()
+        + SECURITY_MAX_SID_SIZE as usize
+        + std::mem::align_of::<usize>();
+    if length == 0 || length as usize > bound {
+        return Err(io::Error::other(
+            "reader TokenUser extent exceeds native SID bound",
+        ));
+    }
+    live(deadline)?;
+    let mut storage = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+    let provided = length;
+    live(deadline)?;
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            provided,
+            &mut length,
+        )
+    } == 0
+    {
+        return at(
+            Err(io::Error::last_os_error()),
+            "seal/reader-query",
+            "GetTokenInformation(TokenUser)",
+            "Win32",
+            Some(TOKEN_QUERY),
+        );
+    }
+    if length > provided {
+        return Err(io::Error::other(
+            "reader TokenUser returned extent exceeds allocation",
+        ));
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            storage.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(storage.as_slice()),
+        )
+    };
+    let sid = crate::sealed::windows::token_user_sid(bytes, length as usize)
+        .map_err(io::Error::other)?
+        .to_vec();
+    validate_sid(&sid).map_err(io::Error::other)?;
+    live(deadline)?;
+    Ok(sid)
+}
+
+fn sid_text(sid: &[u8], deadline: Instant) -> io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    validate_sid(sid).map_err(io::Error::other)?;
+    live(deadline)?;
+    let mut text = ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut text) } == 0 {
+        return at(
+            Err(io::Error::last_os_error()),
+            "seal/reader-text",
+            "ConvertSidToStringSidW",
+            "Win32",
+            None,
+        );
+    }
+    struct SidText(*mut u16);
+    impl Drop for SidText {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+    let text = SidText(text);
+    if text.0.is_null() {
+        return Err(io::Error::other("native SID string result is null"));
+    }
+    let mut units = Vec::new();
+    for index in 0..256 {
+        let unit = unsafe { *text.0.add(index) };
+        if unit == 0 {
+            let result = String::from_utf16(&units).map_err(io::Error::other)?;
+            live(deadline)?;
+            return Ok(result);
+        }
+        units.push(unit);
+    }
+    Err(io::Error::other(
+        "native SID string exceeds fixed SID bound",
+    ))
+}
+
+fn bounded_sid(bytes: &[u8], sid: *const std::ffi::c_void) -> io::Result<Vec<u8>> {
+    let offset = (sid as usize)
+        .checked_sub(bytes.as_ptr() as usize)
+        .ok_or_else(|| io::Error::other("owned security SID precedes descriptor"))?;
+    let prefix = bytes
+        .get(offset..)
+        .and_then(|tail| tail.get(..8))
+        .ok_or_else(|| io::Error::other("owned security SID header exceeds descriptor"))?;
+    let extent = 8 + usize::from(prefix[1]) * std::mem::size_of::<u32>();
+    let sid = bytes
+        .get(offset..)
+        .and_then(|tail| tail.get(..extent))
+        .ok_or_else(|| io::Error::other("owned security SID exceeds descriptor"))?;
+    validate_sid(sid).map_err(io::Error::other)?;
+    Ok(sid.to_vec())
+}
+
+fn read_seal(root: HKEY, reader: &[u8], deadline: Instant) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, SE_DACL_PROTECTED,
+    };
+    let bytes = source_security(root, deadline)?;
+    let descriptor = bytes.as_ptr().cast_mut().cast();
+    let mut control = 0;
+    let mut revision = 0;
+    let mut owner = ptr::null_mut();
+    let mut defaulted = 0;
+    let mut present = 0;
+    let mut acl = ptr::null_mut();
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return at(
+            Err(io::Error::last_os_error()),
+            "seal/read-control",
+            "GetSecurityDescriptorControl",
+            "Win32",
+            None,
+        );
+    }
+    live(deadline)?;
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) } == 0 {
+        return at(
+            Err(io::Error::last_os_error()),
+            "seal/read-owner",
+            "GetSecurityDescriptorOwner",
+            "Win32",
+            None,
+        );
+    }
+    // Observe the real owner; it is deliberately not assumed to equal TokenUser.
+    bounded_sid(&bytes, owner)?;
+    live(deadline)?;
+    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) } == 0
+    {
+        return at(
+            Err(io::Error::last_os_error()),
+            "seal/read-dacl",
+            "GetSecurityDescriptorDacl",
+            "Win32",
+            None,
+        );
+    }
+    if control & SE_DACL_PROTECTED == 0 || present == 0 || acl.is_null() {
+        return Err(io::Error::other(
+            "owned registry seal is not a protected nonnull DACL",
+        ));
+    }
+    let offset = (acl as usize)
+        .checked_sub(bytes.as_ptr() as usize)
+        .ok_or_else(|| io::Error::other("owned DACL precedes descriptor"))?;
+    let header = bytes
+        .get(offset..)
+        .and_then(|tail| tail.get(..std::mem::size_of::<ACL>()))
+        .ok_or_else(|| io::Error::other("owned DACL header exceeds descriptor"))?;
+    let acl = unsafe { ptr::read_unaligned(header.as_ptr().cast::<ACL>()) };
+    let acl_bytes = bytes
+        .get(offset..)
+        .and_then(|tail| tail.get(..usize::from(acl.AclSize)))
+        .ok_or_else(|| io::Error::other("owned DACL extent exceeds descriptor"))?;
+    if acl.AceCount > 4 {
+        return Err(io::Error::other("owned read seal has unexpected ACE count"));
+    }
+    let mut cursor = std::mem::size_of::<ACL>();
+    let mut aces = Vec::new();
+    for _ in 0..acl.AceCount {
+        live(deadline)?;
+        let header = acl_bytes
+            .get(cursor..)
+            .and_then(|tail| tail.get(..std::mem::size_of::<ACE_HEADER>()))
+            .ok_or_else(|| io::Error::other("owned ACE header exceeds DACL"))?;
+        let header = unsafe { ptr::read_unaligned(header.as_ptr().cast::<ACE_HEADER>()) };
+        let ace = acl_bytes
+            .get(cursor..)
+            .and_then(|tail| tail.get(..usize::from(header.AceSize)))
+            .ok_or_else(|| io::Error::other("owned ACE extent exceeds DACL"))?;
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        if header.AceType != 0 || ace.len() < sid_offset {
+            return Err(io::Error::other(
+                "owned seal ACE is not a complete access allow entry",
+            ));
+        }
+        let mask = u32::from_le_bytes(ace[4..sid_offset].try_into().map_err(io::Error::other)?);
+        let sid = ace[sid_offset..].to_vec();
+        aces.push(ReadAce {
+            kind: header.AceType,
+            flags: header.AceFlags,
+            mask,
+            sid,
+        });
+        cursor += usize::from(header.AceSize);
+    }
+    validate_read_acl(reader, &aces).map_err(io::Error::other)?;
     live(deadline)?;
     Ok(bytes)
 }
@@ -507,6 +757,9 @@ pub struct Projection {
     source_security: Vec<u8>,
     namespace: String,
     cleanup_deadline: Instant,
+    reader_sid: Vec<u8>,
+    sealed: bool,
+    root_security: Vec<u8>,
 }
 impl Projection {
     pub fn declaration(&self) -> &Declaration {
@@ -560,6 +813,7 @@ impl Projection {
             ));
         }
         let declaration = manifest.declaration().map_err(io::Error::other)?;
+        let reader_sid = process_user(deadline)?;
         // This DACL applies ONLY to each newly created fixture key. RC can read
         // configuration, never mutate it; owner/system retain cleanup custody.
         let sddl = wide("D:P(A;CI;KA;;;SY)(A;CI;KA;;;OW)(A;CI;KR;;;RC)");
@@ -637,6 +891,9 @@ impl Projection {
             source_security: security_before,
             namespace,
             cleanup_deadline,
+            reader_sid,
+            sealed: false,
+            root_security: Vec::new(),
         };
         let populated = at(
             projection.populate(&mut attributes),
@@ -749,7 +1006,13 @@ impl Projection {
         // Retain only controller-owned pre-seal setup references. All future
         // opens, including an ordinary same-owner workload, are read-only;
         // OWNER_RIGHTS explicitly removes implicit owner WRITE_DAC authority.
-        let sddl = wide("D:P(A;;KR;;;SY)(A;;KR;;;OW)(A;;KR;;;RC)");
+        let mut seal = String::from("D:P");
+        for sid in read_trustees(&self.reader_sid).map_err(io::Error::other)? {
+            seal.push_str("(A;;KR;;;");
+            seal.push_str(&sid_text(&sid, self.deadline)?);
+            seal.push(')');
+        }
+        let sddl = wide(&seal);
         let mut sd = ptr::null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -778,6 +1041,8 @@ impl Projection {
                     Some(WRITE_DAC),
                 )?;
             }
+            self.sealed = true;
+            self.root_security = read_seal(self.root.raw(), &self.reader_sid, self.deadline)?;
             at(
                 self.verify_owned(),
                 "projection/sealed-readback",
@@ -792,6 +1057,17 @@ impl Projection {
         sealed
     }
     pub fn verify_owned(&self) -> io::Result<()> {
+        if self.sealed {
+            for key in self.nodes.iter().chain(std::iter::once(&self.root)) {
+                at(
+                    read_seal(key.raw(), &self.reader_sid, self.deadline),
+                    "seal/effective-readback",
+                    "RegGetKeySecurity",
+                    "boundary",
+                    Some(READ_CONTROL),
+                )?;
+            }
+        }
         at(
             verify(self.root.raw(), &self.declaration, self.deadline),
             "projection/owned-verify",
@@ -814,6 +1090,21 @@ impl Projection {
             ));
         }
         self.verify_owned()?;
+        let intended = sid_text(&self.reader_sid, deadline)?;
+        if at(
+            target.original_token_envelope(deadline),
+            "seal/recipient-token",
+            "WindowsImageProcess::original_token_envelope",
+            "boundary",
+            Some(windows_sys::Win32::Security::TOKEN_QUERY),
+        )?
+        .user_sid
+            != intended
+        {
+            return Err(io::Error::other(
+                "held registry recipient TokenUser differs from captured intended reader",
+            ));
+        }
         // SAFETY: this exclusive owner retains the live registry reference
         // through the native duplicate; target retains its original process.
         let handle = at(
@@ -828,7 +1119,7 @@ impl Projection {
         Ok(handle)
     }
     pub fn diagnostic(&self) -> serde_json::Value {
-        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":1,"declaration":self.declaration,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_bytes":self.source_security,"source_security_sha256":hex_digest(&self.source_security),"source_label_captured":false,"source_view":"native","scope":"exact native WinSock2 Parameters subtree projected below owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
+        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":1,"declaration":self.declaration,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_bytes":self.source_security,"source_security_sha256":hex_digest(&self.source_security),"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native WinSock2 Parameters subtree projected below owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
     }
     fn transferred(&mut self) {
         self.transferred = true;
@@ -930,6 +1221,14 @@ impl Mapping {
         declaration: &Declaration,
         deadline: Instant,
     ) -> io::Result<Self> {
+        let reader = process_user(deadline)?;
+        at(
+            read_seal(key.raw(), &reader, deadline),
+            "mapping/intended-reader-seal",
+            "RegGetKeySecurity",
+            "boundary",
+            Some(READ_CONTROL),
+        )?;
         let manifest = at(
             verified_manifest(key.raw(), declaration, deadline),
             "mapping/manifest-readback",
