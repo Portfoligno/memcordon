@@ -438,7 +438,7 @@ fn explicit_native_registry_dependency_requires_bound_version_three_joint_contro
             version: descriptor::controller_start::REGISTRY_VERSION,
         };
         input.winsock_registry = Some(descriptor::winsock_registry::Declaration {
-            version: 1,
+            version: descriptor::winsock_registry::VERSION,
             view: descriptor::winsock_registry::View::Native,
             sha256: [42; 32],
         });
@@ -496,7 +496,7 @@ fn explicit_native_registry_dependency_requires_bound_version_three_joint_contro
                         version: descriptor::controller_start::VERSION,
                     }
                 }
-                2 => bad.winsock_registry.as_mut().unwrap().version = 2,
+                2 => bad.winsock_registry.as_mut().unwrap().version = 1,
                 3 => bad.case = Case::Envelope,
                 _ => unreachable!(),
             }

@@ -1,6 +1,8 @@
 //! Explicit native Winsock configuration input; never host policy mutation.
 use crate::windows_registry_error::{at, failures, require_access_denied};
-use crate::windows_registry_manifest::{Declaration, Key, Manifest, ValueRecord, View};
+use crate::windows_registry_manifest::{
+    Declaration, Key, Manifest, Root, VERSION, ValueRecord, View,
+};
 use crate::windows_registry_seal::{ReadAce, read_trustees, validate_read_acl, validate_sid};
 use std::{io, ptr, time::Instant};
 use windows_sys::Win32::{
@@ -13,7 +15,6 @@ use windows_sys::Win32::{
     System::Registry::*,
 };
 
-const PARAMETERS: &str = "System\\CurrentControlSet\\Services\\WinSock2\\Parameters";
 const MAX_KEYS: usize = 256;
 const MAX_VALUES: usize = 4096;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -462,6 +463,7 @@ fn open_at(
 
 #[derive(Debug, Eq, PartialEq)]
 struct Stamp {
+    root: Root,
     path: Vec<Vec<u16>>,
     subkeys: u32,
     values: u32,
@@ -469,263 +471,315 @@ struct Stamp {
     high: u32,
 }
 
-fn capture(root: HKEY, deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> {
-    let mut pending = vec![(Vec::<Vec<u16>>::new(), None::<OwnedKey>)];
+fn root_at<T>(result: io::Result<T>, root: Root) -> io::Result<T> {
+    at(
+        result,
+        match root {
+            Root::Winsock2Parameters => "forest/winsock2-parameters",
+            Root::WinsockParameters => "forest/winsock-parameters",
+        },
+        "registry-forest-root",
+        "boundary",
+        Some(KEY_READ),
+    )
+}
+fn roots_at(parent: HKEY, deadline: Instant) -> io::Result<Vec<(Root, OwnedKey)>> {
+    let mut roots = Vec::with_capacity(Root::ALL.len());
+    for kind in Root::ALL {
+        let key = root_at(
+            open_at(
+                parent,
+                &kind.path().encode_utf16().collect::<Vec<_>>(),
+                KEY_READ,
+                deadline,
+                "forest/root-open",
+            ),
+            kind,
+        )?;
+        roots.push((kind, key));
+    }
+    Ok(roots)
+}
+fn forest_security(
+    roots: &[(Root, OwnedKey)],
+    deadline: Instant,
+) -> io::Result<Vec<(Root, Vec<u8>)>> {
+    roots
+        .iter()
+        .map(|(kind, key)| {
+            root_at(source_security(key.raw(), deadline), *kind).map(|security| (*kind, security))
+        })
+        .collect()
+}
+fn capture(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> {
+    let mut pending = roots
+        .iter()
+        .map(|(kind, key)| (*kind, Vec::<Vec<u16>>::new(), None::<OwnedKey>, key.raw()))
+        .collect::<Vec<_>>();
     let mut keys = Vec::new();
     let mut stamps = Vec::new();
     let mut value_count = 0usize;
     let mut byte_count = 0usize;
-    while let Some((path, owner)) = pending.pop() {
-        live(deadline)?;
-        if keys.len() >= MAX_KEYS || path.len() > 16 {
-            return Err(io::Error::other("registry input key/depth bound exceeded"));
-        }
-        let raw = owner.as_ref().map_or(root, OwnedKey::raw);
-        let (mut subkeys, mut values, mut modified) = (0, 0, FILETIME::default());
-        let mut class = vec![0u16; 256];
-        let mut class_length = class.len() as u32;
-        status_at(
-            unsafe {
-                RegQueryInfoKeyW(
-                    raw,
-                    class.as_mut_ptr(),
-                    &mut class_length,
-                    ptr::null(),
-                    &mut subkeys,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    &mut values,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    &mut modified,
-                )
-            },
-            "capture/key-metadata",
-            "RegQueryInfoKeyW",
-            Some(KEY_READ),
-        )?;
-        class.truncate(class_length as usize);
-        byte_count = byte_count
-            .checked_add(class.len() * 2)
-            .ok_or_else(|| io::Error::other("registry class size overflow"))?;
-        if byte_count > MAX_BYTES {
-            return Err(io::Error::other(
-                "registry class/data aggregate bound exceeded",
-            ));
-        }
-        if subkeys as usize > MAX_KEYS || values as usize > MAX_VALUES {
-            return Err(io::Error::other(
-                "registry input enumeration count exceeds bound",
-            ));
-        }
-        let mut captured = Vec::new();
-        for index in 0..values {
+    while let Some((kind, path, owner, root)) = pending.pop() {
+        let captured_root = (|| -> io::Result<()> {
             live(deadline)?;
-            value_count += 1;
-            if value_count > MAX_VALUES {
-                return Err(io::Error::other("registry input value bound exceeded"));
+            byte_count = byte_count
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("registry root tag size overflow"))?;
+            if keys.len() >= MAX_KEYS || path.len() > 16 {
+                return Err(io::Error::other("registry input key/depth bound exceeded"));
             }
+            let raw = owner.as_ref().map_or(root, OwnedKey::raw);
+            let (mut subkeys, mut values, mut modified) = (0, 0, FILETIME::default());
+            let mut class = vec![0u16; 256];
+            let mut class_length = class.len() as u32;
+            status_at(
+                unsafe {
+                    RegQueryInfoKeyW(
+                        raw,
+                        class.as_mut_ptr(),
+                        &mut class_length,
+                        ptr::null(),
+                        &mut subkeys,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        &mut values,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        &mut modified,
+                    )
+                },
+                "capture/key-metadata",
+                "RegQueryInfoKeyW",
+                Some(KEY_READ),
+            )?;
+            class.truncate(class_length as usize);
+            byte_count = byte_count
+                .checked_add(class.len() * 2)
+                .ok_or_else(|| io::Error::other("registry class size overflow"))?;
+            if byte_count > MAX_BYTES {
+                return Err(io::Error::other(
+                    "registry class/data aggregate bound exceeded",
+                ));
+            }
+            if subkeys as usize > MAX_KEYS || values as usize > MAX_VALUES {
+                return Err(io::Error::other(
+                    "registry input enumeration count exceeds bound",
+                ));
+            }
+            let mut captured = Vec::new();
+            for index in 0..values {
+                live(deadline)?;
+                value_count += 1;
+                if value_count > MAX_VALUES {
+                    return Err(io::Error::other("registry input value bound exceeded"));
+                }
+                let mut name = vec![0u16; 16384];
+                let mut length = name.len() as u32;
+                let (mut kind, mut bytes) = (0, 0);
+                status_at(
+                    unsafe {
+                        RegEnumValueW(
+                            raw,
+                            index,
+                            name.as_mut_ptr(),
+                            &mut length,
+                            ptr::null(),
+                            &mut kind,
+                            ptr::null_mut(),
+                            &mut bytes,
+                        )
+                    },
+                    "capture/value-size",
+                    "RegEnumValueW",
+                    Some(KEY_READ),
+                )?;
+                if bytes as usize > 1024 * 1024 {
+                    return Err(io::Error::other(
+                        "registry input single value exceeds bound",
+                    ));
+                }
+                let mut data = vec![0; bytes as usize];
+                let mut second_name = vec![0u16; 16384];
+                let mut second_length = second_name.len() as u32;
+                let mut second_kind = 0;
+                live(deadline)?;
+                status_at(
+                    unsafe {
+                        RegEnumValueW(
+                            raw,
+                            index,
+                            second_name.as_mut_ptr(),
+                            &mut second_length,
+                            ptr::null(),
+                            &mut second_kind,
+                            data.as_mut_ptr(),
+                            &mut bytes,
+                        )
+                    },
+                    "capture/value-data",
+                    "RegEnumValueW",
+                    Some(KEY_READ),
+                )?;
+                name.truncate(length as usize);
+                second_name.truncate(second_length as usize);
+                if name != second_name || kind != second_kind || bytes as usize != data.len() {
+                    return Err(io::Error::other(
+                        "registry input value changed during enumeration",
+                    ));
+                }
+                byte_count = byte_count
+                    .checked_add(data.len() + name.len() * 2)
+                    .ok_or_else(|| io::Error::other("registry input size overflow"))?;
+                if byte_count > MAX_BYTES {
+                    return Err(io::Error::other(
+                        "registry input aggregate byte bound exceeded",
+                    ));
+                }
+                if kind == REG_LINK {
+                    return Err(io::Error::other(
+                        "registry dependency contains unsupported symbolic link",
+                    ));
+                }
+                captured.push(ValueRecord {
+                    name,
+                    kind,
+                    bytes: data,
+                });
+            }
+            // The exact observed counts must also terminate enumeration, not hide
+            // an appended key/value from a concurrent host mutation.
             let mut name = vec![0u16; 16384];
             let mut length = name.len() as u32;
-            let (mut kind, mut bytes) = (0, 0);
-            status_at(
-                unsafe {
-                    RegEnumValueW(
-                        raw,
-                        index,
-                        name.as_mut_ptr(),
-                        &mut length,
-                        ptr::null(),
-                        &mut kind,
-                        ptr::null_mut(),
-                        &mut bytes,
-                    )
-                },
-                "capture/value-size",
-                "RegEnumValueW",
-                Some(KEY_READ),
-            )?;
-            if bytes as usize > 1024 * 1024 {
-                return Err(io::Error::other(
-                    "registry input single value exceeds bound",
-                ));
-            }
-            let mut data = vec![0; bytes as usize];
-            let mut second_name = vec![0u16; 16384];
-            let mut second_length = second_name.len() as u32;
-            let mut second_kind = 0;
             live(deadline)?;
-            status_at(
-                unsafe {
-                    RegEnumValueW(
-                        raw,
-                        index,
-                        second_name.as_mut_ptr(),
-                        &mut second_length,
-                        ptr::null(),
-                        &mut second_kind,
-                        data.as_mut_ptr(),
-                        &mut bytes,
-                    )
-                },
-                "capture/value-data",
-                "RegEnumValueW",
-                Some(KEY_READ),
-            )?;
-            name.truncate(length as usize);
-            second_name.truncate(second_length as usize);
-            if name != second_name || kind != second_kind || bytes as usize != data.len() {
-                return Err(io::Error::other(
-                    "registry input value changed during enumeration",
-                ));
-            }
-            byte_count = byte_count
-                .checked_add(data.len() + name.len() * 2)
-                .ok_or_else(|| io::Error::other("registry input size overflow"))?;
-            if byte_count > MAX_BYTES {
-                return Err(io::Error::other(
-                    "registry input aggregate byte bound exceeded",
-                ));
-            }
-            if kind == REG_LINK {
-                return Err(io::Error::other(
-                    "registry dependency contains unsupported symbolic link",
-                ));
-            }
-            captured.push(ValueRecord {
-                name,
-                kind,
-                bytes: data,
-            });
-        }
-        // The exact observed counts must also terminate enumeration, not hide
-        // an appended key/value from a concurrent host mutation.
-        let mut name = vec![0u16; 16384];
-        let mut length = name.len() as u32;
-        live(deadline)?;
-        let end = unsafe {
-            RegEnumValueW(
-                raw,
-                values,
-                name.as_mut_ptr(),
-                &mut length,
-                ptr::null(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if end != ERROR_NO_MORE_ITEMS {
-            let error = if end == 0 {
-                io::Error::other("registry value enumeration exceeded observed count")
-            } else {
-                io::Error::other(io::Error::from_raw_os_error(end as i32))
+            let end = unsafe {
+                RegEnumValueW(
+                    raw,
+                    values,
+                    name.as_mut_ptr(),
+                    &mut length,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
             };
-            return at(
-                Err(error),
-                "capture/value-end",
-                "RegEnumValueW",
-                "LSTATUS",
-                Some(KEY_READ),
-            );
-        }
-        for index in 0..subkeys {
-            live(deadline)?;
-            let mut name = vec![0u16; 256];
+            if end != ERROR_NO_MORE_ITEMS {
+                let error = if end == 0 {
+                    io::Error::other("registry value enumeration exceeded observed count")
+                } else {
+                    io::Error::other(io::Error::from_raw_os_error(end as i32))
+                };
+                return at(
+                    Err(error),
+                    "capture/value-end",
+                    "RegEnumValueW",
+                    "LSTATUS",
+                    Some(KEY_READ),
+                );
+            }
+            for index in 0..subkeys {
+                live(deadline)?;
+                let mut name = vec![0u16; 256];
+                let mut length = name.len() as u32;
+                status_at(
+                    unsafe {
+                        RegEnumKeyExW(
+                            raw,
+                            index,
+                            name.as_mut_ptr(),
+                            &mut length,
+                            ptr::null(),
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                        )
+                    },
+                    "capture/subkey-name",
+                    "RegEnumKeyExW",
+                    Some(KEY_READ),
+                )?;
+                name.truncate(length as usize);
+                let child = open_at(raw, &name, KEY_READ, deadline, "capture/subkey-open")?;
+                let mut child_path = path.clone();
+                child_path.push(name);
+                byte_count = byte_count
+                    .checked_add(child_path.iter().map(|part| part.len() * 2).sum::<usize>())
+                    .ok_or_else(|| io::Error::other("registry path size overflow"))?;
+                if byte_count > MAX_BYTES {
+                    return Err(io::Error::other(
+                        "registry input name/data aggregate bound exceeded",
+                    ));
+                }
+                pending.push((kind, child_path, Some(child), root));
+                if pending.len() + keys.len() + 1 > MAX_KEYS {
+                    return Err(io::Error::other(
+                        "registry input pending key bound exceeded",
+                    ));
+                }
+            }
+            let mut name = [0u16; 256];
             let mut length = name.len() as u32;
-            status_at(
-                unsafe {
-                    RegEnumKeyExW(
-                        raw,
-                        index,
-                        name.as_mut_ptr(),
-                        &mut length,
-                        ptr::null(),
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                    )
-                },
-                "capture/subkey-name",
-                "RegEnumKeyExW",
-                Some(KEY_READ),
-            )?;
-            name.truncate(length as usize);
-            let child = open_at(raw, &name, KEY_READ, deadline, "capture/subkey-open")?;
-            let mut child_path = path.clone();
-            child_path.push(name);
-            byte_count = byte_count
-                .checked_add(child_path.iter().map(|part| part.len() * 2).sum::<usize>())
-                .ok_or_else(|| io::Error::other("registry path size overflow"))?;
-            if byte_count > MAX_BYTES {
-                return Err(io::Error::other(
-                    "registry input name/data aggregate bound exceeded",
-                ));
-            }
-            pending.push((child_path, Some(child)));
-            if pending.len() + keys.len() > MAX_KEYS {
-                return Err(io::Error::other(
-                    "registry input pending key bound exceeded",
-                ));
-            }
-        }
-        let mut name = [0u16; 256];
-        let mut length = name.len() as u32;
-        live(deadline)?;
-        let end = unsafe {
-            RegEnumKeyExW(
-                raw,
-                subkeys,
-                name.as_mut_ptr(),
-                &mut length,
-                ptr::null(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if end != ERROR_NO_MORE_ITEMS {
-            let error = if end == 0 {
-                io::Error::other("registry key enumeration exceeded observed count")
-            } else {
-                io::Error::other(io::Error::from_raw_os_error(end as i32))
+            live(deadline)?;
+            let end = unsafe {
+                RegEnumKeyExW(
+                    raw,
+                    subkeys,
+                    name.as_mut_ptr(),
+                    &mut length,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
             };
-            return at(
-                Err(error),
-                "capture/key-end",
-                "RegEnumKeyExW",
-                "LSTATUS",
-                Some(KEY_READ),
-            );
-        }
-        stamps.push(Stamp {
-            path: path.clone(),
-            subkeys,
-            values,
-            low: modified.dwLowDateTime,
-            high: modified.dwHighDateTime,
-        });
-        keys.push(Key {
-            path,
-            class,
-            values: captured,
-        });
+            if end != ERROR_NO_MORE_ITEMS {
+                let error = if end == 0 {
+                    io::Error::other("registry key enumeration exceeded observed count")
+                } else {
+                    io::Error::other(io::Error::from_raw_os_error(end as i32))
+                };
+                return at(
+                    Err(error),
+                    "capture/key-end",
+                    "RegEnumKeyExW",
+                    "LSTATUS",
+                    Some(KEY_READ),
+                );
+            }
+            stamps.push(Stamp {
+                root: kind,
+                path: path.clone(),
+                subkeys,
+                values,
+                low: modified.dwLowDateTime,
+                high: modified.dwHighDateTime,
+            });
+            keys.push(Key {
+                root: kind,
+                path,
+                class,
+                values: captured,
+            });
+            Ok(())
+        })();
+        root_at(captured_root, kind)?;
     }
     let manifest = Manifest {
-        version: 1,
+        version: VERSION,
         view: View::Native,
         keys,
     };
     manifest.validate().map_err(io::Error::other)?;
-    stamps.sort_by(|a, b| a.path.cmp(&b.path));
+    stamps.sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
     live(deadline)?;
     Ok((manifest, stamps))
 }
 
-fn coherent(root: HKEY, deadline: Instant) -> io::Result<Manifest> {
-    let (first, first_stamps) = capture(root, deadline)?;
-    let (second, second_stamps) = capture(root, deadline)?;
+fn coherent(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<Manifest> {
+    let (first, first_stamps) = capture(roots, deadline)?;
+    let (second, second_stamps) = capture(roots, deadline)?;
     if first_stamps != second_stamps
         || first.digest().map_err(io::Error::other)? != second.digest().map_err(io::Error::other)?
     {
@@ -745,7 +799,7 @@ pub struct Projection {
     retired: bool,
     transferred: bool,
     recipients_retired: bool,
-    source_security: Vec<u8>,
+    source_security: Vec<(Root, Vec<u8>)>,
     namespace: String,
     cleanup_deadline: Instant,
     reader_sid: Vec<u8>,
@@ -770,29 +824,23 @@ impl Projection {
         {
             return Err(io::Error::other("invalid owned registry namespace nonce"));
         }
-        let source = open_at(
-            HKEY_LOCAL_MACHINE,
-            &PARAMETERS.encode_utf16().collect::<Vec<_>>(),
-            KEY_READ,
-            deadline,
-            "projection/source-open",
-        )?;
+        let sources = roots_at(HKEY_LOCAL_MACHINE, deadline)?;
         let security_before = at(
-            source_security(source.raw(), deadline),
+            forest_security(&sources, deadline),
             "projection/source-security-before",
             "RegGetKeySecurity",
             "boundary",
             Some(READ_CONTROL),
         )?;
         let manifest = at(
-            coherent(source.raw(), deadline),
+            coherent(&sources, deadline),
             "projection/source-snapshot",
             "coherent",
             "boundary",
             Some(KEY_READ),
         )?;
         if at(
-            source_security(source.raw(), deadline),
+            forest_security(&sources, deadline),
             "projection/source-security-after",
             "RegGetKeySecurity",
             "boundary",
@@ -909,11 +957,13 @@ impl Projection {
     }
     fn populate(&mut self, attributes: &mut SECURITY_ATTRIBUTES) -> io::Result<()> {
         let mut keys = self.manifest.keys.clone();
-        keys.sort_by(|a, b| a.path.cmp(&b.path));
+        keys.sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
         let mut created = std::collections::BTreeMap::<Vec<Vec<u16>>, usize>::new();
         for entry in keys {
             live(self.deadline)?;
-            let mut components = PARAMETERS
+            let mut components = entry
+                .root
+                .path()
                 .split('\\')
                 .map(|part| part.encode_utf16().collect::<Vec<_>>())
                 .collect::<Vec<_>>();
@@ -1110,7 +1160,8 @@ impl Projection {
         Ok(handle)
     }
     pub fn diagnostic(&self) -> serde_json::Value {
-        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":1,"declaration":self.declaration,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_bytes":self.source_security,"source_security_sha256":hex_digest(&self.source_security),"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native WinSock2 Parameters subtree projected below owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
+        let security = self.source_security.iter().map(|(root, bytes)| serde_json::json!({"root":root,"path":root.path(),"bytes":bytes,"sha256":hex_digest(bytes)})).collect::<Vec<_>>();
+        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":2,"declaration":self.declaration,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_roots":security,"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native Winsock and WinSock2 Parameters forest projected below one owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
     }
     fn transferred(&mut self) {
         self.transferred = true;
@@ -1186,14 +1237,8 @@ fn verified_manifest(
     deadline: Instant,
 ) -> io::Result<Manifest> {
     declaration.validate().map_err(io::Error::other)?;
-    let parameters = open_at(
-        root,
-        &PARAMETERS.encode_utf16().collect::<Vec<_>>(),
-        KEY_READ,
-        deadline,
-        "verify/parameters-open",
-    )?;
-    let actual = coherent(parameters.raw(), deadline)?;
+    let parameters = roots_at(root, deadline)?;
+    let actual = coherent(&parameters, deadline)?;
     if actual.digest().map_err(io::Error::other)? != declaration.sha256 {
         return Err(io::Error::other("registry input manifest digest differs"));
     }
@@ -1220,6 +1265,9 @@ impl Mapping {
             "boundary",
             Some(READ_CONTROL),
         )?;
+        for (kind, parameters) in roots_at(key.raw(), deadline)? {
+            root_at(read_seal(parameters.raw(), &reader, deadline), kind)?;
+        }
         let manifest = at(
             verified_manifest(key.raw(), declaration, deadline),
             "mapping/manifest-readback",
@@ -1305,6 +1353,43 @@ impl Mapping {
 }
 
 fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<()> {
+    immutable_surface(root, deadline)?;
+    for kind in Root::ALL {
+        let checked = (|| -> io::Result<()> {
+            let parameters = open_at(
+                root,
+                &kind.path().encode_utf16().collect::<Vec<_>>(),
+                KEY_READ,
+                deadline,
+                "immutable/parameters-open",
+            )?;
+            immutable_surface(parameters.raw(), deadline)?;
+            let leaf = manifest
+                .keys
+                .iter()
+                .filter(|key| key.root == kind)
+                .max_by_key(|key| key.path.len())
+                .ok_or_else(|| io::Error::other("verified registry forest has no root leaf"))?;
+            let mut leaf_path = kind.path().encode_utf16().collect::<Vec<_>>();
+            for component in &leaf.path {
+                leaf_path.push(b'\\' as u16);
+                leaf_path.extend(component);
+            }
+            leaf_path.push(0);
+            live(deadline)?;
+            denied_status(
+                unsafe { RegDeleteKeyExW(root, leaf_path.as_ptr(), 0, 0) },
+                "immutable/delete-leaf",
+                "RegDeleteKeyExW",
+                Some(0x0001_0000),
+            )?;
+            live(deadline)
+        })();
+        root_at(checked, kind)?;
+    }
+    live(deadline)
+}
+fn immutable_surface(root: HKEY, deadline: Instant) -> io::Result<()> {
     live(deadline)?;
     for access in [KEY_SET_VALUE, KEY_CREATE_SUB_KEY, 0x0001_0000, 0x0004_0000] {
         require_access_denied(
@@ -1350,25 +1435,6 @@ fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<(
         "immutable/write",
         "RegSetValueExW",
         Some(KEY_SET_VALUE),
-    )?;
-    let leaf = manifest
-        .keys
-        .iter()
-        .max_by_key(|key| key.path.len())
-        .ok_or_else(|| io::Error::other("verified registry manifest has no leaf"))?;
-    let mut leaf_path = PARAMETERS.encode_utf16().collect::<Vec<_>>();
-    for component in &leaf.path {
-        leaf_path.push(b'\\' as u16);
-        leaf_path.extend(component);
-    }
-    leaf_path.push(0);
-    live(deadline)?;
-    let result = unsafe { RegDeleteKeyExW(root, leaf_path.as_ptr(), 0, 0) };
-    denied_status(
-        result,
-        "immutable/delete-leaf",
-        "RegDeleteKeyExW",
-        Some(0x0001_0000),
     )?;
     let mut security = at(
         source_security(root, deadline),
@@ -1496,15 +1562,9 @@ pub fn self_check(
         None,
     )?;
     let tested = (|| -> io::Result<()> {
-        let source = open_at(
-            HKEY_LOCAL_MACHINE,
-            &PARAMETERS.encode_utf16().collect::<Vec<_>>(),
-            KEY_READ,
-            deadline,
-            "selfcheck/source-open",
-        )?;
+        let sources = roots_at(HKEY_LOCAL_MACHINE, deadline)?;
         let source_before = at(
-            coherent(source.raw(), deadline),
+            coherent(&sources, deadline),
             "selfcheck/source-snapshot-before",
             "coherent",
             "boundary",
@@ -1513,7 +1573,7 @@ pub fn self_check(
         .digest()
         .map_err(io::Error::other)?;
         let source_sd = at(
-            source_security(source.raw(), deadline),
+            forest_security(&sources, deadline),
             "selfcheck/source-security-before",
             "RegGetKeySecurity",
             "boundary",
@@ -1702,6 +1762,33 @@ pub fn self_check(
                         "process-local mapping readback differs from held input namespace",
                     ));
                 }
+                for kind in Root::ALL {
+                    let checked = (|| -> io::Result<()> {
+                        let path = kind.path().encode_utf16().collect::<Vec<_>>();
+                        let mapped = open_at(
+                            HKEY_LOCAL_MACHINE,
+                            &path,
+                            KEY_READ,
+                            deadline,
+                            "selfcheck/mapped-forest-open",
+                        )?;
+                        let held = open_at(
+                            mapping.raw(),
+                            &path,
+                            KEY_READ,
+                            deadline,
+                            "selfcheck/held-forest-open",
+                        )?;
+                        if key_name(mapped.raw(), deadline)? != key_name(held.raw(), deadline)? {
+                            return Err(io::Error::other(
+                                "mapped forest root name differs from held input",
+                            ));
+                        }
+                        live(deadline)
+                    })();
+                    root_at(checked, kind)?;
+                }
+                verified_manifest(HKEY_LOCAL_MACHINE, &declaration, deadline)?;
                 live(deadline)?;
                 // The restricted proofs are complete. Revert exactly once,
                 // while the same process-local mapping stays owned by run.
@@ -1823,7 +1910,7 @@ pub fn self_check(
             ));
         }
         if at(
-            coherent(source.raw(), deadline),
+            coherent(&sources, deadline),
             "selfcheck/source-snapshot-after",
             "coherent",
             "boundary",
@@ -1833,7 +1920,7 @@ pub fn self_check(
         .map_err(io::Error::other)?
             != source_before
             || at(
-                source_security(source.raw(), deadline),
+                forest_security(&sources, deadline),
                 "selfcheck/source-security-after",
                 "RegGetKeySecurity",
                 "boundary",

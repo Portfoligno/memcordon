@@ -1,9 +1,9 @@
-//! Canonical semantic input for the fixture-owned native Winsock registry subtree.
+//! Canonical semantic input for the fixture-owned native Winsock registry forest.
 //! A digest describes data; native held-key custody supplies the capability.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_KEYS: usize = 256;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_VALUES: usize = 4096;
@@ -14,6 +14,30 @@ pub const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 #[serde(rename_all = "kebab-case")]
 pub enum View {
     Native,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Root {
+    Winsock2Parameters,
+    WinsockParameters,
+}
+impl Root {
+    pub const ALL: [Self; 2] = [Self::Winsock2Parameters, Self::WinsockParameters];
+
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Winsock2Parameters => "System\\CurrentControlSet\\Services\\WinSock2\\Parameters",
+            Self::WinsockParameters => "System\\CurrentControlSet\\Services\\Winsock\\Parameters",
+        }
+    }
+
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Winsock2Parameters => 1,
+            Self::WinsockParameters => 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -43,7 +67,8 @@ pub struct ValueRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Key {
-    /// Components relative to the fixed WinSock2 Parameters subtree; root is [].
+    pub root: Root,
+    /// Components relative to this fixed root; its own root is [].
     pub path: Vec<Vec<u16>>,
     pub class: Vec<u16>,
     pub values: Vec<ValueRecord>,
@@ -72,7 +97,7 @@ impl Manifest {
             Ok(())
         };
         for key in &self.keys {
-            if key.path.len() > MAX_DEPTH || !paths.insert(key.path.clone()) {
+            if key.path.len() > MAX_DEPTH || !paths.insert((key.root, key.path.clone())) {
                 return Err("Winsock registry key depth/uniqueness differs".into());
             }
             if key.class.len() > 255 || key.class.contains(&0) {
@@ -80,6 +105,7 @@ impl Manifest {
                     "Winsock registry key class is not bounded lossless native UTF16".into(),
                 );
             }
+            charge(1)?; // Fixed canonical root tag, shared across the forest budget.
             charge(key.class.len() * 2)?;
             for component in &key.path {
                 if component.is_empty()
@@ -112,11 +138,13 @@ impl Manifest {
                 charge(value.bytes.len())?;
             }
         }
-        if !paths.contains(&Vec::<Vec<u16>>::new()) {
-            return Err("Winsock registry subtree root is absent".into());
+        for root in Root::ALL {
+            if !paths.contains(&(root, Vec::new())) {
+                return Err("Winsock registry required forest root is absent".into());
+            }
         }
-        for path in &paths {
-            if !path.is_empty() && !paths.contains(&path[..path.len() - 1]) {
+        for (root, path) in &paths {
+            if !path.is_empty() && !paths.contains(&(*root, path[..path.len() - 1].to_vec())) {
                 return Err("Winsock registry key lacks its captured parent".into());
             }
         }
@@ -132,9 +160,15 @@ impl Manifest {
         // The only accepted view is the actual native process view.
         hash.update([1]);
         let mut keys: Vec<_> = self.keys.iter().collect();
-        keys.sort_by(|left, right| left.path.cmp(&right.path));
+        keys.sort_by(|left, right| {
+            left.root
+                .tag()
+                .cmp(&right.root.tag())
+                .then_with(|| left.path.cmp(&right.path))
+        });
         hash.update((keys.len() as u32).to_le_bytes());
         for key in keys {
+            hash.update([key.root.tag()]);
             hash.update((key.path.len() as u32).to_le_bytes());
             for component in &key.path {
                 hash.update((component.len() as u32).to_le_bytes());

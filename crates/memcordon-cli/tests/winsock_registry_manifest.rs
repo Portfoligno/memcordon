@@ -1,15 +1,16 @@
 use memcordon_platform::windows_registry_manifest as registry;
-use registry::{Key, Manifest, ValueRecord, View};
+use registry::{Key, Manifest, Root, ValueRecord, View};
 
 fn name(value: &str) -> Vec<u16> {
     value.encode_utf16().collect()
 }
 fn fixture() -> Manifest {
     Manifest {
-        version: 1,
+        version: registry::VERSION,
         view: View::Native,
         keys: vec![
             Key {
+                root: Root::Winsock2Parameters,
                 path: vec![],
                 class: vec![0x03b1, 0xd800],
                 values: vec![
@@ -26,6 +27,7 @@ fn fixture() -> Manifest {
                 ],
             },
             Key {
+                root: Root::Winsock2Parameters,
                 path: vec![name("Protocol_Catalog9")],
                 class: vec![],
                 values: vec![ValueRecord {
@@ -33,6 +35,12 @@ fn fixture() -> Manifest {
                     kind: 4,
                     bytes: 1u32.to_le_bytes().to_vec(),
                 }],
+            },
+            Key {
+                root: Root::WinsockParameters,
+                path: vec![],
+                class: vec![],
+                values: vec![],
             },
         ],
     }
@@ -134,4 +142,147 @@ fn incomplete_duplicated_or_unbounded_trees_fail_before_sealing() {
     let mut json = serde_json::to_value(fixture()).unwrap();
     json["view"] = "wow64-32".into();
     assert!(serde_json::from_value::<Manifest>(json).is_err());
+}
+
+fn forest() -> Manifest {
+    Manifest {
+        version: registry::VERSION,
+        view: View::Native,
+        keys: Root::ALL
+            .into_iter()
+            .map(|root| Key {
+                root,
+                path: vec![],
+                class: vec![],
+                values: vec![],
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn both_fixed_roots_are_mandatory_and_parent_closure_never_crosses_roots() {
+    forest().validate().unwrap();
+    for root in Root::ALL {
+        let mut missing = forest();
+        missing.keys.retain(|key| key.root != root);
+        assert!(missing.validate().is_err());
+    }
+    let mut same_relative_path = fixture();
+    let mut sibling = same_relative_path.keys[1].clone();
+    sibling.root = Root::WinsockParameters;
+    same_relative_path.keys.push(sibling);
+    same_relative_path.validate().unwrap();
+    let mut wrong_parent = same_relative_path.clone();
+    wrong_parent
+        .keys
+        .last_mut()
+        .unwrap()
+        .path
+        .push(name("leaf"));
+    assert!(wrong_parent.validate().is_err());
+    let mut duplicate = same_relative_path.clone();
+    duplicate.keys.push(duplicate.keys[3].clone());
+    assert!(duplicate.validate().is_err());
+    let mut unknown = serde_json::to_value(forest()).unwrap();
+    unknown["keys"][0]["root"] = "arbitrary-service-parameters".into();
+    assert!(serde_json::from_value::<Manifest>(unknown).is_err());
+    let mut absent = serde_json::to_value(forest()).unwrap();
+    absent["keys"][0].as_object_mut().unwrap().remove("root");
+    assert!(serde_json::from_value::<Manifest>(absent).is_err());
+}
+
+#[test]
+fn roots_are_digest_bound_and_legacy_single_root_declarations_are_refused() {
+    let original = fixture();
+    let digest = original.digest().unwrap();
+    let mut swapped = original.clone();
+    for key in &mut swapped.keys {
+        key.root = match key.root {
+            Root::Winsock2Parameters => Root::WinsockParameters,
+            Root::WinsockParameters => Root::Winsock2Parameters,
+        };
+    }
+    assert_ne!(swapped.digest().unwrap(), digest);
+    let mut moved = original.clone();
+    moved.keys[1].root = Root::WinsockParameters;
+    assert_ne!(moved.digest().unwrap(), digest);
+    let mut changed = original.clone();
+    changed.keys[2].values.push(ValueRecord {
+        name: vec![],
+        kind: 3,
+        bytes: vec![1],
+    });
+    assert_ne!(changed.digest().unwrap(), digest);
+    let mut declaration = original.declaration().unwrap();
+    assert_eq!(declaration.version, 2);
+    declaration.version = 1;
+    assert!(declaration.validate().is_err());
+    let mut legacy = original;
+    legacy.version = 1;
+    assert!(legacy.digest().is_err());
+    let encoded = serde_json::to_value(forest()).unwrap();
+    assert_eq!(encoded["keys"][0]["root"], "winsock2-parameters");
+    assert_eq!(encoded["keys"][1]["root"], "winsock-parameters");
+}
+
+#[test]
+fn forest_key_and_value_limits_are_shared_not_doubled_per_root() {
+    let mut keys = forest();
+    for index in 0..registry::MAX_KEYS - Root::ALL.len() {
+        keys.keys.push(Key {
+            root: Root::ALL[index % Root::ALL.len()],
+            path: vec![name(&index.to_string())],
+            class: vec![],
+            values: vec![],
+        });
+    }
+    keys.validate().unwrap();
+    keys.keys.push(Key {
+        root: Root::WinsockParameters,
+        path: vec![name("one-too-many")],
+        class: vec![],
+        values: vec![],
+    });
+    assert!(keys.validate().is_err());
+
+    let mut values = forest();
+    for (index, key) in values.keys.iter_mut().enumerate() {
+        key.values = (0..registry::MAX_VALUES / 2)
+            .map(|value| ValueRecord {
+                name: name(&format!("{index}-{value}")),
+                kind: 0,
+                bytes: vec![],
+            })
+            .collect();
+    }
+    values.validate().unwrap();
+    values.keys[1].values.push(ValueRecord {
+        name: name("one-too-many"),
+        kind: 0,
+        bytes: vec![],
+    });
+    assert!(values.validate().is_err());
+}
+
+#[test]
+fn forest_byte_budget_charges_both_roots_and_accepts_only_the_exact_shared_extent() {
+    let mut value = forest();
+    for key in &mut value.keys {
+        key.values = (0..2)
+            .map(|index| ValueRecord {
+                name: vec![b'a' as u16 + index],
+                kind: 3,
+                bytes: vec![0; registry::MAX_VALUE_BYTES],
+            })
+            .collect();
+    }
+    // Two root tags plus four one-unit native names consume ten bytes.
+    let metadata = Root::ALL.len() + 4 * size_of::<u16>();
+    value.keys[1].values[1]
+        .bytes
+        .truncate(registry::MAX_VALUE_BYTES - metadata);
+    value.validate().unwrap();
+    value.keys[1].values[1].bytes.push(0);
+    assert!(value.validate().is_err());
 }
