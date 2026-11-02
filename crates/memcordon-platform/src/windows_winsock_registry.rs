@@ -124,40 +124,40 @@ impl OwnedKey {
         if flags & windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT != 0 {
             return Err(io::Error::other("registry input reference is inheritable"));
         }
-        #[link(name = "ntdll")]
-        unsafe extern "system" {
-            fn NtQueryObject(
-                handle: HKEY,
-                class: u32,
-                bytes: *mut std::ffi::c_void,
-                length: u32,
-                returned: *mut u32,
-            ) -> i32;
-        }
-        let mut basic = [0u64; 8];
+        use windows_sys::{
+            Wdk::Foundation::{NtQueryObject, ObjectBasicInformation},
+            Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION,
+        };
+        let mut basic = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+        let provided = std::mem::size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>() as u32;
         let mut returned = 0;
         live(deadline)?;
+        // SAFETY: owner retains the original key; this is the documented fixed
+        // ObjectBasicInformation structure and its exact native buffer extent.
         let result = unsafe {
             NtQueryObject(
                 raw,
-                0,
-                basic.as_mut_ptr().cast(),
-                std::mem::size_of_val(&basic) as u32,
-                &mut returned,
+                ObjectBasicInformation,
+                (&raw mut basic).cast(),
+                provided,
+                &raw mut returned,
             )
         };
         if result < 0 {
             return Err(io::Error::other(format!(
-                "registry input granted-access query failed: {result:#x}"
+                "registry input granted-access query failed: operation=NtQueryObject; class=ObjectBasicInformation({ObjectBasicInformation}); NTSTATUS={result} ({result:#010x}); provided-bytes={provided}; returned-bytes={returned}; failed-output-not-authoritative=true"
             )));
         }
-        if returned < 8
-            || returned as usize > std::mem::size_of_val(&basic)
-            || (basic[0] >> 32) as u32 != KEY_READ
-        {
-            return Err(io::Error::other(
-                "registry input does not carry exact KEY_READ access",
-            ));
+        if returned != provided {
+            return Err(io::Error::other(format!(
+                "registry input granted-access response length differs: operation=NtQueryObject; class=ObjectBasicInformation({ObjectBasicInformation}); NTSTATUS={result} ({result:#010x}); provided-bytes={provided}; returned-bytes={returned}"
+            )));
+        }
+        if basic.GrantedAccess != KEY_READ {
+            return Err(io::Error::other(format!(
+                "registry input does not carry exact KEY_READ access: operation=NtQueryObject; class=ObjectBasicInformation({ObjectBasicInformation}); provided-bytes={provided}; returned-bytes={returned}; granted-access={:#010x}; expected-access={KEY_READ:#010x}",
+                basic.GrantedAccess
+            )));
         }
         live(deadline)?;
         Ok(owner)
