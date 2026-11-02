@@ -1002,18 +1002,41 @@ impl CommandSpec {
         }
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
         let started = Instant::now();
+        let observe_storage = cfg!(target_os = "linux")
+            && matches!(
+                self.phase,
+                Some(CiPhase::NativeCompile | CiPhase::NativeExecute)
+            );
         let diagnostic_directory = if self.phase.is_some() {
-            let directory = self.current_dir.join("target/ci/reports/execution");
-            std::fs::create_dir_all(&directory)?;
-            Some(
-                tempfile::Builder::new()
+            let allocate = || -> std::io::Result<PathBuf> {
+                let directory = self.current_dir.join("target/ci/reports/execution");
+                std::fs::create_dir_all(&directory)?;
+                Ok(tempfile::Builder::new()
                     .prefix("operation-")
                     .tempdir_in(directory)?
-                    .keep(),
-            )
+                    .keep())
+            };
+            match allocate() {
+                Ok(directory) => Some(directory),
+                Err(error) if observe_storage => {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "passive native storage retention unavailable: {error}"
+                    );
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             None
         };
+        let storage_target = self
+            .arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--target-dir")
+            .map(|pair| PathBuf::from(&pair[1]));
+        let storage_cutoff = started + budget;
         let report = |state: &str,
                       observed_budget: Duration,
                       result: Option<
@@ -1026,6 +1049,20 @@ impl CommandSpec {
             };
             let mut value = serde_json::json!({"phase": phase.name(), "state": state, "program": self.program.to_string_lossy(), "arguments": self.arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>(), "toolchain": format!("{:?}", self.toolchain), "original-budget-ms": self.deadline.as_millis(), "available-budget-ms": observed_budget.as_millis(), "elapsed-ms": started.elapsed().as_millis()});
             value["selection"] = self.selection.clone().unwrap_or(serde_json::Value::Null);
+            if observe_storage {
+                let storage = crate::storage_observation::snapshot(
+                    &self.current_dir,
+                    storage_target.as_deref(),
+                    true,
+                    storage_cutoff,
+                );
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[ci native storage {state}] {storage}"
+                );
+                value["storage-observation"] = storage;
+            }
             #[cfg(unix)]
             if let Some(owner) = &self.compiler_owner {
                 value["compiler-pool"] = owner.diagnostic();
@@ -1131,9 +1168,9 @@ impl CommandSpec {
                     }
                 }
             }
-            let directory = diagnostic_directory
-                .as_ref()
-                .expect("phase diagnostics allocated");
+            let Some(directory) = diagnostic_directory.as_ref() else {
+                return Ok(());
+            };
             let temporary = directory.join(phase.name()).with_extension("tmp");
             let path = directory.join(phase.name()).with_extension("json");
             crate::release::source::write_diagnostic_json(&temporary, &value)?;
@@ -1141,9 +1178,26 @@ impl CommandSpec {
             Ok(())
         };
         if let Err(error) = report("in-progress", budget, None, None) {
-            eprintln!("diagnostic retention incomplete: {error}");
+            if observe_storage {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "diagnostic retention incomplete: {error}"
+                );
+            } else {
+                eprintln!("diagnostic retention incomplete: {error}");
+            }
         }
         let budget = self.available_budget()?;
+        let budget = if observe_storage {
+            remaining_budget(
+                budget,
+                storage_cutoff.saturating_duration_since(Instant::now()),
+                Duration::ZERO,
+            )?
+        } else {
+            budget
+        };
         let ordinary = (matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
             && self.arguments.first().is_some_and(|argument| {
                 matches!(
@@ -1170,34 +1224,35 @@ impl CommandSpec {
         let observe_cargo_progress = cfg!(target_os = "macos")
             && matches!(self.phase, Some(CiPhase::NativeCompile))
             && matches!(self.toolchain, Some(ToolchainInvocation::Cargo { .. }));
-        let (result, logger_settled, cargo_progress) =
-            std::thread::scope(|scope| {
-                let lane = match std::thread::current().name() {
-                    Some("ci-source-lane") => "first",
-                    Some("ci-auxiliary-lane") => "second",
-                    _ => "owner",
-                };
-                let phase = self.phase.map_or("command", CiPhase::name);
-                let (sender, receiver) =
-                    std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
-                let (admitted_sender, admitted_receiver) = std::sync::mpsc::sync_channel::<
-                    std::result::Result<memcordon_platform::test_support::ProcessIdentity, String>,
-                >(1);
-                let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let logger_done = done.clone();
-                let secrets: Vec<String> = [
-                    "GH_TOKEN",
-                    "GITHUB_TOKEN",
-                    "CARGO_REGISTRY_TOKEN",
-                    "CARGO_REGISTRIES_CRATES_IO_TOKEN",
-                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-                ]
-                .into_iter()
-                .filter_map(|key| std::env::var(key).ok())
-                .filter(|value| !value.is_empty())
-                .collect();
-                let logger = scope.spawn(move || {
+        let (result, logger_settled, cargo_progress) = std::thread::scope(|scope| {
+            let lane = match std::thread::current().name() {
+                Some("ci-source-lane") => "first",
+                Some("ci-auxiliary-lane") => "second",
+                _ => "owner",
+            };
+            let phase = self.phase.map_or("command", CiPhase::name);
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
+            let (admitted_sender, admitted_receiver) = std::sync::mpsc::sync_channel::<
+                std::result::Result<memcordon_platform::test_support::ProcessIdentity, String>,
+            >(1);
+            let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let logger_done = done.clone();
+            let secrets: Vec<String> = [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "CARGO_REGISTRY_TOKEN",
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            ]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+            .collect();
+            let storage_root = self.current_dir.clone();
+            let storage_target = storage_target.clone();
+            let logger = scope.spawn(move || {
                 let mut cargo_progress = observe_cargo_progress
                     .then(|| crate::cargo_progress::CargoProgress::new(budget));
                 let mut pending = [Vec::new(), Vec::new()];
@@ -1205,11 +1260,34 @@ impl CommandSpec {
                 let mut remaining: usize = 1024 * 1024;
                 let mut omitted_lines = 0_u64;
                 let mut final_chunks = 0;
+                let mut next_storage_sample = Duration::from_secs(60);
+                let mut storage_samples = 0;
                 #[cfg(target_os = "macos")]
                 let mut admitted = None;
                 #[cfg(target_os = "macos")]
                 let mut next_native_sample = Duration::ZERO;
                 loop {
+                    if observe_storage
+                        && storage_samples < 32
+                        && !logger_done.load(std::sync::atomic::Ordering::Acquire)
+                        && Instant::now() < storage_cutoff
+                        && started.elapsed() >= next_storage_sample
+                    {
+                        let storage = crate::storage_observation::snapshot(
+                            &storage_root,
+                            storage_target.as_deref(),
+                            false,
+                            storage_cutoff,
+                        );
+                        use std::io::Write;
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "[ci native storage during elapsed-ms={}] {storage}",
+                            started.elapsed().as_millis()
+                        );
+                        storage_samples += 1;
+                        next_storage_sample = started.elapsed() + Duration::from_secs(60);
+                    }
                     #[cfg(target_os = "macos")]
                     if observe_cargo_progress
                         && !logger_done.load(std::sync::atomic::Ordering::Acquire)
@@ -1254,11 +1332,17 @@ impl CommandSpec {
                     };
                     for byte in chunk.bytes {
                         if byte == b'\n' {
-                            if !discarding[stream] && let Some(safe) =
-                                crate::command_progress_line::observe_complete_line(
-                                    &pending[stream], &secrets, &mut remaining,
-                                    cargo_progress.as_mut(), started.elapsed(), chunk.stream,
-                                ) {
+                            if !discarding[stream]
+                                && let Some(safe) =
+                                    crate::command_progress_line::observe_complete_line(
+                                        &pending[stream],
+                                        &secrets,
+                                        &mut remaining,
+                                        cargo_progress.as_mut(),
+                                        started.elapsed(),
+                                        chunk.stream,
+                                    )
+                            {
                                 eprintln!("[ci {lane} {phase} {:?}] {safe}", chunk.stream);
                             } else if !discarding[stream] {
                                 omitted_lines = omitted_lines.saturating_add(1);
@@ -1287,57 +1371,69 @@ impl CommandSpec {
                 }
                 (cargo_progress, omitted_lines)
             });
-                let progress = (progress || observe_cargo_progress).then(|| {
-                    memcordon_testkit::ProgressOutput {
-                        sender,
-                        omitted: omitted.clone(),
-                        admitted: observe_cargo_progress.then_some(admitted_sender),
-                    }
+            let progress =
+                (progress || observe_cargo_progress).then(|| memcordon_testkit::ProgressOutput {
+                    sender,
+                    omitted: omitted.clone(),
+                    admitted: observe_cargo_progress.then_some(admitted_sender),
                 });
-                let failure = if self.defer_group_failure {
-                    None
-                } else {
-                    group.clone().map(|group| {
-                        let operation = self.phase.map_or("command", CiPhase::name);
-                        std::sync::Arc::new(move |notice| {
-                            group.request_command_failure_notice(operation, notice)
-                        })
-                            as std::sync::Arc<
-                                dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
-                            >
+            let failure = if self.defer_group_failure {
+                None
+            } else {
+                group.clone().map(|group| {
+                    let operation = self.phase.map_or("command", CiPhase::name);
+                    std::sync::Arc::new(move |notice| {
+                        group.request_command_failure_notice(operation, notice)
                     })
-                };
-                let external_stop = (cancel_safe
-                    && crate::cancellation::retirement_deadline().is_none())
-                .then(|| {
+                        as std::sync::Arc<
+                            dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
+                        >
+                })
+            };
+            let external_stop =
+                (cancel_safe && crate::cancellation::retirement_deadline().is_none()).then(|| {
                     std::sync::Arc::new(|| crate::cancellation::observed().is_some())
                         as std::sync::Arc<dyn Fn() -> bool + Send + Sync>
                 });
-                let result = memcordon_testkit::run_with_deadline_external_stop_output_limit(
+            let execution_budget = if observe_storage {
+                budget.min(storage_cutoff.saturating_duration_since(Instant::now()))
+            } else {
+                budget
+            };
+            let result = if execution_budget.is_zero() {
+                Err(memcordon_testkit::ProcessTestError::Spawn(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "original native cutoff exhausted before spawn",
+                    ),
+                ))
+            } else {
+                memcordon_testkit::run_with_deadline_external_stop_output_limit(
                     command,
-                    budget,
+                    execution_budget,
                     self.output_limit,
                     cancellation,
                     progress,
                     failure,
                     external_stop,
-                );
-                done.store(true, std::sync::atomic::Ordering::Release);
-                // Incomplete reader settlement cannot keep the logger waiting for
-                // a sender forever. The native result remains authoritative.
-                let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
-                    Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
-                    Err(_) => (false, None, 0),
-                };
-                let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
-                if let Some(observed) = &mut cargo_progress {
-                    observed.finish(omitted_lines, omitted);
-                }
-                if omitted != 0 {
-                    eprintln!("[ci child] omitted {omitted} progress chunks");
-                }
-                (result, logger_settled, cargo_progress)
-            });
+                )
+            };
+            done.store(true, std::sync::atomic::Ordering::Release);
+            // Incomplete reader settlement cannot keep the logger waiting for
+            // a sender forever. The native result remains authoritative.
+            let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
+                Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
+                Err(_) => (false, None, 0),
+            };
+            let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
+            if let Some(observed) = &mut cargo_progress {
+                observed.finish(omitted_lines, omitted);
+            }
+            if omitted != 0 {
+                eprintln!("[ci child] omitted {omitted} progress chunks");
+            }
+            (result, logger_settled, cargo_progress)
+        });
         if !self.defer_group_failure
             && (result.as_ref().is_err()
                 || result.as_ref().is_ok_and(|output| !output.status.success()))
@@ -1385,7 +1481,15 @@ impl CommandSpec {
             "failed"
         };
         if let Err(error) = report(state, budget, Some(&result), cargo_progress.as_ref()) {
-            eprintln!("diagnostic retention incomplete: {error}");
+            if observe_storage {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "diagnostic retention incomplete: {error}"
+                );
+            } else {
+                eprintln!("diagnostic retention incomplete: {error}");
+            }
         }
         finish_native_observation(result, logger_settled).into_result()
     }

@@ -199,6 +199,7 @@ enum CiCommand {
         mode: memcordon_ci::cache_restore::RestoreMode,
     },
     CheckWorkflows,
+    StorageCheckpoint,
     PerformancePlan,
     WorkflowScope,
     AggregateStress {
@@ -384,6 +385,22 @@ fn run() -> Result<()> {
                 &root, &purpose, &shard, partition, mode,
             ),
             CiCommand::CheckWorkflows => policy::run(&root),
+            CiCommand::StorageCheckpoint => {
+                let mut value = memcordon_ci::storage_observation::snapshot(
+                    &root,
+                    None,
+                    true,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                value["phase"] = serde_json::json!("before-native-compile");
+                value["survivability"] = serde_json::json!(
+                    "precompile baseline only; later peak samples remain best effort"
+                );
+                memcordon_ci::release::source::write_diagnostic_json(
+                    &root.join("target/ci/reports/storage/native-before-compile.json"),
+                    &value,
+                )
+            }
             CiCommand::WorkflowScope => memcordon_ci::workflow_scope::emit_from_github(),
             CiCommand::PerformancePlan => {
                 memcordon_ci::performance_plan::PerformancePlan::read(&root)?.emit()

@@ -2275,6 +2275,21 @@ jobs:
           key: ${{ steps.native-compile-request.outputs.native-tests-partial-key }}
           path: ${{ steps.native-compile-request.outputs.native-tests-partial-path }}
           restore-keys: ${{ steps.native-compile-request.outputs.native-tests-partial-prefix }}
+      - id: native-storage-checkpoint
+        if: '!cancelled() && runner.os == ''Linux'''
+        continue-on-error: true
+        timeout-minutes: 1
+        run: ./target/ci-runtime/current/memcordon-ci ci storage-checkpoint
+      - id: native-storage-retain
+        if: '!cancelled() && runner.os == ''Linux'' && steps.native-storage-checkpoint.outcome == ''success'''
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: native-storage-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/storage/native-before-compile.json
+          if-no-files-found: ignore
+          retention-days: 7
       - id: native-compile
         run: ./target/ci-runtime/current/memcordon-ci ci segment native-compile
         if: runner.os != 'Windows'

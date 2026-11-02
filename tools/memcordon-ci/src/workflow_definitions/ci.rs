@@ -9293,6 +9293,8 @@ fn node_379() -> Value {
     values.push(node_535());
     values.push(node_536());
     values.push(node_538());
+    values.push(native_storage_checkpoint());
+    values.push(native_storage_retention());
     values.push(node_540());
     values.push(node_541());
     values.push(node_543());
@@ -10077,6 +10079,38 @@ fn node_540() -> Value {
     );
     values.insert(text("if"), text("runner.os != 'Windows'"));
     values.insert(text("timeout-minutes"), Value::Number(35.into()));
+    Value::Mapping(values)
+}
+
+fn native_storage_checkpoint() -> Value {
+    let mut values = serde_yaml::Mapping::new();
+    values.insert(text("id"), text("native-storage-checkpoint"));
+    values.insert(text("if"), text("!cancelled() && runner.os == 'Linux'"));
+    values.insert(text("continue-on-error"), Value::Bool(true));
+    values.insert(text("timeout-minutes"), Value::Number(1.into()));
+    values.insert(
+        text("run"),
+        text("./target/ci-runtime/current/memcordon-ci ci storage-checkpoint"),
+    );
+    Value::Mapping(values)
+}
+
+fn native_storage_retention() -> Value {
+    let mut values = serde_yaml::Mapping::new();
+    values.insert(text("id"), text("native-storage-retain"));
+    values.insert(text("if"), text("!cancelled() && runner.os == 'Linux' && steps.native-storage-checkpoint.outcome == 'success'"));
+    values.insert(text("continue-on-error"), Value::Bool(true));
+    values.insert(text("timeout-minutes"), Value::Number(2.into()));
+    values.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    let mut inputs = serde_yaml::Mapping::new();
+    inputs.insert(text("name"), text("native-storage-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}"));
+    inputs.insert(
+        text("path"),
+        text("target/ci/reports/storage/native-before-compile.json"),
+    );
+    inputs.insert(text("if-no-files-found"), text("ignore"));
+    inputs.insert(text("retention-days"), Value::Number(7.into()));
+    values.insert(text("with"), Value::Mapping(inputs));
     Value::Mapping(values)
 }
 

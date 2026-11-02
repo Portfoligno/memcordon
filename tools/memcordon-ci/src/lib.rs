@@ -17,6 +17,7 @@ pub mod linux_snapshot_rejection;
 pub mod linux_source_substitution;
 pub mod linux_transaction_trace;
 pub mod snapshot_copy_contract;
+pub mod storage_observation;
 
 pub mod windows_listener_wait;
 pub mod windows_original_gate_failure;

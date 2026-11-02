@@ -12,6 +12,70 @@ fn root() -> PathBuf {
 const SELECTION_ID: &str = "${{ needs.select.outputs.selection-artifact-id }}";
 
 #[test]
+fn native_storage_baseline_is_uploaded_before_heavy_work_without_admission_authority() {
+    for document in sources("ci.yml") {
+        let sequence = steps(&document, "native");
+        let find = |id: &str| {
+            let matches = sequence
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["id"] == id)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected one {id}");
+            matches[0]
+        };
+        let (checkpoint_index, checkpoint) = find("native-storage-checkpoint");
+        let (upload_index, upload) = find("native-storage-retain");
+        let (compile_index, _) = find("native-compile");
+        for restore in [
+            "native-compile-request-native-tests-complete-restore",
+            "native-compile-request-native-tests-partial-restore",
+        ] {
+            assert!(
+                find(restore).0 < checkpoint_index,
+                "baseline must observe restored capacity"
+            );
+        }
+        assert_eq!(upload_index, checkpoint_index + 1);
+        assert_eq!(compile_index, upload_index + 1);
+        assert_eq!(checkpoint["if"], "!cancelled() && runner.os == 'Linux'");
+        assert_eq!(
+            upload["if"],
+            "!cancelled() && runner.os == 'Linux' && steps.native-storage-checkpoint.outcome == 'success'"
+        );
+        for step in [checkpoint, upload] {
+            assert_eq!(step["continue-on-error"], true);
+            assert!(step["env"].is_null());
+        }
+        assert_eq!(
+            checkpoint["run"],
+            "./target/ci-runtime/current/memcordon-ci ci storage-checkpoint"
+        );
+        assert_eq!(checkpoint["timeout-minutes"].as_u64(), Some(1));
+        assert!(checkpoint["uses"].is_null());
+        assert_eq!(upload["uses"], "./.github/actions/upload-artifact");
+        assert!(upload["run"].is_null());
+        assert_eq!(upload["timeout-minutes"].as_u64(), Some(2));
+        assert_eq!(
+            upload["with"]["path"],
+            "target/ci/reports/storage/native-before-compile.json"
+        );
+        assert_eq!(upload["with"]["if-no-files-found"], "ignore");
+        assert_eq!(upload["with"]["retention-days"].as_u64(), Some(7));
+        assert_eq!(
+            upload["with"]["name"],
+            "native-storage-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        );
+        let mut ids = BTreeSet::new();
+        for step in sequence {
+            if let Some(id) = step["id"].as_str() {
+                assert!(ids.insert(id), "duplicate native step: {id}");
+            }
+        }
+    }
+}
+
+#[test]
 fn backend_original_failure_carriers_precede_the_full_installed_artifact() {
     for document in sources("backend-certification.yml") {
         for job in ["windows-installed-x64", "windows-installed-arm64"] {

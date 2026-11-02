@@ -422,7 +422,23 @@ fn native(
 ) -> Result<()> {
     for command in memcordon_ci::native_test_plan::commands_with_failure(release_mode, mode) {
         memcordon_ci::workflow_output::revoke_compilation("compiled-native-complete")?;
-        cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
+        let phase = if command.arguments.contains(&"--no-run") {
+            crate::command::CiPhase::NativeCompile
+        } else {
+            crate::command::CiPhase::NativeExecute
+        };
+        let command = rustup_cargo(
+            root,
+            stable,
+            std::iter::once("test").chain(command.arguments),
+            command.deadline,
+        );
+        let command = if cfg!(target_os = "linux") {
+            command.phase(phase)
+        } else {
+            command
+        };
+        command.run()?;
         memcordon_ci::workflow_output::compilation_complete("compiled-native-complete")?;
     }
     Ok(())
@@ -439,7 +455,22 @@ fn native_phase(
         .nth(if compile { 0 } else { 1 })
         .expect("native compile/execute plan");
     memcordon_ci::workflow_output::revoke_compilation("compiled-native-complete")?;
-    cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
+    let command = rustup_cargo(
+        root,
+        stable,
+        std::iter::once("test").chain(command.arguments),
+        command.deadline,
+    );
+    let command = if cfg!(target_os = "linux") {
+        command.phase(if compile {
+            crate::command::CiPhase::NativeCompile
+        } else {
+            crate::command::CiPhase::NativeExecute
+        })
+    } else {
+        command
+    };
+    command.run()?;
     memcordon_ci::workflow_output::compilation_complete("compiled-native-complete")?;
     Ok(())
 }
