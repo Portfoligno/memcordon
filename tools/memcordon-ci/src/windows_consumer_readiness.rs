@@ -5578,20 +5578,52 @@ pub(crate) mod native {
                 let retention = (|| -> Result<()> {
                     // Copy this bounded diagnostic into the existing small failure
                     // carrier. It never supplies launch or object-identity authority.
-                    let winsock_trace=(||->Result<serde_json::Value>{
-                        let source=input.descriptor.output_root.join("winsock-startup-trace.json");
-                        if !source.try_exists()? {return Ok(serde_json::json!({"state":"absent","authority":false}));}
-                        let bytes=read(&source,64*1024)?;
-                        let parsed:serde_json::Value=serde_json::from_slice(&bytes)?;
-                        if parsed["format"]!="memcordon.original-winsock-startup-trace" || parsed["revision"]!=1 {
-                            return Err(CiError::Message("startup diagnostic carrier format differs".into()));
+                    let trace_carrier = |name: &str, format: &str| -> Result<serde_json::Value> {
+                        let source = input.descriptor.output_root.join(name);
+                        if !source.try_exists()? {
+                            return Ok(serde_json::json!({"state":"absent","authority":false}));
                         }
-                        let path=report.with_extension("winsock-startup-trace.json");
-                        let mut file=OpenOptions::new().write(true).create_new(true).open(&path)?;
-                        file.write_all(&bytes)?;file.sync_all()?;drop(file);
-                        if read(&path,64*1024)?!=bytes {return Err(CiError::Message("startup diagnostic retained bytes differ".into()));}
-                        Ok(serde_json::json!({"state":"retained","path":path,"sha256":crate::windows_causal_acceptance::sha256(&bytes),"authority":false,"identity_admission":false}))
-                    })().map_err(|error|error.to_string());
+                        let bytes = read(&source, 64 * 1024)?;
+                        let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return Ok(
+                                    serde_json::json!({"state":"invalid","error":error.to_string(),"authority":false,"identity_admission":false}),
+                                );
+                            }
+                        };
+                        if parsed["format"] != format || parsed["revision"] != 1 {
+                            return Ok(
+                                serde_json::json!({"state":"invalid","error":"original-call diagnostic carrier format differs","authority":false,"identity_admission":false}),
+                            );
+                        }
+                        let path = report.with_extension(name);
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)?;
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                        drop(file);
+                        if read(&path, 64 * 1024)? != bytes {
+                            return Err(CiError::Message(
+                                "original-call diagnostic retained bytes differ".into(),
+                            ));
+                        }
+                        Ok(
+                            serde_json::json!({"state":"retained","path":path,"sha256":crate::windows_causal_acceptance::sha256(&bytes),"authority":false,"identity_admission":false}),
+                        )
+                    };
+                    let winsock_trace = trace_carrier(
+                        "winsock-startup-trace.json",
+                        "memcordon.original-winsock-startup-trace",
+                    )
+                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
+                    let listener_trace = trace_carrier(
+                        "listener-call-trace.json",
+                        "memcordon.original-rust-listener-trace",
+                    )
+                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
                     let product_context = if *capture_complete && cleanup.is_ok() {
                         retain_callback_product_context(&public_report, &report, &config.provider)
                             .map_err(|error| error.to_string())
@@ -5605,6 +5637,7 @@ pub(crate) mod native {
                         "termination":termination.map(|status| status.code()), "cleanup":cleanup,
                         "product_context":product_context,
                         "winsock_trace":winsock_trace,
+                        "listener_trace":listener_trace,
                     }))?;
                     for (extension, bytes) in [
                         ("stdout.bin", stdout.as_slice()),

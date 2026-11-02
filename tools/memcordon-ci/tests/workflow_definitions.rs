@@ -93,23 +93,100 @@ fn backend_original_failure_carriers_precede_the_full_installed_artifact() {
             assert_eq!(step["uses"], "./.github/actions/upload-artifact");
             assert_eq!(step["with"]["if-no-files-found"], "ignore");
             let paths: Vec<_> = step["with"]["path"].as_str().unwrap().lines().collect();
-            assert_eq!(paths.len(), 3);
-            for (path, name) in paths.iter().zip([
-                "result.callback-failure.json",
-                "result.winsock-startup-trace.json",
-                "result.stderr.bin",
-            ]) {
-                assert_eq!(
-                    *path,
-                    format!(
-                        "target/ci/windows-installed/${{{{ matrix.channel }}}}/cases/windows-installed/W-JOINT/restricted/{name}"
-                    )
-                );
-            }
+            let expected = expected_listener_carriers(
+                "target/ci/windows-installed/${{ matrix.channel }}/cases",
+            );
+            assert_eq!(paths, expected);
             let full = &steps[index + 1];
             assert_eq!(full["with"]["path"], "target/ci/windows-installed");
             assert_eq!(full["timeout-minutes"].as_u64(), Some(6));
         }
+    }
+}
+
+fn expected_listener_carriers(prefix: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
+        for name in [
+            "result.callback-failure.json",
+            "result.stderr.bin",
+            "result.winsock-startup-trace.json",
+            "result.listener-call-trace.json",
+        ] {
+            paths.push(format!("{prefix}/windows-installed/{case}/{name}"));
+        }
+    }
+    paths
+}
+
+#[test]
+fn release_finite_listener_carriers_precede_general_retention_in_all_windows_deliveries() {
+    for document in sources("release.yml") {
+        let mut consumers = BTreeSet::new();
+        for (name, job) in document["jobs"].as_mapping().unwrap() {
+            let name = name.as_str().unwrap();
+            let Some(steps) = job["steps"].as_sequence() else {
+                continue;
+            };
+            let carriers = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["name"] == "Retain original listener failure carriers")
+                .collect::<Vec<_>>();
+            if carriers.is_empty() {
+                continue;
+            }
+            assert_eq!(carriers.len(), 1);
+            consumers.insert(name.to_owned());
+            assert!(name.starts_with("candidate-windows-") || name.starts_with("public-windows-"));
+            let (index, step) = carriers[0];
+            assert_eq!(steps[index - 1]["id"], "installed-test");
+            assert_eq!(steps[index - 1]["timeout-minutes"].as_u64(), Some(160));
+            assert_eq!(step["if"], "!cancelled() && failure()");
+            assert_eq!(step["continue-on-error"], true);
+            assert_eq!(step["timeout-minutes"].as_u64(), Some(2));
+            assert_eq!(step["uses"], "./.github/actions/upload-artifact");
+            assert_eq!(step["with"]["if-no-files-found"], "ignore");
+            let paths = step["with"]["path"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                paths,
+                expected_listener_carriers("target/ci/reports/installed/raw")
+            );
+            let general = steps
+                .iter()
+                .position(|step| step["name"] == "Retain bounded installed diagnostics")
+                .unwrap();
+            assert!(index < general);
+            for (other, step) in steps.iter().enumerate() {
+                if matches!(
+                    step["with"]["path"].as_str(),
+                    Some(".release/installed-results" | "target/ci/reports/installed")
+                ) {
+                    assert!(index < other);
+                }
+            }
+        }
+        assert_eq!(
+            consumers,
+            [
+                "candidate-windows-x64-native",
+                "candidate-windows-x64-cargo",
+                "candidate-windows-arm64-native",
+                "candidate-windows-arm64-cargo",
+                "public-windows-x64-native",
+                "public-windows-x64-cargo",
+                "public-windows-arm64-native",
+                "public-windows-arm64-cargo"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
     }
 }
 

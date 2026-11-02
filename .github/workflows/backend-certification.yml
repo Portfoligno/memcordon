@@ -2884,9 +2884,14 @@ jobs:
         with:
           name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
           path: |-
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.winsock-startup-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
@@ -3292,9 +3297,14 @@ jobs:
         with:
           name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
           path: |-
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.winsock-startup-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact

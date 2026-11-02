@@ -12,7 +12,12 @@ fn installed_failure_carriers() -> Value {
         text("name"),
         text("windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}"),
     );
-    inputs.insert(text("path"), text("target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json\ntarget/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json\ntarget/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin"));
+    inputs.insert(
+        text("path"),
+        text(&crate::installed_failure_carriers::paths(
+            "target/ci/windows-installed/${{ matrix.channel }}/cases",
+        )),
+    );
     inputs.insert(text("if-no-files-found"), text("ignore"));
     let mut step = serde_yaml::Mapping::new();
     step.insert(

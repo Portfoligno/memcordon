@@ -381,15 +381,21 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
 }
 
 pub fn token_observation() -> io::Result<Vec<u8>> {
+    // Borrowed GetCurrentProcessToken SDK pseudo handle; never close or transfer.
+    token_observation_from(-4isize as windows_sys::Win32::Foundation::HANDLE)
+}
+
+pub fn effective_token_observation() -> io::Result<Vec<u8>> {
+    // Borrowed GetCurrentThreadEffectiveToken SDK pseudo handle. Resolve and
+    // query synchronously on this thread, without reverting or reopening it.
+    token_observation_from(-6isize as windows_sys::Win32::Foundation::HANDLE)
+}
+
+fn token_observation_from(token: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::{GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount};
     use windows_sys::Win32::Security::{
         TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenRestrictedSids,
     };
-    // GetCurrentProcessToken is an inline Windows SDK function returning -4.
-    // Its pseudo-handle queries this process's actual token without reopening
-    // the token object through its DACL. It grants only query access, cannot be
-    // inherited or duplicated, and must not be treated as an owned handle.
-    let token = -4isize as windows_sys::Win32::Foundation::HANDLE;
     let user = token_bytes(token, TokenUser)?;
     let integrity = token_bytes(token, TokenIntegrityLevel)?;
     let elevation = token_bytes(token, TokenElevation)?;
@@ -411,7 +417,7 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
             level,
         )
     };
-    // SAFETY: IsTokenRestricted only observes this process's token pseudo-handle.
+    // SAFETY: IsTokenRestricted only observes this borrowed query-only token.
     let restricted = unsafe { IsTokenRestricted(token) } != 0;
     let groups = token_bytes(token, TokenRestrictedSids)?;
     // SAFETY: native TokenRestrictedSids result is an aligned TOKEN_GROUPS

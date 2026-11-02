@@ -35,3 +35,57 @@ static_assert(sizeof(WsaSlot)==48 && sizeof(WsaNode)==192,"WSA route ABI");
 static_assert(sizeof(WsaPacket)==11648 && offsetof(WsaPacket,nodes)==160 && offsetof(WsaPacket,slots)==544 && offsetof(WsaPacket,first_failure)==1312 && offsetof(WsaPacket,entries)==1920,"WSA packet ABI v1");
 extern "C" void memcordon_wsa_trace_call(WsaPacket*,uintptr_t,uint16_t,uint64_t,uint64_t);
 extern "C" uint32_t memcordon_wsa_trace_mock(uint64_t,uint64_t);
+
+struct ListenerOutcome {
+    uint32_t kind,raw_error_present;
+    int32_t raw_error;
+    uint32_t reserved;
+};
+struct ListenerRequest {
+    uint64_t cutoff_qpc,frequency;
+    uint32_t incoming_win32;
+    int32_t incoming_wsa;
+};
+struct ListenerEntry {
+    uint64_t sequence,parent_sequence,arguments[6],result;
+    uint32_t operation,thread_id,depth,flags,incoming_win32;
+    int32_t incoming_wsa;
+    uint32_t outgoing_win32;
+    int32_t outgoing_wsa;
+    uint32_t entered,returned,failed,error_domain,output_valid,output_u32;
+    uint64_t completion_sequence;
+    uint8_t input_prefix[32];
+    uint32_t input_bytes,input_flags;
+};
+struct ListenerDependencyLink {
+    uint64_t dependency_sequence,timeline_sequence,parent_listener_sequence;
+};
+struct ListenerPacket {
+    uint32_t version,setup_stage,setup_error,setup_reason;
+    uint32_t called,callback_outcome,callback_raw_error_present;
+    int32_t callback_raw_error;
+    uint32_t armed,original_thread,scope_flags,incomplete;
+    uint32_t slot_count,descriptor_count,function_count,callbacks_complete;
+    uint32_t owner_pinned,protections_restored,rollback_error,clock_live;
+    uint32_t total_calls,total_failures,record_count,dropped;
+    uint32_t overflow,first_failure_present,dependency_scope_armed,dependency_scope_error;
+    uint32_t incoming_win32;
+    int32_t incoming_wsa;
+    uint32_t outgoing_win32;
+    int32_t outgoing_wsa;
+    uint32_t discovered_mask,verified_mask,published_mask,entered_mask;
+    uint32_t returned_mask,failure_mask,dependency_link_count,dependency_links_dropped;
+    uint64_t started_qpc,finished_qpc,cutoff_qpc,frequency,next_sequence,listener_owner_anchor;
+    WsaNode owner;
+    WsaSlot slots[16];
+    ListenerEntry first_failure,entries[16];
+    ListenerDependencyLink first_dependency_failure_link,dependency_links[16];
+    WsaPacket dependencies;
+};
+using ListenerInvoke=void(*)(void*,ListenerOutcome*);
+extern "C" void memcordon_listener_trace_call(ListenerPacket*,const ListenerRequest*,ListenerInvoke,void*);
+extern "C" uint32_t memcordon_listener_trace_mock(uint64_t,uint64_t);
+static_assert(sizeof(ListenerOutcome)==16 && sizeof(ListenerRequest)==24,"listener callback ABI v1");
+static_assert(sizeof(ListenerEntry)==176 && offsetof(ListenerEntry,completion_sequence)==128 && offsetof(ListenerEntry,input_prefix)==136,"listener entry ABI v1");
+static_assert(sizeof(ListenerDependencyLink)==24,"listener dependency link ABI v1");
+static_assert(sizeof(ListenerPacket)==16216 && offsetof(ListenerPacket,owner)==208 && offsetof(ListenerPacket,slots)==400 && offsetof(ListenerPacket,first_failure)==1168 && offsetof(ListenerPacket,entries)==1344 && offsetof(ListenerPacket,first_dependency_failure_link)==4160 && offsetof(ListenerPacket,dependency_links)==4184 && offsetof(ListenerPacket,dependencies)==4568,"listener packet ABI v1");

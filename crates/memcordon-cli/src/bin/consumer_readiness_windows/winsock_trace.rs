@@ -17,6 +17,7 @@ unsafe extern "C" {
     );
     fn memcordon_wsa_trace_mock(cutoff: u64, frequency: u64) -> u32;
 }
+#[derive(Clone, Copy)]
 pub struct Context<'a> {
     pub clock: &'a super::descriptor::ControlClock,
     pub output_root: &'a Path,

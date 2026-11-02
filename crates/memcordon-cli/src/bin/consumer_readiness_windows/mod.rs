@@ -17,6 +17,8 @@ mod gate_directory_readback;
 mod gate_directory_record;
 mod gate_entry_route;
 mod gate_precondition_child;
+mod listener_trace;
+mod listener_trace_record;
 mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;
@@ -480,8 +482,7 @@ fn joint_mapped(
         _ => None,
     };
     let _winsock = native::winsock_startup(trace)?;
-    let listener =
-        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(native::tcp_bind_failure)?;
+    let listener = listener_trace::bind(trace.as_ref())?;
     let address = listener.local_addr()?;
     // The original socket stays held until every IPC/churn/descendant stage completes.
     let conflicting_bind = match TcpListener::bind(address) {
@@ -931,6 +932,14 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             }
             winsock_trace::mock()?;
             return Ok(0);
+        }
+        Some("listener-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "listener trace self-check takes no operands",
+                ));
+            }
+            return listener_trace::self_check();
         }
         Some("own-thread-deadline-self-check") => {
             if args.next().is_some() {

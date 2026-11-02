@@ -6,6 +6,30 @@ pub(super) fn definition() -> Value {
     node_0()
 }
 
+fn installed_failure_carriers() -> Value {
+    let mut inputs = serde_yaml::Mapping::new();
+    inputs.insert(text("name"), text("installed-listener-failure-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}"));
+    inputs.insert(
+        text("path"),
+        text(&crate::installed_failure_carriers::paths(
+            "target/ci/reports/installed/raw",
+        )),
+    );
+    inputs.insert(text("if-no-files-found"), text("ignore"));
+    inputs.insert(text("retention-days"), Value::Number(7.into()));
+    let mut step = serde_yaml::Mapping::new();
+    step.insert(
+        text("name"),
+        text("Retain original listener failure carriers"),
+    );
+    step.insert(text("if"), text("!cancelled() && failure()"));
+    step.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    step.insert(text("continue-on-error"), Value::Bool(true));
+    step.insert(text("timeout-minutes"), Value::Number(2.into()));
+    step.insert(text("with"), Value::Mapping(inputs));
+    Value::Mapping(step)
+}
+
 fn selection_download_steps(inputs: Value) -> [Value; 2] {
     let mut first = serde_yaml::Mapping::new();
     first.insert(
@@ -13313,6 +13337,7 @@ fn node_1809() -> Value {
     values.push(node_1824());
     values.push(node_1825());
     values.push(node_1826());
+    values.push(installed_failure_carriers());
     values.push(node_1827());
     values.push(node_1829());
     Value::Sequence(values)
@@ -13635,6 +13660,7 @@ fn node_1780() -> Value {
     values.push(node_1795());
     values.push(node_1796());
     values.push(node_1797());
+    values.push(installed_failure_carriers());
     values.push(node_1798());
     values.push(node_1800());
     Value::Sequence(values)
@@ -13957,6 +13983,7 @@ fn node_1751() -> Value {
     values.push(node_1766());
     values.push(node_1767());
     values.push(node_1768());
+    values.push(installed_failure_carriers());
     values.push(node_1769());
     values.push(node_1771());
     Value::Sequence(values)
@@ -14279,6 +14306,7 @@ fn node_1722() -> Value {
     values.push(node_1737());
     values.push(node_1738());
     values.push(node_1739());
+    values.push(installed_failure_carriers());
     values.push(node_1740());
     values.push(node_1742());
     Value::Sequence(values)
@@ -17291,6 +17319,7 @@ fn node_1439() -> Value {
     values.push(node_1470());
     values.push(node_1472());
     values.push(node_1473());
+    values.push(installed_failure_carriers());
     values.push(node_1474());
     values.push(node_1476());
     values.push(node_1478());
@@ -17915,6 +17944,7 @@ fn node_1390() -> Value {
     values.push(node_1421());
     values.push(node_1423());
     values.push(node_1424());
+    values.push(installed_failure_carriers());
     values.push(node_1425());
     values.push(node_1427());
     values.push(node_1429());
@@ -18539,6 +18569,7 @@ fn node_1341() -> Value {
     values.push(node_1372());
     values.push(node_1374());
     values.push(node_1375());
+    values.push(installed_failure_carriers());
     values.push(node_1376());
     values.push(node_1378());
     values.push(node_1380());
@@ -19163,6 +19194,7 @@ fn node_1292() -> Value {
     values.push(node_1323());
     values.push(node_1325());
     values.push(node_1326());
+    values.push(installed_failure_carriers());
     values.push(node_1327());
     values.push(node_1329());
     values.push(node_1331());

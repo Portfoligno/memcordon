@@ -1,0 +1,559 @@
+//! Original listener call observations; no recorded scalar grants authority.
+use super::winsock_trace_record::{Node, Packet as DependencyPacket, Slot};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+
+pub const RECORD_BYTES: usize = 64 * 1024;
+
+#[repr(C)]
+#[derive(Default)]
+pub struct Outcome {
+    pub kind: u32,
+    pub raw_error_present: u32,
+    pub raw_error: i32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+pub struct Request {
+    pub cutoff_qpc: u64,
+    pub frequency: u64,
+    pub incoming_win32: u32,
+    pub incoming_wsa: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Entry {
+    pub sequence: u64,
+    pub parent_sequence: u64,
+    pub arguments: [u64; 6],
+    pub result: u64,
+    pub operation: u32,
+    pub thread_id: u32,
+    pub depth: u32,
+    pub flags: u32,
+    pub incoming_win32: u32,
+    pub incoming_wsa: i32,
+    pub outgoing_win32: u32,
+    pub outgoing_wsa: i32,
+    pub entered: u32,
+    pub returned: u32,
+    pub failed: u32,
+    pub error_domain: u32,
+    pub output_valid: u32,
+    pub output_u32: u32,
+    pub completion_sequence: u64,
+    pub input_prefix: [u8; 32],
+    pub input_bytes: u32,
+    pub input_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DependencyLink {
+    pub dependency_sequence: u64,
+    pub timeline_sequence: u64,
+    pub parent_listener_sequence: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct Packet {
+    pub version: u32,
+    pub setup_stage: u32,
+    pub setup_error: u32,
+    pub setup_reason: u32,
+    pub called: u32,
+    pub callback_outcome: u32,
+    pub callback_raw_error_present: u32,
+    pub callback_raw_error: i32,
+    pub armed: u32,
+    pub original_thread: u32,
+    pub scope_flags: u32,
+    pub incomplete: u32,
+    pub slot_count: u32,
+    pub descriptor_count: u32,
+    pub function_count: u32,
+    pub callbacks_complete: u32,
+    pub owner_pinned: u32,
+    pub protections_restored: u32,
+    pub rollback_error: u32,
+    pub clock_live: u32,
+    pub total_calls: u32,
+    pub total_failures: u32,
+    pub record_count: u32,
+    pub dropped: u32,
+    pub overflow: u32,
+    pub first_failure_present: u32,
+    pub dependency_scope_armed: u32,
+    pub dependency_scope_error: u32,
+    pub incoming_win32: u32,
+    pub incoming_wsa: i32,
+    pub outgoing_win32: u32,
+    pub outgoing_wsa: i32,
+    pub discovered_mask: u32,
+    pub verified_mask: u32,
+    pub published_mask: u32,
+    pub entered_mask: u32,
+    pub returned_mask: u32,
+    pub failure_mask: u32,
+    pub dependency_link_count: u32,
+    pub dependency_links_dropped: u32,
+    pub started_qpc: u64,
+    pub finished_qpc: u64,
+    pub cutoff_qpc: u64,
+    pub frequency: u64,
+    pub next_sequence: u64,
+    pub listener_owner_anchor: u64,
+    pub owner: Node,
+    pub slots: [Slot; 16],
+    pub first_failure: Entry,
+    pub entries: [Entry; 16],
+    pub first_dependency_failure_link: DependencyLink,
+    pub dependency_links: [DependencyLink; 16],
+    pub dependencies: DependencyPacket,
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<Outcome>() == 16);
+    assert!(size_of::<Request>() == 24);
+    assert!(size_of::<Entry>() == 176);
+    assert!(offset_of!(Entry, completion_sequence) == 128);
+    assert!(offset_of!(Entry, input_prefix) == 136);
+    assert!(size_of::<DependencyLink>() == 24);
+    assert!(size_of::<Packet>() == 16216);
+    assert!(offset_of!(Packet, owner) == 208);
+    assert!(offset_of!(Packet, slots) == 400);
+    assert!(offset_of!(Packet, first_failure) == 1168);
+    assert!(offset_of!(Packet, entries) == 1344);
+    assert!(offset_of!(Packet, first_dependency_failure_link) == 4160);
+    assert!(offset_of!(Packet, dependency_links) == 4184);
+    assert!(offset_of!(Packet, dependencies) == 4568);
+};
+
+fn signature(operation: u32) -> Option<(&'static str, u32, usize)> {
+    Some(match operation {
+        1 => ("WSAStartup", 1, 2),
+        2 => ("WSASocketW", 2, 6),
+        3 => ("SetHandleInformation", 3, 3),
+        4 => ("bind", 2, 3),
+        5 => ("listen", 2, 2),
+        6 => ("closesocket", 2, 1),
+        7 => ("WSACleanup", 2, 0),
+        _ => return None,
+    })
+}
+
+fn failed(entry: &Entry) -> bool {
+    let signed = entry.result as u32 as i32;
+    match entry.operation {
+        1 => signed != 0,
+        2 => entry.result == u64::MAX,
+        3 => signed == 0,
+        4..=7 => signed == -1,
+        _ => false,
+    }
+}
+
+fn entry(value: &Entry, packet: &Packet) -> (Value, bool, bool) {
+    let operation = signature(value.operation);
+    let bit = if (1..=7).contains(&value.operation) {
+        1 << (value.operation - 1)
+    } else {
+        0
+    };
+    let invalid = operation.is_none()
+        || value.sequence == 0
+        || value.sequence > packet.next_sequence
+        || value.thread_id == 0
+        || value.thread_id != packet.original_thread
+        || value.depth >= 16
+        || value.flags != 0
+        || value.parent_sequence >= value.sequence
+        || (value.depth == 0) != (value.parent_sequence == 0)
+        || [
+            value.entered,
+            value.returned,
+            value.failed,
+            value.output_valid,
+        ]
+        .iter()
+        .any(|flag| *flag > 1)
+        || value.returned > value.entered
+        || (value.returned == 1
+            && (value.completion_sequence <= value.sequence
+                || value.completion_sequence > packet.next_sequence))
+        || (value.returned == 0 && value.completion_sequence != 0)
+        || operation.is_some_and(|(_, domain, arity)| {
+            value.error_domain != domain
+                || value.arguments[arity..]
+                    .iter()
+                    .any(|argument| *argument != 0)
+        })
+        || value.input_bytes > 32
+        || value.input_flags & !7 != 0
+        || (value.input_bytes != 0 && (value.operation != 4 || value.input_flags & 1 == 0))
+        || (value.output_valid == 1
+            && (value.operation != 1
+                || value.returned != 1
+                || failed(value)
+                || value.output_u32 > u32::from(u16::MAX)))
+        || (value.returned == 1 && value.failed != u32::from(failed(value)))
+        || packet.published_mask & bit == 0
+        || (value.entered == 1 && packet.entered_mask & bit == 0)
+        || (value.returned == 1 && packet.returned_mask & bit == 0)
+        || (value.failed == 1 && packet.failure_mask & bit == 0);
+    let noncanonical_int = value.operation != 2 && value.result > u64::from(u32::MAX);
+    let scalar_indices: &[usize] = match value.operation {
+        1 => &[0],
+        2 => &[0, 1, 2, 4, 5],
+        3 => &[1, 2],
+        4 => &[2],
+        5 => &[1],
+        _ => &[],
+    };
+    let noncanonical_arguments = scalar_indices
+        .iter()
+        .any(|index| value.arguments[*index] > u64::from(u32::MAX))
+        || (value.operation == 1 && value.arguments[0] > u64::from(u16::MAX));
+    let incomplete = invalid
+        || value.entered != 1
+        || value.returned != 1
+        || value.input_flags & 6 != 0
+        || noncanonical_int
+        || noncanonical_arguments
+        || (value.operation == 1
+            && value.returned == 1
+            && !failed(value)
+            && value.output_valid == 0);
+    let actual_error = if invalid || value.returned != 1 || !failed(value) {
+        None
+    } else {
+        match value.error_domain {
+            1 => Some(value.result as u32 as i32),
+            2 => Some(value.outgoing_wsa),
+            3 => Some(value.outgoing_win32 as i32),
+            _ => None,
+        }
+    };
+    (
+        json!({"sequence":value.sequence,"completion_sequence":value.completion_sequence,"parent_sequence":value.parent_sequence,"depth":value.depth,"thread_id":value.thread_id,
+        "operation":operation.map(|(name,_,_)|name),"operation_code":value.operation,"arguments_raw":value.arguments,"result_raw":value.result,"result_signed_low32":(value.operation!=2).then_some(value.result as u32 as i32),
+        "incoming_win32":value.incoming_win32,"incoming_wsa":value.incoming_wsa,"outgoing_win32":value.outgoing_win32,"outgoing_wsa":value.outgoing_wsa,
+        "entered":value.entered,"returned":value.returned,"reported_failed":value.failed,"observed_failure":if value.returned==1{Some(failed(value))}else{None},"error_domain":value.error_domain,"original_error":actual_error,
+        "startup_negotiated_version":(value.output_valid==1&&value.operation==1&&!failed(value)).then_some(value.output_u32),"output_valid":value.output_valid,"raw_output_u32":value.output_u32,
+        "input_prefix":&value.input_prefix[..(value.input_bytes as usize).min(32)],"input_bytes":value.input_bytes,"input_flags":value.input_flags,
+        "invalid_record":invalid,"observation_incomplete":incomplete,"failure_is_decisive_cause":false,"recorded_socket_is_authority":false}),
+        invalid,
+        incomplete,
+    )
+}
+
+fn dependencies(packet: &DependencyPacket) -> Value {
+    let mut value = super::winsock_trace_record::diagnostic(packet);
+    let object = value.as_object_mut().expect("dependency diagnostic object");
+    for key in [
+        "called",
+        "original_startup_return",
+        "raw_original_return",
+        "requested_version",
+        "negotiated_version",
+    ] {
+        object.remove(key);
+    }
+    object.insert(
+        "format".into(),
+        json!("memcordon.fixture-listener-dependencies"),
+    );
+    object.insert("scope".into(),json!("previously verified startup-owner normal imports during original listener callback only"));
+    object.insert("original_startup_invoked".into(), json!(false));
+    object.insert("failure_is_decisive_cause".into(), json!(false));
+    value
+}
+
+pub fn diagnostic(packet: &Packet) -> Value {
+    let flags = [
+        packet.called,
+        packet.armed,
+        packet.incomplete,
+        packet.callbacks_complete,
+        packet.owner_pinned,
+        packet.protections_restored,
+        packet.clock_live,
+        packet.overflow,
+        packet.first_failure_present,
+        packet.dependency_scope_armed,
+        packet.callback_raw_error_present,
+    ];
+    let mut invalid = packet.version != 1
+        || packet.setup_stage > 9
+        || packet.setup_stage == 8
+        || flags.iter().any(|flag| *flag > 1)
+        || packet.callback_outcome > 3
+        || (packet.called == 0 && packet.callback_outcome != 0)
+        || (packet.called == 1 && packet.callback_outcome == 0)
+        || (packet.callback_raw_error_present == 1 && packet.callback_outcome != 2)
+        || packet.scope_flags & !3 != 0
+        || packet.record_count > 16
+        || packet.slot_count > 16
+        || packet.dependency_link_count > 16
+        || packet.descriptor_count > 256
+        || packet.function_count > 16384
+        || packet.total_failures > packet.total_calls
+        || [
+            packet.discovered_mask,
+            packet.verified_mask,
+            packet.published_mask,
+            packet.entered_mask,
+            packet.returned_mask,
+            packet.failure_mask,
+        ]
+        .iter()
+        .any(|mask| mask & !0x7f != 0)
+        || packet.verified_mask & !packet.discovered_mask != 0
+        || packet.published_mask & !packet.verified_mask != 0
+        || packet.entered_mask & !packet.published_mask != 0
+        || packet.returned_mask & !packet.entered_mask != 0
+        || packet.failure_mask & !packet.returned_mask != 0
+        || (packet.total_failures == 0 && packet.first_failure_present != 0)
+        || packet.dependencies.called != 0;
+    let mut incomplete = packet.incomplete != 0
+        || packet.overflow != 0
+        || packet.dropped != 0
+        || packet.scope_flags & 2 != 0
+        || packet.callback_outcome == 3
+        || (packet.total_failures > 0 && packet.first_failure_present == 0)
+        || u64::from(packet.total_calls)
+            > u64::from(packet.record_count) + u64::from(packet.dropped);
+    let mut addresses = BTreeSet::new();
+    let mut originals = std::collections::BTreeMap::new();
+    let owner_end = packet
+        .owner
+        .owner_base
+        .checked_add(u64::from(packet.owner.owner_size));
+    let owner_available =
+        packet.owner.owner_base != 0 && packet.owner.owner_size != 0 && packet.owner.entry != 0;
+    invalid |= packet.owner.entry_len > 16
+        || (packet.owner.machine != 0 && ![0x8664, 0xaa64].contains(&packet.owner.machine));
+    if owner_available {
+        invalid |= packet.owner.entry != packet.listener_owner_anchor
+            || packet.owner.entry < packet.owner.owner_base
+            || owner_end.is_none_or(|end| packet.owner.entry >= end);
+    }
+    incomplete |= !owner_available;
+    let slots=packet.slots[..(packet.slot_count as usize).min(16)].iter().map(|slot|{
+        let known=signature(slot.operation).is_some();
+        invalid|=!known||!addresses.insert(slot.slot)||slot.published>1||slot.restored>1||slot.reserved!=0;
+        if let Some(original)=originals.insert(slot.operation,slot.original) { invalid|=original!=slot.original; }
+        if slot.published==1 { invalid|=slot.slot==0||slot.slot%8!=0||slot.original==0||slot.hook==0||slot.original==slot.hook||slot.descriptor_module==0||slot.slot<packet.owner.owner_base||owner_end.is_none_or(|end|slot.slot.checked_add(8).is_none_or(|last|last>end)); }
+        incomplete|=slot.published!=1||slot.restored!=0;
+        json!({"operation":signature(slot.operation).map(|(name,_,_)|name),"operation_code":slot.operation,"slot":slot.slot,"original":slot.original,"hook":slot.hook,"descriptor_module":slot.descriptor_module,"published":slot.published,"restored":slot.restored,"unsupported_or_unbound":slot.hook==0||slot.published!=1})
+    }).collect::<Vec<_>>();
+    let mut recent = packet.entries[..(packet.record_count as usize).min(16)]
+        .iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    recent.sort_by_key(|(_, item)| item.sequence);
+    let mut ordinals = BTreeSet::new();
+    let mut entries = Vec::new();
+    for (index, item) in &recent {
+        let (mut value, bad, partial) = entry(item, packet);
+        invalid |= bad
+            || !ordinals.insert(item.sequence)
+            || (item.returned == 1 && !ordinals.insert(item.completion_sequence));
+        incomplete |= partial;
+        if item.parent_sequence != 0 {
+            if let Some((_, parent)) = recent
+                .iter()
+                .find(|(_, parent)| parent.sequence == item.parent_sequence)
+            {
+                invalid |= item.depth != parent.depth + 1
+                    || (parent.returned == 1
+                        && item.completion_sequence > parent.completion_sequence);
+            } else if packet.dropped == 0 {
+                invalid = true;
+            }
+        }
+        value["storage_index"] = json!(index);
+        let recovered = item.operation == 2
+            && item.returned == 1
+            && failed(item)
+            && [10022, 10041].contains(&item.outgoing_wsa)
+            && item.arguments[5] == 0x81
+            && recent.iter().any(|(_, later)| {
+                later.sequence > item.completion_sequence
+                    && later.operation == 2
+                    && later.returned == 1
+                    && !failed(later)
+                    && later.parent_sequence == item.parent_sequence
+                    && later.arguments[..5] == item.arguments[..5]
+                    && later.arguments[5] == 1
+            });
+        value["observed_std_socket_fallback_recovered"] = json!(recovered);
+        entries.push(value);
+    }
+    let first_failure = if packet.first_failure_present == 1 {
+        let (value, bad, partial) = entry(&packet.first_failure, packet);
+        invalid |= bad || !failed(&packet.first_failure);
+        incomplete |= partial;
+        invalid |= recent.iter().any(|(_, item)| {
+            item.returned == 1
+                && failed(item)
+                && item.completion_sequence < packet.first_failure.completion_sequence
+        });
+        if let Some((_, recent_failure)) = recent
+            .iter()
+            .find(|(_, item)| item.sequence == packet.first_failure.sequence)
+        {
+            invalid |= **recent_failure != packet.first_failure;
+        }
+        Some(value)
+    } else {
+        None
+    };
+    let mut dependency_sequences = BTreeSet::new();
+    let links=packet.dependency_links[..(packet.dependency_link_count as usize).min(16)].iter().map(|link|{
+        let exists=packet.dependencies.entries[..(packet.dependencies.record_count as usize).min(16)].iter().any(|entry|entry.sequence==link.dependency_sequence);
+        invalid|=link.dependency_sequence==0||!dependency_sequences.insert(link.dependency_sequence)||link.timeline_sequence==0||link.timeline_sequence>packet.next_sequence||!exists||!ordinals.insert(link.timeline_sequence)||link.parent_listener_sequence>=link.timeline_sequence;
+        if link.parent_listener_sequence!=0 {
+            if let Some((_,parent))=recent.iter().find(|(_,parent)|parent.sequence==link.parent_listener_sequence) {
+                invalid|=parent.returned==1&&link.timeline_sequence>=parent.completion_sequence;
+            } else if packet.dropped==0 {invalid=true;}
+        }
+        json!({"dependency_sequence":link.dependency_sequence,"timeline_sequence":link.timeline_sequence,"parent_listener_sequence":link.parent_listener_sequence})
+    }).collect::<Vec<_>>();
+    incomplete |= packet.dependency_links_dropped != 0
+        || packet.dependency_link_count != packet.dependencies.record_count;
+    let first_dependency_link = if packet.dependencies.first_failure_present == 1 {
+        let link = &packet.first_dependency_failure_link;
+        invalid |= link.dependency_sequence != packet.dependencies.first_failure.sequence
+            || link.timeline_sequence == 0
+            || link.timeline_sequence > packet.next_sequence
+            || link.parent_listener_sequence >= link.timeline_sequence;
+        Some(
+            json!({"dependency_sequence":link.dependency_sequence,"timeline_sequence":link.timeline_sequence,"parent_listener_sequence":link.parent_listener_sequence}),
+        )
+    } else {
+        None
+    };
+    let dependency = dependencies(&packet.dependencies);
+    invalid |= packet.dependency_scope_armed == 1 && dependency["invalid_packet"] == true;
+    let complete = !invalid
+        && !incomplete
+        && packet.called == 1
+        && packet.armed == 1
+        && packet.setup_stage == 1
+        && packet.setup_error == 0
+        && packet.callbacks_complete == 1
+        && packet.owner_pinned == 1
+        && packet.protections_restored == 1
+        && packet.rollback_error == 0
+        && packet.clock_live == 1
+        && packet.scope_flags == 1
+        && packet.published_mask != 0
+        && packet.entered_mask != 0
+        && packet.frequency > 0
+        && packet.started_qpc < packet.cutoff_qpc
+        && packet.finished_qpc >= packet.started_qpc
+        && packet.finished_qpc < packet.cutoff_qpc;
+    let mut value = json!({"format":"memcordon.fixture-original-rust-listener","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target_identity_proved":false,"global_routes_complete":false,"coverage_inconclusive":true,"absence_is_not_evidence":true,"failure_is_decisive_cause":false,
+        "invalid_packet":invalid,"observation_incomplete":incomplete,"observed_entries_complete":complete,"aggregate":{"called":packet.called,"outcome":packet.callback_outcome,"outcome_name":match packet.callback_outcome {1=>"original-Rust-Ok",2=>"original-Rust-io-error",3=>"original-Rust-panic",_=>"not-called-or-unset"},"raw_io_error":(packet.called==1&&packet.callback_outcome==2&&packet.callback_raw_error_present==1).then_some(packet.callback_raw_error),"reported_raw_error_present":packet.callback_raw_error_present,"reported_raw_error":packet.callback_raw_error},
+        "setup_stage":packet.setup_stage,"setup_error":packet.setup_error,"setup_reason":packet.setup_reason,"original_thread":packet.original_thread,"scope_flags":packet.scope_flags});
+    let metadata = json!({"discovered_mask":packet.discovered_mask,"verified_mask":packet.verified_mask,"published_mask":packet.published_mask,"entered_mask":packet.entered_mask,"returned_mask":packet.returned_mask,"failure_mask":packet.failure_mask,"total_calls":packet.total_calls,"total_failures":packet.total_failures,"dropped":packet.dropped,"overflow":packet.overflow,"reported_record_count":packet.record_count,"slot_count":packet.slot_count,"descriptor_count":packet.descriptor_count,"function_count":packet.function_count,"callbacks_complete":packet.callbacks_complete,"protections_restored":packet.protections_restored,"rollback_error":packet.rollback_error,"owner_pinned":packet.owner_pinned,"clock_live":packet.clock_live,
+        "started_qpc":packet.started_qpc,"finished_qpc":packet.finished_qpc,"cutoff_qpc":packet.cutoff_qpc,"frequency":packet.frequency,"next_sequence":packet.next_sequence,"listener_owner_anchor":packet.listener_owner_anchor,"incoming_win32":packet.incoming_win32,"incoming_wsa":packet.incoming_wsa,"outgoing_win32":packet.outgoing_win32,"outgoing_wsa":packet.outgoing_wsa,"dependency_scope_armed":packet.dependency_scope_armed,"dependency_scope_error":packet.dependency_scope_error,"dependency_links_dropped":packet.dependency_links_dropped});
+    value
+        .as_object_mut()
+        .expect("listener object")
+        .extend(metadata.as_object().expect("listener metadata").clone());
+    let units = packet
+        .owner
+        .module_name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(64);
+    value["owner"] = json!({"base":packet.owner.owner_base,"size":packet.owner.owner_size,"entry":packet.owner.entry,"machine":packet.owner.machine,"timestamp":packet.owner.timestamp,"entry_bytes":&packet.owner.entry_bytes[..(packet.owner.entry_len as usize).min(16)],"module_name_utf16":&packet.owner.module_name[..units],"module_name_prefix_only":true});
+    value["slots"] = json!(slots);
+    value["recent_entries"] = json!(entries);
+    value["first_observed_failure"] = json!(first_failure);
+    value["dependency_links"] = json!(links);
+    value["first_dependency_failure_link"] = json!(first_dependency_link);
+    value["dependencies"] = dependency;
+    bounded(value)
+}
+
+struct Capped {
+    remaining: usize,
+}
+impl std::io::Write for Capped {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other("listener diagnostic bound exhausted"));
+        }
+        self.remaining -= bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn fits(value: &Value, limit: usize) -> bool {
+    serde_json::to_writer(Capped { remaining: limit }, value).is_ok()
+}
+fn small(value: Option<&Value>, limit: usize) -> Value {
+    value
+        .filter(|value| fits(value, limit))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Apply the same cap to the model or the bridge's binding-bearing envelope.
+pub fn bounded(value: Value) -> Value {
+    if fits(&value, RECORD_BYTES) {
+        return value;
+    }
+    let trace = value.get("trace").unwrap_or(&value);
+    let mut summary = json!({"format":"memcordon.fixture-original-rust-listener","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target_identity_proved":false,"global_routes_complete":false,"coverage_inconclusive":true,"record_omitted_for_bound":true,"observation_incomplete":true});
+    for key in [
+        "aggregate",
+        "setup_stage",
+        "setup_error",
+        "setup_reason",
+        "invalid_packet",
+        "discovered_mask",
+        "verified_mask",
+        "published_mask",
+        "entered_mask",
+        "returned_mask",
+        "failure_mask",
+        "total_calls",
+        "total_failures",
+        "dropped",
+        "overflow",
+        "reported_record_count",
+        "dependency_scope_armed",
+        "dependency_scope_error",
+        "first_observed_failure",
+        "first_dependency_failure_link",
+    ] {
+        let limit = match key {
+            "first_observed_failure" => 8192,
+            "aggregate" => 1024,
+            "first_dependency_failure_link" => 512,
+            _ => 64,
+        };
+        summary[key] = small(trace.get(key), limit);
+    }
+    summary["first_observed_dependency_failure"] = small(
+        trace
+            .get("dependencies")
+            .and_then(|dependency| dependency.get("first_observed_failure")),
+        8192,
+    );
+    if value.get("trace").is_some() {
+        json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":small(value.get("original_binding"),16*1024),"binding_omitted_if_oversize":!value.get("original_binding").is_some_and(|binding|fits(binding,16*1024)),"trace":summary,"record_omitted_for_envelope_bound":true,"acceptance_authority":false})
+    } else {
+        summary
+    }
+}
