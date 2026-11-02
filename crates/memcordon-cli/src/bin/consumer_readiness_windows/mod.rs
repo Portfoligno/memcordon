@@ -1010,7 +1010,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             if args.next().is_some() {
                 return Err(io::Error::other("extra registry selfcheck arguments"));
             }
-            return winsock_registry::self_check(child_command, settle_peer_failure);
+            return winsock_registry::self_check();
         }
         Some("winsock-registry-uninherited-self-check") => {
             let clock = args

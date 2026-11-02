@@ -32,9 +32,6 @@ mod start_gate_policy;
 #[cfg(windows)]
 #[path = "windows_toolchain_sampling.rs"]
 mod toolchain_sampling;
-#[cfg(windows)]
-#[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/winsock_registry.rs"]
-pub mod winsock_registry;
 
 pub fn validate_toolchain_inventory(
     toolchain: &descriptor::Toolchain,
@@ -3879,7 +3876,7 @@ pub(crate) mod native {
     struct ExecutionClocks {
         work: Instant,
         cleanup: Option<Instant>,
-        registry: Option<Arc<Mutex<super::winsock_registry::Projection>>>,
+        registry: Option<Arc<Mutex<memcordon_testkit::WindowsWinsockRegistryProjection>>>,
     }
 
     fn execute_with_baseline_clocks(
@@ -3896,7 +3893,7 @@ pub(crate) mod native {
             input.descriptor.case,
             descriptor::Case::Joint | descriptor::Case::EndpointMismatch | descriptor::Case::Churn
         ) {
-            let projection = super::winsock_registry::Projection::create(
+            let projection = memcordon_testkit::WindowsWinsockRegistryProjection::create(
                 &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
                 clocks.work,
                 clocks.cleanup.unwrap_or(clocks.work),
@@ -4525,7 +4522,6 @@ pub(crate) mod native {
                             let mut owner = owner.lock().map_err(|_| {
                                 io::Error::other("registry input ownership poisoned")
                             })?;
-                            owner.verify(owner.raw())?;
                             let held = held_family
                                 .lock()
                                 .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
@@ -4534,12 +4530,7 @@ pub(crate) mod native {
                                     "original registry recipient identity differs",
                                 ));
                             }
-                            // SAFETY: this lock retains the original projection key
-                            // while duplicating into the same admitted live root.
-                            let handle = unsafe {
-                                held[0].duplicate_registry_input(owner.raw(), work_deadline)
-                            }?;
-                            owner.transferred();
+                            let handle = owner.duplicate_into(&held[0], work_deadline)?;
                             descriptor::controller_start::Sender::with_registry(
                                 descriptor::controller_start::Capability {
                                     version: 1,

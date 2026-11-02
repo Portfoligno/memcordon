@@ -33,6 +33,8 @@ pub use memcordon_platform::test_support::{
     windows_processes_for_image_until, windows_unresolved_wait_owner_count,
 };
 
+#[cfg(windows)]
+pub use memcordon_platform::test_support::windows_winsock_registry::Projection as WindowsWinsockRegistryProjection;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};

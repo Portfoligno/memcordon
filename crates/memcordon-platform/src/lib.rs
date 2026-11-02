@@ -36,6 +36,9 @@ mod macos_result_frame;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod startup_cleanup_observation;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_registry_manifest;
 #[cfg(target_os = "macos")]
 pub use macos_launch::LaunchRuntime as MacosLaunchRuntime;
 #[cfg(target_os = "macos")]

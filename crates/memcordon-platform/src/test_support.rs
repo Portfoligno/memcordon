@@ -1,5 +1,9 @@
 //! Native containment used only by black-box process tests.
 
+#[cfg(windows)]
+#[path = "windows_winsock_registry.rs"]
+pub mod windows_winsock_registry;
+
 #[cfg(target_os = "linux")]
 pub fn workload_start_bytes(
     policy: &memcordon_core::Policy,
@@ -989,7 +993,7 @@ impl WindowsImageProcess {
     /// No numeric PID is reopened and the target reference is non-inheritable.
     /// # Safety
     /// `key` must be a live owned registry reference throughout this call.
-    pub unsafe fn duplicate_registry_input(
+    unsafe fn duplicate_registry_input(
         &self,
         key: windows_sys::Win32::System::Registry::HKEY,
         deadline: std::time::Instant,

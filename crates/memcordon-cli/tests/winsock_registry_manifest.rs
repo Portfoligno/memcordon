@@ -1,5 +1,4 @@
-#[path = "../src/bin/consumer_readiness_windows/winsock_registry_manifest.rs"]
-mod registry;
+use memcordon_platform::windows_registry_manifest as registry;
 use registry::{Key, Manifest, ValueRecord, View};
 
 fn name(value: &str) -> Vec<u16> {
