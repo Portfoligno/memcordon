@@ -1,13 +1,27 @@
 use memcordon_platform::windows_registry_manifest as registry;
-use registry::{Key, Manifest, Root, ValueRecord, View};
+use registry::{Key, Manifest, Root, TransportPresence, TransportRoot, ValueRecord, View};
 
 fn name(value: &str) -> Vec<u16> {
     value.encode_utf16().collect()
+}
+fn transport_value(services: &[&str]) -> ValueRecord {
+    let mut units = Vec::new();
+    for service in services {
+        units.extend(name(service));
+        units.push(0);
+    }
+    units.push(0);
+    ValueRecord {
+        name: name("Transports"),
+        kind: 7,
+        bytes: units.into_iter().flat_map(u16::to_le_bytes).collect(),
+    }
 }
 fn fixture() -> Manifest {
     Manifest {
         version: registry::VERSION,
         view: View::Native,
+        transports: vec![],
         keys: vec![
             Key {
                 root: Root::Winsock2Parameters,
@@ -40,7 +54,7 @@ fn fixture() -> Manifest {
                 root: Root::WinsockParameters,
                 path: vec![],
                 class: vec![],
-                values: vec![],
+                values: vec![transport_value(&[])],
             },
         ],
     }
@@ -148,13 +162,18 @@ fn forest() -> Manifest {
     Manifest {
         version: registry::VERSION,
         view: View::Native,
+        transports: vec![],
         keys: Root::ALL
             .into_iter()
             .map(|root| Key {
-                root,
+                root: root.clone(),
                 path: vec![],
                 class: vec![],
-                values: vec![],
+                values: if root == Root::WinsockParameters {
+                    vec![transport_value(&[])]
+                } else {
+                    vec![]
+                },
             })
             .collect(),
     }
@@ -198,12 +217,16 @@ fn roots_are_digest_bound_and_legacy_single_root_declarations_are_refused() {
     let digest = original.digest().unwrap();
     let mut swapped = original.clone();
     for key in &mut swapped.keys {
-        key.root = match key.root {
+        key.root = match &key.root {
             Root::Winsock2Parameters => Root::WinsockParameters,
             Root::WinsockParameters => Root::Winsock2Parameters,
+            other => other.clone(),
         };
     }
-    assert_ne!(swapped.digest().unwrap(), digest);
+    assert!(
+        swapped.digest().is_err(),
+        "discovery cannot move to the other root"
+    );
     let mut moved = original.clone();
     moved.keys[1].root = Root::WinsockParameters;
     assert_ne!(moved.digest().unwrap(), digest);
@@ -215,11 +238,13 @@ fn roots_are_digest_bound_and_legacy_single_root_declarations_are_refused() {
     });
     assert_ne!(changed.digest().unwrap(), digest);
     let mut declaration = original.declaration().unwrap();
-    assert_eq!(declaration.version, 2);
+    assert_eq!(declaration.version, 3);
+    declaration.version = 2;
+    assert!(declaration.validate().is_err());
     declaration.version = 1;
     assert!(declaration.validate().is_err());
     let mut legacy = original;
-    legacy.version = 1;
+    legacy.version = 2;
     assert!(legacy.digest().is_err());
     let encoded = serde_json::to_value(forest()).unwrap();
     assert_eq!(encoded["keys"][0]["root"], "winsock2-parameters");
@@ -231,7 +256,7 @@ fn forest_key_and_value_limits_are_shared_not_doubled_per_root() {
     let mut keys = forest();
     for index in 0..registry::MAX_KEYS - Root::ALL.len() {
         keys.keys.push(Key {
-            root: Root::ALL[index % Root::ALL.len()],
+            root: Root::ALL[index % Root::ALL.len()].clone(),
             path: vec![name(&index.to_string())],
             class: vec![],
             values: vec![],
@@ -248,13 +273,16 @@ fn forest_key_and_value_limits_are_shared_not_doubled_per_root() {
 
     let mut values = forest();
     for (index, key) in values.keys.iter_mut().enumerate() {
-        key.values = (0..registry::MAX_VALUES / 2)
-            .map(|value| ValueRecord {
-                name: name(&format!("{index}-{value}")),
-                kind: 0,
-                bytes: vec![],
-            })
-            .collect();
+        let count = registry::MAX_VALUES / 2 - key.values.len();
+        key.values.extend(
+            (0..count)
+                .map(|value| ValueRecord {
+                    name: name(&format!("{index}-{value}")),
+                    kind: 0,
+                    bytes: vec![],
+                })
+                .collect::<Vec<_>>(),
+        );
     }
     values.validate().unwrap();
     values.keys[1].values.push(ValueRecord {
@@ -269,20 +297,214 @@ fn forest_key_and_value_limits_are_shared_not_doubled_per_root() {
 fn forest_byte_budget_charges_both_roots_and_accepts_only_the_exact_shared_extent() {
     let mut value = forest();
     for key in &mut value.keys {
-        key.values = (0..2)
-            .map(|index| ValueRecord {
-                name: vec![b'a' as u16 + index],
-                kind: 3,
-                bytes: vec![0; registry::MAX_VALUE_BYTES],
-            })
-            .collect();
+        key.values.extend(
+            (0..2)
+                .map(|index| ValueRecord {
+                    name: vec![b'a' as u16 + index],
+                    kind: 3,
+                    bytes: vec![0; registry::MAX_VALUE_BYTES],
+                })
+                .collect::<Vec<_>>(),
+        );
     }
-    // Two root tags plus four one-unit native names consume ten bytes.
-    let metadata = Root::ALL.len() + 4 * size_of::<u16>();
-    value.keys[1].values[1]
+    // Root tags, four payload names and the exact empty Transports value.
+    let metadata = Root::ALL.len() + 4 * size_of::<u16>() + name("Transports").len() * 2 + 2;
+    value.keys[1].values[2]
         .bytes
         .truncate(registry::MAX_VALUE_BYTES - metadata);
     value.validate().unwrap();
-    value.keys[1].values[1].bytes.push(0);
+    value.keys[1].values[2].bytes.push(0);
     assert!(value.validate().is_err());
+}
+
+fn transport_forest() -> Manifest {
+    let mut value = forest();
+    value.keys[1].values[0] = transport_value(&["Alpha", "Beta", "Alpha"]);
+    value.transports = vec![
+        TransportRoot {
+            service: name("Alpha"),
+            presence: TransportPresence::Present,
+        },
+        TransportRoot {
+            service: name("Beta"),
+            presence: TransportPresence::Absent { lstatus: 2 },
+        },
+    ];
+    value.keys.push(Key {
+        root: Root::TransportWinsock {
+            service: name("Alpha"),
+        },
+        path: vec![],
+        class: vec![],
+        values: vec![ValueRecord {
+            name: vec![],
+            kind: 3,
+            bytes: vec![1, 0, 255],
+        }],
+    });
+    value
+}
+
+#[test]
+fn native_multi_sz_requires_real_terminators_and_preserves_exact_components() {
+    assert!(
+        registry::parse_transports(&transport_value(&[]))
+            .unwrap()
+            .is_empty()
+    );
+    let original = transport_value(&["Beta", "Alpha", "Beta"]);
+    assert_eq!(
+        registry::parse_transports(&original).unwrap(),
+        vec![name("Alpha"), name("Beta")]
+    );
+    let mut padded = original.clone();
+    padded.bytes.extend([0, 0, 0, 0]);
+    assert_eq!(
+        registry::parse_transports(&padded).unwrap(),
+        registry::parse_transports(&original).unwrap()
+    );
+    let mut native = transport_value(&["Alpha"]);
+    native.bytes.splice(0..2, 0xd800u16.to_le_bytes());
+    assert_eq!(
+        registry::parse_transports(&native).unwrap()[0][0],
+        0xd800,
+        "no lossy Unicode conversion"
+    );
+    for mutation in 0..8 {
+        let mut bad = original.clone();
+        match mutation {
+            0 => {
+                bad.bytes.pop();
+            }
+            1 => {
+                bad.bytes.truncate(bad.bytes.len() - 2);
+            }
+            2 => bad.bytes.extend(1u16.to_le_bytes()),
+            3 => bad.kind = 1,
+            4 => bad.bytes.clear(),
+            5 => bad = transport_value(&["escape\\child"]),
+            6 => bad = transport_value(&["escape/child"]),
+            7 => bad = transport_value(&[&"x".repeat(256)]),
+            _ => unreachable!(),
+        }
+        assert!(
+            registry::parse_transports(&bad).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    let mut aliases = transport_value(&["Alpha", "alpha"]);
+    assert_eq!(
+        registry::parse_transports(&aliases).unwrap().len(),
+        2,
+        "native ordinal alias checks must not be guessed by Unicode folding"
+    );
+    aliases.name = name("tRaNsPoRtS");
+    let mut value = forest();
+    value.keys[1].values[0] = aliases;
+    assert_eq!(registry::transport_services(&value.keys).unwrap().len(), 2);
+    value.keys[1].values.push(transport_value(&[]));
+    assert!(registry::transport_services(&value.keys).is_err());
+}
+
+#[test]
+fn transport_presence_is_exact_source_closure_not_optional_missing_data() {
+    let original = transport_forest();
+    original.validate().unwrap();
+    let roundtrip: Manifest =
+        serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+    assert_eq!(roundtrip, original);
+    assert_eq!(
+        original.keys[1].values[0].bytes,
+        transport_value(&["Alpha", "Beta", "Alpha"]).bytes
+    );
+    assert_eq!(
+        Root::TransportWinsock {
+            service: name("Alpha")
+        }
+        .path(),
+        name("System\\CurrentControlSet\\Services\\Alpha\\Parameters\\Winsock")
+    );
+    for mutation in 0..9 {
+        let mut bad = original.clone();
+        match mutation {
+            0 => {
+                bad.transports.pop();
+            }
+            1 => bad.transports[1].service = name("Unlisted"),
+            2 => bad.transports[1].presence = TransportPresence::Absent { lstatus: 5 },
+            3 => {
+                bad.keys[2].root = Root::TransportWinsock {
+                    service: name("Beta"),
+                }
+            }
+            4 => {
+                bad.keys.pop();
+            }
+            5 => bad.keys[1].values[0] = transport_value(&["Alpha"]),
+            6 => bad.transports.push(bad.transports[0].clone()),
+            7 => bad.keys[2].path = vec![name("missing-parent")],
+            8 => bad.transports[0].service = name("escape\\elsewhere"),
+            _ => unreachable!(),
+        }
+        assert!(bad.digest().is_err(), "mutation {mutation}");
+    }
+    let mut unknown = serde_json::to_value(original).unwrap();
+    unknown["keys"][2]["root"]["transport-winsock"]["unrecognized"] = true.into();
+    assert!(serde_json::from_value::<Manifest>(unknown).is_err());
+}
+
+#[test]
+fn canonical_transport_digest_binds_raw_discovery_presence_and_contents() {
+    let original = transport_forest();
+    let digest = original.digest().unwrap();
+    let mut reordered = original.clone();
+    reordered.transports.reverse();
+    reordered.keys.reverse();
+    assert_eq!(reordered.digest().unwrap(), digest);
+    let mut raw_order = original.clone();
+    raw_order.keys[1].values[0] = transport_value(&["Beta", "Alpha", "Alpha"]);
+    assert_ne!(
+        raw_order.digest().unwrap(),
+        digest,
+        "raw source list is not normalized"
+    );
+    let mut absent = original.clone();
+    absent.transports[0].presence = TransportPresence::Absent { lstatus: 2 };
+    absent.keys.pop();
+    assert_ne!(absent.digest().unwrap(), digest);
+    let mut content = original.clone();
+    content.keys[2].values[0].bytes.push(2);
+    assert_ne!(content.digest().unwrap(), digest);
+    let mut source_missing = original;
+    source_missing.keys[1].values.clear();
+    assert!(
+        source_missing.validate().is_err(),
+        "missing discovery value is not an empty list"
+    );
+}
+
+#[test]
+fn absent_transport_inventory_and_memberships_share_existing_limits() {
+    let mut value = transport_forest();
+    for index in 0..registry::MAX_KEYS - value.keys.len() - 1 {
+        value.keys.push(Key {
+            root: Root::Winsock2Parameters,
+            path: vec![name(&index.to_string())],
+            class: vec![],
+            values: vec![],
+        });
+    }
+    value.validate().unwrap();
+    value.keys.push(Key {
+        root: Root::Winsock2Parameters,
+        path: vec![name("one-too-many")],
+        class: vec![],
+        values: vec![],
+    });
+    assert!(value.validate().is_err());
+    let names = (0..registry::MAX_KEYS)
+        .map(|index| format!("Service{index}"))
+        .collect::<Vec<_>>();
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    assert!(registry::parse_transports(&transport_value(&names)).is_err());
 }

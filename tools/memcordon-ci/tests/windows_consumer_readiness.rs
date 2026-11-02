@@ -496,7 +496,7 @@ fn explicit_native_registry_dependency_requires_bound_version_three_joint_contro
                         version: descriptor::controller_start::VERSION,
                     }
                 }
-                2 => bad.winsock_registry.as_mut().unwrap().version = 1,
+                2 => bad.winsock_registry.as_mut().unwrap().version = 2,
                 3 => bad.case = Case::Envelope,
                 _ => unreachable!(),
             }

@@ -1,7 +1,8 @@
 //! Explicit native Winsock configuration input; never host policy mutation.
 use crate::windows_registry_error::{at, failures, require_access_denied};
 use crate::windows_registry_manifest::{
-    Declaration, Key, Manifest, Root, VERSION, ValueRecord, View,
+    Declaration, Key, Manifest, Root, TransportPresence, TransportRoot, VERSION, ValueRecord, View,
+    transport_services,
 };
 use crate::windows_registry_seal::{ReadAce, read_trustees, validate_read_acl, validate_sid};
 use std::{io, ptr, time::Instant};
@@ -471,12 +472,40 @@ struct Stamp {
     high: u32,
 }
 
-fn root_at<T>(result: io::Result<T>, root: Root) -> io::Result<T> {
+#[derive(Debug)]
+struct RootError {
+    root: Root,
+    original: io::Error,
+}
+impl std::fmt::Display for RootError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "registry-root={:?}; {}",
+            self.root, self.original
+        )
+    }
+}
+impl std::error::Error for RootError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
+}
+fn root_at<T>(result: io::Result<T>, root: &Root) -> io::Result<T> {
     at(
-        result,
+        result.map_err(|original| {
+            io::Error::new(
+                original.kind(),
+                RootError {
+                    root: root.clone(),
+                    original,
+                },
+            )
+        }),
         match root {
             Root::Winsock2Parameters => "forest/winsock2-parameters",
             Root::WinsockParameters => "forest/winsock-parameters",
+            Root::TransportWinsock { .. } => "forest/transport-winsock",
         },
         "registry-forest-root",
         "boundary",
@@ -487,46 +516,58 @@ fn roots_at(parent: HKEY, deadline: Instant) -> io::Result<Vec<(Root, OwnedKey)>
     let mut roots = Vec::with_capacity(Root::ALL.len());
     for kind in Root::ALL {
         let key = root_at(
-            open_at(
-                parent,
-                &kind.path().encode_utf16().collect::<Vec<_>>(),
-                KEY_READ,
-                deadline,
-                "forest/root-open",
-            ),
-            kind,
+            open_at(parent, &kind.path(), KEY_READ, deadline, "forest/root-open"),
+            &kind,
         )?;
         roots.push((kind, key));
     }
     Ok(roots)
 }
-fn forest_security(
-    roots: &[(Root, OwnedKey)],
-    deadline: Instant,
-) -> io::Result<Vec<(Root, Vec<u8>)>> {
+type ForestSecurity = Vec<(Root, Vec<u8>)>;
+fn forest_security(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<ForestSecurity> {
     roots
         .iter()
         .map(|(kind, key)| {
-            root_at(source_security(key.raw(), deadline), *kind).map(|security| (*kind, security))
+            root_at(source_security(key.raw(), deadline), kind)
+                .map(|security| (kind.clone(), security))
         })
         .collect()
 }
-fn capture(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<(Manifest, Vec<Stamp>)> {
+#[derive(Default)]
+struct CaptureState {
+    keys: Vec<Key>,
+    stamps: Vec<Stamp>,
+    values: usize,
+    bytes: usize,
+    absent: usize,
+}
+fn capture(
+    roots: &[(Root, OwnedKey)],
+    state: &mut CaptureState,
+    deadline: Instant,
+) -> io::Result<()> {
     let mut pending = roots
         .iter()
-        .map(|(kind, key)| (*kind, Vec::<Vec<u16>>::new(), None::<OwnedKey>, key.raw()))
+        .map(|(kind, key)| {
+            (
+                kind.clone(),
+                Vec::<Vec<u16>>::new(),
+                None::<OwnedKey>,
+                key.raw(),
+            )
+        })
         .collect::<Vec<_>>();
-    let mut keys = Vec::new();
-    let mut stamps = Vec::new();
-    let mut value_count = 0usize;
-    let mut byte_count = 0usize;
+    let mut keys = std::mem::take(&mut state.keys);
+    let mut stamps = std::mem::take(&mut state.stamps);
+    let mut value_count = state.values;
+    let mut byte_count = state.bytes;
     while let Some((kind, path, owner, root)) = pending.pop() {
         let captured_root = (|| -> io::Result<()> {
             live(deadline)?;
             byte_count = byte_count
-                .checked_add(1)
+                .checked_add(kind.identity_bytes())
                 .ok_or_else(|| io::Error::other("registry root tag size overflow"))?;
-            if keys.len() >= MAX_KEYS || path.len() > 16 {
+            if keys.len() + state.absent >= MAX_KEYS || path.len() > 16 {
                 return Err(io::Error::other("registry input key/depth bound exceeded"));
             }
             let raw = owner.as_ref().map_or(root, OwnedKey::raw);
@@ -712,8 +753,8 @@ fn capture(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<(Manifes
                         "registry input name/data aggregate bound exceeded",
                     ));
                 }
-                pending.push((kind, child_path, Some(child), root));
-                if pending.len() + keys.len() + 1 > MAX_KEYS {
+                pending.push((kind.clone(), child_path, Some(child), root));
+                if pending.len() + keys.len() + state.absent + 1 > MAX_KEYS {
                     return Err(io::Error::other(
                         "registry input pending key bound exceeded",
                     ));
@@ -749,7 +790,7 @@ fn capture(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<(Manifes
                 );
             }
             stamps.push(Stamp {
-                root: kind,
+                root: kind.clone(),
                 path: path.clone(),
                 subkeys,
                 values,
@@ -757,37 +798,198 @@ fn capture(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<(Manifes
                 high: modified.dwHighDateTime,
             });
             keys.push(Key {
-                root: kind,
+                root: kind.clone(),
                 path,
                 class,
                 values: captured,
             });
             Ok(())
         })();
-        root_at(captured_root, kind)?;
+        root_at(captured_root, &kind)?;
+    }
+    state.keys = keys;
+    state.stamps = stamps;
+    state.values = value_count;
+    state.bytes = byte_count;
+    live(deadline)?;
+    Ok(())
+}
+
+fn native_equal(left: &[u16], right: &[u16], deadline: Instant) -> io::Result<bool> {
+    live(deadline)?;
+    if left.is_empty() || right.is_empty() {
+        return Ok(left.is_empty() && right.is_empty());
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CompareStringOrdinal(
+            left: *const u16,
+            left_count: i32,
+            right: *const u16,
+            right_count: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+    let result = unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            i32::try_from(left.len()).map_err(io::Error::other)?,
+            right.as_ptr(),
+            i32::try_from(right.len()).map_err(io::Error::other)?,
+            1,
+        )
+    };
+    let observed = if result == 0 {
+        at(
+            Err(io::Error::last_os_error()),
+            "forest/native-name-compare",
+            "CompareStringOrdinal",
+            "Win32",
+            None,
+        )
+    } else {
+        Ok(result == 2)
+    };
+    match (observed, live(deadline)) {
+        (Err(primary), Err(secondary)) => Err(failures(primary, secondary)),
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(equal), Ok(())) => Ok(equal),
+    }
+}
+fn native_transport_services(keys: &[Key], deadline: Instant) -> io::Result<Vec<Vec<u16>>> {
+    let configuration = keys
+        .iter()
+        .find(|key| key.root == Root::WinsockParameters && key.path.is_empty())
+        .ok_or_else(|| io::Error::other("Winsock transport configuration root is absent"))?;
+    let expected = "Transports".encode_utf16().collect::<Vec<_>>();
+    let mut matches = 0usize;
+    for value in &configuration.values {
+        if native_equal(&value.name, &expected, deadline)? {
+            matches += 1;
+            if value.name.len() != expected.len()
+                || !value.name.iter().zip(&expected).all(|(left, right)| {
+                    *left <= 0x7f && (*left as u8).eq_ignore_ascii_case(&(*right as u8))
+                })
+            {
+                return Err(io::Error::other(
+                    "unsupported native alias for Transports value name",
+                ));
+            }
+        }
+    }
+    if matches != 1 {
+        return Err(io::Error::other(
+            "native Transports value identity is ambiguous or absent",
+        ));
+    }
+    let services = transport_services(keys).map_err(io::Error::other)?;
+    for (index, service) in services.iter().enumerate() {
+        for other in &services[..index] {
+            if native_equal(service, other, deadline)? {
+                return Err(io::Error::other(
+                    "distinct transport spellings alias one native service key",
+                ));
+            }
+        }
+    }
+    live(deadline)?;
+    Ok(services)
+}
+struct Snapshot {
+    manifest: Manifest,
+    stamps: Vec<Stamp>,
+    security: ForestSecurity,
+}
+fn closure_snapshot(parent: HKEY, deadline: Instant) -> io::Result<Snapshot> {
+    let mut sources = roots_at(parent, deadline)?;
+    let mut security = forest_security(&sources, deadline)?;
+    let mut state = CaptureState::default();
+    capture(&sources, &mut state, deadline)?;
+    let services = native_transport_services(&state.keys, deadline)?;
+    let mut transports = Vec::with_capacity(services.len());
+    let mut additional = Vec::with_capacity(services.len());
+    for service in services {
+        live(deadline)?;
+        let root = Root::TransportWinsock {
+            service: service.clone(),
+        };
+        let mut transport = TransportRoot {
+            service,
+            presence: TransportPresence::Present,
+        };
+        state.bytes = state
+            .bytes
+            .checked_add(transport.extent_bytes())
+            .ok_or_else(|| io::Error::other("transport membership extent overflow"))?;
+        if state.bytes > MAX_BYTES {
+            return Err(io::Error::other(
+                "transport membership exceeds shared byte bound",
+            ));
+        }
+        // Classify the direct native result before any context wrapper. Only
+        // witnessed ERROR_FILE_NOT_FOUND is an accepted absent dependency.
+        match open(parent, &root.path(), KEY_READ, deadline) {
+            Ok(key) => {
+                security.push((
+                    root.clone(),
+                    root_at(source_security(key.raw(), deadline), &root)?,
+                ));
+                additional.push((root, key));
+            }
+            Err(error) if error.raw_os_error() == Some(2) => {
+                transport.presence = TransportPresence::Absent { lstatus: 2 };
+                state.absent += 1;
+            }
+            Err(error) => return root_at(Err(error), &root),
+        }
+        if state.keys.len() + additional.len() + state.absent > MAX_KEYS {
+            return Err(io::Error::other(
+                "transport roots exceed shared key inventory",
+            ));
+        }
+        transports.push(transport);
+    }
+    capture(&additional, &mut state, deadline)?;
+    sources.extend(additional);
+    security.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut after = forest_security(&sources, deadline)?;
+    after.sort_by(|left, right| left.0.cmp(&right.0));
+    if security != after {
+        return Err(io::Error::other(
+            "native registry closure security changed during capture",
+        ));
     }
     let manifest = Manifest {
         version: VERSION,
         view: View::Native,
-        keys,
+        transports,
+        keys: state.keys,
     };
     manifest.validate().map_err(io::Error::other)?;
-    stamps.sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
+    state
+        .stamps
+        .sort_by(|left, right| (&left.root, &left.path).cmp(&(&right.root, &right.path)));
     live(deadline)?;
-    Ok((manifest, stamps))
+    Ok(Snapshot {
+        manifest,
+        stamps: state.stamps,
+        security,
+    })
 }
-
-fn coherent(roots: &[(Root, OwnedKey)], deadline: Instant) -> io::Result<Manifest> {
-    let (first, first_stamps) = capture(roots, deadline)?;
-    let (second, second_stamps) = capture(roots, deadline)?;
-    if first_stamps != second_stamps
-        || first.digest().map_err(io::Error::other)? != second.digest().map_err(io::Error::other)?
+fn coherent(parent: HKEY, deadline: Instant) -> io::Result<(Manifest, ForestSecurity)> {
+    let first = closure_snapshot(parent, deadline)?;
+    let second = closure_snapshot(parent, deadline)?;
+    if first.stamps != second.stamps
+        || first.security != second.security
+        || first.manifest.digest().map_err(io::Error::other)?
+            != second.manifest.digest().map_err(io::Error::other)?
     {
         return Err(io::Error::other(
-            "native registry input changed during coherent capture",
+            "native registry dependency closure changed during coherent capture",
         ));
     }
-    Ok(second)
+    Ok((second.manifest, second.security))
 }
 
 pub struct Projection {
@@ -799,7 +1001,7 @@ pub struct Projection {
     retired: bool,
     transferred: bool,
     recipients_retired: bool,
-    source_security: Vec<(Root, Vec<u8>)>,
+    source_security: ForestSecurity,
     namespace: String,
     cleanup_deadline: Instant,
     reader_sid: Vec<u8>,
@@ -824,33 +1026,13 @@ impl Projection {
         {
             return Err(io::Error::other("invalid owned registry namespace nonce"));
         }
-        let sources = roots_at(HKEY_LOCAL_MACHINE, deadline)?;
-        let security_before = at(
-            forest_security(&sources, deadline),
-            "projection/source-security-before",
-            "RegGetKeySecurity",
-            "boundary",
-            Some(READ_CONTROL),
-        )?;
-        let manifest = at(
-            coherent(&sources, deadline),
+        let (manifest, security_before) = at(
+            coherent(HKEY_LOCAL_MACHINE, deadline),
             "projection/source-snapshot",
             "coherent",
             "boundary",
             Some(KEY_READ),
         )?;
-        if at(
-            forest_security(&sources, deadline),
-            "projection/source-security-after",
-            "RegGetKeySecurity",
-            "boundary",
-            Some(READ_CONTROL),
-        )? != security_before
-        {
-            return Err(io::Error::other(
-                "source registry security changed during capture",
-            ));
-        }
         let declaration = manifest.declaration().map_err(io::Error::other)?;
         let reader_sid = reader_user(ReaderToken::CreatorPrimary, deadline)?;
         // This DACL applies ONLY to each newly created fixture key. RC can read
@@ -957,15 +1139,14 @@ impl Projection {
     }
     fn populate(&mut self, attributes: &mut SECURITY_ATTRIBUTES) -> io::Result<()> {
         let mut keys = self.manifest.keys.clone();
-        keys.sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
+        keys.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));
         let mut created = std::collections::BTreeMap::<Vec<Vec<u16>>, usize>::new();
         for entry in keys {
             live(self.deadline)?;
-            let mut components = entry
-                .root
-                .path()
-                .split('\\')
-                .map(|part| part.encode_utf16().collect::<Vec<_>>())
+            let root_path = entry.root.path();
+            let mut components = root_path
+                .split(|unit| *unit == b'\\' as u16)
+                .map(<[u16]>::to_vec)
                 .collect::<Vec<_>>();
             components.extend(entry.path.iter().cloned());
             let mut parent = self.root.raw();
@@ -1160,8 +1341,8 @@ impl Projection {
         Ok(handle)
     }
     pub fn diagnostic(&self) -> serde_json::Value {
-        let security = self.source_security.iter().map(|(root, bytes)| serde_json::json!({"root":root,"path":root.path(),"bytes":bytes,"sha256":hex_digest(bytes)})).collect::<Vec<_>>();
-        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":2,"declaration":self.declaration,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_roots":security,"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native Winsock and WinSock2 Parameters forest projected below one owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
+        let security = self.source_security.iter().map(|(root, bytes)| serde_json::json!({"root":root,"path_utf16":root.path(),"bytes":bytes,"sha256":hex_digest(bytes)})).collect::<Vec<_>>();
+        serde_json::json!({"format":"memcordon.fixture-winsock-registry-input","version":3,"declaration":self.declaration,"transports":self.manifest.transports,"owned_namespace_hkcu":self.namespace,"retirement_observed":self.retired,"source_security_information":7,"source_security_roots":security,"source_label_captured":false,"source_view":"native","intended_reader_sid":self.reader_sid,"owned_root_security_at_seal":self.root_security,"owned_seal_verified_at_creation":self.sealed,"scope":"exact native Winsock roots and configuration-derived transport Winsock inputs, including witnessed absence, projected below one owned HKLM root","host_registry_policy_changed":false,"acceptance_authority":false})
     }
     fn transferred(&mut self) {
         self.transferred = true;
@@ -1237,13 +1418,19 @@ fn verified_manifest(
     deadline: Instant,
 ) -> io::Result<Manifest> {
     declaration.validate().map_err(io::Error::other)?;
-    let parameters = roots_at(root, deadline)?;
-    let actual = coherent(&parameters, deadline)?;
+    let (actual, _) = coherent(root, deadline)?;
     if actual.digest().map_err(io::Error::other)? != declaration.sha256 {
         return Err(io::Error::other("registry input manifest digest differs"));
     }
     live(deadline)?;
     Ok(actual)
+}
+fn present_roots(manifest: &Manifest) -> impl Iterator<Item = &Root> {
+    manifest
+        .keys
+        .iter()
+        .filter(|key| key.path.is_empty())
+        .map(|key| &key.root)
 }
 
 pub struct Mapping {
@@ -1265,9 +1452,6 @@ impl Mapping {
             "boundary",
             Some(READ_CONTROL),
         )?;
-        for (kind, parameters) in roots_at(key.raw(), deadline)? {
-            root_at(read_seal(parameters.raw(), &reader, deadline), kind)?;
-        }
         let manifest = at(
             verified_manifest(key.raw(), declaration, deadline),
             "mapping/manifest-readback",
@@ -1275,6 +1459,19 @@ impl Mapping {
             "boundary",
             Some(KEY_READ),
         )?;
+        for kind in present_roots(&manifest) {
+            let parameters = root_at(
+                open_at(
+                    key.raw(),
+                    &kind.path(),
+                    KEY_READ,
+                    deadline,
+                    "mapping/root-seal-open",
+                ),
+                kind,
+            )?;
+            root_at(read_seal(parameters.raw(), &reader, deadline), kind)?;
+        }
         at(
             immutable(key.raw(), &manifest, deadline),
             "mapping/immutability",
@@ -1354,11 +1551,11 @@ impl Mapping {
 
 fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<()> {
     immutable_surface(root, deadline)?;
-    for kind in Root::ALL {
+    for kind in present_roots(manifest) {
         let checked = (|| -> io::Result<()> {
             let parameters = open_at(
                 root,
-                &kind.path().encode_utf16().collect::<Vec<_>>(),
+                &kind.path(),
                 KEY_READ,
                 deadline,
                 "immutable/parameters-open",
@@ -1367,10 +1564,10 @@ fn immutable(root: HKEY, manifest: &Manifest, deadline: Instant) -> io::Result<(
             let leaf = manifest
                 .keys
                 .iter()
-                .filter(|key| key.root == kind)
+                .filter(|key| &key.root == kind)
                 .max_by_key(|key| key.path.len())
                 .ok_or_else(|| io::Error::other("verified registry forest has no root leaf"))?;
-            let mut leaf_path = kind.path().encode_utf16().collect::<Vec<_>>();
+            let mut leaf_path = kind.path();
             for component in &leaf.path {
                 leaf_path.push(b'\\' as u16);
                 leaf_path.extend(component);
@@ -1562,23 +1759,14 @@ pub fn self_check(
         None,
     )?;
     let tested = (|| -> io::Result<()> {
-        let sources = roots_at(HKEY_LOCAL_MACHINE, deadline)?;
-        let source_before = at(
-            coherent(&sources, deadline),
+        let (source_before, source_sd) = at(
+            coherent(HKEY_LOCAL_MACHINE, deadline),
             "selfcheck/source-snapshot-before",
             "coherent",
             "boundary",
             Some(KEY_READ),
-        )?
-        .digest()
-        .map_err(io::Error::other)?;
-        let source_sd = at(
-            forest_security(&sources, deadline),
-            "selfcheck/source-security-before",
-            "RegGetKeySecurity",
-            "boundary",
-            Some(READ_CONTROL),
         )?;
+        let source_before = source_before.digest().map_err(io::Error::other)?;
         let declaration = projection.declaration().clone();
         let mut mismatch = declaration.clone();
         mismatch.sha256[0] ^= 1;
@@ -1762,9 +1950,11 @@ pub fn self_check(
                         "process-local mapping readback differs from held input namespace",
                     ));
                 }
-                for kind in Root::ALL {
+                let mapped_manifest =
+                    verified_manifest(HKEY_LOCAL_MACHINE, &declaration, deadline)?;
+                for kind in present_roots(&mapped_manifest) {
                     let checked = (|| -> io::Result<()> {
-                        let path = kind.path().encode_utf16().collect::<Vec<_>>();
+                        let path = kind.path();
                         let mapped = open_at(
                             HKEY_LOCAL_MACHINE,
                             &path,
@@ -1788,7 +1978,6 @@ pub fn self_check(
                     })();
                     root_at(checked, kind)?;
                 }
-                verified_manifest(HKEY_LOCAL_MACHINE, &declaration, deadline)?;
                 live(deadline)?;
                 // The restricted proofs are complete. Revert exactly once,
                 // while the same process-local mapping stays owned by run.
@@ -1909,23 +2098,15 @@ pub fn self_check(
                 "registry dependency changed the original token",
             ));
         }
-        if at(
-            coherent(&sources, deadline),
+        let (source_after, source_security_after) = at(
+            coherent(HKEY_LOCAL_MACHINE, deadline),
             "selfcheck/source-snapshot-after",
             "coherent",
             "boundary",
             Some(KEY_READ),
-        )?
-        .digest()
-        .map_err(io::Error::other)?
-            != source_before
-            || at(
-                forest_security(&sources, deadline),
-                "selfcheck/source-security-after",
-                "RegGetKeySecurity",
-                "boundary",
-                Some(READ_CONTROL),
-            )? != source_sd
+        )?;
+        if source_after.digest().map_err(io::Error::other)? != source_before
+            || source_security_after != source_sd
         {
             return Err(io::Error::other(
                 "native source data/security changed during owned registry test",
