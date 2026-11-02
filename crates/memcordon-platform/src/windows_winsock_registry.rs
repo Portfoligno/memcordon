@@ -1667,7 +1667,7 @@ pub fn self_check(
                 }
             }
         }
-        let impersonation = Impersonation;
+        let mut impersonation = Some(Impersonation);
         let mapped = (|| -> io::Result<()> {
             let mapping = at(
                 Mapping::install(key, &declaration, deadline),
@@ -1703,6 +1703,29 @@ pub fn self_check(
                     ));
                 }
                 live(deadline)?;
+                // The restricted proofs are complete. Revert exactly once,
+                // while the same process-local mapping stays owned by run.
+                // The child tests mapping noninheritance, not a thread token.
+                drop(
+                    impersonation
+                        .take()
+                        .expect("restricted proof owns its impersonation guard"),
+                );
+                live(deadline)?;
+                let ordinary_manifest = at(
+                    verified_manifest(mapping.raw(), &declaration, deadline),
+                    "selfcheck/ordinary-manifest",
+                    "verified_manifest",
+                    "boundary",
+                    Some(KEY_READ),
+                )?;
+                at(
+                    immutable(mapping.raw(), &ordinary_manifest, deadline),
+                    "selfcheck/ordinary-immutability",
+                    "immutable",
+                    "boundary",
+                    Some(KEY_READ),
+                )?;
                 let mut command = at(
                     child_command(deadline),
                     "selfcheck/uninherited-child-prepare",
@@ -1769,7 +1792,7 @@ pub fn self_check(
                 Ok(())
             })
         })();
-        if let Err(original) = &mapped {
+        if let (Some(_), Err(original)) = (&impersonation, &mapped) {
             use std::io::Write;
             let _ = writeln!(
                 io::stderr().lock(),
