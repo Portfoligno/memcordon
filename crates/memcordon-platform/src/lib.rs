@@ -38,6 +38,9 @@ mod macos_result_frame;
 pub mod startup_cleanup_observation;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub mod windows_registry_difference;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub mod windows_registry_error;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

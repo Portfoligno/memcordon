@@ -1,4 +1,5 @@
 //! Explicit native Winsock configuration input; never host policy mutation.
+use crate::windows_registry_difference::ReadbackStage;
 use crate::windows_registry_error::{at, failures, require_access_denied};
 use crate::windows_registry_manifest::{
     Declaration, Key, Manifest, Root, TransportPresence, TransportRoot, VERSION, ValueRecord, View,
@@ -1291,7 +1292,18 @@ impl Projection {
             }
         }
         at(
-            verify(self.root.raw(), &self.declaration, self.deadline),
+            verified_readback(
+                self.root.raw(),
+                &self.declaration,
+                Some(&self.manifest),
+                if self.sealed {
+                    ReadbackStage::Sealed
+                } else {
+                    ReadbackStage::Copied
+                },
+                self.deadline,
+            )
+            .map(|_| ()),
             "projection/owned-verify",
             "verify",
             "boundary",
@@ -1417,10 +1429,51 @@ fn verified_manifest(
     declaration: &Declaration,
     deadline: Instant,
 ) -> io::Result<Manifest> {
+    verified_readback(root, declaration, None, ReadbackStage::Recipient, deadline)
+}
+fn verified_readback(
+    root: HKEY,
+    declaration: &Declaration,
+    expected: Option<&Manifest>,
+    stage: ReadbackStage,
+    deadline: Instant,
+) -> io::Result<Manifest> {
     declaration.validate().map_err(io::Error::other)?;
     let (actual, _) = coherent(root, deadline)?;
-    if actual.digest().map_err(io::Error::other)? != declaration.sha256 {
-        return Err(io::Error::other("registry input manifest digest differs"));
+    let actual_digest = actual.digest().map_err(io::Error::other)?;
+    if actual_digest != declaration.sha256 {
+        let cutoff = live(deadline);
+        let detail = if cutoff.is_ok() {
+            crate::windows_registry_difference::diagnostic(
+                expected,
+                &actual,
+                declaration,
+                deadline,
+                stage,
+            )
+        } else {
+            serde_json::json!({"format":"memcordon.fixture-registry-difference","revision":1,"stage":stage.label(),"diagnostic_only":true,"acceptance_authority":false,"detail_unavailable":"original-cutoff","expected_sha256":declaration.sha256,"actual_sha256":actual_digest,"expected_payload_available":false,"owner_payload_supplied":expected.is_some()})
+        };
+        // Emit the already bounded record independently: contextual error
+        // wrappers cap their source text and could cut an appended JSON blob.
+        // Diagnostic I/O never replaces the mandatory original mismatch.
+        use std::io::Write;
+        let retained = at(
+            writeln!(io::stderr().lock(), "{detail}"),
+            "registry/mismatch-diagnostic-stderr",
+            "Write::write_fmt",
+            "I/O",
+            None,
+        );
+        let mismatch = io::Error::other("registry input manifest digest differs");
+        let mismatch = match retained {
+            Ok(()) => mismatch,
+            Err(error) => failures(mismatch, error),
+        };
+        return match cutoff.and_then(|()| live(deadline)) {
+            Ok(()) => Err(mismatch),
+            Err(cutoff) => Err(failures(mismatch, cutoff)),
+        };
     }
     live(deadline)?;
     Ok(actual)
