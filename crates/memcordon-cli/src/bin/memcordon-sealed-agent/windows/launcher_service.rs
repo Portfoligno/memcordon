@@ -36,6 +36,9 @@ use super::pipe::{self, OwnedHandle, PipeListener, PipePreparationError};
 use super::process::{GuardianProcess, StreamSet, SuspendedTarget};
 use super::security::{SecurityDescriptor, private_pipe_sddl};
 
+#[path = "settlement_observation.rs"]
+mod settlement_observation;
+
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_job_diagnostic_conversion.rs"]
 mod job_conversion_tests;
@@ -1324,9 +1327,26 @@ fn handle_control(
             // workers whose Job handles have closed but terminal writes continue.
             let mut admission_snapshot = None;
             let mut admission_unavailable = None;
+            let mut writer_observation = settlement_observation::Observation::default();
             let settlement = SETTLEMENT.settle_until(deadline, || {
                 terminate_active_jobs(deadline)?;
                 let empty = super::record::admissions_empty()?;
+                let empty = writer_observation.observe(empty, deadline, || {
+                    use settlement_observation::WriterStatus;
+                    match super::attempt_store::ensure_no_quarantined_writer() {
+                        Ok(()) => WriterStatus::NoQuarantinedObserved,
+                        Err(super::attempt_store::WriterRegistryCheckError::Unavailable) => {
+                            WriterStatus::Unavailable
+                        }
+                        Err(super::attempt_store::WriterRegistryCheckError::Unconfirmed {
+                            detail,
+                            native_code,
+                        }) => WriterStatus::Unconfirmed {
+                            detail,
+                            native_code,
+                        },
+                    }
+                });
                 if !empty {
                     let observed = super::record::admission_blocker_observation(deadline);
                     if observed.unavailable.is_none() {
@@ -1342,6 +1362,10 @@ fn handle_control(
                 Ok(_) => converge_package_cleanup(deadline),
                 Err(error) => {
                     let mut detail = error.clone();
+                    if let Some(observed) = writer_observation.detail() {
+                        detail.push_str("; ");
+                        detail.push_str(&observed);
+                    }
                     if let Some(observed) = admission_snapshot {
                         detail.push_str("; last-admission-name-snapshot-after-false-quiesce: ");
                         detail.push_str(&observed.detail());
