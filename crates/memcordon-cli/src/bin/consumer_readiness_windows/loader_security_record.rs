@@ -1,8 +1,230 @@
 //! Selection of an observed loader name, never authority over the original file.
 use super::{listener_trace_record as listener, winsock_trace_record as dependency};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io;
 
 pub const RECORD_BYTES: usize = 8192;
+pub const ANCESTRY_BYTES: usize = 3072;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallState {
+    #[default]
+    NotInvoked,
+    Succeeded,
+    Failed,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallOutcome {
+    pub state: CallState,
+    pub native_error: Option<i32>,
+}
+impl CallOutcome {
+    pub fn from_result<T>(result: &io::Result<T>) -> Self {
+        match result {
+            Ok(_) => Self {
+                state: CallState::Succeeded,
+                native_error: None,
+            },
+            Err(error) => Self {
+                state: CallState::Failed,
+                native_error: error.raw_os_error(),
+            },
+        }
+    }
+    fn valid(self) -> bool {
+        self.state == CallState::Failed || self.native_error.is_none()
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AncestorPhase {
+    #[default]
+    OuterBefore,
+    BeforeOpen,
+    Open,
+    AfterOpenBeforeQuery,
+    Query,
+    ValidateAttributes,
+    AfterValidationBeforeRetain,
+    Retained,
+    OuterAfter,
+    Complete,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AncestorRole {
+    Root,
+    #[default]
+    Ancestor,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ValidationReason {
+    ReparsePoint,
+    NotDirectory,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AncestorRow {
+    pub ancestor_index: u32,
+    pub selected_path_prefix_utf16_units: u32,
+    pub role: AncestorRole,
+    pub phase: AncestorPhase,
+    pub open: CallOutcome,
+    pub query: CallOutcome,
+    pub validation: CallState,
+    pub observed_directory: Option<bool>,
+    pub observed_reparse: Option<bool>,
+    pub validation_reason: Option<ValidationReason>,
+    pub before_open: CallOutcome,
+    pub after_open: CallOutcome,
+    pub after_validation: CallOutcome,
+    pub retained: bool,
+}
+impl AncestorRow {
+    pub fn new(
+        ancestor_index: u32,
+        selected_path_prefix_utf16_units: u32,
+        role: AncestorRole,
+    ) -> Self {
+        Self {
+            ancestor_index,
+            selected_path_prefix_utf16_units,
+            role,
+            ..Default::default()
+        }
+    }
+    fn failed(&self) -> bool {
+        self.open.state == CallState::Failed
+            || self.query.state == CallState::Failed
+            || self.validation == CallState::Failed
+            || self.before_open.state == CallState::Failed
+            || self.after_open.state == CallState::Failed
+            || self.after_validation.state == CallState::Failed
+    }
+    fn valid(&self, path: &[u16]) -> bool {
+        let length = self.selected_path_prefix_utf16_units as usize;
+        let root = path
+            .iter()
+            .position(|unit| *unit == 92)
+            .map(|index| index + 1);
+        let prefix = length > 0
+            && length < path.len()
+            && match self.role {
+                AncestorRole::Root => Some(length) == root,
+                AncestorRole::Ancestor => {
+                    root.is_some_and(|root| length > root)
+                        && path.get(length) == Some(&92)
+                        && path.get(length - 1) != Some(&92)
+                }
+            };
+        prefix
+            && [
+                self.open,
+                self.query,
+                self.before_open,
+                self.after_open,
+                self.after_validation,
+            ]
+            .iter()
+            .all(|outcome| outcome.valid())
+            && (self.open.state == CallState::NotInvoked
+                || self.before_open.state == CallState::Succeeded)
+            && (self.after_open.state == CallState::NotInvoked
+                || self.open.state == CallState::Succeeded)
+            && (self.query.state == CallState::NotInvoked
+                || self.after_open.state == CallState::Succeeded)
+            && (self.validation == CallState::NotInvoked
+                || self.query.state == CallState::Succeeded)
+            && (self.query.state == CallState::Succeeded
+                || (self.observed_directory.is_none()
+                    && self.observed_reparse.is_none()
+                    && self.validation == CallState::NotInvoked
+                    && self.validation_reason.is_none()))
+            && (self.validation != CallState::Succeeded
+                || (self.observed_directory == Some(true)
+                    && self.observed_reparse == Some(false)
+                    && self.validation_reason.is_none()))
+            && (self.after_validation.state == CallState::NotInvoked
+                || self.validation == CallState::Succeeded)
+            && (!self.retained
+                || (self.validation == CallState::Succeeded
+                    && self.after_validation.state == CallState::Succeeded
+                    && self.observed_directory == Some(true)
+                    && self.observed_reparse == Some(false)))
+    }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AncestryProgress {
+    pub rows: Vec<AncestorRow>,
+    pub omitted_rows: u32,
+    pub completed_retained: u32,
+    pub outer_before: CallOutcome,
+    pub outer_after: CallOutcome,
+    pub terminal: Option<AncestorRow>,
+    pub terminal_phase: Option<AncestorPhase>,
+    pub failed: bool,
+}
+impl AncestryProgress {
+    pub fn record(&mut self, row: AncestorRow) {
+        let previous = self
+            .rows
+            .iter()
+            .find(|previous| previous.ancestor_index == row.ancestor_index)
+            .or_else(|| {
+                self.terminal
+                    .as_ref()
+                    .filter(|previous| previous.ancestor_index == row.ancestor_index)
+            });
+        if row.retained && previous.is_none_or(|previous| !previous.retained) {
+            self.completed_retained = self.completed_retained.saturating_add(1);
+        }
+        let fresh = previous.is_none();
+        if let Some(previous) = self
+            .rows
+            .iter_mut()
+            .find(|previous| previous.ancestor_index == row.ancestor_index)
+        {
+            *previous = row.clone();
+        } else if self.rows.len() < 8 {
+            self.rows.push(row.clone());
+        } else if fresh {
+            self.omitted_rows = self.omitted_rows.saturating_add(1);
+        }
+        self.failed |= row.failed();
+        if self
+            .terminal
+            .as_ref()
+            .is_none_or(|previous| !previous.failed())
+        {
+            self.terminal_phase = Some(row.phase);
+            self.terminal = Some(row);
+        }
+    }
+    pub fn diagnostic(&self, path: &[u16]) -> Value {
+        let valid = self.rows.len() <= 8
+            && self.rows.iter().all(|row| row.valid(path))
+            && self.terminal.as_ref().is_none_or(|row| row.valid(path))
+            && self.outer_before.valid()
+            && self.outer_after.valid();
+        let mut value = json!({"diagnostic_only":true,"acceptance_authority":false,"valid_prefixes_and_outcomes":valid,"rows":self.rows,"omitted_rows":self.omitted_rows,"completed_retained":self.completed_retained,"outer_before":self.outer_before,"outer_after":self.outer_after,"terminal":self.terminal,"terminal_phase":self.terminal_phase,"failed":self.failed,"rows_omitted_for_bound":0});
+        let mut omitted = 0u32;
+        while !fits(&value, ANCESTRY_BYTES) {
+            if value["rows"]
+                .as_array_mut()
+                .is_none_or(|rows| rows.pop().is_none())
+            {
+                break;
+            }
+            omitted = omitted.saturating_add(1);
+            value["rows_omitted_for_bound"] = json!(omitted);
+        }
+        value
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub struct SelectedPath {
     pub path: Vec<u16>,
@@ -203,6 +425,22 @@ fn small(value: Option<&Value>, bound: usize) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({"unavailable_or_omitted_for_bound":true}))
 }
+fn terminal_ancestry(value: &Value) -> Value {
+    let mut result = json!({"diagnostic_only":true,"acceptance_authority":false,"ordinary_rows_omitted_for_bound":true});
+    for (key, limit) in [
+        ("terminal", 1024),
+        ("terminal_phase", 64),
+        ("outer_before", 128),
+        ("outer_after", 128),
+        ("completed_retained", 32),
+        ("omitted_rows", 32),
+        ("failed", 32),
+        ("valid_prefixes_and_outcomes", 32),
+    ] {
+        result[key] = small(value.get(key), limit);
+    }
+    result
+}
 pub fn bounded(mut value: Value) -> Value {
     if !value.is_object() {
         value = json!({"state":"unavailable","stage":"invalid-diagnostic-record"});
@@ -239,6 +477,7 @@ pub fn bounded(mut value: Value) -> Value {
         ("security_descriptor", 512),
         ("generic_mapping", 256),
         ("hypothetical_checks", 2048),
+        ("ancestry", ANCESTRY_BYTES),
         ("later_file_open_request", 256),
         ("later_ancestor_open_request", 256),
         ("token_source_requested_access", 64),
@@ -247,6 +486,12 @@ pub fn bounded(mut value: Value) -> Value {
         summary[key] = small(value.get(key), bound);
     }
     let mut selection = json!({"path_utf16_omitted_for_bound":true});
+    selection["path_utf16_units"] = value
+        .get("selection")
+        .and_then(|selection| selection.get("path_utf16"))
+        .and_then(Value::as_array)
+        .map(|path| json!(path.len()))
+        .unwrap_or(Value::Null);
     for key in [
         "path_sha256",
         "thread_id",
@@ -286,6 +531,9 @@ pub fn bounded(mut value: Value) -> Value {
         ("access_check_duplicate_requested_access", 64),
     ] {
         compact[key] = small(summary.get(key), limit);
+    }
+    if let Some(ancestry) = summary.get("ancestry") {
+        compact["ancestry"] = terminal_ancestry(ancestry);
     }
     compact
 }

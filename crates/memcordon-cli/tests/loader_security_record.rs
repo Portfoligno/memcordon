@@ -7,8 +7,245 @@ mod loader_security_record;
 #[path = "../src/bin/consumer_readiness_windows/winsock_trace_record.rs"]
 mod winsock_trace_record;
 use listener_trace_record::{DependencyLink, Entry, LoaderLink, LoaderWindow, Packet};
+use loader_security_record::{
+    AncestorPhase, AncestorRole, AncestorRow, AncestryProgress, CallOutcome, CallState,
+};
 use loader_security_record::{RECORD_BYTES, bounded, select};
 use serde_json::json;
+
+fn succeeded() -> CallOutcome {
+    CallOutcome::from_result(&Ok::<_, std::io::Error>(()))
+}
+fn failed(code: i32) -> CallOutcome {
+    CallOutcome::from_result(&Err::<(), _>(std::io::Error::from_raw_os_error(code)))
+}
+fn retained(index: u32, prefix: u32) -> AncestorRow {
+    AncestorRow {
+        ancestor_index: index,
+        selected_path_prefix_utf16_units: prefix,
+        role: if index == 0 {
+            AncestorRole::Root
+        } else {
+            AncestorRole::Ancestor
+        },
+        phase: AncestorPhase::Retained,
+        before_open: succeeded(),
+        open: succeeded(),
+        after_open: succeeded(),
+        query: succeeded(),
+        validation: CallState::Succeeded,
+        observed_directory: Some(true),
+        observed_reparse: Some(false),
+        after_validation: succeeded(),
+        retained: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn ancestry_keeps_native_failure_distinct_from_cutoff_and_attribute_failure() {
+    let path = "C:\\Windows\\System32\\mswsock.dll"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let mut row = retained(0, 3);
+    row.phase = AncestorPhase::Query;
+    row.query = failed(5);
+    row.validation = CallState::NotInvoked;
+    row.observed_directory = None;
+    row.observed_reparse = None;
+    row.after_validation = Default::default();
+    row.retained = false;
+    let mut progress = AncestryProgress::default();
+    progress.record(row.clone());
+    progress.outer_after = failed(1460);
+    let result = progress.diagnostic(&path);
+    assert_eq!(result["valid_prefixes_and_outcomes"], true);
+    assert_eq!(result["terminal"]["query"]["native_error"], 5);
+    assert_eq!(result["outer_after"]["native_error"], 1460);
+    assert_eq!(result["terminal_phase"], "query");
+    row.after_open = Default::default();
+    let mut invalid = AncestryProgress::default();
+    invalid.record(row);
+    assert_eq!(
+        invalid.diagnostic(&path)["valid_prefixes_and_outcomes"],
+        false
+    );
+    let mut row = retained(0, 3);
+    row.before_open = Default::default();
+    let mut invalid = AncestryProgress::default();
+    invalid.record(row);
+    assert_eq!(
+        invalid.diagnostic(&path)["valid_prefixes_and_outcomes"],
+        false
+    );
+    let mut row = retained(0, 3);
+    row.observed_directory = Some(false);
+    let mut invalid = AncestryProgress::default();
+    invalid.record(row);
+    assert_eq!(
+        invalid.diagnostic(&path)["valid_prefixes_and_outcomes"],
+        false
+    );
+    assert!(serde_json::from_value::<CallState>(json!("unknown")).is_err());
+    for (directory, reparse, reason) in [
+        (
+            false,
+            false,
+            loader_security_record::ValidationReason::NotDirectory,
+        ),
+        (
+            true,
+            true,
+            loader_security_record::ValidationReason::ReparsePoint,
+        ),
+    ] {
+        let mut row = retained(0, 3);
+        row.phase = AncestorPhase::ValidateAttributes;
+        row.validation = CallState::Failed;
+        row.validation_reason = Some(reason);
+        row.observed_directory = Some(directory);
+        row.observed_reparse = Some(reparse);
+        row.after_validation = Default::default();
+        row.retained = false;
+        let mut progress = AncestryProgress::default();
+        progress.record(row);
+        let value = progress.diagnostic(&path);
+        assert_eq!(value["valid_prefixes_and_outcomes"], true);
+        assert!(value["terminal"]["query"]["native_error"].is_null());
+        assert_eq!(value["terminal"]["validation"], "failed");
+        assert_eq!(
+            value["terminal"]["after_validation"]["state"],
+            "not-invoked"
+        );
+    }
+    let mut progress = AncestryProgress::default();
+    progress.record(retained(0, 3));
+    progress.outer_after = failed(1460);
+    progress.terminal_phase = Some(AncestorPhase::OuterAfter);
+    progress.failed = true;
+    let value = progress.diagnostic(&path);
+    assert_eq!(value["terminal_phase"], "outer-after");
+    assert_eq!(value["terminal"]["retained"], true);
+    assert_eq!(value["terminal"]["query"]["state"], "succeeded");
+}
+
+#[test]
+fn ancestry_terminal_survives_row_and_both_record_bounds() {
+    let text = format!("C:\\{}leaf.dll", "a\\".repeat(14));
+    let path = text.encode_utf16().collect::<Vec<_>>();
+    let mut progress = AncestryProgress::default();
+    for index in 0..10 {
+        progress.record(retained(index, if index == 0 { 3 } else { 2 + 2 * index }));
+    }
+    let mut terminal = AncestorRow::new(10, 22, AncestorRole::Ancestor);
+    terminal.phase = AncestorPhase::Open;
+    terminal.before_open = succeeded();
+    terminal.open = failed(5);
+    progress.record(terminal);
+    progress.outer_after = failed(1460);
+    let ancestry = progress.diagnostic(&path);
+    assert!(serde_json::to_vec(&ancestry).unwrap().len() <= loader_security_record::ANCESTRY_BYTES);
+    assert_eq!(ancestry["valid_prefixes_and_outcomes"], true);
+    assert_eq!(ancestry["completed_retained"], 10);
+    assert_eq!(ancestry["omitted_rows"], 3);
+    assert_eq!(ancestry["terminal"]["ancestor_index"], 10);
+    let selection = json!({"path_utf16":path,"path_sha256":vec![7u8;32],"dependency_sequence":17,"loader_dependency_sequence":2,"parent_listener_sequence":3});
+    let security = bounded(
+        json!({"stage":"hold-selected-ancestry","selection":selection,"ancestry":ancestry,"padding":"x".repeat(100000)}),
+    );
+    assert!(serde_json::to_vec(&security).unwrap().len() <= RECORD_BYTES);
+    let envelope = listener_trace_record::bounded(
+        json!({"trace":{},"padding":"x".repeat(100000),"post_original_loader_security":security}),
+    );
+    assert!(serde_json::to_vec(&envelope).unwrap().len() <= listener_trace_record::RECORD_BYTES);
+    assert_eq!(
+        envelope["post_original_loader_security"]["ancestry"]["terminal"]["open"]["native_error"],
+        5
+    );
+    assert_eq!(
+        envelope["post_original_loader_security"]["selection"]["path_sha256"],
+        json!(vec![7u8; 32])
+    );
+    assert_eq!(
+        envelope["post_original_loader_security"]["selection"]["path_utf16_units"],
+        path.len()
+    );
+    let oversize = listener_trace_record::bounded(
+        json!({"trace":{},"post_original_loader_security":{"selection":selection,"ancestry":ancestry,"padding":"x".repeat(100000)}}),
+    );
+    assert_eq!(
+        oversize["post_original_loader_security"]["ancestry"]["terminal"]["ancestor_index"],
+        10
+    );
+    assert_eq!(
+        oversize["post_original_loader_security"]["ancestry"]["outer_after"]["native_error"],
+        1460
+    );
+    assert_eq!(
+        oversize["post_original_loader_security"]["selection"]["path_sha256"],
+        json!(vec![7u8; 32])
+    );
+    assert_eq!(
+        oversize["post_original_loader_security"]["selection"]["path_utf16"],
+        json!(path)
+    );
+    for value in [&envelope, &oversize] {
+        let security = &value["post_original_loader_security"];
+        assert!(security["original_desired_access"].is_null());
+        assert_eq!(security["original_desired_access_unavailable"], true);
+        assert_eq!(security["original_file_identity_proved"], false);
+        assert_eq!(security["continuous_token_equality_proved"], false);
+        assert_eq!(security["checks_are_hypotheses"], true);
+    }
+}
+
+#[test]
+fn ancestry_cutoff_partial_states_do_not_invent_calls_or_retention() {
+    let path = "C:\\Windows\\mswsock.dll"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    for phase in [
+        AncestorPhase::BeforeOpen,
+        AncestorPhase::AfterOpenBeforeQuery,
+        AncestorPhase::AfterValidationBeforeRetain,
+    ] {
+        let mut row = AncestorRow::new(0, 3, AncestorRole::Root);
+        row.phase = phase;
+        match phase {
+            AncestorPhase::BeforeOpen => row.before_open = failed(1460),
+            AncestorPhase::AfterOpenBeforeQuery => {
+                row.before_open = succeeded();
+                row.open = succeeded();
+                row.after_open = failed(1460);
+            }
+            _ => {
+                row = retained(0, 3);
+                row.phase = phase;
+                row.after_validation = failed(1460);
+                row.retained = false;
+            }
+        }
+        let mut progress = AncestryProgress::default();
+        progress.record(row);
+        let value = progress.diagnostic(&path);
+        assert_eq!(value["valid_prefixes_and_outcomes"], true);
+        assert_eq!(value["completed_retained"], 0);
+        assert_eq!(value["terminal"]["retained"], false);
+    }
+    let mut progress = AncestryProgress::default();
+    progress.outer_before = failed(1460);
+    progress.failed = true;
+    progress.terminal_phase = Some(AncestorPhase::OuterBefore);
+    assert!(progress.diagnostic(&path)["terminal"].is_null());
+    let mut row = retained(0, 2);
+    row.role = AncestorRole::Root;
+    progress = AncestryProgress::default();
+    progress.record(row);
+    assert_eq!(
+        progress.diagnostic(&path)["valid_prefixes_and_outcomes"],
+        false
+    );
+}
 
 fn named(entry: &mut winsock_trace_record::Entry, path: &str) {
     entry.name = [0; 256];

@@ -51,22 +51,62 @@ fn checked<T>(
 }
 
 fn identity(file: &File, directory: bool) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    identity_observed(file, directory, None)
+}
+
+fn identity_observed(
+    file: &File,
+    directory: bool,
+    mut row: Option<&mut record::AncestorRow>,
+) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    if let Some(row) = row.as_deref_mut() {
+        row.phase = record::AncestorPhase::Query;
+    }
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: exact held file handle and complete fixed writable output.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(io::Error::last_os_error());
+    let queried = if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(info)
+    };
+    if let Some(row) = row.as_deref_mut() {
+        row.query = record::CallOutcome::from_result(&queried);
+    }
+    let info = queried?;
+    if let Some(row) = row.as_deref_mut() {
+        row.phase = record::AncestorPhase::ValidateAttributes;
+        row.observed_directory = Some(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0);
+        row.observed_reparse = Some(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0);
     }
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
     {
+        if let Some(row) = row.as_deref_mut() {
+            row.validation = record::CallState::Failed;
+            row.validation_reason = Some(
+                if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    record::ValidationReason::ReparsePoint
+                } else {
+                    record::ValidationReason::NotDirectory
+                },
+            );
+        }
         return Err(io::Error::other(
             "selected path type or reparse attribute differs",
         ));
     }
+    if let Some(row) = row {
+        row.validation = record::CallState::Succeeded;
+    }
     Ok(info)
 }
 
-fn ancestors(context: &Context<'_>, path: &Path) -> io::Result<Vec<File>> {
+fn ancestors(
+    context: &Context<'_>,
+    path: &Path,
+    selected_path: &[u16],
+    progress: &mut record::AncestryProgress,
+) -> io::Result<Vec<File>> {
     if path
         .components()
         .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
@@ -74,22 +114,115 @@ fn ancestors(context: &Context<'_>, path: &Path) -> io::Result<Vec<File>> {
         return Err(io::Error::other("selected ancestry is not normalized"));
     }
     let mut held = Vec::new();
-    for parent in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
-        if parent.as_os_str().is_empty() {
-            continue;
+    for (index, parent) in path
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .enumerate()
+    {
+        let prefix = parent.as_os_str().encode_wide().collect::<Vec<_>>();
+        let mut row = record::AncestorRow::new(
+            index as u32,
+            prefix.len() as u32,
+            if parent.parent().is_none() {
+                record::AncestorRole::Root
+            } else {
+                record::AncestorRole::Ancestor
+            },
+        );
+        let result = (|| -> io::Result<File> {
+            row.phase = record::AncestorPhase::BeforeOpen;
+            if !selected_path.starts_with(&prefix) {
+                return Err(io::Error::other("selected ancestry prefix differs"));
+            }
+            let before = super::listener_trace::live(context.clock);
+            row.before_open = record::CallOutcome::from_result(&before);
+            before?;
+            row.phase = record::AncestorPhase::Open;
+            let opened = OpenOptions::new()
+                .access_mode(0)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(parent);
+            row.open = record::CallOutcome::from_result(&opened);
+            let file = opened?;
+            row.phase = record::AncestorPhase::AfterOpenBeforeQuery;
+            let after = super::listener_trace::live(context.clock);
+            row.after_open = record::CallOutcome::from_result(&after);
+            after?;
+            identity_observed(&file, true, Some(&mut row))?;
+            row.phase = record::AncestorPhase::AfterValidationBeforeRetain;
+            let after = super::listener_trace::live(context.clock);
+            row.after_validation = record::CallOutcome::from_result(&after);
+            after?;
+            Ok(file)
+        })();
+        match result {
+            Ok(file) => {
+                held.push(file);
+                row.retained = true;
+                row.phase = record::AncestorPhase::Retained;
+                progress.record(row);
+            }
+            Err(error) => {
+                progress.record(row);
+                progress.failed = true;
+                return Err(error);
+            }
         }
-        super::listener_trace::live(context.clock)?;
-        let file = OpenOptions::new()
-            .access_mode(0)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(parent)?;
-        super::listener_trace::live(context.clock)?;
-        identity(&file, true)?;
-        super::listener_trace::live(context.clock)?;
-        held.push(file);
     }
     Ok(held)
+}
+
+fn checked_ancestors(
+    context: &Context<'_>,
+    path: &Path,
+    selected_path: &[u16],
+    progress: &mut record::AncestryProgress,
+) -> Result<Vec<File>, Value> {
+    // Exactly the original checked() precondition, ancestry call and postcondition.
+    // Progress recording itself makes no native or clock queries.
+    let before = super::listener_trace::live(context.clock);
+    progress.outer_before = record::CallOutcome::from_result(&before);
+    if let Err(error) = before {
+        progress.failed = true;
+        progress.terminal_phase = Some(record::AncestorPhase::OuterBefore);
+        return Err(
+            json!({"native_error":error.raw_os_error(),"kind":format!("{:?}",error.kind()),"original_cutoff_unavailable":true}),
+        );
+    }
+    let value = path
+        .parent()
+        .ok_or_else(|| io::Error::other("selected path parent absent"))
+        .and_then(|parent| ancestors(context, parent, selected_path, progress));
+    let ended = super::listener_trace::live(context.clock);
+    progress.outer_after = record::CallOutcome::from_result(&ended);
+    if value.is_err() {
+        progress.failed = true;
+        if progress.terminal_phase.is_none() {
+            progress.terminal_phase = Some(record::AncestorPhase::BeforeOpen);
+        }
+    }
+    if ended.is_err() {
+        progress.failed = true;
+        if value.is_ok() {
+            progress.terminal_phase = Some(record::AncestorPhase::OuterAfter);
+        }
+    }
+    if value.is_ok() && ended.is_ok() {
+        progress.terminal_phase = Some(record::AncestorPhase::Complete);
+    }
+    match (value, ended) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), ended) => Err(
+            json!({"native_error":error.raw_os_error(),"kind":format!("{:?}",error.kind()),"cutoff_error":ended.err().map(|error|json!({"native_error":error.raw_os_error(),"kind":format!("{:?}",error.kind())}))}),
+        ),
+        (Ok(_), Err(error)) => Err(
+            json!({"native_error":error.raw_os_error(),"kind":format!("{:?}",error.kind()),"original_cutoff_unavailable":true}),
+        ),
+    }
 }
 
 struct Descriptor(*mut std::ffi::c_void);
@@ -317,13 +450,10 @@ pub fn observe(
             Ok(())
         })?;
         stage = "hold-no-reparse-selected-ancestry";
-        let _ancestors = checked(context, || {
-            ancestors(
-                context,
-                path.parent()
-                    .ok_or_else(|| io::Error::other("selected path parent absent"))?,
-            )
-        })?;
+        let mut progress = record::AncestryProgress::default();
+        let ancestry = checked_ancestors(context, &path, &selected.path, &mut progress);
+        output["ancestry"] = progress.diagnostic(&selected.path);
+        let _ancestors = ancestry?;
         stage = "open-selected-leaf-read-control-and-attributes";
         let file = checked(context, || {
             OpenOptions::new()

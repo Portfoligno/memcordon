@@ -1077,13 +1077,62 @@ fn small(value: Option<&Value>, limit: usize) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn security_terminal(security: &Value, state: &str) -> Value {
+    let mut result = json!({"state":state,"diagnostic_only":true,"acceptance_authority":false,"denied_object_proved":false,"ordinary_details_omitted_for_bound":true});
+    result["original_desired_access"] = Value::Null;
+    result["original_desired_access_unavailable"] = json!(true);
+    result["original_file_identity_proved"] = json!(false);
+    result["continuous_token_equality_proved"] = json!(false);
+    result["checks_are_hypotheses"] = json!(true);
+    let ancestry = security.get("ancestry");
+    let mut terminal = json!({"ordinary_rows_omitted_for_bound":true});
+    for (key, limit) in [
+        ("terminal", 1024),
+        ("terminal_phase", 64),
+        ("outer_before", 128),
+        ("outer_after", 128),
+        ("completed_retained", 32),
+        ("omitted_rows", 32),
+        ("failed", 32),
+        ("valid_prefixes_and_outcomes", 32),
+    ] {
+        terminal[key] = small(ancestry.and_then(|value| value.get(key)), limit);
+    }
+    result["ancestry"] = terminal;
+    let source = security.get("selection");
+    let mut selection = json!({});
+    for (key, limit) in [
+        ("path_utf16", 2048),
+        ("path_sha256", 160),
+        ("path_utf16_units", 32),
+        ("thread_id", 32),
+        ("dependency_sequence", 32),
+        ("loader_dependency_sequence", 32),
+        ("parent_listener_sequence", 32),
+    ] {
+        selection[key] = small(source.and_then(|value| value.get(key)), limit);
+    }
+    if selection["path_utf16_units"].is_null() {
+        selection["path_utf16_units"] = source
+            .and_then(|value| value.get("path_utf16"))
+            .and_then(Value::as_array)
+            .map(|path| json!(path.len()))
+            .unwrap_or(Value::Null);
+    }
+    result["selection"] = selection;
+    result
+}
+
 /// Apply the same cap to the model or the bridge's binding-bearing envelope.
 pub fn bounded(mut value: Value) -> Value {
     if value
         .get("post_original_loader_security")
         .is_some_and(|security| !fits(security, 8192))
     {
-        value["post_original_loader_security"] = json!({"state":"omitted-for-loader-security-bound","diagnostic_only":true,"acceptance_authority":false,"denied_object_proved":false});
+        value["post_original_loader_security"] = security_terminal(
+            &value["post_original_loader_security"],
+            "omitted-for-loader-security-bound",
+        );
     }
     if fits(&value, RECORD_BYTES) {
         return value;
@@ -1283,7 +1332,8 @@ pub fn bounded(mut value: Value) -> Value {
     if let Some(security) = value.get("post_original_loader_security") {
         result["post_original_loader_security"] = security.clone();
         if !fits(&result, RECORD_BYTES) {
-            result["post_original_loader_security"] = json!({"state":"omitted-for-listener-envelope-bound","diagnostic_only":true,"acceptance_authority":false,"denied_object_proved":false});
+            result["post_original_loader_security"] =
+                security_terminal(security, "omitted-for-listener-envelope-bound");
         }
     }
     result
