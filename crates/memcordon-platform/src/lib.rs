@@ -41,6 +41,9 @@ pub mod startup_cleanup_observation;
 pub mod windows_fileio_record;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub mod windows_process_candidate;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub mod windows_registry_difference;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

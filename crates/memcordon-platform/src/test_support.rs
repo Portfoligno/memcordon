@@ -2140,6 +2140,132 @@ pub fn windows_fixture_input_processes_for_image_until(
     windows_processes_for_image_inner(image, Some(deadline), None, true)
 }
 
+/// Positive admission only. Unavailability does not establish absence or retirement.
+#[cfg(windows)]
+pub enum WindowsProcessCandidate {
+    Held(WindowsImageProcess),
+    CandidateUnavailable {
+        pid: u32,
+        raw_open_error: Option<i32>,
+    },
+}
+
+/// Acquire only the published candidate, retaining image, birth and liveness proof.
+/// This query-only API never grants capability-transfer or cleanup authority.
+#[cfg(windows)]
+pub fn windows_process_candidate_for_image_until(
+    image: &Path,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> io::Result<WindowsProcessCandidate> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        QueryFullProcessImageNameW,
+    };
+    let live = || {
+        if std::time::Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original candidate admission cutoff expired",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    live()?;
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "published candidate PID is zero",
+        ));
+    }
+    let expected = std::fs::canonicalize(image)?;
+    live()?;
+    // SAFETY: this acquires a query/synchronize handle only, never inheritable.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    let original_error = if raw.is_null() {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    if let Some(error) = original_error {
+        if crate::windows_process_candidate::classify(pid, true, false, false, error.raw_os_error())
+            == crate::windows_process_candidate::Acquisition::CandidateUnavailable
+        {
+            live()?;
+            return Ok(WindowsProcessCandidate::CandidateUnavailable {
+                pid,
+                raw_open_error: error.raw_os_error(),
+            });
+        }
+        return Err(windows_process_observation_error(
+            "positive candidate OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)",
+            Some(pid),
+            error,
+        ));
+    }
+    // SAFETY: the successful OpenProcess handle is uniquely owned on every exit.
+    let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+    live()?;
+    let mut units = [0u16; 32768];
+    let mut length = u32::try_from(units.len()).expect("image path capacity fits u32");
+    // SAFETY: held query handle and writable bounded path buffer.
+    if unsafe { QueryFullProcessImageNameW(raw, 0, units.as_mut_ptr(), &mut length) } == 0 {
+        return Err(windows_process_observation_error(
+            "positive candidate QueryFullProcessImageNameW",
+            Some(pid),
+            io::Error::last_os_error(),
+        ));
+    }
+    live()?;
+    let observed_name = std::ffi::OsString::from_wide(&units[..length as usize]);
+    let observed = std::fs::canonicalize(Path::new(&observed_name))?;
+    if observed != expected {
+        return Err(io::Error::other(
+            "published candidate held image differs from expected fixture",
+        ));
+    }
+    live()?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: same held process object, with query rights and writable outputs.
+    if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(windows_process_observation_error(
+            "positive candidate GetProcessTimes",
+            Some(pid),
+            io::Error::last_os_error(),
+        ));
+    }
+    let process = WindowsImageProcess {
+        identity: ProcessIdentity {
+            pid,
+            birth: (u128::from(creation.dwHighDateTime) << 32) | u128::from(creation.dwLowDateTime),
+        },
+        _handle: handle,
+    };
+    live()?;
+    let exited = process.has_exited()?;
+    live()?;
+    if exited {
+        return Ok(WindowsProcessCandidate::CandidateUnavailable {
+            pid,
+            raw_open_error: None,
+        });
+    }
+    Ok(WindowsProcessCandidate::Held(process))
+}
+
 #[cfg(windows)]
 impl WindowsImageProcess {
     /// Hold only image-verified direct children of this still-held live root.

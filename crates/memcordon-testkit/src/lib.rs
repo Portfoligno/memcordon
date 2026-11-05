@@ -23,13 +23,15 @@ pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
 #[cfg(windows)]
 pub use memcordon_platform::test_support::{
     ProcessIdentity, WINDOWS_WAIT_OBSERVER_BOUND, WindowsHeldFileIdentity, WindowsImageProcess,
-    WindowsRenameCommitted, WindowsSynchronousRenameSource, WindowsThreadActivitySample,
-    WindowsWaitInherited, WindowsWaitObserver, WindowsWaitObserverRetirement,
-    WindowsWaitObserverSnapshot, WindowsWaitThreadHandle, windows_available_memory_bytes,
-    windows_console_host_path, windows_fixture_input_processes_for_image_until,
-    windows_held_file_identity, windows_held_file_metadata, windows_native_work_cutoff,
+    WindowsProcessCandidate, WindowsRenameCommitted, WindowsSynchronousRenameSource,
+    WindowsThreadActivitySample, WindowsWaitInherited, WindowsWaitObserver,
+    WindowsWaitObserverRetirement, WindowsWaitObserverSnapshot, WindowsWaitThreadHandle,
+    windows_available_memory_bytes, windows_console_host_path,
+    windows_fixture_input_processes_for_image_until, windows_held_file_identity,
+    windows_held_file_metadata, windows_native_work_cutoff,
     windows_observe_transferred_wait_cleanup, windows_open_synchronous_rename_source,
-    windows_performance_counter, windows_prepare_persistent_stage, windows_processes_for_image,
+    windows_performance_counter, windows_prepare_persistent_stage,
+    windows_process_candidate_for_image_until, windows_processes_for_image,
     windows_processes_for_image_until, windows_unresolved_wait_owner_count,
 };
 

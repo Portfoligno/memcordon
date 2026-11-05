@@ -4280,6 +4280,7 @@ pub(crate) mod native {
                     &callback_fileio_owner,
                 ));
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
+                let mut candidate_unavailable = None;
                 let (held, root_pid) = loop {
                     if barrier_report.try_exists()? {
                         super::check_positive_barrier_result(
@@ -4297,19 +4298,34 @@ pub(crate) mod native {
                             ))
                         })?;
                     }
-                    let mut held = if registry_recipient.is_some() {
-                        memcordon_testkit::windows_fixture_input_processes_for_image_until(
-                            &fixture, deadline,
-                        )?
-                    } else {
-                        memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?
-                    };
-                    if transcript.is_file() && !held.is_empty() {
+                    if transcript.is_file() {
                         let published = super::live_events(
                             &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
                         )
                         .map_err(io::Error::other)?;
                         if let Some(started) = published.first() {
+                            let mut held = if registry_recipient.is_some() {
+                                // Capability-transfer acquisition retains its strict census contract.
+                                memcordon_testkit::windows_fixture_input_processes_for_image_until(
+                                    &fixture, deadline,
+                                )?
+                            } else {
+                                match memcordon_testkit::windows_process_candidate_for_image_until(
+                                    &fixture, started.pid, deadline,
+                                )? {
+                                    memcordon_testkit::WindowsProcessCandidate::Held(process) => vec![process],
+                                    memcordon_testkit::WindowsProcessCandidate::CandidateUnavailable { pid, raw_open_error } => {
+                                        let observation = format!("published query-only candidate unavailable; pid={pid}; raw-open-error={raw_open_error:?}; identity-admitted=false; retirement-established=false");
+                                        if candidate_unavailable.is_none() {
+                                            // Keep the acquisition fact even if the wrapper fails before the loop cutoff.
+                                            use std::io::Write;
+                                            let _ = writeln!(std::io::stderr().lock(), "{observation}");
+                                        }
+                                        candidate_unavailable = Some(observation);
+                                        Vec::new()
+                                    },
+                                }
+                            };
                             held.retain(|process| process.identity.pid == started.pid);
                             if held.len() == 1 && !held[0].has_exited()? {
                                 break (held, started.pid);
@@ -4317,7 +4333,9 @@ pub(crate) mod native {
                         }
                     }
                     if Instant::now() >= deadline {
-                        return Err(io::Error::other("native held fixture barrier unavailable"));
+                        return Err(io::Error::other(format!(
+                            "native held fixture barrier unavailable; candidate-observation={candidate_unavailable:?}"
+                        )));
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 };
