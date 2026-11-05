@@ -178,6 +178,7 @@ impl Calibration {
         let mut state = PreparationState {
             request: RequestFacts {
                 owner_file_desired_access: windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
                     | FILE_READ_DATA
                     | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA,
                 owner_file_share: FILE_SHARE_READ | FILE_SHARE_WRITE,

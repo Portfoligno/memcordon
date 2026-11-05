@@ -304,7 +304,7 @@ fn preparation_operation_and_native_error_survive_helper_and_controller_custody(
     assert_eq!(record.operation, PreparationOperation::ApplyOwnedDacl);
     assert_eq!(record.native_error, Some(5));
     assert!(!record.progress.dacl_applied);
-    assert_eq!(record.request.owner_file_desired_access, 0x40003);
+    assert_eq!(record.request.owner_file_desired_access, 0x60003);
     let retained = serde_json::to_vec(&record).unwrap();
     assert_eq!(serde_json::from_slice::<Record>(&retained).unwrap(), record);
     let error = preserve(

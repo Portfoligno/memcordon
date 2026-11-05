@@ -45,7 +45,7 @@ fn native_failure_preserves_original_code_kind_source_and_bounded_facts() {
         serde_json::from_slice::<Record>(&bytes).unwrap(),
         failure.record
     );
-    assert_eq!(failure.record.request.owner_file_desired_access, 0x40003);
+    assert_eq!(failure.record.request.owner_file_desired_access, 0x60003);
     assert_eq!(failure.record.request.security_information, 0x80000004);
     let nested = Record::from_error(&before_apply(), &wrapped);
     nested.validate().unwrap();
@@ -100,7 +100,10 @@ fn contradictions_unknown_operations_and_fabricated_progress_are_rejected() {
     invalid.kind = FailureKind::Semantic;
     assert!(invalid.validate().is_err());
     let mut invalid = record;
-    invalid.request.owner_file_desired_access |= 0x20000;
+    invalid.request.owner_file_desired_access |= 0x10000;
+    assert!(invalid.validate().is_err());
+    let mut invalid = record;
+    invalid.request.owner_file_desired_access &= !0x20000;
     assert!(invalid.validate().is_err());
     let mut invalid = record;
     invalid.native_error = Some(0);

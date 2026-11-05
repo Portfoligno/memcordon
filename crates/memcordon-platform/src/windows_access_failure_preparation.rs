@@ -128,7 +128,7 @@ pub struct RequestFacts {
 impl Default for RequestFacts {
     fn default() -> Self {
         Self {
-            owner_file_desired_access: 0x40003,
+            owner_file_desired_access: 0x60003,
             owner_file_share: 3,
             owner_file_flags: 0x200000,
             security_information: 0x80000004,
