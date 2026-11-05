@@ -347,20 +347,139 @@ fn read_utf16(bytes: &[u8], offset: usize) -> io::Result<Vec<u16>> {
 }
 struct Schema {
     fields: std::collections::BTreeMap<String, u16>,
+    metadata: Metadata,
 }
-fn schema(event: &EVENT_RECORD) -> io::Result<Schema> {
+// This owns only the already-returned bounded TDH metadata, never event data.
+struct Metadata {
+    words: Vec<u64>,
+    length: usize,
+}
+impl Metadata {
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.length) }
+    }
+    fn info(&self) -> &TRACE_EVENT_INFO {
+        unsafe { &*self.words.as_ptr().cast() }
+    }
+    fn property(&self, index: usize) -> Option<EVENT_PROPERTY_INFO> {
+        let offset = offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray)
+            .checked_add(index.checked_mul(size_of::<EVENT_PROPERTY_INFO>())?)?;
+        if offset.checked_add(size_of::<EVENT_PROPERTY_INFO>())? > self.length {
+            return None;
+        }
+        Some(unsafe { ptr::read_unaligned(self.bytes().as_ptr().add(offset).cast()) })
+    }
+    fn preview(&self) -> SchemaPreview {
+        let info = self.info();
+        let mut properties = Vec::with_capacity(8);
+        for index in 0..info.PropertyCount.min(8) {
+            let Some(property) = self.property(index as usize) else {
+                break;
+            };
+            let (name_prefix, name_units, name_truncated, name_unavailable) =
+                metadata_name(self.bytes(), property.NameOffset as usize);
+            // Unsupported unions remain opaque; flags alone explain their rejection.
+            let (in_type, out_type) = if property.Flags == 0 {
+                let scalar = unsafe { property.Anonymous1.nonStructType };
+                (Some(scalar.InType), Some(scalar.OutType))
+            } else {
+                (None, None)
+            };
+            properties.push(PropertyPreview {
+                index,
+                flags: property.Flags as u32,
+                in_type,
+                out_type,
+                name_prefix,
+                name_units,
+                name_truncated,
+                name_unavailable,
+            });
+        }
+        SchemaPreview {
+            decoding_source: info.DecodingSource,
+            provider_guid: guid_bytes(&info.ProviderGuid),
+            event_guid: guid_bytes(&info.EventGuid),
+            descriptor_id: info.EventDescriptor.Id,
+            descriptor_version: info.EventDescriptor.Version,
+            descriptor_opcode: info.EventDescriptor.Opcode,
+            property_count: info.PropertyCount,
+            top_level_property_count: info.TopLevelPropertyCount,
+            properties_omitted: info.PropertyCount.saturating_sub(properties.len() as u32),
+            properties,
+        }
+    }
+}
+fn guid_bytes(value: &GUID) -> [u8; 16] {
+    ((u128::from(value.data1) << 96)
+        | (u128::from(value.data2) << 80)
+        | (u128::from(value.data3) << 64)
+        | u128::from(u64::from_be_bytes(value.data4)))
+    .to_be_bytes()
+}
+fn metadata_name(bytes: &[u8], offset: usize) -> (Vec<u16>, Option<u32>, bool, bool) {
+    if offset % 2 != 0 || offset >= bytes.len() {
+        return (vec![], None, false, true);
+    }
+    let units = bytes[offset..].chunks_exact(2);
+    let Some(length) = units
+        .clone()
+        .position(|pair| u16::from_le_bytes([pair[0], pair[1]]) == 0)
+    else {
+        return (vec![], None, false, true);
+    };
+    (
+        units
+            .take(length.min(32))
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect(),
+        Some(length as u32),
+        length > 32,
+        false,
+    )
+}
+struct NativeRejection {
+    detail: DecodeRejection,
+    metadata: Option<Metadata>,
+}
+impl NativeRejection {
+    fn new(stage: RejectStage, field: Option<FieldId>) -> Self {
+        let mut detail = DecodeRejection::new(stage);
+        detail.field = field;
+        Self {
+            detail,
+            metadata: None,
+        }
+    }
+    fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+    fn status(stage: RejectStage, field: Option<FieldId>, status: u32) -> Self {
+        let mut value = Self::new(stage, field);
+        value.detail.native_status = Some(status);
+        value
+    }
+}
+type Decoded<T> = Result<T, NativeRejection>;
+fn schema(event: &EVENT_RECORD) -> Decoded<Schema> {
     let mut length = 0;
     let result =
         unsafe { TdhGetEventInformation(event, 0, ptr::null(), ptr::null_mut(), &mut length) };
-    if result != ERROR_INSUFFICIENT_BUFFER
-        || length as usize > 65536
-        || (length as usize) < size_of::<TRACE_EVENT_INFO>()
-    {
-        return Err(io::Error::other("unsupported bounded TDH schema extent"));
+    if result != ERROR_INSUFFICIENT_BUFFER {
+        let mut failure = NativeRejection::status(RejectStage::SchemaSizeQuery, None, result);
+        failure.detail.returned_bytes = Some(length);
+        return Err(failure);
+    }
+    if length as usize > 65536 || (length as usize) < size_of::<TRACE_EVENT_INFO>() {
+        let mut failure = NativeRejection::new(RejectStage::SchemaExtent, None);
+        failure.detail.required_bytes = Some(size_of::<TRACE_EVENT_INFO>() as u32);
+        failure.detail.returned_bytes = Some(length);
+        return Err(failure);
     }
     let mut words = vec![0u64; (length as usize).div_ceil(8)];
     let capacity = length;
-    status(unsafe {
+    let result = unsafe {
         TdhGetEventInformation(
             event,
             0,
@@ -368,61 +487,90 @@ fn schema(event: &EVENT_RECORD) -> io::Result<Schema> {
             words.as_mut_ptr().cast(),
             &mut length,
         )
-    })?;
-    if length > capacity || (length as usize) < size_of::<TRACE_EVENT_INFO>() {
-        return Err(io::Error::other("TDH returned schema extent"));
+    };
+    if result != 0 {
+        let mut failure = NativeRejection::status(RejectStage::SchemaRead, None, result);
+        failure.detail.required_bytes = Some(capacity);
+        failure.detail.returned_bytes = Some(length);
+        return Err(failure);
     }
-    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), length as usize) };
-    let info = unsafe { &*words.as_ptr().cast::<TRACE_EVENT_INFO>() };
+    if length > capacity || (length as usize) < size_of::<TRACE_EVENT_INFO>() {
+        let mut failure = NativeRejection::new(RejectStage::SchemaExtent, None);
+        failure.detail.required_bytes = Some(capacity);
+        failure.detail.returned_bytes = Some(length);
+        return Err(failure);
+    }
+    let metadata = Metadata {
+        words,
+        length: length as usize,
+    };
+    let info = metadata.info();
     // Classic TDH metadata identifies the MOF class through EventGuid; its
     // controlling provider GUID need not equal that class GUID.
-    if (!same_guid(&info.ProviderGuid, &event.EventHeader.ProviderId)
-        && !same_guid(&info.EventGuid, &event.EventHeader.ProviderId))
-        || info.EventDescriptor.Version != event.EventHeader.EventDescriptor.Version
-        || info.EventDescriptor.Opcode != event.EventHeader.EventDescriptor.Opcode
-        || info.PropertyCount != info.TopLevelPropertyCount
-        || info.PropertyCount > 32
+    if !same_guid(&info.ProviderGuid, &event.EventHeader.ProviderId)
+        && !same_guid(&info.EventGuid, &event.EventHeader.ProviderId)
     {
-        return Err(io::Error::other(
-            "unsupported TDH nested/property inventory",
-        ));
+        return Err(NativeRejection::new(RejectStage::SchemaIdentity, None).with_metadata(metadata));
+    }
+    if info.EventDescriptor.Version != event.EventHeader.EventDescriptor.Version
+        || info.EventDescriptor.Opcode != event.EventHeader.EventDescriptor.Opcode
+    {
+        return Err(
+            NativeRejection::new(RejectStage::SchemaDescriptor, None).with_metadata(metadata)
+        );
+    }
+    if info.PropertyCount != info.TopLevelPropertyCount || info.PropertyCount > 32 {
+        return Err(
+            NativeRejection::new(RejectStage::SchemaInventory, None).with_metadata(metadata)
+        );
     }
     let mut fields = std::collections::BTreeMap::new();
     for index in 0..info.PropertyCount as usize {
-        let offset = offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray)
-            + index * size_of::<EVENT_PROPERTY_INFO>();
-        if offset + size_of::<EVENT_PROPERTY_INFO>() > bytes.len() {
-            return Err(io::Error::other("TDH property extent"));
-        }
-        let property = unsafe {
-            ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<EVENT_PROPERTY_INFO>())
+        let Some(property) = metadata.property(index) else {
+            return Err(
+                NativeRejection::new(RejectStage::PropertyExtent, None).with_metadata(metadata)
+            );
         };
         if property.Flags != 0 {
-            return Err(io::Error::other("unsupported TDH property flags"));
+            return Err(
+                NativeRejection::new(RejectStage::PropertyFlags, None).with_metadata(metadata)
+            );
         }
-        let name = String::from_utf16(&read_utf16(bytes, property.NameOffset as usize)?)
-            .map_err(io::Error::other)?;
+        let name = read_utf16(metadata.bytes(), property.NameOffset as usize)
+            .ok()
+            .and_then(|units| String::from_utf16(&units).ok());
+        let Some(name) = name else {
+            return Err(
+                NativeRejection::new(RejectStage::PropertyName, None).with_metadata(metadata)
+            );
+        };
         if fields
             .insert(name, unsafe { property.Anonymous1.nonStructType.InType })
             .is_some()
         {
-            return Err(io::Error::other("duplicate TDH property identity"));
+            return Err(
+                NativeRejection::new(RejectStage::DuplicateProperty, None).with_metadata(metadata)
+            );
         }
     }
-    Ok(Schema { fields })
+    Ok(Schema { fields, metadata })
 }
 fn property(
     event: &EVENT_RECORD,
     schema: &Schema,
-    name: &str,
+    field: FieldId,
     types: &[i32],
-) -> io::Result<Vec<u8>> {
+) -> Decoded<Vec<u8>> {
+    let name = field.name();
     if !schema
         .fields
         .get(name)
         .is_some_and(|kind| types.contains(&i32::from(*kind)))
     {
-        return Err(io::Error::other("unsupported TDH property type"));
+        let mut failure = NativeRejection::new(RejectStage::PropertyType, Some(field));
+        failure.detail.expected_type = (types.len() == 1).then_some(types[0] as u16);
+        failure.detail.actual_type = schema.fields.get(name).copied();
+        return Err(failure);
     }
     let name = name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let descriptor = PROPERTY_DATA_DESCRIPTOR {
@@ -431,12 +579,19 @@ fn property(
         Reserved: 0,
     };
     let mut length = 0;
-    status(unsafe { TdhGetPropertySize(event, 0, ptr::null(), 1, &descriptor, &mut length) })?;
+    let result = unsafe { TdhGetPropertySize(event, 0, ptr::null(), 1, &descriptor, &mut length) };
+    if result != 0 {
+        let mut failure = NativeRejection::status(RejectStage::PropertySize, Some(field), result);
+        failure.detail.returned_bytes = Some(length);
+        return Err(failure);
+    }
     if length == 0 || length > 65536 {
-        return Err(io::Error::other("TDH property byte bound"));
+        let mut failure = NativeRejection::new(RejectStage::PropertySize, Some(field));
+        failure.detail.returned_bytes = Some(length);
+        return Err(failure);
     }
     let mut data = vec![0; length as usize];
-    status(unsafe {
+    let result = unsafe {
         TdhGetProperty(
             event,
             0,
@@ -446,14 +601,19 @@ fn property(
             length,
             data.as_mut_ptr(),
         )
-    })?;
+    };
+    if result != 0 {
+        let mut failure = NativeRejection::status(RejectStage::PropertyRead, Some(field), result);
+        failure.detail.required_bytes = Some(length);
+        return Err(failure);
+    }
     Ok(data)
 }
-fn scalar(event: &EVENT_RECORD, schema: &Schema, name: &str, pointer: bool) -> io::Result<u64> {
+fn scalar(event: &EVENT_RECORD, schema: &Schema, field: FieldId, pointer: bool) -> Decoded<u64> {
     let data = property(
         event,
         schema,
-        name,
+        field,
         if pointer {
             &[TDH_INTYPE_POINTER]
         } else {
@@ -471,12 +631,17 @@ fn scalar(event: &EVENT_RECORD, schema: &Schema, name: &str, pointer: bool) -> i
         {
             8
         } else {
-            return Err(io::Error::other("unavailable ETW pointer width"));
+            return Err(NativeRejection::new(RejectStage::PointerWidth, Some(field)));
         }
     } else {
         4
     };
-    crate::windows_fileio_record::pointer(&data, width).map_err(io::Error::other)
+    crate::windows_fileio_record::pointer(&data, width).map_err(|_| {
+        let mut failure = NativeRejection::new(RejectStage::ScalarExtent, Some(field));
+        failure.detail.expected_width = Some(width as u8);
+        failure.detail.actual_width = Some(data.len() as u32);
+        failure
+    })
 }
 struct Context {
     spec: ConsumerSpec,
@@ -538,55 +703,99 @@ unsafe fn callback_inner(raw: *mut EVENT_RECORD) {
         counters.filtered = counters.filtered.saturating_add(1);
         return;
     }
-    let decoded = (|| -> io::Result<()> {
+    let opcode = header.EventDescriptor.Opcode;
+    collector.received(opcode);
+    let decoded = (|| -> Decoded<()> {
         if header.EventDescriptor.Version != 2 {
-            return Err(io::Error::other("unsupported FileIo schema version"));
+            return Err(NativeRejection::new(RejectStage::EventVersion, None));
         }
         let shape = schema(event)?;
-        let irp = scalar(event, &shape, "IrpPtr", true)?;
-        if header.EventDescriptor.Opcode == 76 {
-            collector.completion(Completion {
+        let result = (|| -> Decoded<()> {
+            let irp = scalar(event, &shape, FieldId::IrpPtr, true)?;
+            if header.EventDescriptor.Opcode == 76 {
+                collector.completion(Completion {
+                    irp,
+                    qpc: header.TimeStamp as u64,
+                    extra_info: scalar(event, &shape, FieldId::ExtraInfo, true)?,
+                    ntstatus: scalar(event, &shape, FieldId::NtStatus, false)? as u32 as i32,
+                });
+                return Ok(());
+            }
+            let path = property(
+                event,
+                &shape,
+                FieldId::OpenPath,
+                &[TDH_INTYPE_UNICODESTRING],
+            )?;
+            let units = path_units(&path).map_err(|_| {
+                let mut failure =
+                    NativeRejection::new(RejectStage::PathEncoding, Some(FieldId::OpenPath));
+                failure.detail.returned_bytes = Some(path.len() as u32);
+                failure
+            })?;
+            let full = units.as_slice();
+            let mut hash = Sha256::new();
+            for unit in full {
+                hash.update(unit.to_le_bytes());
+            }
+            let ttid_pointer = match shape.fields.get("TTID").copied().map(i32::from) {
+                Some(TDH_INTYPE_POINTER) => true,
+                Some(TDH_INTYPE_UINT32 | TDH_INTYPE_HEXINT32) => false,
+                actual => {
+                    let mut failure =
+                        NativeRejection::new(RejectStage::PropertyType, Some(FieldId::Ttid));
+                    failure.detail.actual_type = actual.map(|value| value as u16);
+                    return Err(failure);
+                }
+            };
+            let ttid =
+                thread_id(scalar(event, &shape, FieldId::Ttid, ttid_pointer)?).map_err(|_| {
+                    let mut failure =
+                        NativeRejection::new(RejectStage::ThreadId, Some(FieldId::Ttid));
+                    failure.detail.expected_width = Some(4);
+                    failure
+                })?;
+            collector.create(Create {
                 irp,
                 qpc: header.TimeStamp as u64,
-                extra_info: scalar(event, &shape, "ExtraInfo", true)?,
-                ntstatus: scalar(event, &shape, "NtStatus", false)? as u32 as i32,
+                header_pid: header.ProcessId,
+                header_tid: header.ThreadId,
+                ttid,
+                file_object: scalar(event, &shape, FieldId::FileObject, true)?,
+                create_options: scalar(event, &shape, FieldId::CreateOptions, false)? as u32,
+                file_attributes: scalar(event, &shape, FieldId::FileAttributes, false)? as u32,
+                share_access: scalar(event, &shape, FieldId::ShareAccess, false)? as u32,
+                path_prefix: full[..full.len().min(128)].to_vec(),
+                path_units: full.len() as u32,
+                path_sha256: Some(hash.finalize().into()),
+                path_truncated: full.len() > 128,
             });
-            return Ok(());
-        }
-        let path = property(event, &shape, "OpenPath", &[TDH_INTYPE_UNICODESTRING])?;
-        let units = path_units(&path).map_err(io::Error::other)?;
-        let full = units.as_slice();
-        let mut hash = Sha256::new();
-        for unit in full {
-            hash.update(unit.to_le_bytes());
-        }
-        let ttid_pointer = match shape.fields.get("TTID").copied().map(i32::from) {
-            Some(TDH_INTYPE_POINTER) => true,
-            Some(TDH_INTYPE_UINT32 | TDH_INTYPE_HEXINT32) => false,
-            _ => return Err(io::Error::other("unsupported TDH thread identifier type")),
-        };
-        let ttid =
-            thread_id(scalar(event, &shape, "TTID", ttid_pointer)?).map_err(io::Error::other)?;
-        collector.create(Create {
-            irp,
-            qpc: header.TimeStamp as u64,
-            header_pid: header.ProcessId,
-            header_tid: header.ThreadId,
-            ttid,
-            file_object: scalar(event, &shape, "FileObject", true)?,
-            create_options: scalar(event, &shape, "CreateOptions", false)? as u32,
-            file_attributes: scalar(event, &shape, "FileAttributes", false)? as u32,
-            share_access: scalar(event, &shape, "ShareAccess", false)? as u32,
-            path_prefix: full[..full.len().min(128)].to_vec(),
-            path_units: full.len() as u32,
-            path_sha256: Some(hash.finalize().into()),
-            path_truncated: full.len() > 128,
-        });
-        Ok(())
+            Ok(())
+        })();
+        result.map_err(|failure| failure.with_metadata(shape.metadata))
     })();
-    if decoded.is_err() {
-        let counters = collector.counters();
-        counters.unsupported = counters.unsupported.saturating_add(1);
+    match decoded {
+        Ok(()) => collector.decoded(opcode),
+        Err(failure) => {
+            let metadata = if collector.wants_sample(
+                opcode,
+                header.EventDescriptor.Version,
+                failure.detail.stage,
+                failure.detail.field,
+            ) {
+                failure.metadata.as_ref().map(Metadata::preview)
+            } else {
+                None
+            };
+            collector.rejected(RejectSample {
+                opcode,
+                event_version: header.EventDescriptor.Version,
+                header_flags: header.Flags,
+                user_data_length: event.UserDataLength,
+                rejection: failure.detail,
+                metadata,
+            });
+        }
     }
 }
 /// Runs only in the separately owned consumer process. The caller supervises

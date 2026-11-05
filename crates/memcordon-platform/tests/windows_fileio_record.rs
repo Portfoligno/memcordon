@@ -51,6 +51,211 @@ fn windows() -> Vec<Window> {
     }]
 }
 
+fn rejection(opcode: u8, version: u8, stage: RejectStage) -> RejectSample {
+    RejectSample {
+        opcode,
+        event_version: version,
+        header_flags: 64,
+        user_data_length: 4096,
+        rejection: DecodeRejection::new(stage),
+        metadata: None,
+    }
+}
+fn preview() -> SchemaPreview {
+    SchemaPreview {
+        decoding_source: 1,
+        provider_guid: [255; 16],
+        event_guid: [254; 16],
+        descriptor_id: u16::MAX,
+        descriptor_version: 2,
+        descriptor_opcode: 64,
+        property_count: 8,
+        top_level_property_count: 8,
+        properties: (0..8)
+            .map(|index| PropertyPreview {
+                index,
+                flags: 0,
+                in_type: Some(u16::MAX),
+                out_type: Some(u16::MAX),
+                name_prefix: vec![65535; 32],
+                name_units: Some(32),
+                name_truncated: false,
+                name_unavailable: false,
+            })
+            .collect(),
+        properties_omitted: 0,
+    }
+}
+
+#[test]
+fn opcode_quotas_keep_create_reason_after_unbound_completion_flood() {
+    let mut collector = Collector::new(spec()).unwrap();
+    for version in 3..23 {
+        collector.received(76);
+        collector.rejected(rejection(76, version, RejectStage::EventVersion));
+    }
+    let mut sample = rejection(64, 2, RejectStage::SchemaRead);
+    sample.rejection.native_status = Some(87);
+    collector.received(64);
+    collector.rejected(sample);
+    assert!(!collector.wants_sample(64, 2, RejectStage::SchemaRead, None));
+    let observed = collector.finish(0, false);
+    assert!(observed.validate().is_ok());
+    assert_eq!(observed.decode.completion_received, 20);
+    assert_eq!(observed.decode.completion_rejected, 20);
+    assert_eq!(observed.decode.create_header_matched, 1);
+    assert_eq!(observed.decode.create_rejected, 1);
+    assert_eq!(observed.counters.unsupported, 21);
+    assert_eq!(observed.decode.sample_omitted, 16);
+    assert_eq!(
+        observed
+            .decode
+            .samples
+            .iter()
+            .filter(|sample| sample.opcode == 76)
+            .count(),
+        4
+    );
+    let eligible = observed
+        .decode
+        .samples
+        .iter()
+        .find(|sample| sample.opcode == 64)
+        .unwrap();
+    assert_eq!(eligible.rejection.native_status, Some(87));
+    assert!(eligible.metadata.is_none());
+    let value = decode_diagnostic(&observed.decode);
+    assert_eq!(value["native_status_domain"], "Win32 TDH direct return");
+    for sample in value["samples"].as_array().unwrap() {
+        for forbidden in ["pid", "tid", "irp", "path", "payload", "file_object"] {
+            assert!(sample.get(forbidden).is_none());
+        }
+    }
+}
+
+#[test]
+fn raw_and_rendered_details_share_existing_carrier_bounds_and_fair_metadata() {
+    let mut collector = Collector::new(spec()).unwrap();
+    for opcode in [76, 64] {
+        for version in 2..6 {
+            collector.received(opcode);
+            let mut sample = rejection(opcode, version, RejectStage::PropertyFlags);
+            sample.metadata = Some(preview());
+            collector.rejected(sample);
+        }
+    }
+    for irp in 1..=32 {
+        let mut row = create(irp, 12);
+        row.path_prefix = vec![65535; 128];
+        row.path_units = 32767;
+        row.path_truncated = true;
+        collector.create(row);
+        collector.completion(end(irp, 20));
+    }
+    let observed = collector.finish(0, false);
+    assert!(observed.validate().is_ok());
+    assert_eq!(observed.decode.samples.len(), 8);
+    assert!(observed.decode.detail_truncated);
+    assert!(observed.decode.metadata_omitted > 0);
+    for opcode in [64, 76] {
+        assert!(
+            observed
+                .decode
+                .samples
+                .iter()
+                .any(|sample| sample.opcode == opcode && sample.metadata.is_some())
+        );
+    }
+    assert!(serde_json::to_vec(&observed.decode).unwrap().len() <= DECODE_BYTES);
+    assert!(
+        serde_json::to_vec(&decode_diagnostic(&observed.decode))
+            .unwrap()
+            .len()
+            <= DECODE_BYTES
+    );
+    assert!(serde_json::to_vec(&observed).unwrap().len() <= RECORD_BYTES);
+    let rendered = correlate(&observed, &spec(), 11, &windows());
+    assert!(serde_json::to_vec(&rendered).unwrap().len() <= CORRELATION_BYTES);
+    assert_eq!(rendered["unsupported_history_prevents_association"], true);
+    assert!(!rendered["rows"].as_array().unwrap().is_empty());
+    assert!(
+        rendered["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["temporal_original_call_association"] == false)
+    );
+}
+
+#[test]
+fn malformed_schema_previews_and_stage_totals_are_rejected_without_interpreting_unions() {
+    let mut collector = Collector::new(spec()).unwrap();
+    collector.received(64);
+    let mut sample = rejection(64, 2, RejectStage::SchemaInventory);
+    sample.metadata = Some(preview());
+    collector.rejected(sample);
+    let observed = collector.finish(0, false);
+    for mutation in 0..8 {
+        let mut bad = observed.clone();
+        let metadata = bad.decode.samples[0].metadata.as_mut().unwrap();
+        match mutation {
+            0 => metadata.properties[0].name_prefix.push(1),
+            1 => metadata.properties[0].name_units = None,
+            2 => metadata.properties[0].name_unavailable = true,
+            3 => metadata.properties[0].flags = 1,
+            4 => metadata.properties.push(metadata.properties[0].clone()),
+            5 => metadata.properties_omitted = 1,
+            6 => metadata.properties[1].index = 0,
+            _ => bad.decode.stage_counts[0][RejectStage::SchemaInventory as usize] = 0,
+        }
+        assert!(bad.validate().is_err(), "mutation {mutation}");
+    }
+    let mut large = observed.clone();
+    let metadata = large.decode.samples[0].metadata.as_mut().unwrap();
+    metadata.property_count = u32::MAX;
+    metadata.top_level_property_count = u32::MAX;
+    metadata.properties_omitted = u32::MAX - 8;
+    assert!(
+        large.validate().is_ok(),
+        "actual rejected inventory counts are raw facts, not allocation sizes"
+    );
+    let mut unknown = serde_json::to_value(&observed).unwrap();
+    unknown["decode"]["samples"][0]["rejection"]["stage"] = serde_json::json!("not-a-stage");
+    assert!(serde_json::from_value::<Observation>(unknown).is_err());
+}
+
+#[test]
+fn version_two_requires_telemetry_and_duplicate_rejections_count_once_per_attempt() {
+    let mut collector = Collector::new(spec()).unwrap();
+    for _ in 0..2 {
+        collector.received(64);
+        collector.rejected(rejection(64, 7, RejectStage::EventVersion));
+    }
+    collector.received(76);
+    collector.decoded(76);
+    let observed = collector.finish(0, false);
+    assert_eq!(observed.version, 2);
+    assert_eq!(observed.spec.version, 1);
+    assert!(observed.validate().is_ok());
+    assert_eq!(observed.decode.samples.len(), 1);
+    assert!(observed.decode.samples[0].metadata.is_none());
+    assert_eq!(
+        observed.decode.stage_counts[0][RejectStage::EventVersion as usize],
+        2
+    );
+    assert_eq!(observed.counters.unsupported, 2);
+    assert_eq!(observed.decode.sample_omitted, 0);
+    let roundtrip: Observation =
+        serde_json::from_slice(&serde_json::to_vec(&observed).unwrap()).unwrap();
+    assert!(roundtrip.validate().is_ok());
+    let mut old = roundtrip.clone();
+    old.version = 1;
+    assert!(old.validate().is_err());
+    let mut missing = serde_json::to_value(roundtrip).unwrap();
+    missing.as_object_mut().unwrap().remove("decode");
+    assert!(serde_json::from_value::<Observation>(missing).is_err());
+}
+
 #[test]
 fn exact_session_thread_and_unique_window_required() {
     let mut collector = Collector::new(spec()).unwrap();

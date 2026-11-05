@@ -449,7 +449,7 @@ mod native {
                             && stop.realtime_buffers_lost == 0
                     });
                 if !loss_free {
-                    json!({"state":"incomplete-unassociated","reason":"session loss, cutoff or consumer retirement is unproved","counters":observation.counters,"candidate_records":observation.rows,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false})
+                    json!({"state":"incomplete-unassociated","reason":"session loss, cutoff or consumer retirement is unproved","counters":observation.counters,"decode":memcordon_platform::windows_fileio_record::decode_diagnostic(&observation.decode),"candidate_records":observation.rows,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false})
                 } else {
                     match listener_windows(&bytes, spec) {
                         Ok((thread, windows)) => {

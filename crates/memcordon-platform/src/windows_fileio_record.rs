@@ -8,6 +8,296 @@ pub const RECORD_BYTES: usize = 65536;
 pub const MAX_ROWS: usize = 32;
 pub const MAX_PENDING: usize = 128;
 pub const CORRELATION_BYTES: usize = 49152;
+pub const DECODE_BYTES: usize = 12 * 1024;
+// Leave space for the renderer's fixed native-status-domain annotation.
+const DECODE_STORAGE_BYTES: usize = DECODE_BYTES - 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum RejectStage {
+    EventVersion,
+    SchemaSizeQuery,
+    SchemaExtent,
+    SchemaRead,
+    SchemaIdentity,
+    SchemaDescriptor,
+    SchemaInventory,
+    PropertyExtent,
+    PropertyFlags,
+    PropertyName,
+    DuplicateProperty,
+    PropertyType,
+    PropertySize,
+    PropertyRead,
+    PointerWidth,
+    ScalarExtent,
+    ThreadId,
+    PathEncoding,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FieldId {
+    IrpPtr,
+    ExtraInfo,
+    NtStatus,
+    OpenPath,
+    Ttid,
+    FileObject,
+    CreateOptions,
+    FileAttributes,
+    ShareAccess,
+}
+impl FieldId {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IrpPtr => "IrpPtr",
+            Self::ExtraInfo => "ExtraInfo",
+            Self::NtStatus => "NtStatus",
+            Self::OpenPath => "OpenPath",
+            Self::Ttid => "TTID",
+            Self::FileObject => "FileObject",
+            Self::CreateOptions => "CreateOptions",
+            Self::FileAttributes => "FileAttributes",
+            Self::ShareAccess => "ShareAccess",
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeRejection {
+    pub stage: RejectStage,
+    pub field: Option<FieldId>,
+    pub native_status: Option<u32>,
+    pub required_bytes: Option<u32>,
+    pub returned_bytes: Option<u32>,
+    pub expected_type: Option<u16>,
+    pub actual_type: Option<u16>,
+    pub expected_width: Option<u8>,
+    pub actual_width: Option<u32>,
+}
+impl DecodeRejection {
+    pub fn new(stage: RejectStage) -> Self {
+        Self {
+            stage,
+            field: None,
+            native_status: None,
+            required_bytes: None,
+            returned_bytes: None,
+            expected_type: None,
+            actual_type: None,
+            expected_width: None,
+            actual_width: None,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropertyPreview {
+    pub index: u32,
+    pub flags: u32,
+    pub in_type: Option<u16>,
+    pub out_type: Option<u16>,
+    pub name_prefix: Vec<u16>,
+    pub name_units: Option<u32>,
+    pub name_truncated: bool,
+    pub name_unavailable: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaPreview {
+    pub decoding_source: i32,
+    pub provider_guid: [u8; 16],
+    pub event_guid: [u8; 16],
+    pub descriptor_id: u16,
+    pub descriptor_version: u8,
+    pub descriptor_opcode: u8,
+    pub property_count: u32,
+    pub top_level_property_count: u32,
+    pub properties: Vec<PropertyPreview>,
+    pub properties_omitted: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectSample {
+    pub opcode: u8,
+    pub event_version: u8,
+    pub header_flags: u16,
+    pub user_data_length: u16,
+    pub rejection: DecodeRejection,
+    pub metadata: Option<SchemaPreview>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeDiagnostics {
+    pub create_header_matched: u64,
+    pub create_decoded: u64,
+    pub create_rejected: u64,
+    pub completion_received: u64,
+    pub completion_decoded: u64,
+    pub completion_rejected: u64,
+    pub stage_counts: [[u64; 18]; 2],
+    pub samples: Vec<RejectSample>,
+    pub sample_omitted: u64,
+    pub detail_truncated: bool,
+    pub metadata_omitted: u32,
+}
+fn opcode_index(opcode: u8) -> Option<usize> {
+    match opcode {
+        64 => Some(0),
+        76 => Some(1),
+        _ => None,
+    }
+}
+fn same_sample(
+    sample: &RejectSample,
+    opcode: u8,
+    version: u8,
+    stage: RejectStage,
+    field: Option<FieldId>,
+) -> bool {
+    sample.opcode == opcode
+        && sample.event_version == version
+        && sample.rejection.stage == stage
+        && sample.rejection.field == field
+}
+impl DecodeDiagnostics {
+    fn bound(&mut self) {
+        // Split sample space so an unbound completion flood cannot spend the
+        // eligible-Create metadata reservation. Fixed counters keep 2KiB.
+        for opcode in [64, 76] {
+            while serde_json::to_vec(
+                &self
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.opcode == opcode)
+                    .collect::<Vec<_>>(),
+            )
+            .map_or(true, |bytes| bytes.len() > (DECODE_BYTES - 2048) / 2)
+            {
+                if let Some(sample) = self
+                    .samples
+                    .iter_mut()
+                    .rev()
+                    .find(|sample| sample.opcode == opcode && sample.metadata.is_some())
+                {
+                    sample.metadata = None;
+                    self.metadata_omitted = self.metadata_omitted.saturating_add(1);
+                    self.detail_truncated = true;
+                } else {
+                    break;
+                }
+            }
+        }
+        while serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > DECODE_STORAGE_BYTES) {
+            // Samples keep their opcode/error facts; discard metadata only.
+            if let Some(sample) = self
+                .samples
+                .iter_mut()
+                .rev()
+                .find(|sample| sample.metadata.is_some())
+            {
+                sample.metadata = None;
+                self.metadata_omitted = self.metadata_omitted.saturating_add(1);
+                self.detail_truncated = true;
+            } else if self.samples.pop().is_some() {
+                self.sample_omitted = self.sample_omitted.saturating_add(1);
+                self.detail_truncated = true;
+            } else {
+                break;
+            }
+        }
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.samples.len() > 8
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > DECODE_BYTES)
+        {
+            return Err("FileIo decode diagnostic extent differs".into());
+        }
+        let mut quotas = [0; 2];
+        for (index, sample) in self.samples.iter().enumerate() {
+            let opcode = opcode_index(sample.opcode).ok_or("FileIo rejection opcode differs")?;
+            quotas[opcode] += 1;
+            if quotas[opcode] > 4
+                || self.samples[..index].iter().any(|prior| {
+                    same_sample(
+                        prior,
+                        sample.opcode,
+                        sample.event_version,
+                        sample.rejection.stage,
+                        sample.rejection.field,
+                    )
+                })
+                || self.stage_counts[opcode][sample.rejection.stage as usize] == 0
+            {
+                return Err("FileIo rejection quota/identity differs".into());
+            }
+            if sample
+                .rejection
+                .expected_width
+                .is_some_and(|width| !matches!(width, 4 | 8))
+            {
+                return Err("FileIo expected scalar width differs".into());
+            }
+            if let Some(metadata) = &sample.metadata {
+                if metadata.properties.len() > 8
+                    || metadata.properties_omitted
+                        != metadata
+                            .property_count
+                            .saturating_sub(metadata.properties.len() as u32)
+                {
+                    return Err("FileIo schema preview inventory differs".into());
+                }
+                for (index, property) in metadata.properties.iter().enumerate() {
+                    if property.index >= metadata.property_count
+                        || metadata.properties[..index]
+                            .iter()
+                            .any(|prior| prior.index == property.index)
+                        || property.name_prefix.len() > 32
+                        || property.name_prefix.contains(&0)
+                        || (property.flags != 0
+                            && (property.in_type.is_some() || property.out_type.is_some()))
+                        || if property.name_unavailable {
+                            property.name_units.is_some()
+                                || !property.name_prefix.is_empty()
+                                || property.name_truncated
+                        } else {
+                            property.name_units.is_none_or(|units| {
+                                units > 32768
+                                    || property.name_prefix.len() != (units as usize).min(32)
+                                    || property.name_truncated != (units > 32)
+                            })
+                        }
+                    {
+                        return Err("FileIo schema property preview differs".into());
+                    }
+                }
+            }
+        }
+        let sums = self.stage_counts.map(|counts| {
+            counts
+                .iter()
+                .fold(0u64, |total, count| total.saturating_add(*count))
+        });
+        if sums != [self.create_rejected, self.completion_rejected]
+            || self.create_decoded.saturating_add(self.create_rejected) > self.create_header_matched
+            || self
+                .completion_decoded
+                .saturating_add(self.completion_rejected)
+                > self.completion_received
+        {
+            return Err("FileIo rejection counter totals differ".into());
+        }
+        Ok(())
+    }
+}
+pub fn decode_diagnostic(value: &DecodeDiagnostics) -> Value {
+    let mut value = value.clone();
+    value.bound();
+    let mut value = serde_json::to_value(value).expect("fixed FileIo diagnostic fields serialize");
+    value["native_status_domain"] = json!("Win32 TDH direct return");
+    value
+}
 
 /// Decode only the pointer width actually declared by the event header.
 pub fn pointer(bytes: &[u8], width: usize) -> Result<u64, String> {
@@ -145,6 +435,7 @@ pub struct Observation {
     pub spec: ConsumerSpec,
     pub rows: Vec<Row>,
     pub counters: Counters,
+    pub decode: DecodeDiagnostics,
     pub process_trace_status: u32,
     pub close_trace_status: u32,
     pub consumer_completed: bool,
@@ -153,8 +444,17 @@ pub struct Observation {
 impl Observation {
     pub fn validate(&self) -> Result<(), String> {
         self.spec.validate()?;
-        if self.version != 1 || self.rows.len() > MAX_ROWS {
+        if self.version != 2 || self.rows.len() > MAX_ROWS {
             return Err("FileIo record bound/version differs".into());
+        }
+        self.decode.validate()?;
+        if self.counters.unsupported
+            != self
+                .decode
+                .create_rejected
+                .saturating_add(self.decode.completion_rejected)
+        {
+            return Err("FileIo unsupported/rejection totals differ".into());
         }
         for row in &self.rows {
             let create = &row.create;
@@ -202,10 +502,11 @@ impl Collector {
         spec.validate()?;
         Ok(Self {
             observation: Observation {
-                version: 1,
+                version: 2,
                 spec,
                 rows: vec![],
                 counters: Counters::default(),
+                decode: DecodeDiagnostics::default(),
                 process_trace_status: 0,
                 close_trace_status: 0,
                 consumer_completed: false,
@@ -216,6 +517,80 @@ impl Collector {
     }
     pub fn counters(&mut self) -> &mut Counters {
         &mut self.observation.counters
+    }
+    pub fn received(&mut self, opcode: u8) {
+        let decode = &mut self.observation.decode;
+        match opcode {
+            64 => decode.create_header_matched = decode.create_header_matched.saturating_add(1),
+            76 => decode.completion_received = decode.completion_received.saturating_add(1),
+            _ => {}
+        }
+    }
+    pub fn decoded(&mut self, opcode: u8) {
+        let decode = &mut self.observation.decode;
+        match opcode {
+            64 => decode.create_decoded = decode.create_decoded.saturating_add(1),
+            76 => decode.completion_decoded = decode.completion_decoded.saturating_add(1),
+            _ => {}
+        }
+    }
+    pub fn wants_sample(
+        &self,
+        opcode: u8,
+        version: u8,
+        stage: RejectStage,
+        field: Option<FieldId>,
+    ) -> bool {
+        opcode_index(opcode).is_some()
+            && self
+                .observation
+                .decode
+                .samples
+                .iter()
+                .filter(|sample| sample.opcode == opcode)
+                .count()
+                < 4
+            && !self
+                .observation
+                .decode
+                .samples
+                .iter()
+                .any(|sample| same_sample(sample, opcode, version, stage, field))
+    }
+    pub fn rejected(&mut self, sample: RejectSample) {
+        let Some(opcode) = opcode_index(sample.opcode) else {
+            return;
+        };
+        let wanted = self.wants_sample(
+            sample.opcode,
+            sample.event_version,
+            sample.rejection.stage,
+            sample.rejection.field,
+        );
+        let duplicate = self.observation.decode.samples.iter().any(|prior| {
+            same_sample(
+                prior,
+                sample.opcode,
+                sample.event_version,
+                sample.rejection.stage,
+                sample.rejection.field,
+            )
+        });
+        let decode = &mut self.observation.decode;
+        match opcode {
+            0 => decode.create_rejected = decode.create_rejected.saturating_add(1),
+            _ => decode.completion_rejected = decode.completion_rejected.saturating_add(1),
+        }
+        let count = &mut decode.stage_counts[opcode][sample.rejection.stage as usize];
+        *count = count.saturating_add(1);
+        self.observation.counters.unsupported =
+            self.observation.counters.unsupported.saturating_add(1);
+        if wanted {
+            decode.samples.push(sample);
+        } else if !duplicate {
+            decode.sample_omitted = decode.sample_omitted.saturating_add(1);
+        }
+        decode.bound();
     }
     pub fn create(&mut self, create: Create) {
         let counters = &mut self.observation.counters;
@@ -296,7 +671,8 @@ pub fn correlate(
         && observation.process_trace_status == 0
         && observation.close_trace_status == 0
         && observation.counters.overflow == 0
-        && observation.counters.malformed == 0;
+        && observation.counters.malformed == 0
+        && observation.counters.unsupported == 0;
     let mut rows = if valid {
         observation.rows.iter().map(|row|{
         let matched=windows.iter().filter(|window|window.dependency_sequence!=0&&window.loader_dependency_sequence!=0&&window.parent_listener_sequence!=0
@@ -311,7 +687,7 @@ pub fn correlate(
     };
     // Keep the first associated failed create when bounded output omits later rows.
     rows.sort_by_key(|row| !row["observed_failed_create"].as_bool().unwrap_or(false));
-    let mut result = json!({"format":"memcordon.loader-fileio-observation","revision":1,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"valid_binding_and_record":valid,"consumer_side_header_pid_filter":true,"header_pid_may_miss_requestor_context":true,"absence_proves_no_file_activity":false,"counters":observation.counters,"process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,"consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,"rows":rows,"rows_omitted":0});
+    let mut result = json!({"format":"memcordon.loader-fileio-observation","revision":2,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"valid_binding_and_record":valid,"consumer_side_header_pid_filter":true,"header_pid_may_miss_requestor_context":true,"absence_proves_no_file_activity":false,"counters":observation.counters,"decode":decode_diagnostic(&observation.decode),"unsupported_history_prevents_association":observation.counters.unsupported!=0,"process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,"consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,"rows":rows,"rows_omitted":0});
     let mut omitted = 0;
     while serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > CORRELATION_BYTES) {
         let Some(rows) = result["rows"].as_array_mut() else {
