@@ -232,10 +232,12 @@ fn ancestry_cutoff_partial_states_do_not_invent_calls_or_retention() {
         assert_eq!(value["completed_retained"], 0);
         assert_eq!(value["terminal"]["retained"], false);
     }
-    let mut progress = AncestryProgress::default();
-    progress.outer_before = failed(1460);
-    progress.failed = true;
-    progress.terminal_phase = Some(AncestorPhase::OuterBefore);
+    let mut progress = AncestryProgress {
+        outer_before: failed(1460),
+        failed: true,
+        terminal_phase: Some(AncestorPhase::OuterBefore),
+        ..Default::default()
+    };
     assert!(progress.diagnostic(&path)["terminal"].is_null());
     let mut row = retained(0, 2);
     row.role = AncestorRole::Root;
