@@ -164,6 +164,13 @@ pub fn run(root: &Path, diagnostics: &Path, work: Instant, cleanup: Instant) -> 
         destination.join("cases"),
     )?;
     let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;
+    crate::windows_fixture_inventory::publish_to(
+        &config.fixture_inventory_input(),
+        &root
+            .join(diagnostics)
+            .join(crate::windows_fixture_inventory::REPORT_NAME),
+        work,
+    )?;
     let selectors = crate::windows_readiness_components::fault_selectors()
         .into_iter()
         .enumerate()

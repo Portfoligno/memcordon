@@ -151,6 +151,10 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
         )
     };
     let payload = construct(&source).unwrap();
+    assert_eq!(
+        payload.fixture_manifest_inventory,
+        memcordon_ci::windows_pe_manifest::inventory(&pe)
+    );
     let select_agent = |source: &SelectedSource| {
         memcordon_ci::release::installed_consumer::materialized_windows_agent(
             &BuildSourceIdentity::from(source.clone()),

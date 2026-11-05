@@ -23,9 +23,11 @@ pub mod storage_observation;
 pub mod windows_access_failure_probe;
 pub mod windows_component_diagnostics;
 pub mod windows_component_retention;
+pub mod windows_fixture_inventory;
 pub mod windows_listener_wait;
 pub mod windows_loader_fileio;
 pub mod windows_original_gate_failure;
+pub mod windows_pe_manifest;
 pub mod windows_status_streams;
 
 pub mod bootstrap_profile;

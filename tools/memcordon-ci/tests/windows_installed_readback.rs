@@ -76,6 +76,7 @@ impl Fixture {
             components: selected,
             installed_components: providers.clone(),
             fixture,
+            fixture_manifest_inventory: serde_json::Value::Null,
             installed_agent: providers[0].clone(),
             installed_manifest: SelectedArtifact {
                 path: installed.join("runtime-manifest.json"),

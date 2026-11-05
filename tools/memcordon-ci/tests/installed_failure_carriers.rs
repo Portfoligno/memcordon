@@ -42,6 +42,17 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
         .unwrap();
     expected.push(fileio);
+    let inventory = root
+        .path()
+        .join("windows-installed/fixture-manifest-inventory.json");
+    fs::write(&inventory, b"original inventory").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&inventory)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    expected.push(inventory);
     for index in 0..180 {
         fs::write(
             root.path().join(format!("recent-{index:03}.json")),

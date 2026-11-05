@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RELATIVE_PATHS: [&str; 9] = [
+pub const RELATIVE_PATHS: [&str; 10] = [
     "windows-installed/C-IO/empty-message/result.callback-failure.json",
     "windows-installed/C-IO/empty-message/result.stderr.bin",
     "windows-installed/C-IO/empty-message/result.winsock-startup-trace.json",
@@ -15,6 +15,7 @@ pub const RELATIVE_PATHS: [&str; 9] = [
     "windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json",
     "windows-installed/W-JOINT/restricted/result.listener-call-trace.json",
     "windows-installed/W-JOINT/restricted/result.loader-fileio.json",
+    "windows-installed/fixture-manifest-inventory.json",
 ];
 
 pub fn paths(prefix: &str) -> String {

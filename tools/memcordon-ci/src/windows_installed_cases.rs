@@ -291,6 +291,8 @@ pub struct InstalledWindowsPayload {
     pub components: Vec<SelectedArtifact>,
     pub installed_components: Vec<SelectedArtifact>,
     pub fixture: SelectedArtifact,
+    /// Diagnostic preparation snapshot, never executable-selection authority.
+    pub fixture_manifest_inventory: serde_json::Value,
     pub installed_agent: SelectedArtifact,
     pub installed_manifest: SelectedArtifact,
     pub provider: memcordon_core::PublicProviderBindingV1,
@@ -473,6 +475,15 @@ fn installed_public_command_format(
 }
 
 impl InstalledWindowsPayload {
+    pub fn fixture_inventory_input(&self) -> crate::windows_fixture_inventory::Input<'_> {
+        crate::windows_fixture_inventory::Input {
+            source_commit: &self.source_commit,
+            target: &self.target,
+            path: &self.fixture.path,
+            sha256: &self.fixture.sha256,
+            embedded: &self.fixture_manifest_inventory,
+        }
+    }
     /// Bind the installed case inputs to the measured channel payload, independently
     /// of any report produced by the workload. This is inventory, not permission.
     #[expect(
@@ -612,13 +623,25 @@ impl InstalledWindowsPayload {
                 "fixture must not be a production runtime component".into(),
             ));
         }
-        let fixture_bytes = files::read_file(&fixture.path)?;
-        target::validate_executable(&fixture_bytes, &distribution.target)?;
-        if files::checksum(&fixture_bytes) != fixture.sha256 {
+        #[cfg(windows)]
+        let fixture_held = crate::windows_native_files::hold_artifact(
+            &fixture.path,
+            Some(&fixture.sha256),
+            512 * 1024 * 1024,
+        )?;
+        #[cfg(windows)]
+        let fixture_bytes = fixture_held.bytes.as_slice();
+        #[cfg(not(windows))]
+        let fixture_bytes_owned = files::read_file(&fixture.path)?;
+        #[cfg(not(windows))]
+        let fixture_bytes = fixture_bytes_owned.as_slice();
+        target::validate_executable(fixture_bytes, &distribution.target)?;
+        if files::checksum(fixture_bytes) != fixture.sha256 {
             return Err(CiError::Message(
                 "selected native fixture bytes changed".into(),
             ));
         }
+        let fixture_manifest_inventory = crate::windows_pe_manifest::inventory(fixture_bytes);
         for artifact in &artifacts {
             if files::checksum(&files::read_file(&artifact.path)?) != artifact.sha256 {
                 return Err(CiError::Message(
@@ -648,6 +671,7 @@ impl InstalledWindowsPayload {
             components,
             installed_components,
             fixture,
+            fixture_manifest_inventory,
             provider: manifest_provider,
             output_directory,
         })
@@ -1644,6 +1668,13 @@ mod native {
         }
         fs::create_dir_all(&config.output_directory)?;
         verify_selected(config)?;
+        crate::windows_fixture_inventory::publish_to(
+            &config.fixture_inventory_input(),
+            &config
+                .output_directory
+                .join(crate::windows_fixture_inventory::REPORT_NAME),
+            deadlines.work,
+        )?;
         if memcordon_testkit::windows_available_memory_bytes()? < 4 * 1024 * 1024 * 1024 {
             return Err(CiError::Message(
                 "selected Windows installed fixture requires 4 GiB available memory".to_owned(),

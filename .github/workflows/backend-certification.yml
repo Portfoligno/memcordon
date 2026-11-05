@@ -2893,6 +2893,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
@@ -3307,6 +3308,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact

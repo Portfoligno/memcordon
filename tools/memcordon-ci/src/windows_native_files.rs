@@ -10,6 +10,14 @@ pub struct HeldWindowsArtifact {
     _ancestors: Vec<std::fs::File>,
 }
 
+#[cfg(windows)]
+impl HeldWindowsArtifact {
+    /// Query the same continuously held regular file, not a fresh path identity.
+    pub fn identity(&self, path: &Path) -> std::io::Result<(u32, u64)> {
+        native_file_identity(&self._file, false, path)
+    }
+}
+
 /// Compare the named leaf and every retained directory to the original native
 /// handles; equal bytes alone do not authorize replacement of a custody record.
 #[cfg(windows)]

@@ -119,6 +119,9 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
     paths.push(format!(
         "{prefix}/windows-installed/W-JOINT/restricted/result.loader-fileio.json"
     ));
+    paths.push(format!(
+        "{prefix}/windows-installed/fixture-manifest-inventory.json"
+    ));
     paths
 }
 
