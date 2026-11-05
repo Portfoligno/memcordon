@@ -706,7 +706,7 @@ unsafe fn callback_inner(raw: *mut EVENT_RECORD) {
     let opcode = header.EventDescriptor.Opcode;
     collector.received(opcode);
     let decoded = (|| -> Decoded<()> {
-        if header.EventDescriptor.Version != 2 {
+        if !matches!(header.EventDescriptor.Version, 2 | 3) {
             return Err(NativeRejection::new(RejectStage::EventVersion, None));
         }
         let shape = schema(event)?;
