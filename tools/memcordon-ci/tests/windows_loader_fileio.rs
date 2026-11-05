@@ -20,10 +20,11 @@ fn spec() -> ConsumerSpec {
 fn output(spec: &ConsumerSpec) -> Vec<u8> {
     let ready = json!({"format":"memcordon.fileio-consumer-ready","version":1,"ready":true,"error":null,"spec":spec});
     let observation = Observation {
-        version: 2,
+        version: 3,
         spec: spec.clone(),
         rows: vec![],
         counters: Counters::default(),
+        history: Default::default(),
         decode: Default::default(),
         process_trace_status: 0,
         close_trace_status: 0,

@@ -428,6 +428,31 @@ pub struct Counters {
     pub reversed: u64,
     pub unmatched: u64,
 }
+/// Bounded accounting over the entire decoded callback stream, including
+/// events whose rows cannot be retained. This is not a global ETW order claim.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct History {
+    pub decoded_events: u64,
+    pub maximum_qpc: u64,
+    pub timestamp_regression: bool,
+    pub dropped_creates: u64,
+    pub earliest_dropped_create_qpc: Option<u64>,
+}
+impl History {
+    fn record(&mut self, qpc: u64) {
+        self.decoded_events = self.decoded_events.saturating_add(1);
+        self.timestamp_regression |= qpc == 0 || qpc < self.maximum_qpc;
+        self.maximum_qpc = self.maximum_qpc.max(qpc);
+    }
+    fn dropped(&mut self, qpc: u64) {
+        self.dropped_creates = self.dropped_creates.saturating_add(1);
+        self.earliest_dropped_create_qpc = Some(
+            self.earliest_dropped_create_qpc
+                .map_or(qpc, |previous| previous.min(qpc)),
+        );
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
@@ -435,6 +460,7 @@ pub struct Observation {
     pub spec: ConsumerSpec,
     pub rows: Vec<Row>,
     pub counters: Counters,
+    pub history: History,
     pub decode: DecodeDiagnostics,
     pub process_trace_status: u32,
     pub close_trace_status: u32,
@@ -444,8 +470,25 @@ pub struct Observation {
 impl Observation {
     pub fn validate(&self) -> Result<(), String> {
         self.spec.validate()?;
-        if self.version != 2 || self.rows.len() > MAX_ROWS {
+        if self.version != 3 || self.rows.len() > MAX_ROWS {
             return Err("FileIo record bound/version differs".into());
+        }
+        let history = &self.history;
+        let retained_events = self.rows.iter().fold(0u64, |count, row| {
+            count.saturating_add(1 + u64::from(row.completion.is_some()))
+        });
+        if history.decoded_events != self.counters.seen
+            || history.dropped_creates != self.counters.overflow
+            || (history.decoded_events == 0) != (history.maximum_qpc == 0)
+            || history.maximum_qpc > self.spec.binding.cutoff_qpc
+            || (history.dropped_creates == 0) != history.earliest_dropped_create_qpc.is_none()
+            || history.dropped_creates > history.decoded_events
+            || retained_events.saturating_add(history.dropped_creates) > history.decoded_events
+            || history
+                .earliest_dropped_create_qpc
+                .is_some_and(|qpc| qpc == 0 || qpc > history.maximum_qpc)
+        {
+            return Err("FileIo decoded history differs from retention counters".into());
         }
         self.decode.validate()?;
         if self.counters.unsupported
@@ -468,12 +511,14 @@ impl Observation {
                 || (!create.path_truncated
                     && create.path_prefix.len() != create.path_units as usize)
                 || create.qpc > self.spec.binding.cutoff_qpc
+                || create.qpc > history.maximum_qpc
                 || create.path_units > 32767
                 || create.path_sha256.is_none()
                 || row.completion.as_ref().is_some_and(|end| {
                     end.irp != create.irp
                         || end.qpc == 0
                         || end.qpc > self.spec.binding.cutoff_qpc
+                        || end.qpc > history.maximum_qpc
                         || (end.qpc < create.qpc && !row.ambiguous)
                 })
             {
@@ -502,10 +547,11 @@ impl Collector {
         spec.validate()?;
         Ok(Self {
             observation: Observation {
-                version: 2,
+                version: 3,
                 spec,
                 rows: vec![],
                 counters: Counters::default(),
+                history: History::default(),
                 decode: DecodeDiagnostics::default(),
                 process_trace_status: 0,
                 close_trace_status: 0,
@@ -593,6 +639,7 @@ impl Collector {
         decode.bound();
     }
     pub fn create(&mut self, create: Create) {
+        self.observation.history.record(create.qpc);
         let counters = &mut self.observation.counters;
         counters.seen = counters.seen.saturating_add(1);
         if create.header_pid != self.observation.spec.pid
@@ -605,6 +652,21 @@ impl Collector {
             counters.malformed = counters.malformed.saturating_add(1);
             return;
         }
+        let mut ambiguous = false;
+        for row in &mut self.observation.rows {
+            if row.create.irp == create.irp
+                && row
+                    .completion
+                    .as_ref()
+                    .is_some_and(|end| end.qpc == create.qpc)
+            {
+                row.ambiguous = true;
+                ambiguous = true;
+            }
+        }
+        if ambiguous {
+            counters.ambiguous = counters.ambiguous.saturating_add(1);
+        }
         if let Some(old) = self.pending.get_mut(&create.irp) {
             if let Some(index) = old.take() {
                 self.observation.rows[index].ambiguous = true;
@@ -614,6 +676,7 @@ impl Collector {
         }
         if self.pending.len() == MAX_PENDING || self.observation.rows.len() == MAX_ROWS {
             counters.overflow = counters.overflow.saturating_add(1);
+            self.observation.history.dropped(create.qpc);
             return;
         }
         let index = self.observation.rows.len();
@@ -621,11 +684,28 @@ impl Collector {
         self.observation.rows.push(Row {
             create,
             completion: None,
-            ambiguous: false,
+            ambiguous,
         });
     }
     pub fn completion(&mut self, end: Completion) {
+        self.observation.history.record(end.qpc);
         self.observation.counters.seen = self.observation.counters.seen.saturating_add(1);
+        let mut ambiguous = false;
+        for row in &mut self.observation.rows {
+            if row.create.irp == end.irp
+                && row
+                    .completion
+                    .as_ref()
+                    .is_some_and(|prior| prior.qpc == end.qpc)
+            {
+                row.ambiguous = true;
+                ambiguous = true;
+            }
+        }
+        if ambiguous {
+            self.observation.counters.ambiguous =
+                self.observation.counters.ambiguous.saturating_add(1);
+        }
         if self.pending.get(&end.irp).is_some_and(Option::is_none) {
             self.observation.counters.ambiguous =
                 self.observation.counters.ambiguous.saturating_add(1);
@@ -639,6 +719,12 @@ impl Collector {
             return;
         };
         let row = &mut self.observation.rows[index];
+        row.ambiguous |= ambiguous;
+        if end.qpc == row.create.qpc {
+            row.ambiguous = true;
+            self.observation.counters.ambiguous =
+                self.observation.counters.ambiguous.saturating_add(1);
+        }
         if end.qpc < row.create.qpc {
             row.ambiguous = true;
             self.observation.counters.reversed =
@@ -670,7 +756,7 @@ pub fn correlate(
         && !observation.cutoff_reached
         && observation.process_trace_status == 0
         && observation.close_trace_status == 0
-        && observation.counters.overflow == 0
+        && !observation.history.timestamp_regression
         && observation.counters.malformed == 0
         && observation.counters.unsupported == 0;
     let mut rows = if valid {
@@ -679,15 +765,18 @@ pub fn correlate(
             &&window.started_qpc!=0&&window.started_qpc<=window.finished_qpc&&window.finished_qpc<=binding.cutoff_qpc
             &&row.create.ttid==original_thread&&row.create.qpc>=window.started_qpc
             &&row.completion.as_ref().is_some_and(|end|end.qpc>=row.create.qpc&&end.qpc<=window.finished_qpc)).collect::<Vec<_>>();
-        let attributed=complete&&!row.ambiguous&&row.create.irp!=0&&matched.len()==1;
-        json!({"create":row.create,"completion":row.completion,"ambiguous":row.ambiguous,"temporal_original_call_association":attributed,"window":if attributed{Some(matched[0])}else{None},"observed_failed_create":attributed&&row.completion.as_ref().is_some_and(|end|end.ntstatus<0),"denied_object_proved":false})
+        let prefix = matched.len()==1 && (observation.counters.overflow==0
+            || observation.history.earliest_dropped_create_qpc.is_some_and(|frontier|matched[0].finished_qpc<frontier));
+        let strict_pair = row.completion.as_ref().is_some_and(|end| row.create.qpc<end.qpc);
+        let attributed=complete&&prefix&&strict_pair&&!row.ambiguous&&row.create.irp!=0&&matched.len()==1;
+        json!({"create":row.create,"completion":row.completion,"ambiguous":row.ambiguous,"temporal_original_call_association":attributed,"association_scope":if attributed{Some(if observation.counters.overflow==0{"retained-decoded-history"}else{"retained-prefix-before-first-dropped-create"})}else{None},"capacity_truncation_blocks_window":matched.len()==1&&!prefix,"window":if attributed{Some(matched[0])}else{None},"observed_failed_create":attributed&&row.completion.as_ref().is_some_and(|end|end.ntstatus<0),"denied_object_proved":false})
     }).collect::<Vec<_>>()
     } else {
         vec![]
     };
     // Keep the first associated failed create when bounded output omits later rows.
     rows.sort_by_key(|row| !row["observed_failed_create"].as_bool().unwrap_or(false));
-    let mut result = json!({"format":"memcordon.loader-fileio-observation","revision":2,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"valid_binding_and_record":valid,"consumer_side_header_pid_filter":true,"header_pid_may_miss_requestor_context":true,"absence_proves_no_file_activity":false,"counters":observation.counters,"decode":decode_diagnostic(&observation.decode),"unsupported_history_prevents_association":observation.counters.unsupported!=0,"process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,"consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,"rows":rows,"rows_omitted":0});
+    let mut result = json!({"format":"memcordon.loader-fileio-observation","revision":3,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"valid_binding_and_record":valid,"consumer_side_header_pid_filter":true,"header_pid_may_miss_requestor_context":true,"absence_proves_no_file_activity":false,"counters":observation.counters,"history":observation.history,"capacity_truncated":observation.counters.overflow!=0,"timestamp_regression_prevents_association":observation.history.timestamp_regression,"decode":decode_diagnostic(&observation.decode),"unsupported_history_prevents_association":observation.counters.unsupported!=0,"process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,"consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,"rows":rows,"rows_omitted":0});
     let mut omitted = 0;
     while serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > CORRELATION_BYTES) {
         let Some(rows) = result["rows"].as_array_mut() else {
