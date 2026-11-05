@@ -623,7 +623,16 @@ fn run_command_exit_grace_allows_remaining_workload_to_drain_naturally() -> Case
         .arg("--completion-marker")
         .arg(&completion_marker);
 
-    let output = completed(&mut invocation, Duration::from_secs(4));
+    let harness_guard = memcordon_testkit::harness_budget::sum(&[
+        Duration::from_secs(5), // Product startup.
+        Duration::from_secs(2), // Prompt root-exit observation.
+        Duration::from_secs(2), // Requested command-exit grace.
+        Duration::from_secs(3), // Retirement.
+        Duration::from_secs(1), // Result delivery.
+        Duration::from_secs(1), // Harness observation margin.
+    ])
+    .expect("natural command-exit grace phases must fit the harness guard");
+    let output = completed(&mut invocation, harness_guard);
     assert_eq!(
         output.status.code(),
         Some(37),
@@ -697,7 +706,21 @@ fn run_command_exit_grace_force_cleans_survivors_after_expiry() -> CaseRun {
         .arg("--completion-marker")
         .arg(&completion_marker);
 
-    let output = completed(&mut invocation, Duration::from_secs(4));
+    let root_exit_and_grace = memcordon_testkit::harness_budget::sum(&[
+        Duration::from_secs(2),     // Prompt root-exit observation.
+        Duration::from_millis(100), // Requested command-exit grace.
+    ])
+    .expect("root-exit observation and grace must fit the harness guard");
+    let harness_guard = memcordon_testkit::harness_budget::natural_root_guard(
+        Duration::from_secs(5), // Product startup.
+        root_exit_and_grace,
+        Duration::from_secs(3),  // Retirement.
+        Duration::from_secs(1),  // Result delivery.
+        Duration::from_secs(1),  // Harness observation margin.
+        Duration::from_secs(30), // Descendant must not finish naturally.
+    )
+    .expect("forced command-exit grace guard must precede natural descendant exit");
+    let output = completed(&mut invocation, harness_guard);
     assert_eq!(output.status.code(), Some(37));
     assert_stdout_empty(&output);
     assert!(!completion_marker.exists(), "survivor completed naturally");
