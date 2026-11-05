@@ -34,7 +34,56 @@ fn node_14() -> Value {
     values.insert(text("windows-fixture-feedback"), node_1036());
     values.insert(text("windows-sealed-agent-contracts"), node_1060());
     values.insert(text("windows-fixture-native"), node_1084());
+    values.insert(
+        text("windows-access-failure-calibration"),
+        access_failure_calibration(),
+    );
     Value::Mapping(values)
+}
+
+fn access_failure_calibration() -> Value {
+    // Reuse only the existing independently owned driver bootstrap/cache prefix.
+    // Do not wait for fixture compilation, installed payloads or consumer jobs.
+    let mut job = node_1084();
+    job["name"] = text("Windows access-failure calibration / ${{ matrix.id }}");
+    let mut steps = node_1090()
+        .as_sequence()
+        .expect("fixture bootstrap steps")
+        .iter()
+        .take_while(|step| step["id"].as_str() != Some("windows-fixture-native-request"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut collect = serde_yaml::Mapping::new();
+    collect.insert(
+        text("name"),
+        text("Collect isolated ordinary RC access-failure feasibility"),
+    );
+    collect.insert(text("id"), text("access-failure-calibration"));
+    collect.insert(text("run"),text("./target/ci-runtime/current/memcordon-ci.exe ci access-failure-probe --output target/ci/reports/access-failure-calibration.json"));
+    collect.insert(text("timeout-minutes"), Value::Number(3.into()));
+    steps.push(Value::Mapping(collect));
+    let mut upload = serde_yaml::Mapping::new();
+    upload.insert(
+        text("name"),
+        text("Retain bounded access-failure calibration"),
+    );
+    upload.insert(text("if"), text("always()"));
+    upload.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    upload.insert(text("timeout-minutes"), Value::Number(2.into()));
+    let mut with = serde_yaml::Mapping::new();
+    with.insert(
+        text("name"),
+        text("windows-access-failure-calibration-${{ matrix.id }}"),
+    );
+    with.insert(
+        text("path"),
+        text("target/ci/reports/access-failure-calibration.json"),
+    );
+    with.insert(text("if-no-files-found"), text("warn"));
+    upload.insert(text("with"), Value::Mapping(with));
+    steps.push(Value::Mapping(upload));
+    job["steps"] = Value::Sequence(steps);
+    job
 }
 
 fn node_1084() -> Value {

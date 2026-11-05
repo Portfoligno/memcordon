@@ -1,6 +1,12 @@
 //! Native containment used only by black-box process tests.
 
 #[cfg(windows)]
+#[path = "windows_access_failure.rs"]
+pub mod windows_access_failure;
+#[cfg(windows)]
+#[path = "windows_access_failure_probe.rs"]
+pub mod windows_access_failure_probe;
+#[cfg(windows)]
 #[path = "windows_fileio.rs"]
 pub mod windows_fileio;
 #[cfg(windows)]

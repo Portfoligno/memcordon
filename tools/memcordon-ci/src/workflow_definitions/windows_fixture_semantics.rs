@@ -5,6 +5,7 @@ use serde_yaml::Value;
 use std::collections::BTreeSet;
 
 pub(super) fn validate(document: &Value) -> Result<()> {
+    validate_access_calibration(document)?;
     let job = &document["jobs"]["windows-fixture-native"];
     required(job)?;
     if !job.is_mapping()
@@ -106,6 +107,49 @@ pub(super) fn validate(document: &Value) -> Result<()> {
                 "workspace native compilation must precede execution",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_access_calibration(document: &Value) -> Result<()> {
+    let job = &document["jobs"]["windows-access-failure-calibration"];
+    required(job)?;
+    if !job["needs"].is_null()
+        || job["strategy"] != document["jobs"]["windows-fixture-native"]["strategy"]
+        || job["runs-on"] != "${{ matrix.runner }}"
+    {
+        return Err(reject(
+            "access-failure calibration must be independent on both Windows hosts",
+        ));
+    }
+    let steps = job["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("access calibration steps absent"))?;
+    let collect = steps
+        .iter()
+        .filter(|step| field(step, "id") == "access-failure-calibration")
+        .collect::<Vec<_>>();
+    if collect.len() != 1
+        || field(collect[0], "run")
+            != "./target/ci-runtime/current/memcordon-ci.exe ci access-failure-probe --output target/ci/reports/access-failure-calibration.json"
+        || collect[0]["timeout-minutes"].as_u64() != Some(3)
+        || steps
+            .iter()
+            .any(|step| field(step, "id").starts_with("windows-fixture-native"))
+    {
+        return Err(reject(
+            "access calibration must not wait for unrelated fixture or installed work",
+        ));
+    }
+    required(collect[0])?;
+    if !steps.iter().any(|step| {
+        field(step, "uses") == "./.github/actions/upload-artifact"
+            && field(step, "if") == "always()"
+            && step["with"]["path"] == "target/ci/reports/access-failure-calibration.json"
+    }) {
+        return Err(reject(
+            "access calibration requires only its finite independent report",
+        ));
     }
     Ok(())
 }

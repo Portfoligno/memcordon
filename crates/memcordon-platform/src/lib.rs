@@ -38,6 +38,9 @@ mod macos_result_frame;
 pub mod startup_cleanup_observation;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub mod windows_access_failure_record;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub mod windows_fileio_record;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
@@ -59,7 +62,7 @@ pub use macos_launch::LaunchRuntime as MacosLaunchRuntime;
 #[cfg(target_os = "macos")]
 pub use macos_result_delivery::{
     DeliveryLimits, DeliveryObservation, DeliveryOutcome, DeliveryRequest, DeliveryStage,
-    MacosDeliveryRuntime, WriterImage,
+    MacosDeliveryRuntime, ObservationProvenance, WriterImage,
 };
 #[cfg(target_os = "macos")]
 #[doc(hidden)]

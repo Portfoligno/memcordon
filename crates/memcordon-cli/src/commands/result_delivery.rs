@@ -12,11 +12,17 @@ use std::time::Duration;
 #[cfg(feature = "test-fixtures")]
 use memcordon_core::MemcordonReport;
 use memcordon_core::ResultReport;
-use serde::Serialize;
+#[cfg(feature = "test-fixtures")]
+#[path = "result_delivery_evidence.rs"]
+mod evidence;
+#[cfg(feature = "test-fixtures")]
+use evidence::{EvidenceOutcome, WriterPhase};
 
+#[cfg(feature = "test-fixtures")]
+use memcordon_platform::DeliveryObservation;
 use memcordon_platform::{
-    DeliveryLimits, DeliveryObservation, DeliveryOutcome, DeliveryRequest,
-    DeliveryStage as FailureStage, MacosDeliveryRuntime, WriterImage,
+    DeliveryLimits, DeliveryOutcome, DeliveryRequest, DeliveryStage as FailureStage,
+    MacosDeliveryRuntime, WriterImage,
 };
 
 #[cfg(feature = "test-fixtures")]
@@ -24,21 +30,6 @@ static EVIDENCE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 
 #[cfg(feature = "test-fixtures")]
 static WRITER_OBSERVED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(feature = "test-fixtures")]
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-enum WriterPhase {
-    Entered = 1,
-    PayloadRead,
-    PayloadDecoded,
-    BeforeWrite,
-    BeforeRename,
-    BeforeAck,
-    Diagnostics,
-    Complete,
-}
 
 #[cfg(feature = "test-fixtures")]
 fn writer_phase(phase: WriterPhase) {
@@ -49,17 +40,6 @@ fn writer_phase(phase: WriterPhase) {
             libc::write(libc::STDOUT_FILENO, (&raw const byte).cast(), 1);
         }
     }
-}
-
-#[cfg(feature = "test-fixtures")]
-#[derive(Serialize)]
-struct WriterObservation {
-    // Best-effort prefix only: an unresolved writer or dropped nonblocking
-    // publication can have advanced beyond the last retained phase.
-    phases: Vec<WriterPhase>,
-    os_error: Option<i32>,
-    malformed: bool,
-    truncated: bool,
 }
 
 /// Explicit test-only telemetry channel: never stderr or a filesystem sink.
@@ -92,35 +72,28 @@ fn failed_observed(
     stage: FailureStage,
     error: Option<&io::Error>,
     exit_code: Option<i32>,
-    #[cfg(feature = "test-fixtures")] writer: Option<WriterObservation>,
+    #[cfg(feature = "test-fixtures")] outcome: EvidenceOutcome,
+    #[cfg(feature = "test-fixtures")] observation: Option<DeliveryObservation>,
 ) -> bool {
     #[cfg(feature = "test-fixtures")]
     {
-        #[derive(Serialize)]
-        struct Evidence {
-            schema: u32,
-            stage: FailureStage,
-            os_error: Option<i32>,
-            writer_exit_code: Option<i32>,
-            writer: Option<WriterObservation>,
-        }
         let descriptor = EVIDENCE_FD.load(Ordering::Acquire);
-        if descriptor >= 3 {
-            let evidence = Evidence {
-                schema: 1,
-                stage,
-                os_error: error.and_then(io::Error::raw_os_error),
-                writer_exit_code: exit_code,
-                writer,
-            };
-            if let Ok(mut bytes) = serde_json::to_vec(&evidence) {
-                bytes.push(b'\n');
-                // A single best-effort nonblocking write: no retry, flush or
-                // fallback to stderr. A full channel cannot delay CLI return.
-                unsafe { libc::write(descriptor, bytes.as_ptr().cast(), bytes.len()) };
-            }
+        if descriptor < 3 {
+            return false;
+        }
+        if let Ok(bytes) = evidence::encode(
+            outcome,
+            stage,
+            error.and_then(io::Error::raw_os_error),
+            observation,
+        ) {
+            // A single best-effort nonblocking write: no retry, flush or
+            // fallback to stderr. A full channel cannot delay CLI return.
+            unsafe { libc::write(descriptor, bytes.as_ptr().cast(), bytes.len()) };
         }
     }
+    #[cfg(feature = "test-fixtures")]
+    let _ = exit_code;
     #[cfg(not(feature = "test-fixtures"))]
     let _ = (stage, error, exit_code);
     false
@@ -133,6 +106,8 @@ pub(super) fn runtime_initialization_failed(error: &io::Error) {
         FailureStage::OwnerThread,
         Some(error),
         None,
+        #[cfg(feature = "test-fixtures")]
+        EvidenceOutcome::InitializationFailed,
         #[cfg(feature = "test-fixtures")]
         None,
     );
@@ -185,14 +160,11 @@ fn deliver_inner(
             None,
             None,
             #[cfg(feature = "test-fixtures")]
+            EvidenceOutcome::Busy,
+            #[cfg(feature = "test-fixtures")]
             None,
         ),
         DeliveryOutcome::Failed {
-            stage,
-            error,
-            observation,
-        }
-        | DeliveryOutcome::Uncertain {
             stage,
             error,
             observation,
@@ -201,31 +173,23 @@ fn deliver_inner(
             error.as_ref(),
             observation.exit_code,
             #[cfg(feature = "test-fixtures")]
-            Some(writer_observation(observation)),
+            EvidenceOutcome::Failed,
+            #[cfg(feature = "test-fixtures")]
+            Some(observation),
         ),
-    }
-}
-
-#[cfg(feature = "test-fixtures")]
-fn writer_observation(observation: DeliveryObservation) -> WriterObservation {
-    WriterObservation {
-        phases: observation.writer_phases[..observation.writer_phase_count]
-            .iter()
-            .filter_map(|phase| match phase {
-                1 => Some(WriterPhase::Entered),
-                2 => Some(WriterPhase::PayloadRead),
-                3 => Some(WriterPhase::PayloadDecoded),
-                4 => Some(WriterPhase::BeforeWrite),
-                5 => Some(WriterPhase::BeforeRename),
-                6 => Some(WriterPhase::BeforeAck),
-                7 => Some(WriterPhase::Diagnostics),
-                8 => Some(WriterPhase::Complete),
-                _ => None,
-            })
-            .collect(),
-        os_error: observation.writer_phase_error,
-        malformed: observation.writer_phase_malformed,
-        truncated: observation.writer_phase_truncated,
+        DeliveryOutcome::Uncertain {
+            stage,
+            error,
+            observation,
+        } => failed_observed(
+            stage,
+            error.as_ref(),
+            observation.exit_code,
+            #[cfg(feature = "test-fixtures")]
+            EvidenceOutcome::Uncertain,
+            #[cfg(feature = "test-fixtures")]
+            Some(observation),
+        ),
     }
 }
 

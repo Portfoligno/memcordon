@@ -21,6 +21,12 @@ struct Cli {
 enum TopLevel {
     #[cfg(windows)]
     #[command(hide = true)]
+    AccessFailureConsumer,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    AccessFailureCalibration,
+    #[cfg(windows)]
+    #[command(hide = true)]
     LoaderFileioConsumer,
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
@@ -75,6 +81,11 @@ enum TopLevel {
 
 #[derive(Subcommand)]
 enum CiCommand {
+    #[cfg(windows)]
+    AccessFailureProbe {
+        #[arg(long)]
+        output: PathBuf,
+    },
     Workflows {
         #[arg(long, conflicts_with = "write", required_unless_present = "write")]
         check: bool,
@@ -255,6 +266,24 @@ mod standalone_dispatch_tests;
 fn run() -> Result<()> {
     let cli = Cli::parse();
     #[cfg(windows)]
+    match &cli.command {
+        Some(TopLevel::AccessFailureConsumer) => {
+            return memcordon_ci::windows_access_failure_probe::consumer_stdio()
+                .map_err(CiError::from);
+        }
+        Some(TopLevel::AccessFailureCalibration) => {
+            return memcordon_ci::windows_access_failure_probe::calibration_stdio()
+                .map_err(CiError::from);
+        }
+        Some(TopLevel::Ci {
+            command: CiCommand::AccessFailureProbe { output },
+        }) => {
+            return memcordon_ci::windows_access_failure_probe::collect(output)
+                .map_err(CiError::from);
+        }
+        _ => {}
+    }
+    #[cfg(windows)]
     if matches!(&cli.command, Some(TopLevel::LoaderFileioConsumer)) {
         // The consumer is a separately owned helper, not a workflow command.
         return memcordon_ci::windows_loader_fileio::consume_stdio().map_err(CiError::from);
@@ -294,7 +323,11 @@ fn run() -> Result<()> {
     let root = command_root(&current, &cli.command, workspace_root)?;
     let result = (|| match cli.command {
         #[cfg(windows)]
-        Some(TopLevel::LoaderFileioConsumer) => {
+        Some(
+            TopLevel::LoaderFileioConsumer
+            | TopLevel::AccessFailureConsumer
+            | TopLevel::AccessFailureCalibration,
+        ) => {
             unreachable!("helper dispatched before workflow setup")
         }
         #[cfg(target_os = "linux")]
@@ -306,6 +339,10 @@ fn run() -> Result<()> {
             memcordon_ci::linux_snapshot_probe::run(&input, &output)
         }
         Some(TopLevel::Ci { command }) => match command {
+            #[cfg(windows)]
+            CiCommand::AccessFailureProbe { .. } => {
+                unreachable!("calibration dispatched before workflow setup")
+            }
             CiCommand::Workflows { check: _, write } => {
                 memcordon_ci::workflow_definitions::run(&root, write)
             }
