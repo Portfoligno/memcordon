@@ -272,7 +272,7 @@ pub(crate) fn native_file_identity(
 }
 
 #[cfg(windows)]
-fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
+pub(crate) fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,

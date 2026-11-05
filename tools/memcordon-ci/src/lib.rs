@@ -20,6 +20,8 @@ pub mod linux_transaction_trace;
 pub mod snapshot_copy_contract;
 pub mod storage_observation;
 
+pub mod windows_component_diagnostics;
+pub mod windows_component_retention;
 pub mod windows_listener_wait;
 pub mod windows_loader_fileio;
 pub mod windows_original_gate_failure;

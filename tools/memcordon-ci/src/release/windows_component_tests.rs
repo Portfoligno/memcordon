@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn run(root: &Path, work: Instant, cleanup: Instant) -> Result<()> {
+pub fn run(root: &Path, diagnostics: &Path, work: Instant, cleanup: Instant) -> Result<()> {
     let selected = BuildSourceIdentity::working(root)?;
     let host = distribution::native_target()?;
     let distribution = distribution::Distribution::read(root)?
@@ -163,9 +163,41 @@ pub fn run(root: &Path, work: Instant, cleanup: Instant) -> Result<()> {
         &installed,
         destination.join("cases"),
     )?;
-    crate::windows_installed_cases::run_components_from_source_until(
-        root,
-        &config,
-        crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?,
+    let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;
+    let selectors = crate::windows_readiness_components::fault_selectors()
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, fault)| {
+            (
+                format!("fault-{ordinal}"),
+                serde_json::json!({"kind":"fault","fault":fault}),
+            )
+        })
+        .chain(
+            crate::windows_readiness_components::envelope_mutants()
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, mutant)| {
+                    (
+                        format!("mutant-{ordinal}"),
+                        serde_json::json!({"kind":"mutant","mutant":mutant}),
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+    crate::windows_component_retention::after(
+        || {
+            crate::windows_installed_cases::run_components_from_source_until(
+                root, &config, deadlines,
+            )
+        },
+        || {
+            crate::windows_component_retention::export(
+                &config.output_directory.join("native-components"),
+                &root.join(diagnostics).join("windows-components"),
+                &selectors,
+                cleanup,
+            )
+        },
     )
 }
