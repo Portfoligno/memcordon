@@ -297,14 +297,21 @@ fn summary(packet: &record::Packet) -> serde_json::Value {
         7 => "WSACleanup",
         _ => "unobserved",
     };
-    serde_json::json!({"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,
+    let mut value = serde_json::json!({"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,
+        "packet_version":packet.version,"original_thread":packet.original_thread,"frequency":packet.frequency,"cutoff_qpc":packet.cutoff_qpc,
         "called":packet.called,"aggregate_outcome":packet.callback_outcome,"aggregate_raw_error":(packet.callback_raw_error_present==1).then_some(packet.callback_raw_error),
         "setup_stage":packet.setup_stage,"setup_error":packet.setup_error,"installed_mask":packet.published_mask,"entered_mask":packet.entered_mask,"returned_mask":packet.returned_mask,
         "calls":packet.total_calls,"failures":packet.total_failures,"dropped":packet.dropped,"overflow":packet.overflow,"incomplete":packet.incomplete,
         "returned_module":{"selected":packet.returned_module.selected,"armed":packet.returned_module.armed,"setup_stage":packet.returned_module.setup_stage,"setup_error":packet.returned_module.setup_error,"setup_reason":packet.returned_module.setup_reason,"calls":packet.returned_module.dependencies.total_calls,"failures":packet.returned_module.dependencies.total_failures,"incomplete":packet.returned_module.incomplete},
         "loader_owner":{"selected":packet.loader_owner.selected,"armed":packet.loader_owner.armed,"setup_stage":packet.loader_owner.setup_stage,"setup_error":packet.loader_owner.setup_error,"setup_reason":packet.loader_owner.setup_reason,"calls":packet.loader_owner.dependencies.total_calls,"failures":packet.loader_owner.dependencies.total_failures,"incomplete":packet.loader_owner.incomplete,"scope":"verified original LoadLibraryExW owner normal imports during the original call only","acceptance_authority":false},
         "first_observed_failure":{"present":packet.first_failure_present,"operation":name,"result":first.result,"domain":first.error_domain,"win32_error":first.outgoing_win32,"wsa_error":first.outgoing_wsa},
-        "first_observed_failure_is_decisive_cause":false,"full_record":"listener-call-trace.json"})
+        "first_observed_failure_is_decisive_cause":false,"full_record":"listener-call-trace.json"});
+    let timing = record::loader_window_summary(packet);
+    value["loader_owner"]
+        .as_object_mut()
+        .expect("loader summary object")
+        .extend(timing.as_object().expect("loader timing object").clone());
+    value
 }
 
 pub fn bind(context: Option<&Context<'_>>) -> io::Result<TcpListener> {

@@ -73,6 +73,10 @@ struct ListenerLoaderLink {
     uint64_t dependency_sequence,timeline_sequence,parent_listener_sequence;
     uint64_t loader_dependency_sequence,loader_timeline_sequence;
 };
+struct ListenerLoaderWindow {
+    uint64_t dependency_sequence,loader_dependency_sequence;
+    uint64_t parent_listener_sequence,started_qpc,finished_qpc;
+};
 struct ListenerLoaderOwner {
     uint32_t version,setup_stage,setup_error,setup_reason;
     uint32_t selected,armed,scope_flags,incomplete;
@@ -80,6 +84,8 @@ struct ListenerLoaderOwner {
     uint64_t loader_target,owner_base;
     WsaPacket dependencies;
     ListenerLoaderLink first_failure_link,links[16];
+    uint32_t window_count,windows_dropped,first_failure_window_present,windows_invalid;
+    ListenerLoaderWindow first_failure_window,windows[16];
 };
 struct ListenerPacket {
     uint32_t version,setup_stage,setup_error,setup_reason;
@@ -113,5 +119,6 @@ static_assert(sizeof(ListenerEntry)==176 && offsetof(ListenerEntry,completion_se
 static_assert(sizeof(ListenerDependencyLink)==24,"listener dependency link ABI v1");
 static_assert(sizeof(ListenerReturnedModule)==12136 && offsetof(ListenerReturnedModule,dependencies)==80 && offsetof(ListenerReturnedModule,first_failure_link)==11728 && offsetof(ListenerReturnedModule,links)==11752,"listener returned module ABI v1");
 static_assert(sizeof(ListenerLoaderLink)==40,"listener loader link ABI v1");
-static_assert(sizeof(ListenerLoaderOwner)==12392 && offsetof(ListenerLoaderOwner,dependencies)==64 && offsetof(ListenerLoaderOwner,first_failure_link)==11712 && offsetof(ListenerLoaderOwner,links)==11752,"listener loader owner ABI v1");
-static_assert(sizeof(ListenerPacket)==40744 && offsetof(ListenerPacket,owner)==208 && offsetof(ListenerPacket,slots)==400 && offsetof(ListenerPacket,first_failure)==1168 && offsetof(ListenerPacket,entries)==1344 && offsetof(ListenerPacket,first_dependency_failure_link)==4160 && offsetof(ListenerPacket,dependency_links)==4184 && offsetof(ListenerPacket,dependencies)==4568 && offsetof(ListenerPacket,returned_module)==16216 && offsetof(ListenerPacket,loader_owner)==28352,"listener packet ABI v3");
+static_assert(sizeof(ListenerLoaderWindow)==40,"listener loader window ABI v1");
+static_assert(sizeof(ListenerLoaderOwner)==13088 && offsetof(ListenerLoaderOwner,dependencies)==64 && offsetof(ListenerLoaderOwner,first_failure_link)==11712 && offsetof(ListenerLoaderOwner,links)==11752 && offsetof(ListenerLoaderOwner,window_count)==12392 && offsetof(ListenerLoaderOwner,first_failure_window)==12408 && offsetof(ListenerLoaderOwner,windows)==12448,"listener loader owner ABI v2");
+static_assert(sizeof(ListenerPacket)==41440 && offsetof(ListenerPacket,owner)==208 && offsetof(ListenerPacket,slots)==400 && offsetof(ListenerPacket,first_failure)==1168 && offsetof(ListenerPacket,entries)==1344 && offsetof(ListenerPacket,first_dependency_failure_link)==4160 && offsetof(ListenerPacket,dependency_links)==4184 && offsetof(ListenerPacket,dependencies)==4568 && offsetof(ListenerPacket,returned_module)==16216 && offsetof(ListenerPacket,loader_owner)==28352 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,window_count)==40744 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,first_failure_window)==40760 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,windows)==40800,"listener packet ABI v4");

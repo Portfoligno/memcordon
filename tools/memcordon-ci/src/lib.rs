@@ -21,6 +21,7 @@ pub mod snapshot_copy_contract;
 pub mod storage_observation;
 
 pub mod windows_listener_wait;
+pub mod windows_loader_fileio;
 pub mod windows_original_gate_failure;
 pub mod windows_status_streams;
 

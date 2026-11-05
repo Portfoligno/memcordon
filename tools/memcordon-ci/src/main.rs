@@ -19,6 +19,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    LoaderFileioConsumer,
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     CurrentLinuxOwnerProbe {
@@ -251,6 +254,11 @@ mod standalone_dispatch_tests;
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if matches!(&cli.command, Some(TopLevel::LoaderFileioConsumer)) {
+        // The consumer is a separately owned helper, not a workflow command.
+        return memcordon_ci::windows_loader_fileio::consume_stdio().map_err(CiError::from);
+    }
     let backend = |suite: &Suite| {
         matches!(
             suite,
@@ -285,6 +293,10 @@ fn run() -> Result<()> {
     let current = std::env::current_dir()?;
     let root = command_root(&current, &cli.command, workspace_root)?;
     let result = (|| match cli.command {
+        #[cfg(windows)]
+        Some(TopLevel::LoaderFileioConsumer) => {
+            unreachable!("helper dispatched before workflow setup")
+        }
         #[cfg(target_os = "linux")]
         Some(TopLevel::CurrentLinuxOwnerProbe { input, output }) => {
             memcordon_ci::release::linux_test_owners::probe(&input, &output)

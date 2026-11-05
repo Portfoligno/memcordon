@@ -31,6 +31,17 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
             expected.push(path);
         }
     }
+    let fileio = root
+        .path()
+        .join("windows-installed/W-JOINT/restricted/result.loader-fileio.json");
+    fs::write(&fileio, b"original fileio").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&fileio)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    expected.push(fileio);
     for index in 0..180 {
         fs::write(
             root.path().join(format!("recent-{index:03}.json")),

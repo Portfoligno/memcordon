@@ -111,6 +111,22 @@ pub struct LoaderOwner {
     pub dependencies: DependencyPacket,
     pub first_failure_link: LoaderLink,
     pub links: [LoaderLink; 16],
+    pub window_count: u32,
+    pub windows_dropped: u32,
+    pub first_failure_window_present: u32,
+    pub windows_invalid: u32,
+    pub first_failure_window: LoaderWindow,
+    pub windows: [LoaderWindow; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoaderWindow {
+    pub dependency_sequence: u64,
+    pub loader_dependency_sequence: u64,
+    pub parent_listener_sequence: u64,
+    pub started_qpc: u64,
+    pub finished_qpc: u64,
 }
 
 #[repr(C)]
@@ -186,11 +202,15 @@ const _: () = {
     assert!(offset_of!(ReturnedModule, first_failure_link) == 11728);
     assert!(offset_of!(ReturnedModule, links) == 11752);
     assert!(size_of::<LoaderLink>() == 40);
-    assert!(size_of::<LoaderOwner>() == 12392);
+    assert!(size_of::<LoaderWindow>() == 40);
+    assert!(size_of::<LoaderOwner>() == 13088);
     assert!(offset_of!(LoaderOwner, dependencies) == 64);
     assert!(offset_of!(LoaderOwner, first_failure_link) == 11712);
     assert!(offset_of!(LoaderOwner, links) == 11752);
-    assert!(size_of::<Packet>() == 40744);
+    assert!(offset_of!(LoaderOwner, window_count) == 12392);
+    assert!(offset_of!(LoaderOwner, first_failure_window) == 12408);
+    assert!(offset_of!(LoaderOwner, windows) == 12448);
+    assert!(size_of::<Packet>() == 41440);
     assert!(offset_of!(Packet, owner) == 208);
     assert!(offset_of!(Packet, slots) == 400);
     assert!(offset_of!(Packet, first_failure) == 1168);
@@ -200,6 +220,11 @@ const _: () = {
     assert!(offset_of!(Packet, dependencies) == 4568);
     assert!(offset_of!(Packet, returned_module) == 16216);
     assert!(offset_of!(Packet, loader_owner) == 28352);
+    assert!(offset_of!(Packet, loader_owner) + offset_of!(LoaderOwner, window_count) == 40744);
+    assert!(
+        offset_of!(Packet, loader_owner) + offset_of!(LoaderOwner, first_failure_window) == 40760
+    );
+    assert!(offset_of!(Packet, loader_owner) + offset_of!(LoaderOwner, windows) == 40800);
 };
 
 fn signature(operation: u32) -> Option<(&'static str, u32, usize)> {
@@ -560,13 +585,135 @@ fn loader_link(link: &LoaderLink) -> Value {
     json!({"namespace":"loader_owner","dependency_sequence":link.dependency_sequence,"timeline_sequence":link.timeline_sequence,"timeline_domain":"ENTER","parent_listener_sequence":link.parent_listener_sequence,"loader_parent_namespace":"startup","loader_dependency_sequence":link.loader_dependency_sequence,"loader_timeline_sequence":link.loader_timeline_sequence,"loader_timeline_domain":"ENTER"})
 }
 
+fn loader_window(packet: &Packet, window: &LoaderWindow, failure: bool) -> (Value, bool, bool) {
+    let scope = &packet.loader_owner;
+    let events = &scope.dependencies;
+    let mut invalid = window.dependency_sequence == 0
+        || window.dependency_sequence > u64::from(events.total_calls)
+        || window.loader_dependency_sequence == 0
+        || window.loader_dependency_sequence > u64::from(packet.dependencies.total_calls)
+        || window.parent_listener_sequence == 0
+        || packet.original_thread == 0
+        || packet.frequency == 0
+        || window.started_qpc == 0
+        || window.started_qpc < packet.started_qpc
+        || window.finished_qpc < window.started_qpc
+        || window.finished_qpc > packet.finished_qpc
+        || window.finished_qpc > packet.cutoff_qpc
+        || (events.started_qpc != 0 && window.started_qpc < events.started_qpc)
+        || (events.finished_qpc != 0 && window.finished_qpc > events.finished_qpc)
+        || scope.selected != 1
+        || scope.armed != 1
+        || events.original_thread != packet.original_thread
+        || events.cutoff_qpc != packet.cutoff_qpc
+        || events.frequency != packet.frequency;
+    let mut incomplete = false;
+    let link = scope.links[..(scope.link_count as usize).min(16)]
+        .iter()
+        .find(|link| link.dependency_sequence == window.dependency_sequence)
+        .or_else(|| {
+            (events.first_failure_present == 1
+                && scope.first_failure_link.dependency_sequence == window.dependency_sequence)
+                .then_some(&scope.first_failure_link)
+        });
+    if let Some(link) = link {
+        let (bad, partial) = loader_parent(packet, link);
+        invalid |= bad
+            || link.loader_dependency_sequence != window.loader_dependency_sequence
+            || link.parent_listener_sequence != window.parent_listener_sequence;
+        incomplete |= partial;
+    } else if scope.links_dropped == 0 {
+        invalid = true;
+    } else {
+        incomplete = true;
+    }
+    let event = events.entries[..(events.record_count as usize).min(16)]
+        .iter()
+        .find(|entry| entry.sequence == window.dependency_sequence)
+        .or_else(|| {
+            (events.first_failure_present == 1
+                && events.first_failure.sequence == window.dependency_sequence)
+                .then_some(&events.first_failure)
+        });
+    if let Some(event) = event {
+        invalid |= event.operation != 4
+            || event.thread_id != packet.original_thread
+            || event.entered != 1
+            || event.returned != 1
+            || (failure && event.native_status >= 0);
+    } else if events.dropped == 0 {
+        invalid = true;
+    } else {
+        incomplete = true;
+    }
+    (
+        json!({"dependency_sequence":window.dependency_sequence,"loader_dependency_sequence":window.loader_dependency_sequence,"parent_listener_sequence":window.parent_listener_sequence,"started_qpc":window.started_qpc,"finished_qpc":window.finished_qpc,"thread_id":packet.original_thread,"namespace":"loader_owner","operation":"LdrLoadDll","clock_domain":"original-QPC","invalid_window":invalid,"observation_incomplete":incomplete,"temporal_attribution_only":true}),
+        invalid,
+        incomplete,
+    )
+}
+
+pub fn loader_window_summary(packet: &Packet) -> Value {
+    let scope = &packet.loader_owner;
+    let mut invalid = scope.window_count > 16
+        || scope.first_failure_window_present > 1
+        || u64::from(scope.window_count)
+            + u64::from(scope.windows_dropped)
+            + u64::from(scope.windows_invalid)
+            > u64::from(scope.dependencies.total_calls)
+        || (scope.first_failure_window_present == 0
+            && scope.first_failure_window != LoaderWindow::default());
+    let mut incomplete = scope.windows_dropped != 0 || scope.windows_invalid != 0;
+    let mut seen = BTreeSet::new();
+    let windows = scope.windows[..(scope.window_count as usize).min(16)]
+        .iter()
+        .map(|window| {
+            let (value, bad, partial) = loader_window(packet, window, false);
+            invalid |= bad || !seen.insert(window.dependency_sequence);
+            incomplete |= partial;
+            value
+        })
+        .collect::<Vec<_>>();
+    let first = if scope.first_failure_window_present == 1 {
+        let window = &scope.first_failure_window;
+        let (value, bad, partial) = loader_window(packet, window, true);
+        invalid |= bad || scope.window_count == 0;
+        incomplete |= partial;
+        if let Some(recent) = scope.windows[..(scope.window_count as usize).min(16)]
+            .iter()
+            .find(|recent| recent.dependency_sequence == window.dependency_sequence)
+        {
+            invalid |= recent != window;
+        } else {
+            invalid |= scope.windows_dropped == 0;
+            incomplete = true;
+        }
+        Some(value)
+    } else {
+        None
+    };
+    for event in &scope.dependencies.entries[..(scope.dependencies.record_count as usize).min(16)] {
+        if event.operation != 4 || event.returned != 1 {
+            continue;
+        }
+        let present = scope.windows[..(scope.window_count as usize).min(16)]
+            .iter()
+            .any(|window| window.dependency_sequence == event.sequence)
+            || (scope.first_failure_window_present == 1
+                && scope.first_failure_window.dependency_sequence == event.sequence);
+        invalid |= !present && scope.windows_invalid == 0 && scope.windows_dropped == 0;
+        invalid |= present && event.native_status < 0 && scope.first_failure_window_present == 0;
+    }
+    json!({"window_count":scope.window_count,"windows_dropped":scope.windows_dropped,"first_failure_window_present":scope.first_failure_window_present,"windows_invalid":scope.windows_invalid,"first_failure_window":first,"windows":windows,"invalid_windows":invalid,"windows_observation_incomplete":incomplete,"window_clock_domain":"original-QPC","window_failure_is_decisive_cause":false})
+}
+
 fn loader_owner(packet: &Packet, ordinals: &mut BTreeSet<u64>) -> (Value, bool, bool) {
     let scope = &packet.loader_owner;
     let events = &scope.dependencies;
     let ldr_published = events.slots[..(events.slot_count as usize).min(16)]
         .iter()
         .any(|slot| slot.operation == 4 && slot.published == 1 && slot.hook != 0);
-    let mut invalid = scope.version != 1
+    let mut invalid = scope.version != 2
         || scope.setup_stage > 9
         || scope.setup_stage == 8
         || scope.setup_reason > 8
@@ -675,11 +822,15 @@ fn loader_owner(packet: &Packet, ordinals: &mut BTreeSet<u64>) -> (Value, bool, 
     dependency["LdrLoadDll_normal_import_published"] = json!(ldr_published);
     invalid |= scope.armed == 1 && dependency["invalid_packet"] == true;
     incomplete |= dependency["observation_incomplete"] == true;
-    (
-        json!({"version":scope.version,"setup_stage":scope.setup_stage,"setup_error":scope.setup_error,"setup_reason":scope.setup_reason,"selected":scope.selected,"armed":scope.armed,"scope_flags":scope.scope_flags,"incomplete":scope.incomplete,"attempt_count":scope.attempt_count,"skipped_count":scope.skipped_count,"links_dropped":scope.links_dropped,"loader_target":scope.loader_target,"owner_base":scope.owner_base,"invalid_scope":invalid,"observation_incomplete":incomplete,"acceptance_authority":false,"target_identity_proved":false,"global_routes_complete":false,"original_startup_invoked":false,"original_loader_result_is_not_observer_setup_error":true,"first_observed_failure_is_decisive_cause":false,"cross_namespace_failure_return_order_proved":false,"links":links,"first_failure_link":first,"dependencies":dependency}),
-        invalid,
-        incomplete,
-    )
+    let timing = loader_window_summary(packet);
+    invalid |= timing["invalid_windows"] == true;
+    incomplete |= timing["windows_observation_incomplete"] == true;
+    let mut value = json!({"version":scope.version,"setup_stage":scope.setup_stage,"setup_error":scope.setup_error,"setup_reason":scope.setup_reason,"selected":scope.selected,"armed":scope.armed,"scope_flags":scope.scope_flags,"incomplete":scope.incomplete,"attempt_count":scope.attempt_count,"skipped_count":scope.skipped_count,"links_dropped":scope.links_dropped,"loader_target":scope.loader_target,"owner_base":scope.owner_base,"invalid_scope":invalid,"observation_incomplete":incomplete,"acceptance_authority":false,"target_identity_proved":false,"global_routes_complete":false,"original_startup_invoked":false,"original_loader_result_is_not_observer_setup_error":true,"first_observed_failure_is_decisive_cause":false,"cross_namespace_failure_return_order_proved":false,"links":links,"first_failure_link":first,"dependencies":dependency});
+    value
+        .as_object_mut()
+        .expect("loader scope object")
+        .extend(timing.as_object().expect("loader timing object").clone());
+    (value, invalid, incomplete)
 }
 
 pub fn diagnostic(packet: &Packet) -> Value {
@@ -696,7 +847,7 @@ pub fn diagnostic(packet: &Packet) -> Value {
         packet.dependency_scope_armed,
         packet.callback_raw_error_present,
     ];
-    let mut invalid = packet.version != 3
+    let mut invalid = packet.version != 4
         || packet.setup_stage > 9
         || packet.setup_stage == 8
         || flags.iter().any(|flag| *flag > 1)
@@ -934,6 +1085,12 @@ pub fn bounded(value: Value) -> Value {
     let trace = value.get("trace").unwrap_or(&value);
     let mut summary = json!({"format":"memcordon.fixture-original-rust-listener","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target_identity_proved":false,"global_routes_complete":false,"coverage_inconclusive":true,"record_omitted_for_bound":true,"observation_incomplete":true});
     for key in [
+        "packet_version",
+        "original_thread",
+        "started_qpc",
+        "finished_qpc",
+        "cutoff_qpc",
+        "frequency",
         "aggregate",
         "setup_stage",
         "setup_error",
@@ -1063,9 +1220,22 @@ pub fn bounded(value: Value) -> Value {
         "owner_base",
         "invalid_scope",
         "first_failure_link",
+        "window_count",
+        "windows_dropped",
+        "first_failure_window_present",
+        "windows_invalid",
+        "first_failure_window",
+        "invalid_windows",
+        "windows_observation_incomplete",
+        "window_clock_domain",
+        "window_failure_is_decisive_cause",
     ] {
-        loader_summary[key] = small(loader.and_then(|scope| scope.get(key)), 512);
+        loader_summary[key] = small(loader.and_then(|scope| scope.get(key)), 1024);
     }
+    let windows = loader.and_then(|scope| scope.get("windows"));
+    loader_summary["windows"] = small(windows, 16 * 1024);
+    loader_summary["windows_omitted_for_bound"] =
+        json!(windows.is_some_and(|value| !fits(value, 16 * 1024)));
     let loader_dependency = loader.and_then(|scope| scope.get("dependencies"));
     loader_summary["LdrLoadDll_normal_import_published"] = small(
         loader_dependency

@@ -484,11 +484,47 @@ pub fn run_with_deadline_owned_spawn_after_output_limit(
 /// Use one absolute execution cutoff, including the custom exec-stop callback.
 /// Existing duration-based entrypoints retain their original behavior.
 pub fn run_until_owned_spawn_after_output_limit(
-    mut command: Command,
+    command: Command,
     cutoff: Instant,
     limit: usize,
     spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
     after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_until_owned_spawn_with_io_output_limit(command, cutoff, limit, spawn, move |pid, _, _| {
+        after_spawn(pid)
+    })
+}
+
+/// Own the exact child pipes while preserving one absolute execution cutoff.
+pub fn run_until_owned_spawn_with_io_output_limit(
+    command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_until_owned_spawn_with_io_controlled_output_limit(
+        command,
+        cutoff,
+        limit,
+        None,
+        spawn,
+        after_spawn,
+    )
+}
+
+/// The cancellation flag requests settlement of this exact owned child only.
+pub fn run_until_owned_spawn_with_io_controlled_output_limit(
+    mut command: Command,
+    cutoff: Instant,
+    limit: usize,
+    cancelled: Option<Arc<AtomicBool>>,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
 ) -> Result<ObservedOutput, ProcessTestError> {
     let started = Instant::now();
     let deadline = cutoff
@@ -515,9 +551,12 @@ pub fn run_until_owned_spawn_after_output_limit(
         started,
         spawn_returned,
         deadline,
-        move |pid, _, _| after_spawn(pid),
+        after_spawn,
         Some(limit),
-        ProcessControl::default(),
+        ProcessControl {
+            cancelled,
+            ..ProcessControl::default()
+        },
     )
 }
 

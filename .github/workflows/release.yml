@@ -2863,6 +2863,7 @@ jobs:
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.stderr.bin
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
+            target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.loader-fileio.json
           if-no-files-found: ignore
           retention-days: 7
       - *shared_step_92

@@ -267,11 +267,48 @@ template<unsigned Returned=0> static NTSTATUS NTAPI query_value(HANDLE key,PUNIC
     finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using Load=NTSTATUS(NTAPI*)(PWSTR,PULONG,PUNICODE_STRING,PHANDLE);
+using LoaderWindowClock=BOOL(*)(LARGE_INTEGER*);
+static std::atomic<LoaderWindowClock> loader_private_clock{nullptr};
+static BOOL loader_window_clock(LARGE_INTEGER* value){const auto mock=loader_private_clock.load(std::memory_order_acquire);return mock?mock(value):QueryPerformanceCounter(value);}
+struct LoaderWindowCapture {ListenerPacket* packet;ListenerLoaderWindow window;bool start_valid;};
+static LoaderWindowCapture loader_window_begin(const WsaEntry* entry,bool active){
+    LoaderWindowCapture capture={};if(!active||!loader_collector.timeline)return capture;
+    capture.packet=loader_collector.timeline;
+    capture.window={entry->sequence,loader_collector.loader_dependency_sequence,loader_collector.parent_listener_sequence,0,0};
+    bool linked=false;
+    for(size_t index=0;index<loader_collector.pending_count;++index){
+        const auto& pending=loader_collector.pending[index];
+        if(pending.dependency_sequence==entry->sequence&&pending.parent_listener_sequence==capture.window.parent_listener_sequence)linked=true;
+    }
+    LARGE_INTEGER started={};const BOOL clock=loader_window_clock(&started);
+    capture.start_valid=linked&&capture.window.loader_dependency_sequence&&capture.window.parent_listener_sequence&&clock&&started.QuadPart>0;
+    if(capture.start_valid)capture.window.started_qpc=static_cast<uint64_t>(started.QuadPart);
+    return capture;
+}
+static void loader_window_end(LoaderWindowCapture* capture,bool failed){
+    if(!capture->packet)return;
+    loader_collector.inside=true;
+    LARGE_INTEGER finished={};const BOOL clock=loader_window_clock(&finished);
+    auto* packet=capture->packet;auto& scope=packet->loader_owner;auto& window=capture->window;
+    const bool valid=loader_collector.packet==&scope.dependencies&&capture->start_valid&&clock&&finished.QuadPart>0&&window.started_qpc>=packet->started_qpc&&
+        static_cast<uint64_t>(finished.QuadPart)>=window.started_qpc&&static_cast<uint64_t>(finished.QuadPart)<=packet->cutoff_qpc;
+    if(!valid){scope.windows_invalid=increment(scope.windows_invalid);if(scope.windows_invalid==UINT32_MAX)packet->overflow=1;scope.incomplete=1;packet->incomplete=1;return;}
+    window.finished_qpc=static_cast<uint64_t>(finished.QuadPart);
+    if(failed&&!scope.first_failure_window_present){scope.first_failure_window=window;scope.first_failure_window_present=1;}
+    if(scope.window_count<16)scope.windows[scope.window_count++]=window;
+    else {
+        for(size_t index=1;index<16;++index)scope.windows[index-1]=scope.windows[index];
+        scope.windows[15]=window;scope.windows_dropped=increment(scope.windows_dropped);scope.incomplete=1;packet->incomplete=1;packet->overflow=1;
+    }
+}
 template<unsigned Returned=0> static NTSTATUS NTAPI load_dll(PWSTR search,PULONG flags,PUNICODE_STRING value,PHANDLE out){
     if constexpr(Returned){if(!dependency_collector<Returned>().packet)return original<Load,Returned>(4)(search,flags,value,out);}
     DependencyErrors<Returned> saved;const DWORD incoming=saved.incoming.win32;WsaEntry entry={};bool active=begin<Returned>(&entry,4,incoming);
-    if(active){unicode(&entry,value);entry.flags=dword_input<Returned>(flags,&entry,4);}saved.forward(active);
+    if(active){unicode(&entry,value);entry.flags=dword_input<Returned>(flags,&entry,4);}
+    LoaderWindowCapture window={};if constexpr(Returned==2)window=loader_window_begin(&entry,active);
+    saved.forward(active);
     const auto result=original<Load,Returned>(4)(search,flags,value,out);const DWORD error=saved.returned();
+    if constexpr(Returned==2)loader_window_end(&window,result<0);
     if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
 using NtCreate=NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,ULONG,BOOLEAN);
@@ -1522,7 +1559,7 @@ static void listener_invoke(ListenerPacket* packet,const ListenerRequest* reques
 }
 extern "C" void memcordon_listener_trace_call(ListenerPacket* packet,const ListenerRequest* request,ListenerInvoke callback,void* opaque){
     if(!packet||!request||!callback)__fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    *packet={};packet->version=3;packet->returned_module.version=1;packet->loader_owner.version=1;packet->scope_flags=1;
+    *packet={};packet->version=4;packet->returned_module.version=1;packet->loader_owner.version=2;packet->scope_flags=1;
     packet->cutoff_qpc=request->cutoff_qpc;packet->frequency=request->frequency;
     packet->incoming_win32=request->incoming_win32;packet->incoming_wsa=request->incoming_wsa;
     packet->original_thread=GetCurrentThreadId();packet->listener_owner_anchor=reinterpret_cast<uintptr_t>(callback);
@@ -1683,7 +1720,7 @@ struct ListenerMockScope {
     }
 };
 static void listener_mock_packet(ListenerPacket* packet,uint64_t cutoff,uint64_t frequency){
-    *packet={};packet->version=3;packet->returned_module.version=1;packet->loader_owner.version=1;packet->cutoff_qpc=cutoff;packet->frequency=frequency;packet->original_thread=GetCurrentThreadId();
+    *packet={};packet->version=4;packet->returned_module.version=1;packet->loader_owner.version=2;packet->cutoff_qpc=cutoff;packet->frequency=frequency;packet->original_thread=GetCurrentThreadId();
     packet->returned_module.dependencies.version=1;packet->returned_module.dependencies.cutoff_qpc=cutoff;packet->returned_module.dependencies.frequency=frequency;packet->returned_module.dependencies.original_thread=packet->original_thread;
     packet->loader_owner.dependencies.version=1;packet->loader_owner.dependencies.cutoff_qpc=cutoff;packet->loader_owner.dependencies.frequency=frequency;packet->loader_owner.dependencies.original_thread=packet->original_thread;
     listener_collector={};listener_collector.packet=packet;collector={};returned_collector={};loader_collector={};
@@ -1709,6 +1746,8 @@ struct ReturnedMock {
     LPCWSTR path;HMODULE module;
     std::atomic<uint32_t> loader_native_calls,loader_heap_calls,prepare_calls;
     bool loader_nested,prepare_failed;
+    uint32_t window_clock_mode,window_clock_calls;
+    uint64_t window_clock_start,window_clock_cutoff;
     PWSTR search;PULONG flags;PUNICODE_STRING name;PHANDLE output;
 };
 static std::atomic<ReturnedMock*> returned_mock{nullptr};
@@ -1740,6 +1779,20 @@ static NTSTATUS NTAPI loader_mock_native(PWSTR search,PULONG flags,PUNICODE_STRI
     if(search!=state->search||flags!=state->flags||name!=state->name||output!=state->output||!same_errors(incoming,state->incoming))state->same=false;
     errors_restore(state->outgoing);return static_cast<NTSTATUS>(0xC0000022u);
 }
+static BOOL loader_mock_clock(LARGE_INTEGER* value){
+    auto* state=returned_mock.load(std::memory_order_acquire);const bool finish=(state->window_clock_calls++%2)!=0;
+    // Deliberately clobber both reachable channels: forwarding must restore the
+    // original incoming/outgoing pair around either optional QPC read.
+    seed_listener_error(0xabc1);
+    value->QuadPart=static_cast<LONGLONG>(state->window_clock_start+(finish?1:0));
+    if(state->window_clock_mode==1&&!finish)return FALSE;
+    if(state->window_clock_mode==2&&!finish)value->QuadPart=-1;
+    if(state->window_clock_mode==3&&finish)return FALSE;
+    if(state->window_clock_mode==4&&finish)value->QuadPart=static_cast<LONGLONG>(state->window_clock_start-1);
+    if(state->window_clock_mode==5&&finish)value->QuadPart=static_cast<LONGLONG>(state->window_clock_cutoff+1);
+    if(state->window_clock_mode==6&&!finish)value->QuadPart=0;
+    return TRUE;
+}
 static void* NTAPI loader_mock_heap(void* handle,ULONG flags,SIZE_T size){
     auto* state=returned_mock_enter(handle,flags,size);++state->loader_heap_calls;
     errors_restore(state->outgoing);return reinterpret_cast<void*>(0x3333);
@@ -1764,7 +1817,7 @@ struct ReturnedMockScope {
     bool owns_ws2,owns_returned;
     Collector previous_loader;
     ~ReturnedMockScope(){
-        dependency_private_routes[0].store(nullptr,std::memory_order_release);dependency_private_routes[1].store(nullptr,std::memory_order_release);dependency_private_routes[2].store(nullptr,std::memory_order_release);loader_private_prepare.store(nullptr,std::memory_order_release);returned_mock.store(nullptr,std::memory_order_release);
+        dependency_private_routes[0].store(nullptr,std::memory_order_release);dependency_private_routes[1].store(nullptr,std::memory_order_release);dependency_private_routes[2].store(nullptr,std::memory_order_release);loader_private_prepare.store(nullptr,std::memory_order_release);loader_private_clock.store(nullptr,std::memory_order_release);returned_mock.store(nullptr,std::memory_order_release);
         listener_collector=previous_listener;collector=previous_ws2;returned_collector=previous_returned;loader_collector=previous_loader;observer_setup_active=previous_setup;
         // These states protected private mocks only; no live route was installed
         // and neither permanent original table was written or cleared.
@@ -1909,7 +1962,25 @@ static uint32_t returned_native_mock(ListenerPacket* packet,ListenerMock* listen
     errors_restore(state.incoming);const auto failed_load=load_library<false>(path,nullptr,0);const auto failed_errors=errors();
     const auto& linked=packet->loader_owner.first_failure_link;
     if(failed_load||!same_errors(failed_errors,state.outgoing)||!state.same||state.loader_calls!=outer_before+1||state.loader_native_calls!=inner_before+1||state.prepare_calls!=prepare_before+1||output!=reinterpret_cast<HANDLE>(0xc0de)||packet->next_sequence!=5||packet->dependencies.total_calls!=1||packet->loader_owner.dependencies.total_calls!=1||packet->loader_owner.dependencies.first_failure.native_status!=static_cast<NTSTATUS>(0xC0000022u)||packet->dependencies.entries[0].outgoing_error!=5||packet->returned_module.setup_error!=ERROR_MOD_NOT_FOUND||linked.dependency_sequence!=1||linked.timeline_sequence!=3||linked.parent_listener_sequence!=1||linked.loader_dependency_sequence!=1||linked.loader_timeline_sequence!=2||loader_collector.packet)return 27;
+    const auto pinned_window=packet->loader_owner.first_failure_window;
+    if(packet->loader_owner.window_count!=1||packet->loader_owner.first_failure_window_present!=1||packet->loader_owner.windows_invalid||pinned_window.dependency_sequence!=1||pinned_window.loader_dependency_sequence!=1||pinned_window.parent_listener_sequence!=1||!pinned_window.started_qpc||pinned_window.finished_qpc<pinned_window.started_qpc||pinned_window.finished_qpc>cutoff)return 32;
     errors_restore(state.incoming);if(load_library<false>(path,nullptr,0)||!same_errors(errors(),state.outgoing)||state.loader_calls!=outer_before+2||state.loader_native_calls!=inner_before+2||state.prepare_calls!=prepare_before+2||packet->loader_owner.link_count!=2||packet->loader_owner.links[1].loader_dependency_sequence!=2||packet->loader_owner.links[1].loader_timeline_sequence!=6||packet->loader_owner.links[1].timeline_sequence!=7||packet->next_sequence!=9||loader_collector.packet)return 28;
+    if(packet->loader_owner.window_count!=2||packet->loader_owner.windows[1].dependency_sequence!=2||packet->loader_owner.windows[1].loader_dependency_sequence!=2||packet->loader_owner.first_failure_window.dependency_sequence!=pinned_window.dependency_sequence||packet->loader_owner.first_failure_window.started_qpc!=pinned_window.started_qpc)return 32;
+    for(size_t index=0;index<20;++index){errors_restore(state.incoming);if(load_library<false>(path,nullptr,0)||!same_errors(errors(),state.outgoing))return 33;}
+    if(packet->loader_owner.window_count!=16||packet->loader_owner.windows_dropped!=6||packet->loader_owner.windows_invalid||packet->loader_owner.first_failure_window.dependency_sequence!=1||packet->loader_owner.windows[0].dependency_sequence!=7||packet->loader_owner.windows[15].dependency_sequence!=22||!state.same)return 33;
+    // Script only private optional QPC reads under the same existing cutoff;
+    // failed, negative, reversed and late timing never suppresses original work.
+    for(uint32_t mode=0;mode<=6;++mode){
+        LARGE_INTEGER now={};if(!QueryPerformanceCounter(&now)||now.QuadPart<=1||static_cast<uint64_t>(now.QuadPart)+1>=cutoff)return 34;
+        listener_mock_packet(packet,cutoff,frequency);listener_mock_dependencies(packet);
+        listener_collector.depth=1;listener_collector.operations[0]=2;listener_collector.parents[0]=1;packet->next_sequence=1;
+        state.window_clock_mode=mode;state.window_clock_calls=0;state.window_clock_start=static_cast<uint64_t>(now.QuadPart);state.window_clock_cutoff=cutoff;
+        const auto native_before=state.loader_native_calls.load(),load_before=state.loader_calls.load();loader_private_clock.store(loader_mock_clock,std::memory_order_release);
+        errors_restore(state.incoming);const auto result=load_library<false>(path,nullptr,0);const auto outgoing=errors();loader_private_clock.store(nullptr,std::memory_order_release);
+        if(result||!same_errors(outgoing,state.outgoing)||state.loader_native_calls!=native_before+1||state.loader_calls!=load_before+1||state.window_clock_calls!=2||!state.same||output!=reinterpret_cast<HANDLE>(0xc0de)||flags||packet->loader_owner.dependencies.first_failure.native_status!=static_cast<NTSTATUS>(0xC0000022u))return 34;
+        if(mode==0){if(packet->loader_owner.window_count!=1||packet->loader_owner.windows_invalid||packet->loader_owner.windows[0].started_qpc!=state.window_clock_start||packet->loader_owner.windows[0].finished_qpc!=state.window_clock_start+1)return 34;}
+        else if(packet->loader_owner.window_count||packet->loader_owner.first_failure_window_present||packet->loader_owner.windows_invalid!=1||!packet->loader_owner.incomplete)return 34;
+    }
     // Unavailable observer setup must neither suppress the original load nor
     // change its error. Nested cold forwarding records no invented event.
     listener_mock_packet(packet,cutoff,frequency);listener_mock_dependencies(packet);

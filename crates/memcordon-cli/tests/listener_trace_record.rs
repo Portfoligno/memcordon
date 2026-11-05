@@ -9,7 +9,7 @@ use serde_json::json;
 
 fn base() -> Packet {
     let mut value = Packet {
-        version: 3,
+        version: 4,
         setup_stage: 1,
         called: 1,
         callback_outcome: 1,
@@ -36,7 +36,7 @@ fn base() -> Packet {
     value.returned_module.dependencies.original_thread = value.original_thread;
     value.returned_module.dependencies.cutoff_qpc = value.cutoff_qpc;
     value.returned_module.dependencies.frequency = value.frequency;
-    value.loader_owner.version = 1;
+    value.loader_owner.version = 2;
     value.loader_owner.dependencies.version = 1;
     value.loader_owner.dependencies.original_thread = value.original_thread;
     value.loader_owner.dependencies.cutoff_qpc = value.cutoff_qpc;
@@ -242,6 +242,16 @@ fn loader_scope() -> Packet {
         ..Default::default()
     };
     events.first_failure = events.entries[0];
+    scope.window_count = 1;
+    scope.first_failure_window_present = 1;
+    scope.windows[0] = record::LoaderWindow {
+        dependency_sequence: 1,
+        loader_dependency_sequence: 1,
+        parent_listener_sequence: 1,
+        started_qpc: 4,
+        finished_qpc: 5,
+    };
+    scope.first_failure_window = scope.windows[0];
     value
 }
 
@@ -261,6 +271,9 @@ fn loader_owner_records_are_bound_to_both_original_call_namespaces() {
     other_route.loader_owner.dependencies.entries[0].output_flags = 1;
     other_route.loader_owner.dependencies.first_failure =
         other_route.loader_owner.dependencies.entries[0];
+    other_route.loader_owner.window_count = 0;
+    other_route.loader_owner.first_failure_window_present = 0;
+    other_route.loader_owner.first_failure_window = record::LoaderWindow::default();
     let other = diagnostic(&other_route);
     assert_eq!(other["invalid_packet"], false, "{other}");
     assert_eq!(
@@ -320,6 +333,149 @@ fn loader_owner_records_are_bound_to_both_original_call_namespaces() {
             "mutation {mutation}"
         );
     }
+}
+
+#[test]
+fn exact_ldr_window_keeps_both_original_parents_thread_and_qpc_domain() {
+    let value = loader_scope();
+    let rendered = diagnostic(&value);
+    assert_eq!(rendered["invalid_packet"], false);
+    assert_eq!(rendered["packet_version"], 4);
+    let timing = &rendered["loader_owner"];
+    assert_eq!(timing["version"], 2);
+    assert_eq!(timing["window_count"], 1);
+    assert_eq!(timing["invalid_windows"], false);
+    assert_eq!(timing["windows"][0]["dependency_sequence"], 1);
+    assert_eq!(timing["windows"][0]["loader_dependency_sequence"], 1);
+    assert_eq!(timing["windows"][0]["parent_listener_sequence"], 1);
+    assert_eq!(timing["windows"][0]["thread_id"], 7);
+    assert_eq!(timing["windows"][0]["started_qpc"], 4);
+    assert_eq!(timing["windows"][0]["finished_qpc"], 5);
+    assert_eq!(timing["windows"][0]["operation"], "LdrLoadDll");
+    assert_eq!(timing["windows"][0]["clock_domain"], "original-QPC");
+    assert_eq!(timing["first_failure_window"], timing["windows"][0]);
+    assert_eq!(timing["window_failure_is_decisive_cause"], false);
+}
+
+#[test]
+fn malformed_timing_never_becomes_an_original_ldr_interval() {
+    for mutation in 0..14 {
+        let mut value = loader_scope();
+        match mutation {
+            0 => value.loader_owner.windows[0].started_qpc = 0,
+            1 => value.loader_owner.windows[0].finished_qpc = 3,
+            2 => value.loader_owner.windows[0].finished_qpc = 101,
+            3 => value.started_qpc = 5,
+            4 => value.finished_qpc = 4,
+            5 => value.loader_owner.dependencies.original_thread = 8,
+            6 => value.loader_owner.windows[0].dependency_sequence = 2,
+            7 => value.loader_owner.windows[0].loader_dependency_sequence = 2,
+            8 => value.loader_owner.windows[0].parent_listener_sequence = 2,
+            9 => value.loader_owner.first_failure_window_present = 2,
+            10 => value.loader_owner.window_count = 17,
+            11 => value.loader_owner.dependencies.frequency += 1,
+            12 => value.loader_owner.windows_invalid = 1,
+            _ => value.loader_owner.first_failure_window.finished_qpc = 6,
+        }
+        assert_eq!(
+            diagnostic(&value)["invalid_packet"],
+            true,
+            "mutation {mutation}"
+        );
+    }
+    let mut missing = loader_scope();
+    missing.loader_owner.window_count = 0;
+    missing.loader_owner.first_failure_window_present = 0;
+    missing.loader_owner.first_failure_window = record::LoaderWindow::default();
+    assert_eq!(diagnostic(&missing)["invalid_packet"], true);
+    // A native clock-unavailable marker is valid incomplete evidence. It cannot
+    // be silently replaced by the wider original callback interval.
+    missing.loader_owner.windows_invalid = 1;
+    missing.loader_owner.incomplete = 1;
+    let unavailable = diagnostic(&missing);
+    assert_eq!(unavailable["invalid_packet"], false);
+    assert_eq!(unavailable["observation_incomplete"], true);
+    assert_eq!(unavailable["loader_owner"]["windows"], json!([]));
+    assert_eq!(
+        unavailable["loader_owner"]["first_failure_window"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn pinned_failure_window_survives_recent_window_and_dependency_eviction() {
+    let mut value = loader_scope();
+    install(&mut value, &[call(2, 1, 60, 42)]);
+    value.finished_qpc = 1000;
+    value.cutoff_qpc = 2000;
+    value.dependencies.cutoff_qpc = 2000;
+    let scope = &mut value.loader_owner;
+    scope.dependencies.cutoff_qpc = 2000;
+    scope.window_count = 16;
+    scope.windows_dropped = 4;
+    scope.link_count = 16;
+    scope.links_dropped = 4;
+    scope.dependencies.total_calls = 20;
+    scope.dependencies.total_failures = 20;
+    scope.dependencies.record_count = 16;
+    scope.dependencies.dropped = 4;
+    scope.first_failure_window.started_qpc = 4;
+    scope.first_failure_window.finished_qpc = 5;
+    for index in 0..16 {
+        let sequence = index as u64 + 5;
+        scope.dependencies.entries[index] = scope.dependencies.first_failure;
+        scope.dependencies.entries[index].sequence = sequence;
+        scope.links[index] = scope.first_failure_link;
+        scope.links[index].dependency_sequence = sequence;
+        scope.links[index].timeline_sequence = sequence * 2 + 1;
+        scope.windows[index] = record::LoaderWindow {
+            dependency_sequence: sequence,
+            loader_dependency_sequence: 1,
+            parent_listener_sequence: 1,
+            started_qpc: sequence * 2 + 4,
+            finished_qpc: sequence * 2 + 5,
+        };
+    }
+    let rendered = diagnostic(&value);
+    assert_eq!(rendered["invalid_packet"], false);
+    assert_eq!(rendered["observation_incomplete"], true);
+    assert_eq!(
+        rendered["loader_owner"]["first_failure_window"]["dependency_sequence"],
+        1
+    );
+    assert_eq!(
+        rendered["loader_owner"]["windows"][0]["dependency_sequence"],
+        5
+    );
+    assert_eq!(rendered["loader_owner"]["windows_dropped"], 4);
+}
+
+#[test]
+fn bounded_sidecar_preserves_exact_windows_and_original_clock_binding() {
+    let value = loader_scope();
+    let rendered = diagnostic(&value);
+    let envelope = json!({"format":"memcordon.original-rust-listener-trace","revision":1,
+        "original_binding":{"pid":99,"creation_time_100ns":123,"descriptor_sha256":"bound","challenge_sha256":"challenge","cutoff_qpc":100,"qpc_frequency":10},
+        "trace":rendered,"force_summary":"x".repeat(record::RECORD_BYTES)});
+    let bounded = record::bounded(envelope);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= record::RECORD_BYTES);
+    assert_eq!(bounded["record_omitted_for_envelope_bound"], true);
+    assert_eq!(bounded["trace"]["packet_version"], 4);
+    assert_eq!(bounded["trace"]["original_thread"], 7);
+    assert_eq!(bounded["trace"]["frequency"], 10);
+    assert_eq!(bounded["trace"]["cutoff_qpc"], 100);
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["windows"][0]["started_qpc"],
+        4
+    );
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["first_failure_window"]["finished_qpc"],
+        5
+    );
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["windows_omitted_for_bound"],
+        false
+    );
 }
 
 #[test]
@@ -393,19 +549,35 @@ fn loader_observer_setup_errors_do_not_replace_original_failed_loader_errors() {
 #[test]
 fn appended_abi_and_historical_json_are_explicit_without_v1_reinterpretation() {
     use std::mem::{offset_of, size_of};
-    assert_eq!(size_of::<Packet>(), 40744);
+    assert_eq!(size_of::<Packet>(), 41440);
     assert_eq!(size_of::<record::ReturnedModule>(), 12136);
     assert_eq!(offset_of!(Packet, returned_module), 16216);
     assert_eq!(size_of::<record::LoaderLink>(), 40);
-    assert_eq!(size_of::<record::LoaderOwner>(), 12392);
+    assert_eq!(size_of::<record::LoaderOwner>(), 13088);
+    assert_eq!(size_of::<record::LoaderWindow>(), 40);
     assert_eq!(offset_of!(Packet, loader_owner), 28352);
     assert_eq!(offset_of!(record::LoaderOwner, dependencies), 64);
     assert_eq!(offset_of!(record::LoaderOwner, first_failure_link), 11712);
     assert_eq!(offset_of!(record::LoaderOwner, links), 11752);
+    assert_eq!(offset_of!(record::LoaderOwner, window_count), 12392);
+    assert_eq!(
+        offset_of!(Packet, loader_owner) + offset_of!(record::LoaderOwner, window_count),
+        40744
+    );
+    assert_eq!(
+        offset_of!(Packet, loader_owner) + offset_of!(record::LoaderOwner, first_failure_window),
+        40760
+    );
+    assert_eq!(
+        offset_of!(Packet, loader_owner) + offset_of!(record::LoaderOwner, windows),
+        40800
+    );
     let mut value = base();
     value.version = 1;
     assert_eq!(diagnostic(&value)["invalid_packet"], true);
     value.version = 2;
+    assert_eq!(diagnostic(&value)["invalid_packet"], true);
+    value.version = 3;
     assert_eq!(diagnostic(&value)["invalid_packet"], true);
     let historical = json!({"format":"memcordon.original-rust-listener-trace","revision":1,"trace":{"format":"memcordon.fixture-original-rust-listener","revision":1,"aggregate":{"called":1,"outcome":2,"raw_io_error":2}}});
     let bytes = serde_json::to_vec(&historical).unwrap();

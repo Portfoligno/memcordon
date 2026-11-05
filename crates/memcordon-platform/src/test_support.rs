@@ -1,6 +1,9 @@
 //! Native containment used only by black-box process tests.
 
 #[cfg(windows)]
+#[path = "windows_fileio.rs"]
+pub mod windows_fileio;
+#[cfg(windows)]
 #[path = "windows_winsock_registry.rs"]
 pub mod windows_winsock_registry;
 

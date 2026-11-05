@@ -4255,6 +4255,14 @@ pub(crate) mod native {
         );
         let native_started_utc = std::time::SystemTime::now();
         let registry_recipient = clocks.registry.clone();
+        let fileio_requested = input.key.family == "W-JOINT"
+            && input.key.scenario == "restricted"
+            && input.descriptor.case == descriptor::Case::Joint;
+        let fileio_state = Arc::new(Mutex::new(crate::windows_loader_fileio::Captured::default()));
+        let callback_fileio = Arc::clone(&fileio_state);
+        let fileio_owner: crate::windows_loader_fileio::OwnedCapture = Arc::new(Mutex::new(None));
+        let callback_fileio_owner = Arc::clone(&fileio_owner);
+        let cleanup_deadline = clocks.cleanup.unwrap_or(work_deadline);
         let work_budget = work_budget.min(work_deadline.saturating_duration_since(Instant::now()));
         if work_budget.is_zero() {
             return Err(CiError::Message(
@@ -4268,6 +4276,9 @@ pub(crate) mod native {
             |mut command| command.spawn(),
             move |wrapper_pid, mut stdin, _| {
                 let mut control_session = None;
+                let _fileio_guard = crate::windows_loader_fileio::callback_guard(Arc::clone(
+                    &callback_fileio_owner,
+                ));
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                 let (held, root_pid) = loop {
                     if barrier_report.try_exists()? {
@@ -4557,6 +4568,52 @@ pub(crate) mod native {
                             sender,
                             deadline: work_deadline,
                         };
+                        if fileio_requested {
+                            let prepared = (|| -> io::Result<_> {
+                                let clock = actual.control_clock.as_ref().ok_or_else(|| {
+                                    io::Error::other("original FileIo work clock unavailable")
+                                })?;
+                                let held = held_family
+                                    .lock()
+                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                if held.len() != 1 || held[0].identity != root_identity {
+                                    return Err(io::Error::other(
+                                        "original FileIo recipient identity differs",
+                                    ));
+                                }
+                                memcordon_platform::test_support::windows_fileio::OwnedFileIoSession::prepare(
+                                    &held[0],
+                                    memcordon_platform::windows_fileio_record::Binding {
+                                        descriptor_sha256: session.binding.descriptor_sha256,
+                                        challenge_sha256: descriptor::controller_start::descriptor_digest(&session.binding.challenge),
+                                        cutoff_qpc: clock.work_cutoff_qpc,
+                                        frequency: clock.qpc_frequency,
+                                    },
+                                    work_deadline,
+                                    cleanup_deadline,
+                                )
+                            })();
+                            match prepared {
+                                Ok(prepared) => {
+                                    // prepare only borrowed the held object; no family
+                                    // mutex is held across ETW startup or helper waits.
+                                    let capture = crate::windows_loader_fileio::Capture::begin(
+                                        prepared,
+                                        work_deadline,
+                                        cleanup_deadline,
+                                        Arc::clone(&callback_fileio),
+                                    );
+                                    *callback_fileio_owner
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        Some(capture);
+                                }
+                                Err(error) => crate::windows_loader_fileio::unavailable(
+                                    &callback_fileio,
+                                    error,
+                                ),
+                            }
+                        }
                         session.release(descriptor::controller_start::Phase::Start)?;
                         control_session = Some(session);
                         super::guardian_query::update(&callback_guardian_query, |trace| {
@@ -4622,6 +4679,7 @@ pub(crate) mod native {
                         }
                         std::thread::sleep(Duration::from_millis(10));
                     };
+                    crate::windows_loader_fileio::stop_collection(&callback_fileio_owner);
                     let held = held_family
                         .lock()
                         .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
@@ -5326,6 +5384,43 @@ pub(crate) mod native {
                 Ok(())
             },
         );
+        // Mandatory child/callback outcome is frozen before optional consumer
+        // drain. The owner still stops on every callback exit and joins once.
+        crate::windows_loader_fileio::finish(&fileio_owner);
+        if fileio_requested {
+            let retained = (|| -> Result<()> {
+                if Instant::now() >= cleanup_deadline {
+                    return Err(CiError::Message(
+                        "original FileIo retention cutoff exhausted".into(),
+                    ));
+                }
+                let listener = read(
+                    &input
+                        .descriptor
+                        .output_root
+                        .join("listener-call-trace.json"),
+                    crate::windows_loader_fileio::RECORD_BYTES,
+                )
+                .map_err(io::Error::other);
+                let value = crate::windows_loader_fileio::record(&fileio_state, listener);
+                let bytes = serde_json::to_vec(&value)?;
+                if bytes.len() > crate::windows_loader_fileio::RECORD_BYTES {
+                    return Err(CiError::Message("FileIo carrier exceeds bound".into()));
+                }
+                drop(crate::windows_native_files::publish_owned_file(
+                    &report.with_extension("loader-fileio.json"),
+                    &bytes,
+                )?);
+                Ok(())
+            })();
+            if let Err(error) = retained {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "optional FileIo retention unavailable: {}",
+                    crate::command::bounded_excerpt(error.to_string().as_bytes())
+                );
+            }
+        }
         let controller_resolution = if capture_gate_diagnostic && output.is_err() {
             let name: Vec<u16> = gate_name.encode_utf16().chain(Some(0)).collect();
             Some(super::gate_resolution::query(
