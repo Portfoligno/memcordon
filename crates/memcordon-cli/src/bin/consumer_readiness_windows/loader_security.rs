@@ -80,7 +80,7 @@ fn ancestors(context: &Context<'_>, path: &Path) -> io::Result<Vec<File>> {
         }
         super::listener_trace::live(context.clock)?;
         let file = OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
+            .access_mode(0)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(parent)?;
@@ -112,7 +112,7 @@ pub fn observe(
         "observation_timing":"same-caller-after-original-collectors-disarmed","file_observation_timing":"later-path-open-not-original-file-object","checks_are_hypotheses":true,
         "access_check_scope":"later-leaf-owner-group-dacl-only","unmodeled_inputs":["original-desired-access","original-file-object","mandatory-integrity-policy","parent-traversal","image-mapping","sharing","other-kernel-policy"],
         "later_file_open_request":{"desired_access":READ_CONTROL|FILE_READ_ATTRIBUTES,"share_access":FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,"flags":FILE_FLAG_OPEN_REPARSE_POINT,"original_request":false},
-        "later_ancestor_open_request":{"desired_access":FILE_READ_ATTRIBUTES,"share_access":FILE_SHARE_READ|FILE_SHARE_WRITE,"flags":FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,"original_request":false},
+        "later_ancestor_open_request":{"desired_access":0,"share_access":FILE_SHARE_READ|FILE_SHARE_WRITE,"flags":FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,"original_request":false},
         "token_source_requested_access":TOKEN_QUERY|TOKEN_DUPLICATE,"access_check_duplicate_requested_access":TOKEN_QUERY});
     let selected = match record::select(packet) {
         Ok(value) => value,
