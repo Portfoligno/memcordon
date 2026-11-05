@@ -479,6 +479,35 @@ fn bounded_sidecar_preserves_exact_windows_and_original_clock_binding() {
 }
 
 #[test]
+fn bounded_listener_keeps_small_post_original_security_and_prioritizes_original_trace() {
+    let security = json!({"format":"memcordon.post-original-loader-security","revision":1,"state":"unavailable","stage":"capture-post-original-effective-token","unavailable":{"native_error":5},"acceptance_authority":false,"denied_object_proved":false,"checks_are_hypotheses":true});
+    let envelope = json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":{"pid":99,"creation_time_100ns":123},"trace":diagnostic(&loader_scope()),"post_original_loader_security":security,"force_summary":"x".repeat(record::RECORD_BYTES)});
+    let bounded = record::bounded(envelope);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= record::RECORD_BYTES);
+    assert_eq!(bounded["post_original_loader_security"], security);
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["first_failure_window"]["finished_qpc"],
+        5
+    );
+    let oversized = json!({"trace":diagnostic(&loader_scope()),"post_original_loader_security":{"private_unbounded_data":"x".repeat(9000)}});
+    let bounded = record::bounded(oversized);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= record::RECORD_BYTES);
+    assert_eq!(
+        bounded["post_original_loader_security"]["state"],
+        "omitted-for-loader-security-bound"
+    );
+    assert_eq!(
+        bounded["trace"]["loader_owner"]["first_failure_window"]["finished_qpc"],
+        5
+    );
+    assert!(
+        !serde_json::to_string(&bounded)
+            .unwrap()
+            .contains("private_unbounded_data")
+    );
+}
+
+#[test]
 fn evicted_loader_or_socket_parents_are_incomplete_rather_than_invented() {
     for which in 0..2 {
         let mut value = loader_scope();

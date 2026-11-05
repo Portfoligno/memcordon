@@ -86,7 +86,7 @@ unsafe extern "C" fn invoke_listener(opaque: *mut c_void, outcome: *mut record::
     errors.restore();
 }
 
-fn live(clock: &super::descriptor::ControlClock) -> io::Result<()> {
+pub(super) fn live(clock: &super::descriptor::ControlClock) -> io::Result<()> {
     let mut now = 0i64;
     let mut frequency = 0i64;
     // SAFETY: initialized fixed outputs; no change to the original clock.
@@ -239,7 +239,11 @@ impl Write for Bounded {
         Ok(())
     }
 }
-fn retain(context: &Context<'_>, capture: &Captured) -> io::Result<()> {
+fn retain(
+    context: &Context<'_>,
+    capture: &Captured,
+    security: Option<serde_json::Value>,
+) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     live(context.clock)?;
     let binding = context.binding;
@@ -251,7 +255,7 @@ fn retain(context: &Context<'_>, capture: &Captured) -> io::Result<()> {
             "prior_admitted_token_envelope_sha256":super::descriptor::controller_start::descriptor_digest(context.token_envelope),
             "current_process_token":capture.process_token,"current_effective_token":capture.effective_token,
             "cutoff_qpc":context.clock.work_cutoff_qpc,"qpc_frequency":context.clock.qpc_frequency,
-            "authority":false},"trace":record::diagnostic(&capture.packet)
+            "authority":false},"trace":record::diagnostic(&capture.packet),"post_original_loader_security":security
     }));
     let mut bytes = Bounded(Vec::new());
     serde_json::to_writer(&mut bytes, &envelope).map_err(io::Error::other)?;
@@ -320,7 +324,21 @@ pub fn bind(context: Option<&Context<'_>>) -> io::Result<TcpListener> {
             .map_err(super::native::tcp_bind_failure);
     };
     let mut captured = capture(context.clock);
-    let retention = retain(context, &captured).err();
+    let security = if captured.invocation.panic.is_none()
+        && captured
+            .invocation
+            .result
+            .as_ref()
+            .is_some_and(|result| result.is_err())
+    {
+        // All native scopes are disarmed. A diagnostic panic cannot replace
+        // the original Rust error or transfer its socket/result ownership.
+        Some(catch_unwind(AssertUnwindSafe(||super::loader_security::observe(context,&captured.packet,&captured.effective_token)))
+            .unwrap_or_else(|_|serde_json::json!({"state":"unavailable","stage":"diagnostic-panicked","diagnostic_only":true,"acceptance_authority":false,"denied_object_proved":false})))
+    } else {
+        None
+    };
+    let retention = retain(context, &captured, security).err();
     let result = captured.take_result();
     if let (true, Some(error)) = (result.is_ok(), &retention) {
         let _ = writeln!(

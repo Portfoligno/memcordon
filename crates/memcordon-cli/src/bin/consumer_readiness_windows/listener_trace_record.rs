@@ -1078,7 +1078,13 @@ fn small(value: Option<&Value>, limit: usize) -> Value {
 }
 
 /// Apply the same cap to the model or the bridge's binding-bearing envelope.
-pub fn bounded(value: Value) -> Value {
+pub fn bounded(mut value: Value) -> Value {
+    if value
+        .get("post_original_loader_security")
+        .is_some_and(|security| !fits(security, 8192))
+    {
+        value["post_original_loader_security"] = json!({"state":"omitted-for-loader-security-bound","diagnostic_only":true,"acceptance_authority":false,"denied_object_proved":false});
+    }
     if fits(&value, RECORD_BYTES) {
         return value;
     }
@@ -1269,9 +1275,16 @@ pub fn bounded(value: Value) -> Value {
     }
     loader_summary["dependencies"] = counters;
     summary["loader_owner"] = loader_summary;
-    if value.get("trace").is_some() {
+    let mut result = if value.get("trace").is_some() {
         json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":small(value.get("original_binding"),16*1024),"binding_omitted_if_oversize":!value.get("original_binding").is_some_and(|binding|fits(binding,16*1024)),"trace":summary,"record_omitted_for_envelope_bound":true,"acceptance_authority":false})
     } else {
         summary
+    };
+    if let Some(security) = value.get("post_original_loader_security") {
+        result["post_original_loader_security"] = security.clone();
+        if !fits(&result, RECORD_BYTES) {
+            result["post_original_loader_security"] = json!({"state":"omitted-for-listener-envelope-bound","diagnostic_only":true,"acceptance_authority":false,"denied_object_proved":false});
+        }
     }
+    result
 }

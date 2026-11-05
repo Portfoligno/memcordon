@@ -19,6 +19,8 @@ mod gate_entry_route;
 mod gate_precondition_child;
 mod listener_trace;
 mod listener_trace_record;
+mod loader_security;
+mod loader_security_record;
 mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;

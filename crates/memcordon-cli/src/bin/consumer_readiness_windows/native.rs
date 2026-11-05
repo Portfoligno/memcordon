@@ -391,7 +391,9 @@ pub fn effective_token_observation() -> io::Result<Vec<u8>> {
     token_observation_from(-6isize as windows_sys::Win32::Foundation::HANDLE)
 }
 
-fn token_observation_from(token: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Vec<u8>> {
+pub(super) fn token_observation_from(
+    token: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::{GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount};
     use windows_sys::Win32::Security::{
         TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenRestrictedSids,
