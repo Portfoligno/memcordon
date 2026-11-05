@@ -1,4 +1,7 @@
 //! Isolated feasibility collection, never a product capability or caller authority.
+use memcordon_platform::windows_access_failure_preparation::{
+    FailureKind as PreparationKind, PreparationFailure, Record as PreparationRecord,
+};
 use memcordon_platform::windows_access_failure_record::{
     ConsumerSpec, Observation, Ready, StopRecord,
 };
@@ -31,6 +34,78 @@ pub fn preserve(primary: io::Result<()>, secondary: io::Result<()>) -> io::Resul
             ProbeSecondary { primary, secondary },
         )),
     }
+}
+
+/// Validate preparation failure before creating any observation session.
+pub fn preparation_failure_ready(
+    value: &Value,
+    owned_pid: u32,
+) -> io::Result<Option<PreparationRecord>> {
+    if owned_pid == 0
+        || value["format"] != "memcordon.access-calibration-ready"
+        || value["pid"].as_u64() != Some(u64::from(owned_pid))
+    {
+        return Err(io::Error::other("calibration readiness identity differs"));
+    }
+    match value["prepared"].as_bool() {
+        Some(true) => {
+            if value.get("preparation_failure").is_some() || value.get("native_error").is_some() {
+                return Err(io::Error::other(
+                    "prepared calibration contradicts failure record",
+                ));
+            }
+            Ok(None)
+        }
+        Some(false) => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct FailedReady {
+                format: String,
+                prepared: bool,
+                pid: u32,
+                native_error: Option<i32>,
+                preparation_failure: PreparationRecord,
+            }
+            if value.get("native_error").is_none() {
+                return Err(io::Error::other("preparation status field absent"));
+            }
+            let ready: FailedReady =
+                serde_json::from_value(value.clone()).map_err(io::Error::other)?;
+            ready
+                .preparation_failure
+                .validate()
+                .map_err(io::Error::other)?;
+            if ready.format != "memcordon.access-calibration-ready"
+                || ready.prepared
+                || ready.pid != owned_pid
+                || ready.native_error != ready.preparation_failure.native_error
+            {
+                return Err(io::Error::other(
+                    "preparation status or identity contradicts typed operation",
+                ));
+            }
+            Ok(Some(ready.preparation_failure))
+        }
+        None => Err(io::Error::other("calibration readiness state unavailable")),
+    }
+}
+
+pub fn preparation_error(record: PreparationRecord) -> io::Error {
+    if let Err(error) = record.validate() {
+        return io::Error::new(io::ErrorKind::InvalidData, error);
+    }
+    let primary = match record.kind {
+        PreparationKind::Native => record
+            .native_error
+            .map(io::Error::from_raw_os_error)
+            .unwrap_or_else(|| io::Error::other("native preparation I/O failed without OS status")),
+        PreparationKind::Cutoff => io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original calibration preparation cutoff expired",
+        ),
+        PreparationKind::Semantic => io::Error::other("calibration preparation validation failed"),
+    };
+    io::Error::new(primary.kind(), PreparationFailure { primary, record })
 }
 
 pub fn checked_attempt(value: &Value) -> io::Result<Value> {
@@ -308,7 +383,11 @@ mod native {
         let mut calibration = match Calibration::prepare(Path::new(directory), work) {
             Ok(calibration) => calibration,
             Err(error) => {
-                let record = json!({"format":"memcordon.access-calibration-ready","prepared":false,"pid":std::process::id(),"native_error":native_code(&error)});
+                let failure = error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<PreparationFailure>())
+                    .map(|failure| failure.record);
+                let record = json!({"format":"memcordon.access-calibration-ready","prepared":false,"pid":std::process::id(),"native_error":native_code(&error),"preparation_failure":failure});
                 return preserve(Err(error), line(&record));
             }
         };
@@ -553,8 +632,14 @@ mod native {
         let mut calibration_cleanup = false;
         let mut attempt = Value::Null;
         let mut calibration_native_error = None;
+        let mut preparation_failure = None;
         let execution = (|| -> io::Result<()> {
             let (owned_pid, ready) = calibration.ready(work)?;
+            if let Some(record) = preparation_failure_ready(&ready, owned_pid)? {
+                calibration_native_error = record.native_error.map(i64::from);
+                preparation_failure = Some(record);
+                return Err(preparation_error(record));
+            }
             if ready["format"] != "memcordon.access-calibration-ready" {
                 return Err(io::Error::other("calibration readiness format differs"));
             }
@@ -566,17 +651,6 @@ mod native {
                 return Err(io::Error::other(
                     "calibration readiness differs from original owned child",
                 ));
-            }
-            if ready["prepared"] != true {
-                calibration_native_error = ready["native_error"].as_i64();
-                return Err(calibration_native_error
-                    .and_then(|code| i32::try_from(code).ok())
-                    .map(io::Error::from_raw_os_error)
-                    .unwrap_or_else(|| {
-                        io::Error::other(
-                            "owned calibration preparation failed without native status",
-                        )
-                    }));
             }
             let candidate = memcordon_testkit::windows_process_candidate_for_image_until(
                 &std::env::current_exe()?,
@@ -757,6 +831,10 @@ mod native {
         );
         report["setup_error"] = json!(setup_error);
         report["calibration_native_error"] = json!(calibration_native_error);
+        report["preparation_failure"] = json!(preparation_failure);
+        report["preparation_request_scope"] = json!(
+            "configured Win32 and SetSecurityInfo caller arguments; not native syscall DesiredAccess or granted rights"
+        );
         report["consumer_execution_error"] = json!(consumer_failure.as_ref().map(detail));
         report["token_profile_construction"] = json!({"source":"owned calibration helper process primary","disable_max_privilege":true,"restricting_sid":"RestrictedCode","restricting_sid_input_attributes":0,"disabled_sid_count":0,"explicitly_deleted_privileges":0,"required_effective_token_type":"TokenImpersonation","required_effective_impersonation_level":"SecurityImpersonation","source_compared_with_installed_caller":false});
         report["event_counter_scope"] = json!(

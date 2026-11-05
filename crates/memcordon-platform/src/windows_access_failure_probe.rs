@@ -1,4 +1,7 @@
 //! Isolated calibration resources; never an original workload or access authority.
+use crate::windows_access_failure_preparation::{
+    PreparationOperation as PrepOp, RequestFacts, State as PreparationState,
+};
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -87,9 +90,19 @@ fn abort_restoration(phase: &str) -> ! {
     std::process::abort()
 }
 
-fn rc_profile(token: &OwnedHandle, rc: *mut core::ffi::c_void) -> io::Result<()> {
+fn rc_profile(
+    token: &OwnedHandle,
+    rc: *mut core::ffi::c_void,
+    mut preparation: Option<&mut PreparationState>,
+) -> io::Result<()> {
+    let mut operation = |operation| {
+        if let Some(state) = preparation.as_deref_mut() {
+            state.operation = operation;
+        }
+    };
     let mut bytes = [0usize; 256];
     let mut length = 0;
+    operation(PrepOp::QueryRestrictedSids);
     // SAFETY: aligned bounded writable token buffer and held query token.
     if unsafe {
         GetTokenInformation(
@@ -103,6 +116,7 @@ fn rc_profile(token: &OwnedHandle, rc: *mut core::ffi::c_void) -> io::Result<()>
     {
         return Err(io::Error::last_os_error());
     }
+    operation(PrepOp::ValidateRestrictedSidsExtent);
     if length as usize > std::mem::size_of_val(&bytes)
         || (length as usize) < std::mem::size_of::<TOKEN_GROUPS>()
     {
@@ -110,6 +124,7 @@ fn rc_profile(token: &OwnedHandle, rc: *mut core::ffi::c_void) -> io::Result<()>
     }
     // SAFETY: successful bounded TOKEN_GROUPS output, checked fixed prefix.
     let groups = unsafe { &*bytes.as_ptr().cast::<TOKEN_GROUPS>() };
+    operation(PrepOp::ValidateRestrictedSidCount);
     if groups.GroupCount != 1 {
         return Err(io::Error::other(
             "calibration requires exactly RestrictedCode",
@@ -118,6 +133,7 @@ fn rc_profile(token: &OwnedHandle, rc: *mut core::ffi::c_void) -> io::Result<()>
     let base = bytes.as_ptr() as usize;
     let end = base + length as usize;
     let sid = groups.Groups[0].Sid as usize;
+    operation(PrepOp::ValidateRestrictedSidPointer);
     if sid < base || sid.checked_add(8).is_none_or(|limit| limit > end) {
         return Err(io::Error::other(
             "restricted SID pointer outside token output",
@@ -125,6 +141,7 @@ fn rc_profile(token: &OwnedHandle, rc: *mut core::ffi::c_void) -> io::Result<()>
     }
     // SAFETY: the fixed SID header is within the successful native output extent.
     let header = unsafe { std::slice::from_raw_parts(sid as *const u8, 8) };
+    operation(PrepOp::ValidateRestrictedSidExtent);
     if header[0] != 1
         || header[1] > 15
         || sid
@@ -134,12 +151,14 @@ fn rc_profile(token: &OwnedHandle, rc: *mut core::ffi::c_void) -> io::Result<()>
         return Err(io::Error::other("restricted SID extent invalid"));
     }
     // SAFETY: complete native SID extent is now proved inside the held output buffer.
+    operation(PrepOp::CompareRestrictedSid);
     if unsafe { EqualSid(groups.Groups[0].Sid, rc) } == 0 {
         return Err(io::Error::other(
             "calibration requires exactly RestrictedCode",
         ));
     }
     // SAFETY: held token query only.
+    operation(PrepOp::ValidateTokenRestricted);
     if unsafe { IsTokenRestricted(token.as_raw_handle()) } == 0 {
         return Err(io::Error::other("calibration token is not restricted"));
     }
@@ -156,40 +175,68 @@ pub struct Calibration {
 
 impl Calibration {
     pub fn prepare(directory: &Path, deadline: Instant) -> io::Result<Self> {
+        let mut state = PreparationState {
+            request: RequestFacts {
+                owner_file_desired_access: windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                    | FILE_READ_DATA
+                    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA,
+                owner_file_share: FILE_SHARE_READ | FILE_SHARE_WRITE,
+                owner_file_flags:
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                security_information: DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                source_token_access: TOKEN_QUERY | TOKEN_DUPLICATE,
+            },
+            ..Default::default()
+        };
+        Self::prepare_observed(directory, deadline, &mut state)
+            .map_err(|primary| state.failure(primary))
+    }
+
+    fn prepare_observed(
+        directory: &Path,
+        deadline: Instant,
+        state: &mut PreparationState,
+    ) -> io::Result<Self> {
+        state.operation = PrepOp::CutoffInitial;
         live(deadline)?;
         let mut existing = std::ptr::null_mut();
+        state.operation = PrepOp::OpenCurrentThreadToken;
         // SAFETY: current thread/query output; this probe refuses an existing impersonation.
         if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut existing) } != 0 {
             // SAFETY: successful native token acquisition is uniquely owned.
             drop(unsafe { OwnedHandle::from_raw_handle(existing) });
+            state.operation = PrepOp::ValidateNoThreadToken;
             return Err(io::Error::other("calibration helper already impersonates"));
         }
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(ERROR_NO_TOKEN as i32) {
             return Err(error);
         }
+        state.operation = PrepOp::CutoffBeforeOwnedFile;
         live(deadline)?;
         let path = directory.join("ordinary-rc-denied-input.bin");
         // The parent owns this separate calibration namespace through helper settlement.
         use std::io::Write;
+        state.operation = PrepOp::CreateOwnedFile;
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
-            .access_mode(
-                windows_sys::Win32::Storage::FileSystem::WRITE_DAC
-                    | FILE_READ_DATA
-                    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA,
-            )
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .access_mode(state.request.owner_file_desired_access)
+            .share_mode(state.request.owner_file_share)
+            .custom_flags(state.request.owner_file_flags)
             .open(&path)?;
+        state.progress.file_created = true;
+        state.operation = PrepOp::WriteOwnedFile;
         file.write_all(b"owned access-check calibration\n")?;
+        state.progress.fixed_bytes_written = true;
         let mut descriptor = std::ptr::null_mut();
         let sddl: Vec<u16> = "D:P(D;;0x1;;;RC)(A;;FA;;;OW)(A;;FA;;;SY)"
             .encode_utf16()
             .chain(Some(0))
             .collect();
+        state.operation = PrepOp::ConvertOwnedDacl;
         // SAFETY: fixed NUL-terminated DACL only; no host object or SACL is modified.
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -214,6 +261,7 @@ impl Calibration {
         let mut present = 0;
         let mut defaulted = 0;
         let mut dacl = std::ptr::null_mut();
+        state.operation = PrepOp::ExtractOwnedDacl;
         // SAFETY: held valid converted descriptor and writable ACL outputs.
         if unsafe {
             GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
@@ -221,15 +269,17 @@ impl Calibration {
         {
             return Err(io::Error::last_os_error());
         }
+        state.operation = PrepOp::ValidateOwnedDacl;
         if present == 0 || dacl.is_null() {
             return Err(io::Error::other("owned calibration DACL absent"));
         }
+        state.operation = PrepOp::ApplyOwnedDacl;
         // SAFETY: mutate ONLY the same create-new held file object; never a pathname target.
         let status = unsafe {
             SetSecurityInfo(
                 file.as_raw_handle(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                state.request.security_information,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 dacl,
@@ -239,13 +289,19 @@ impl Calibration {
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
+        state.progress.dacl_applied = true;
+        state.operation = PrepOp::CutoffAfterOwnedDacl;
         live(deadline)?;
-        // The ordinary source caller must read the same object before RC impersonation.
+        // This reads through the pre-DACL held handle, not a fresh ordinary access check.
         use std::io::{Read, Seek};
+        state.operation = PrepOp::RewindOwnedFile;
         file.rewind()?;
         let mut ordinary = [0u8; 1];
+        state.operation = PrepOp::ReadOwnedFile;
         file.read_exact(&mut ordinary)?;
+        state.progress.ordinary_held_read_completed = true;
         let mut object_name = vec![0u16; 32768];
+        state.operation = PrepOp::QueryOwnedNativeName;
         // SAFETY: held owned file and bounded writable native name buffer.
         let units = unsafe {
             windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
@@ -258,16 +314,19 @@ impl Calibration {
         if units == 0 {
             return Err(io::Error::last_os_error());
         }
+        state.operation = PrepOp::ValidateOwnedNativeName;
         if units as usize >= object_name.len() {
             return Err(io::Error::other("owned probe native path exceeds bound"));
         }
         object_name.truncate(units as usize);
+        state.progress.native_name_observed = true;
         let mut source = std::ptr::null_mut();
+        state.operation = PrepOp::OpenSourceToken;
         // SAFETY: current process token only, query/duplicate rights as required to derive a token.
         if unsafe {
             OpenProcessToken(
                 GetCurrentProcess(),
-                TOKEN_QUERY | TOKEN_DUPLICATE,
+                state.request.source_token_access,
                 &mut source,
             )
         } == 0
@@ -276,8 +335,10 @@ impl Calibration {
         }
         // SAFETY: new uniquely owned token handle.
         let source = unsafe { OwnedHandle::from_raw_handle(source) };
+        state.progress.source_token_opened = true;
         let mut rc = [0u32; 17];
         let mut length = std::mem::size_of_val(&rc) as u32;
+        state.operation = PrepOp::CreateRestrictedCodeSid;
         // SAFETY: aligned maximum SID buffer with writable native extent.
         if unsafe {
             CreateWellKnownSid(
@@ -295,6 +356,7 @@ impl Calibration {
             Attributes: 0,
         };
         let mut restricted = std::ptr::null_mut();
+        state.operation = PrepOp::DeriveRestrictedToken;
         // SAFETY: same RC construction as the installed fixture; no privilege enablement.
         if unsafe {
             CreateRestrictedToken(
@@ -314,7 +376,10 @@ impl Calibration {
         }
         // SAFETY: successful native creation transfers a unique handle.
         let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
-        rc_profile(&restricted, rc.as_mut_ptr().cast())?;
+        state.progress.restricted_token_created = true;
+        rc_profile(&restricted, rc.as_mut_ptr().cast(), Some(state))?;
+        state.progress.restricted_profile_validated = true;
+        state.operation = PrepOp::CutoffFinal;
         live(deadline)?;
         Ok(Self {
             path,
@@ -357,7 +422,7 @@ impl Calibration {
             }
             // SAFETY: successful native token acquisition transfers a unique handle.
             let effective = unsafe { OwnedHandle::from_raw_handle(effective) };
-            rc_profile(&effective, self.rc.as_mut_ptr().cast())?;
+            rc_profile(&effective, self.rc.as_mut_ptr().cast(), None)?;
             let mut effective_type = 0i32;
             let mut effective_level = 0i32;
             let mut native_length = 0;

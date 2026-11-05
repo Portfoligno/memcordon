@@ -2,6 +2,7 @@ use memcordon_ci::windows_access_failure_probe::{
     FRAME_BYTES, assessment, checked_attempt, consumer_output, finish_consumer, first_frame,
     preserve,
 };
+use memcordon_platform::windows_access_failure_preparation::{PreparationOperation, Record, State};
 use memcordon_platform::windows_access_failure_record::{
     Binding, ConsumerSpec, Observation, Ready, StopRecord,
 };
@@ -274,4 +275,90 @@ fn required_native_failure_survives_report_publication_failure() {
     assert_eq!(primary.raw_os_error(), Some(5));
     assert!(error.to_string().contains("bounded report write failure"));
     assert!(preserve(Ok(()), Err(std::io::Error::other("required report absent"))).is_err());
+}
+
+fn failed_preparation_ready() -> serde_json::Value {
+    let state = State {
+        operation: PreparationOperation::ApplyOwnedDacl,
+        progress: memcordon_platform::windows_access_failure_preparation::Milestones {
+            file_created: true,
+            fixed_bytes_written: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let record = Record::from_error(&state, &std::io::Error::from_raw_os_error(5));
+    json!({"format":"memcordon.access-calibration-ready","prepared":false,"pid":123,"native_error":5,"preparation_failure":record})
+}
+
+#[test]
+fn preparation_operation_and_native_error_survive_helper_and_controller_custody() {
+    use memcordon_ci::windows_access_failure_probe::{
+        preparation_error, preparation_failure_ready,
+    };
+    let mut bytes = serde_json::to_vec(&failed_preparation_ready()).unwrap();
+    bytes.push(b'\n');
+    assert!(bytes.len() < FRAME_BYTES);
+    let frame = first_frame(&bytes).unwrap().unwrap();
+    let record = preparation_failure_ready(&frame, 123).unwrap().unwrap();
+    assert_eq!(record.operation, PreparationOperation::ApplyOwnedDacl);
+    assert_eq!(record.native_error, Some(5));
+    assert!(!record.progress.dacl_applied);
+    assert_eq!(record.request.owner_file_desired_access, 0x40003);
+    let retained = serde_json::to_vec(&record).unwrap();
+    assert_eq!(serde_json::from_slice::<Record>(&retained).unwrap(), record);
+    let error = preserve(
+        Err(preparation_error(record)),
+        Err(std::io::Error::other("publication secondary")),
+    )
+    .unwrap_err();
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    let mut native = None;
+    for _ in 0..8 {
+        if let Some(code) = source
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            native = Some(code);
+            break;
+        }
+        match source.source() {
+            Some(next) => source = next,
+            None => break,
+        }
+    }
+    assert_eq!(native, Some(5));
+    assert!(error.to_string().contains("ApplyOwnedDacl"));
+}
+
+#[test]
+fn contradictory_or_unbound_preparation_frames_are_mandatory_protocol_failures() {
+    use memcordon_ci::windows_access_failure_probe::preparation_failure_ready;
+    let frame = failed_preparation_ready();
+    assert!(preparation_failure_ready(&frame, 124).is_err());
+    for (field, value) in [("prepared", json!(true)), ("native_error", json!(87))] {
+        let mut bad = frame.clone();
+        bad[field] = value;
+        assert!(preparation_failure_ready(&bad, 123).is_err());
+    }
+    for (field, value) in [
+        ("operation", json!("unknown-operation")),
+        ("native_error", json!(0)),
+    ] {
+        let mut bad = frame.clone();
+        bad["preparation_failure"][field] = value;
+        assert!(preparation_failure_ready(&bad, 123).is_err());
+    }
+    let mut bad = frame.clone();
+    bad["preparation_failure"]["progress"]["dacl_applied"] = json!(true);
+    assert!(preparation_failure_ready(&bad, 123).is_err());
+    let mut missing = frame.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("preparation_failure");
+    assert!(preparation_failure_ready(&missing, 123).is_err());
+    let mut foreign = frame;
+    foreign["raw_sid"] = json!("not accepted");
+    assert!(preparation_failure_ready(&foreign, 123).is_err());
 }

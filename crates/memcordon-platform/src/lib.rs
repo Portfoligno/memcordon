@@ -38,6 +38,9 @@ mod macos_result_frame;
 pub mod startup_cleanup_observation;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub mod windows_access_failure_preparation;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub mod windows_access_failure_record;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
