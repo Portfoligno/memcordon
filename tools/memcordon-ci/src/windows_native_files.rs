@@ -413,6 +413,18 @@ pub fn hold_artifact(
     })
 }
 
+/// Keep source file/ancestry custody live through synchronous publication.
+#[cfg(windows)]
+pub fn retain_captured_artifact(
+    source: &Path,
+    destination: &Path,
+    maximum: u64,
+) -> crate::Result<Vec<u8>> {
+    let held = hold_artifact(source, None, maximum)?;
+    drop(publish_owned_file(destination, &held.bytes)?);
+    Ok(held.bytes)
+}
+
 #[cfg(windows)]
 pub fn copy_owned_artifact(
     source: &Path,

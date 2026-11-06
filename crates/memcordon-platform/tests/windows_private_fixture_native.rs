@@ -146,7 +146,30 @@ fn actual_main_image_requires_exact_object_content_ancestry_and_separate_output(
     assert!(native::verify(&wrong, &setup.paths, output.path(), cutoff).is_err());
     let mut wrong = setup.binding.clone();
     wrong.ancestors.last_mut().unwrap().file_index += 1;
-    assert!(native::verify(&wrong, &setup.paths, output.path(), cutoff).is_err());
+    let refusal = native::verify(&wrong, &setup.paths, output.path(), cutoff)
+        .err()
+        .unwrap();
+    let detail = native::failure_record(&refusal);
+    assert_eq!(detail["progress"]["role"], "input-ancestor");
+    assert_eq!(detail["progress"]["index"], wrong.ancestors.len() - 1);
+    assert_eq!(detail["progress"]["count"], wrong.ancestors.len());
+    assert_eq!(detail["progress"]["substage"], "identity-compare");
+    assert_eq!(
+        detail["progress"]["requested_win32_mask"],
+        windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES
+    );
+    assert_eq!(detail["progress"]["cutoff_before"], true);
+    assert!(detail["progress"]["cutoff_after"].is_null());
+    assert!(detail["native_code"].is_null());
+    let mut wrong = setup.binding.clone();
+    wrong.local_directory.file_index += 1;
+    let refusal = native::verify(&wrong, &setup.paths, output.path(), cutoff)
+        .err()
+        .unwrap();
+    assert_eq!(
+        native::failure_record(&refusal)["progress"]["role"],
+        "local-directory"
+    );
     for change in [0x400, 0x10] {
         let mut wrong = setup.binding.clone();
         wrong.attributes |= change;
@@ -171,7 +194,17 @@ fn actual_main_image_requires_exact_object_content_ancestry_and_separate_output(
         alias_metadata.file_index,
         setup.binding.ancestors.last().unwrap().file_index
     );
-    assert!(native::verify_output(&setup.binding, &alias, cutoff).is_err());
+    let refusal = native::verify_output(&setup.binding, &alias, cutoff)
+        .err()
+        .unwrap();
+    assert_eq!(
+        native::failure_record(&refusal)["progress"]["role"],
+        "output-ancestor"
+    );
+    assert_eq!(
+        native::failure_record(&refusal)["progress"]["substage"],
+        "output-alias-compare"
+    );
     assert!(native::verify(&setup.binding, &setup.paths, &alias, cutoff).is_err());
 
     let copy_root = tempfile::tempdir().unwrap();

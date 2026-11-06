@@ -39,6 +39,7 @@ fn fileio_capture_keeps_restricted_joint_and_only_adds_ordinary_provider_joint()
 fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     use memcordon_ci::windows_consumer_readiness::{
         CaseKey, ProviderExperimentRecord as Record, controller_case_directory,
+        retain_provider_experiment_facts,
     };
     use std::{collections::BTreeSet, fs};
 
@@ -58,9 +59,15 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     for record in Record::ALL {
         assert!(leaves.insert(record.leaf()));
         let (producer, decoy, expected) = match record {
-            Record::NativeListener | Record::NativeTcpPeer | Record::LoaderFileIo => {
-                (&native, &fixture, b"controller".as_slice())
-            }
+            Record::NativeListener
+            | Record::NativeTcpPeer
+            | Record::LoaderFileIo
+            | Record::CallbackFailure
+            | Record::CallbackStdout
+            | Record::CallbackStderr
+            | Record::GuardianQuery
+            | Record::GuardianStdout
+            | Record::GuardianStderr => (&native, &fixture, b"controller".as_slice()),
             _ => (&fixture, &native, b"fixture".as_slice()),
         };
         fs::write(producer.join(record.leaf()), expected).unwrap();
@@ -72,6 +79,113 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     assert!(leaves.contains("winsock-startup-trace.json"));
     assert!(leaves.contains("peer-winsock-startup-trace.json"));
     assert!(leaves.contains("result.loader-fileio.json"));
+    assert!(leaves.contains("result.callback-failure.json"));
+    assert!(leaves.contains("result.guardian-query.stderr.bin"));
+
+    let original_stderr = vec![b'x'; 4984];
+    fs::write(native.join("result.stderr.bin"), &original_stderr).unwrap();
+    fs::write(native.join("result.stdout.bin"), vec![0; 64 * 1024]).unwrap();
+    fs::write(
+        native.join("result.guardian-query.stderr.bin"),
+        vec![0; 64 * 1024 + 1],
+    )
+    .unwrap();
+    fs::remove_file(native.join("result.guardian-query.stdout.bin")).unwrap();
+    let facts = temporary.path().join("facts");
+    let mut copied = Vec::new();
+    retain_provider_experiment_facts(
+        &controller,
+        &key,
+        &fixture,
+        &facts,
+        |source, destination, maximum| {
+            let bytes = fs::read(source)?;
+            assert!(bytes.len() as u64 <= maximum);
+            copied.push(source.to_owned());
+            fs::write(destination, &bytes)?;
+            Ok(bytes)
+        },
+        |path, bytes| {
+            fs::write(path, bytes)?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(facts.join("result.stderr.bin")).unwrap(),
+        original_stderr
+    );
+    assert_eq!(
+        fs::metadata(facts.join("result.stdout.bin")).unwrap().len(),
+        64 * 1024
+    );
+    assert!(!facts.join("result.guardian-query.stderr.bin").exists());
+    assert!(!facts.join("result.guardian-query.stdout.bin").exists());
+    assert!(!copied.contains(&native.join("result.guardian-query.stderr.bin")));
+    let index_bytes = fs::read(facts.join("controller-capture-retention.json")).unwrap();
+    assert!(index_bytes.len() <= 8 * 1024);
+    let index: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    let captures = index["captures"].as_array().unwrap();
+    assert_eq!(captures.len(), 6);
+    for (leaf, state) in [
+        ("result.stderr.bin", "copied"),
+        ("result.stdout.bin", "copied"),
+        ("result.guardian-query.stderr.bin", "oversize-not-copied"),
+        ("result.guardian-query.stdout.bin", "not-present"),
+    ] {
+        assert_eq!(
+            captures.iter().find(|row| row["leaf"] == leaf).unwrap()["state"],
+            state
+        );
+    }
+}
+
+#[test]
+fn controller_capture_metadata_distinguishes_complete_files_oversize_and_producer_unknown() {
+    use memcordon_ci::windows_consumer_readiness::ProviderExperimentRecord as Record;
+    let captures = [
+        Record::CallbackFailure,
+        Record::CallbackStdout,
+        Record::CallbackStderr,
+        Record::GuardianQuery,
+        Record::GuardianStdout,
+        Record::GuardianStderr,
+    ];
+    let original_stderr = vec![b'x'; 4984];
+    let mut index = Vec::new();
+    for record in captures {
+        assert_eq!(record.capture_ceiling(), Some(64 * 1024));
+        let copied =
+            record.capture_retention(Some(original_stderr.len() as u64), Some(&original_stderr));
+        assert_eq!(copied["state"], "copied");
+        assert_eq!(copied["retained_bytes"], original_stderr.len());
+        assert_eq!(copied["file_copy_complete"], true);
+        assert_eq!(copied["retained_sha256"].as_str().unwrap().len(), 64);
+        assert!(copied["producer_capture_complete"].is_null());
+        assert_eq!(copied["acceptance_authority"], false);
+        let limit = vec![0; 64 * 1024];
+        assert_eq!(
+            record.capture_retention(Some(limit.len() as u64), Some(&limit))["file_copy_complete"],
+            true
+        );
+        let oversized = record.capture_retention(Some(64 * 1024 + 1), None);
+        assert_eq!(oversized["state"], "oversize-not-copied");
+        assert_eq!(oversized["file_copy_complete"], false);
+        assert!(oversized["retained_sha256"].is_null());
+        assert!(oversized["retained_bytes"].is_null());
+        let oversized_bytes = vec![0; 64 * 1024 + 1];
+        let rejected_copy =
+            record.capture_retention(Some(oversized_bytes.len() as u64), Some(&oversized_bytes));
+        assert!(rejected_copy["retained_sha256"].is_null());
+        assert!(rejected_copy["retained_bytes"].is_null());
+        index.push(oversized);
+        let absent = record.capture_retention(None, None);
+        assert_eq!(absent["state"], "not-present");
+        assert!(!absent["file_copy_complete"].as_bool().unwrap());
+        let changed = record.capture_retention(Some(1), Some(&original_stderr));
+        assert_eq!(changed["state"], "not-completely-copied");
+    }
+    assert!(serde_json::to_vec(&index).unwrap().len() < 8 * 1024);
 }
 
 #[test]

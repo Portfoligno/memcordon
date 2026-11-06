@@ -116,10 +116,16 @@ pub enum ProviderExperimentRecord {
     NativeListener,
     NativeTcpPeer,
     LoaderFileIo,
+    CallbackFailure,
+    CallbackStdout,
+    CallbackStderr,
+    GuardianQuery,
+    GuardianStdout,
+    GuardianStderr,
 }
 
 impl ProviderExperimentRecord {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 17] = [
         Self::ListenerTrace,
         Self::PeerListenerTrace,
         Self::StartupTrace,
@@ -131,6 +137,12 @@ impl ProviderExperimentRecord {
         Self::NativeListener,
         Self::NativeTcpPeer,
         Self::LoaderFileIo,
+        Self::CallbackFailure,
+        Self::CallbackStdout,
+        Self::CallbackStderr,
+        Self::GuardianQuery,
+        Self::GuardianStdout,
+        Self::GuardianStderr,
     ];
 
     pub fn leaf(self) -> &'static str {
@@ -146,7 +158,57 @@ impl ProviderExperimentRecord {
             Self::NativeListener => "native-listener.json",
             Self::NativeTcpPeer => "native-tcp-peer.json",
             Self::LoaderFileIo => "result.loader-fileio.json",
+            Self::CallbackFailure => "result.callback-failure.json",
+            Self::CallbackStdout => "result.stdout.bin",
+            Self::CallbackStderr => "result.stderr.bin",
+            Self::GuardianQuery => "result.guardian-query.json",
+            Self::GuardianStdout => "result.guardian-query.stdout.bin",
+            Self::GuardianStderr => "result.guardian-query.stderr.bin",
         }
+    }
+
+    /// These are separately bounded copies of existing controller captures,
+    /// not a change to the producer's larger stream/record limits.
+    pub fn capture_ceiling(self) -> Option<usize> {
+        match self {
+            Self::CallbackFailure
+            | Self::CallbackStdout
+            | Self::CallbackStderr
+            | Self::GuardianQuery
+            | Self::GuardianStdout
+            | Self::GuardianStderr => Some(64 * 1024),
+            _ => None,
+        }
+    }
+
+    pub fn capture_retention(
+        self,
+        source_bytes: Option<u64>,
+        copied: Option<&[u8]>,
+    ) -> serde_json::Value {
+        let ceiling = self.capture_ceiling();
+        let copied = copied.filter(|bytes| ceiling.is_some_and(|cap| bytes.len() <= cap));
+        let complete = copied.is_some_and(|bytes| {
+            source_bytes == Some(bytes.len() as u64)
+                && ceiling.is_some_and(|cap| bytes.len() <= cap)
+        });
+        let state = if source_bytes.is_none() {
+            "not-present"
+        } else if source_bytes
+            .zip(ceiling)
+            .is_some_and(|(size, cap)| size > cap as u64)
+        {
+            "oversize-not-copied"
+        } else if complete {
+            "copied"
+        } else {
+            "not-completely-copied"
+        };
+        serde_json::json!({"leaf":self.leaf(),"copy_ceiling_bytes":ceiling,"source_metadata_bytes":source_bytes,
+            "retained_bytes":copied.map(<[u8]>::len),"retained_sha256":copied.map(crate::windows_causal_acceptance::sha256),
+            "file_copy_complete":complete,"state":state,"producer_capture_complete":null,
+            "producer_capture_completeness":"not inferred; consult original callback-failure or guardian-query record",
+            "acceptance_authority":false})
     }
 
     pub fn source_path(
@@ -156,12 +218,71 @@ impl ProviderExperimentRecord {
         fixture_output: &Path,
     ) -> PathBuf {
         match self {
-            Self::NativeListener | Self::NativeTcpPeer | Self::LoaderFileIo => {
+            Self::NativeListener
+            | Self::NativeTcpPeer
+            | Self::LoaderFileIo
+            | Self::CallbackFailure
+            | Self::CallbackStdout
+            | Self::CallbackStderr
+            | Self::GuardianQuery
+            | Self::GuardianStdout
+            | Self::GuardianStderr => {
                 controller_case_directory(controller_output, key).join(self.leaf())
             }
             _ => fixture_output.join(self.leaf()),
         }
     }
+}
+
+/// The native caller retains original held-file custody through each synchronous
+/// copy. This shared finite algorithm supplies no file or mutation authority.
+pub fn retain_provider_experiment_facts(
+    controller_output: &Path,
+    key: &CaseKey,
+    fixture_output: &Path,
+    facts_dir: &Path,
+    mut retain_file: impl FnMut(&Path, &Path, u64) -> Result<Vec<u8>>,
+    mut publish_index: impl FnMut(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    use std::{fs, io};
+    fs::create_dir(facts_dir)?;
+    let mut capture_index = Vec::new();
+    for record in ProviderExperimentRecord::ALL {
+        let path = record.source_path(controller_output, key, fixture_output);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let maximum = record.capture_ceiling().unwrap_or(64 * 1024);
+                if record
+                    .capture_ceiling()
+                    .is_some_and(|cap| metadata.len() > cap as u64)
+                {
+                    capture_index.push(record.capture_retention(Some(metadata.len()), None));
+                    continue;
+                }
+                let bytes = retain_file(&path, &facts_dir.join(record.leaf()), maximum as u64)?;
+                if record.capture_ceiling().is_some() {
+                    capture_index
+                        .push(record.capture_retention(Some(metadata.len()), Some(&bytes)));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if record.capture_ceiling().is_some() {
+                    capture_index.push(record.capture_retention(None, None));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let index = serde_json::to_vec(&serde_json::json!({
+        "format":"memcordon.provider-controller-capture-retention","revision":1,
+        "diagnostic_only":true,"acceptance_authority":false,"captures":capture_index,
+    }))?;
+    if index.len() > 8 * 1024 {
+        return Err(CiError::Message(
+            "provider capture retention index exceeds8KiB".into(),
+        ));
+    }
+    publish_index(&facts_dir.join("controller-capture-retention.json"), &index)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6718,32 +6839,20 @@ pub(crate) mod native {
                 (Err(primary), Ok(())) => Err(primary),
                 (Ok(()), other) => other,
             };
-            // Copy only finite already-sanitized records while TempDir custody is live.
-            let retained = (|| -> Result<()> {
-                let facts_dir = attempt_directory.join("facts");
-                fs::create_dir(&facts_dir)?;
-                for record in ProviderExperimentRecord::ALL {
-                    let name = record.leaf();
-                    let path = record.source_path(
-                        &selected.output_directory,
-                        &input.key,
-                        &input.descriptor.output_root,
-                    );
-                    match fs::symlink_metadata(&path) {
-                        Ok(_) => {
-                            let held =
-                                crate::windows_native_files::hold_artifact(&path, None, 64 * 1024)?;
-                            drop(crate::windows_native_files::publish_owned_file(
-                                &facts_dir.join(name),
-                                &held.bytes,
-                            )?);
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                Ok(())
-            })();
+            // Retain finite bounded records while original TempDir custody is live.
+            let retained = retain_provider_experiment_facts(
+                &selected.output_directory,
+                &input.key,
+                &input.descriptor.output_root,
+                &attempt_directory.join("facts"),
+                crate::windows_native_files::retain_captured_artifact,
+                |path, bytes| {
+                    drop(crate::windows_native_files::publish_owned_file(
+                        path, bytes,
+                    )?);
+                    Ok(())
+                },
+            );
             let cleanup = if !probe_created {
                 Ok(())
             } else if !workload_launched || assessment.retirement.is_ok() {

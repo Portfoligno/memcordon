@@ -6923,6 +6923,10 @@ jobs:
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.stdout.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stdout.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stderr.bin
             target/ci/provider-input-experiment/cases/package-uninstall.capture.json
@@ -7327,6 +7331,10 @@ jobs:
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.stdout.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stdout.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stderr.bin
             target/ci/provider-input-experiment/cases/package-uninstall.capture.json

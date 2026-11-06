@@ -42,6 +42,17 @@ fn provider_input_experiment_job(mut job: Value) -> Value {
     let mut paths = String::from(
         "target/ci/provider-input-experiment/cases/provider-input-experiment.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json",
     );
+    for leaf in [
+        "result.stdout.bin",
+        "result.stderr.bin",
+        "result.guardian-query.stdout.bin",
+        "result.guardian-query.stderr.bin",
+    ] {
+        paths.push('\n');
+        paths.push_str(&format!(
+            "target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/{leaf}"
+        ));
+    }
     paths.push('\n');
     paths.push_str(&crate::installed_failure_carriers::package_cleanup_paths(
         "target/ci/provider-input-experiment/cases",

@@ -69,7 +69,44 @@ impl VerifiedOutput {
 #[derive(Debug)]
 struct Refusal {
     phase: &'static str,
+    progress: Progress,
     primary: io::Error,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Progress {
+    role: Option<&'static str>,
+    index: usize,
+    count: usize,
+    substage: &'static str,
+    requested_win32_mask: u32,
+    cutoff_before: Option<bool>,
+    cutoff_after: Option<bool>,
+}
+impl Progress {
+    fn object(&mut self, role: &'static str, index: usize, count: usize) {
+        *self = Self {
+            role: Some(role),
+            index,
+            count,
+            ..Self::default()
+        };
+    }
+    fn step(&mut self, substage: &'static str) {
+        self.substage = substage;
+        self.cutoff_before = None;
+        self.cutoff_after = None;
+    }
+    fn before(&mut self, cutoff: Instant) -> io::Result<()> {
+        let result = live(cutoff);
+        self.cutoff_before = Some(result.is_ok());
+        result
+    }
+    fn after(&mut self, cutoff: Instant) -> io::Result<()> {
+        let result = live(cutoff);
+        self.cutoff_after = Some(result.is_ok());
+        result
+    }
 }
 #[derive(Debug)]
 struct DeadlineFailure {
@@ -126,8 +163,9 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             output,
-            "private fixture binding phase={}; native-code={:?}; {}",
+            "private fixture binding phase={}; progress={:?}; native-code={:?}; {}",
             self.phase,
+            self.progress,
             native_code(&self.primary),
             self.primary
         )
@@ -144,6 +182,10 @@ pub fn failure_record(error: &io::Error) -> serde_json::Value {
         .and_then(|source| source.downcast_ref::<Refusal>())
     {
         serde_json::json!({"phase":refusal.phase,"native_code":native_code(&refusal.primary),
+            "progress":{"role":refusal.progress.role,"index":refusal.progress.index,"count":refusal.progress.count,
+                "substage":refusal.progress.substage,"requested_win32_mask":refusal.progress.requested_win32_mask,
+                "cutoff_before":refusal.progress.cutoff_before,"cutoff_after":refusal.progress.cutoff_after,
+                "cutoff_scope":"existing checks around current query/compare; null means not reached"},
             "error":refusal.primary.to_string(),"mutation_authority":false})
     } else {
         serde_json::json!({"phase":"unavailable","native_code":error.raw_os_error(),
@@ -160,33 +202,45 @@ fn live(cutoff: Instant) -> io::Result<()> {
         Ok(())
     }
 }
-fn noninheritable(file: &File, cutoff: Instant) -> io::Result<()> {
-    live(cutoff)?;
+fn noninheritable(file: &File, cutoff: Instant, progress: &mut Progress) -> io::Result<()> {
+    progress.step("noninheritability-query");
+    progress.before(cutoff)?;
     let mut flags = 0;
     // SAFETY: File owns the queried handle and flags is an initialized output.
     if unsafe { GetHandleInformation(file.as_raw_handle().cast(), &mut flags) } == 0 {
         return Err(io::Error::last_os_error());
     }
     if flags & HANDLE_FLAG_INHERIT != 0 {
+        progress.substage = "noninheritability-compare";
         return Err(io::Error::other(
             "private fixture query handle is inheritable",
         ));
     }
-    live(cutoff)
+    progress.after(cutoff)
 }
-fn open(path: &Path, directory: bool, cutoff: Instant) -> io::Result<File> {
-    live(cutoff)?;
+fn open(
+    path: &Path,
+    directory: bool,
+    cutoff: Instant,
+    progress: &mut Progress,
+) -> io::Result<File> {
+    progress.step("open");
+    progress.requested_win32_mask =
+        FILE_READ_ATTRIBUTES | if directory { 0 } else { FILE_READ_DATA };
+    progress.before(cutoff)?;
     let file = OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES | if directory { 0 } else { FILE_READ_DATA })
+        .access_mode(progress.requested_win32_mask)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
-    noninheritable(&file, cutoff)?;
+    noninheritable(&file, cutoff, progress)?;
+    progress.step("metadata-query");
     let metadata = windows_held_file_metadata(&file)?;
-    live(cutoff)?;
+    progress.after(cutoff)?;
     if metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || (metadata.attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
     {
+        progress.substage = "type-reparse-compare";
         return Err(io::Error::other(
             "private fixture query type or reparse state differs",
         ));
@@ -197,9 +251,12 @@ fn directory_matches(
     file: &File,
     expected: &PrivateFixtureAncestor,
     cutoff: Instant,
+    progress: &mut Progress,
 ) -> io::Result<()> {
-    live(cutoff)?;
+    progress.step("identity-metadata-query");
+    progress.before(cutoff)?;
     let metadata = windows_held_file_metadata(file)?;
+    progress.substage = "identity-compare";
     if metadata.volume_serial != expected.volume_serial
         || metadata.file_index != expected.file_index
         || metadata.attributes != expected.attributes
@@ -208,7 +265,7 @@ fn directory_matches(
             "private fixture directory identity or attributes differ",
         ));
     }
-    live(cutoff)
+    progress.after(cutoff)
 }
 fn file_matches(
     metadata: &WindowsHeldFileMetadata,
@@ -319,14 +376,30 @@ pub fn verify_output(
     output: &Path,
     cutoff: Instant,
 ) -> io::Result<VerifiedOutput> {
-    with_deadline(cutoff, || verify_output_inner(binding, output, cutoff))
+    let mut progress = Progress::default();
+    with_deadline(cutoff, || {
+        verify_output_inner(binding, output, cutoff, &mut progress)
+    })
+    .map_err(|primary| {
+        io::Error::new(
+            primary.kind(),
+            Refusal {
+                phase: "output-ancestry-separation",
+                progress,
+                primary,
+            },
+        )
+    })
 }
 fn verify_output_inner(
     binding: &PrivateFixtureBinding,
     output: &Path,
     cutoff: Instant,
+    progress: &mut Progress,
 ) -> io::Result<VerifiedOutput> {
-    live(cutoff)?;
+    progress.object("output-ancestor", 0, 0);
+    progress.step("output-path-validation");
+    progress.before(cutoff)?;
     if !output.is_absolute()
         || output
             .components()
@@ -346,11 +419,15 @@ fn verify_output_inner(
         .last()
         .ok_or_else(|| io::Error::other("private fixture parent absent"))?;
     let mut handles = Vec::new();
-    for path in paths.into_iter().rev() {
-        let handle = open(path, true, cutoff)?;
-        live(cutoff)?;
+    let count = paths.len();
+    for (index, path) in paths.into_iter().rev().enumerate() {
+        progress.object("output-ancestor", index, count);
+        let handle = open(path, true, cutoff, progress)?;
+        progress.step("output-identity-metadata-query");
+        progress.before(cutoff)?;
         let metadata = windows_held_file_metadata(&handle)?;
-        live(cutoff)?;
+        progress.after(cutoff)?;
+        progress.substage = "output-alias-compare";
         for input in [parent, &binding.local_directory] {
             if metadata.volume_serial == input.volume_serial
                 && metadata.file_index == input.file_index
@@ -381,6 +458,7 @@ pub fn verify(
     cutoff: Instant,
 ) -> io::Result<VerifiedPrivateFixture> {
     let mut phase = "declaration";
+    let mut progress = Progress::default();
     let attempted = with_deadline(cutoff, || {
         live(cutoff)?;
         binding.validate(paths).map_err(io::Error::other)?;
@@ -388,18 +466,23 @@ pub fn verify(
         let (base, mapped_name) = main_image(cutoff)?;
         phase = "held-ancestry-join";
         let mut directories = Vec::new();
-        for ancestor in &binding.ancestors {
-            let file = open(&ancestor.path, true, cutoff)?;
-            directory_matches(&file, ancestor, cutoff)?;
+        for (index, ancestor) in binding.ancestors.iter().enumerate() {
+            progress.object("input-ancestor", index, binding.ancestors.len());
+            let file = open(&ancestor.path, true, cutoff, &mut progress)?;
+            directory_matches(&file, ancestor, cutoff, &mut progress)?;
             directories.push(file);
         }
-        let local = open(&binding.local_directory.path, true, cutoff)?;
-        directory_matches(&local, &binding.local_directory, cutoff)?;
+        progress.object("local-directory", 0, 1);
+        let local = open(&binding.local_directory.path, true, cutoff, &mut progress)?;
+        directory_matches(&local, &binding.local_directory, cutoff, &mut progress)?;
         directories.push(local);
         phase = "held-fixture-identity";
-        let mut file = open(&binding.fixture, false, cutoff)?;
+        progress.object("fixture", 0, 1);
+        let mut file = open(&binding.fixture, false, cutoff, &mut progress)?;
+        progress.step("fixture-identity-metadata-query");
         file_matches(&windows_held_file_metadata(&file)?, binding)?;
         phase = "held-fixture-bytes";
+        progress.step("fixture-byte-hash");
         let mut hasher = Sha256::new();
         let mut total = 0u64;
         let mut buffer = [0u8; 64 * 1024];
@@ -431,6 +514,7 @@ pub fn verify(
         live(cutoff)?;
         file_matches(&windows_held_file_metadata(&file)?, binding)?;
         phase = "mapping-to-held-native-name";
+        progress.step("mapping-native-name-join");
         if query_native_name_inner(&file, cutoff)? != binding.native_path_utf16
             || mapped_name != binding.native_path_utf16
         {
@@ -439,7 +523,7 @@ pub fn verify(
             ));
         }
         phase = "output-ancestry-separation";
-        let output = verify_output_inner(binding, output, cutoff)?;
+        let output = verify_output_inner(binding, output, cutoff, &mut progress)?;
         let output_count = output.ancestors;
         drop(file);
         drop(directories);
@@ -458,6 +542,14 @@ pub fn verify(
                 "completed_before_original_cutoff":true}),
         })
     });
-    attempted
-        .map_err(|primary: io::Error| io::Error::new(primary.kind(), Refusal { phase, primary }))
+    attempted.map_err(|primary: io::Error| {
+        io::Error::new(
+            primary.kind(),
+            Refusal {
+                phase,
+                progress,
+                primary,
+            },
+        )
+    })
 }

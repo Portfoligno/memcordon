@@ -28,7 +28,15 @@ fn provider_experiments_are_payload_ready_siblings_of_unchanged_mandatory_consum
                     .filter(|path| path.contains("provider-input-experiment.json"))
             })
             .unwrap();
-        assert_eq!(retained.lines().count(), 10);
+        assert_eq!(retained.lines().count(), 14);
+        for leaf in [
+            "result.stdout.bin",
+            "result.stderr.bin",
+            "result.guardian-query.stdout.bin",
+            "result.guardian-query.stderr.bin",
+        ] {
+            assert!(retained.lines().any(|path| path == format!("target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/{leaf}")));
+        }
         for leaf in [
             "package-uninstall.stdout.bin",
             "package-uninstall.stderr.bin",
