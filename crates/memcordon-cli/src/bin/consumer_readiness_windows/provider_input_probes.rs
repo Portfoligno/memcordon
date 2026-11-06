@@ -1,13 +1,16 @@
 //! Actual mutation attempts against only the separately declared private inputs.
-use super::descriptor::ControlClock;
+use super::descriptor::Descriptor;
 use super::provider_input_target_record::{self as target_record, Context, Rejection};
+use memcordon_platform::test_support::windows_private_fixture::{
+    self as binding_native, VerifiedOutput,
+};
 use sha2::{Digest, Sha256};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::{
     fs::OpenOptions,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     time::Instant,
 };
 use windows_sys::Win32::{
@@ -30,14 +33,15 @@ struct Failure {
 #[derive(Debug)]
 struct TargetRejection {
     primary: io::Error,
+    guard: &'static str,
     diagnostic: serde_json::Value,
 }
 impl std::fmt::Display for TargetRejection {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             output,
-            "{}; private-target-rejection={}",
-            self.primary, self.diagnostic
+            "{}; primary={}; private-target-rejection={}",
+            self.guard, self.primary, self.diagnostic
         )
     }
 }
@@ -80,8 +84,20 @@ fn named_identity(path: &Path, work: Instant) -> serde_json::Value {
     })
 }
 
-fn reject_target(context: &Context<'_>, rejection: &Rejection, work: Instant) -> io::Result<()> {
-    let current = named_identity(context.executable, work);
+struct RejectionEvidence<'a> {
+    current_executable: Option<&'a Path>,
+    native_failure: Option<io::Error>,
+    output: Option<&'a VerifiedOutput>,
+}
+fn reject_target(
+    context: &Context<'_>,
+    rejection: &Rejection,
+    work: Instant,
+    evidence: RejectionEvidence<'_>,
+) -> io::Result<()> {
+    let current = evidence
+        .current_executable
+        .map(|path| named_identity(path, work));
     let declared = context.paths.first().map(|path| named_identity(path, work));
     let process = live(work).and_then(|_| super::native::current_identity());
     let process = match process {
@@ -95,18 +111,20 @@ fn reject_target(context: &Context<'_>, rejection: &Rejection, work: Instant) ->
         "diagnostic_only":true,"acceptance_authority":false,"mutation_authority":false,
         "peer":context.peer,"performed":false,"complete":false,
         "failed_predicate":rejection.predicate,"target_index":rejection.target_index,
-        "target_count":context.paths.len(),"current_executable":target_record::path_record(context.executable.as_os_str().encode_wide(),true),
+        "target_count":context.paths.len(),"current_executable":evidence.current_executable.map(|path|target_record::path_record(path.as_os_str().encode_wide(),true)),
         "declared_fixture":context.paths.first().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true)),
         "derived_local_directory":target_record::path_record(context.directory.as_os_str().encode_wide(),false),
         "output":target_record::path_record(context.output_root.as_os_str().encode_wide(),false),
         "current_process":process,"current_executable_named_file":current,
         "declared_fixture_named_file":declared,
+        "native_binding_failure":evidence.native_failure.as_ref().map(binding_native::failure_record),
         "same_loaded_image_or_custody_proved":false,"primary_error":rejection.primary,
         "targets":context.paths.iter().take(9).enumerate().map(|(index,path)|serde_json::json!({
             "index":index,"path":target_record::path_record(path.as_os_str().encode_wide(),false),
             "absolute":path.is_absolute(),"no_dot_components":target_record::no_dot_components(path),
-            "equals_current_executable":path==context.executable,
-            "immediate_current_local_leaf":path.parent()==Some(context.directory)})).collect::<Vec<_>>(),
+            "equals_observed_current_executable":evidence.current_executable.is_some_and(|current|path==current),
+            "equals_declared_fixture":path==context.fixture,
+            "immediate_declared_local_leaf":path.parent()==Some(context.directory)})).collect::<Vec<_>>(),
         "targets_omitted":context.paths.len().saturating_sub(9),
         "completed_before_original_cutoff":Instant::now()<work
     });
@@ -122,7 +140,11 @@ fn reject_target(context: &Context<'_>, rejection: &Rejection, work: Instant) ->
     }
     let retained = (|| -> io::Result<()> {
         // A rejected output location must never receive even diagnostic writes.
-        if !target_record::output_separate(context) {
+        if !target_record::output_separate(context)
+            || !evidence
+                .output
+                .is_some_and(|output| output.path() == context.output_root)
+        {
             return Err(io::Error::other(
                 "target rejection output separation unavailable",
             ));
@@ -144,11 +166,18 @@ fn reject_target(context: &Context<'_>, rejection: &Rejection, work: Instant) ->
         file.sync_all()?;
         live(work)
     })();
+    let primary = evidence
+        .native_failure
+        .unwrap_or_else(|| io::Error::other(rejection.primary));
     preserve(
-        Err(io::Error::other(TargetRejection {
-            primary: io::Error::other(rejection.primary),
-            diagnostic,
-        })),
+        Err(io::Error::new(
+            primary.kind(),
+            TargetRejection {
+                primary,
+                guard: rejection.primary,
+                diagnostic,
+            },
+        )),
         retained,
     )
 }
@@ -249,41 +278,85 @@ fn denied_authority(path: &Path, access: u32, work: Instant) -> io::Result<i32> 
 }
 
 /// These attempts are experiment assertions, never permission or product authority.
-pub fn run(
-    paths: &[PathBuf],
-    clock: &ControlClock,
-    output_root: &Path,
-    peer: bool,
-) -> io::Result<()> {
+pub fn run(descriptor: &Descriptor, peer: bool) -> io::Result<()> {
     let _errors = Errors::capture();
+    let paths = &descriptor.provider_input_paths;
+    let output_root = &descriptor.output_root;
+    let clock = descriptor
+        .control_clock
+        .as_ref()
+        .ok_or_else(|| io::Error::other("private fixture control clock absent"))?;
     let work = super::controller_start_input::deadline_from_clock(clock)?;
     live(work)?;
-    let executable = std::env::current_exe()?;
-    let parent = executable
+    let pid = std::process::id();
+    live(work)?;
+    // The loading-time spelling is retained only as an observation.
+    let current_executable = std::env::current_exe().ok();
+    let binding = descriptor
+        .provider_input_binding
+        .as_ref()
+        .ok_or_else(|| io::Error::other("private fixture binding declaration absent"))?;
+    binding.validate(paths).map_err(io::Error::other)?;
+    let parent = binding
+        .fixture
         .parent()
         .ok_or_else(|| io::Error::other("private fixture parent absent"))?;
-    let mut directory = executable
-        .file_name()
-        .ok_or_else(|| io::Error::other("private fixture leaf absent"))?
-        .to_os_string();
-    directory.push(".local");
-    let directory = parent.join(directory);
+    let verified = match binding_native::verify(binding, paths, output_root, work) {
+        Ok(verified) => verified,
+        Err(primary) => {
+            let output = binding_native::verify_output(binding, output_root, work).ok();
+            let context = Context {
+                paths,
+                fixture: &binding.fixture,
+                output_root,
+                parent,
+                directory: &binding.local_directory.path,
+                peer,
+            };
+            return reject_target(
+                &context,
+                &Rejection {
+                    predicate: "native-private-fixture-binding-refused",
+                    target_index: None,
+                    primary: "mutation targets are not the exact private fixture and immediate .local leaves",
+                },
+                work,
+                RejectionEvidence {
+                    current_executable: current_executable.as_deref(),
+                    native_failure: Some(primary),
+                    output: output.as_ref(),
+                },
+            );
+        }
+    };
+    let executable = verified.fixture();
+    let directory = verified.local_directory();
     let context = Context {
         paths,
-        executable: &executable,
+        fixture: executable,
         output_root,
         parent,
-        directory: &directory,
+        directory,
         peer,
     };
     if let Some(rejection) = target_record::reject(&context) {
-        return reject_target(&context, &rejection, work);
+        return reject_target(
+            &context,
+            &rejection,
+            work,
+            RejectionEvidence {
+                current_executable: current_executable.as_deref(),
+                native_failure: None,
+                output: Some(verified.output()),
+            },
+        );
     }
+    live(work)?;
     let token: super::descriptor::gate_precondition::TokenObservation =
         serde_json::from_slice(&super::native::effective_token_observation()?)
             .map_err(io::Error::other)?;
     if !token.restricted {
-        let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":std::process::id(),"peer":peer,"restricted":false,"performed":false,"state":"not-required-for-ordinary-baseline","complete":false,"rows":[]})).map_err(io::Error::other)?;
+        let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":pid,"peer":peer,"restricted":false,"performed":false,"state":"not-required-for-ordinary-baseline","complete":false,"rows":[],"fixture_binding":verified.observation(),"observed_current_executable":current_executable.as_ref().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true))})).map_err(io::Error::other)?;
         live(work)?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -330,8 +403,7 @@ pub fn run(
             // SAFETY: only a declared experiment-owned input, never a host source.
             let delete_error = denied(unsafe { DeleteFileW(name.as_ptr()) } != 0)?;
             live(work)?;
-            let rename =
-                output_root.join(format!("provider-rename-{}-{index}", std::process::id()));
+            let rename = output_root.join(format!("provider-rename-{pid}-{index}"));
             if rename.try_exists()? {
                 return Err(io::Error::other(
                     "private rename destination already exists",
@@ -343,10 +415,7 @@ pub fn run(
             let rename_error =
                 denied(unsafe { MoveFileExW(name.as_ptr(), rename_name.as_ptr(), 0) } != 0)?;
             live(work)?;
-            let replacement = output_root.join(format!(
-                "provider-substitute-{}-{index}",
-                std::process::id()
-            ));
+            let replacement = output_root.join(format!("provider-substitute-{pid}-{index}"));
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -380,14 +449,14 @@ pub fn run(
                 .collect::<String>();
             rows.push(serde_json::json!({"path_sha256":path_sha256,"write_dac_error":write_dac_error,"write_owner_error":write_owner_error,"write_error":write_error,"delete_error":delete_error,"rename_error":rename_error,"substitution_error":substitution_error,"all_mutations_refused":true}));
         }
-        for path in [parent, directory.as_path()] {
+        for path in [parent, directory] {
             let write_dac_error = denied_authority(path, WRITE_DAC, work)?;
             let write_owner_error = denied_authority(path, WRITE_OWNER, work)?;
             directory_authority.push(serde_json::json!({"write_dac_error":write_dac_error,"write_owner_error":write_owner_error}));
         }
         live(work)
     })();
-    let report=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":std::process::id(),"peer":peer,"restricted":true,"performed":true,"complete":attempted.is_ok(),"rows":rows,"directory_authority":directory_authority,"failure":attempted.as_ref().err().map(|error|error.to_string())})).map_err(io::Error::other);
+    let report=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":pid,"peer":peer,"restricted":true,"performed":true,"complete":attempted.is_ok(),"rows":rows,"directory_authority":directory_authority,"fixture_binding":verified.observation(),"observed_current_executable":current_executable.as_ref().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true)),"failure":attempted.as_ref().err().map(|error|error.to_string())})).map_err(io::Error::other);
     let retained = report.and_then(|bytes| {
         if bytes.len() > 16 * 1024 {
             return Err(io::Error::other("private mutation report bound"));

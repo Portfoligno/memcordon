@@ -47,6 +47,9 @@ pub mod windows_access_failure_record;
 pub mod windows_fileio_record;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub mod windows_private_fixture_binding;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub mod windows_private_input_record;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

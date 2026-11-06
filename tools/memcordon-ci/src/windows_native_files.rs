@@ -214,6 +214,68 @@ impl HeldProviderSource {
 
 #[cfg(windows)]
 impl HeldWindowsArtifact {
+    /// Declaration from the original live file and directory guards, never a
+    /// later named-file snapshot. The caller keeps this owner through execution.
+    pub fn private_fixture_binding(
+        &self,
+        path: &Path,
+        local_directory: memcordon_platform::windows_private_fixture_binding::PrivateFixtureAncestor,
+        work: std::time::Instant,
+    ) -> crate::Result<memcordon_platform::windows_private_fixture_binding::PrivateFixtureBinding>
+    {
+        use memcordon_platform::{
+            test_support::windows_held_file_metadata,
+            windows_private_fixture_binding::{PrivateFixtureAncestor, PrivateFixtureBinding},
+        };
+        provider_live(work)?;
+        let metadata = windows_held_file_metadata(&self._file)?;
+        native_file_identity(&self._file, false, path)?;
+        if metadata.length != self.bytes.len() as u64
+            || crate::windows_causal_acceptance::sha256(&self.bytes) != self.sha256
+        {
+            return Err(crate::CiError::Message("held fixture bytes differ".into()));
+        }
+        let paths = path
+            .parent()
+            .ok_or_else(|| crate::CiError::Message("held fixture parent absent".into()))?
+            .ancestors()
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect::<Vec<_>>();
+        if paths.len() != self._ancestors.len() || paths.len() > 64 {
+            return Err(crate::CiError::Message(
+                "held fixture ancestry extent differs".into(),
+            ));
+        }
+        let mut ancestors = Vec::new();
+        for (path, file) in paths.into_iter().rev().zip(&self._ancestors) {
+            provider_live(work)?;
+            let identity = native_file_identity(file, true, path)?;
+            let metadata = windows_held_file_metadata(file)?;
+            ancestors.push(PrivateFixtureAncestor {
+                path: path.to_owned(),
+                volume_serial: identity.0,
+                file_index: identity.1,
+                attributes: metadata.attributes,
+            });
+        }
+        provider_live(work)?;
+        let binding = PrivateFixtureBinding {
+            revision: 1,
+            fixture: path.to_owned(),
+            volume_serial: metadata.volume_serial,
+            file_index: metadata.file_index,
+            attributes: metadata.attributes,
+            links: metadata.links,
+            bytes: metadata.length,
+            sha256: self.sha256.clone(),
+            native_path_utf16: self.native_path()?,
+            ancestors,
+            local_directory,
+        };
+        provider_live(work)?;
+        Ok(binding)
+    }
+
     /// Query the same continuously held regular file, not a fresh path identity.
     pub fn identity(&self, path: &Path) -> std::io::Result<(u32, u64)> {
         native_file_identity(&self._file, false, path)

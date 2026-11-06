@@ -19,7 +19,7 @@ pub mod native {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
     };
 
     fn live(work: Instant) -> Result<()> {
@@ -91,6 +91,7 @@ pub mod native {
         witnesses: Vec<PrivateInput>,
         directories: Vec<fs::File>,
         pub inventory: serde_json::Value,
+        sealed: bool,
         launched: bool,
         retired: bool,
     }
@@ -168,6 +169,7 @@ pub mod native {
                 inventory: serde_json::json!({"format":"memcordon.declared-provider-inputs","revision":1,"diagnostic_only":true,"acceptance_authority":false,"original_file_identities_preserved":false,"fixture_manifest":manifest,"sources":[],"sealed":false}),
                 launched: false,
                 retired: false,
+                sealed: false,
             })
         }
         pub fn copy_providers(
@@ -273,7 +275,9 @@ pub mod native {
             security.push(seal(base, true, sid, work, ObjectRole::OwnedBase, None)?);
             self.inventory["security"] = serde_json::json!(security);
             self.inventory["sealed"] = serde_json::json!(true);
-            live(work)
+            live(work)?;
+            self.sealed = true;
+            Ok(())
         }
         pub fn paths(&self) -> Vec<PathBuf> {
             self.files.iter().map(|(path, _)| path.clone()).collect()
@@ -282,7 +286,7 @@ pub mod native {
             &self.witnesses
         }
         pub fn verify(&self, work: Instant) -> Result<()> {
-            if self.inventory["sealed"] != true {
+            if !self.sealed {
                 return Err(CiError::Message(
                     "private input sealing not complete".into(),
                 ));
@@ -292,6 +296,103 @@ pub mod native {
                 windows_native_files::verify_named_artifact(held, path)?;
             }
             live(work)
+        }
+        pub fn fixture_binding(
+            &self,
+            work: Instant,
+        ) -> Result<memcordon_platform::windows_private_fixture_binding::PrivateFixtureBinding>
+        {
+            use memcordon_platform::{
+                test_support::windows_held_file_metadata,
+                windows_private_fixture_binding::PrivateFixtureAncestor,
+            };
+            self.verify(work)?;
+            let (path, held) = self
+                .files
+                .first()
+                .ok_or_else(|| CiError::Message("held private fixture absent".into()))?;
+            if path != &self.fixture.path || held.sha256 != self.fixture.sha256 {
+                return Err(CiError::Message(
+                    "held private fixture selection differs".into(),
+                ));
+            }
+            let local = self
+                .directories
+                .last()
+                .ok_or_else(|| CiError::Message("held private local directory absent".into()))?;
+            // Use the declared fixture's immediate namespace spelling, joined
+            // back to the original held directory by native identity below.
+            let declared_local =
+                path.parent()
+                    .ok_or_else(|| CiError::Message("held private fixture parent absent".into()))?
+                    .join(self.local.file_name().ok_or_else(|| {
+                        CiError::Message("held private local leaf absent".into())
+                    })?);
+            live(work)?;
+            let identity =
+                windows_native_files::native_file_identity(local, true, &declared_local)?;
+            let metadata = windows_held_file_metadata(local)?;
+            let named = fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&declared_local)?;
+            live(work)?;
+            if windows_native_files::native_file_identity(&named, true, &declared_local)?
+                != identity
+            {
+                return Err(CiError::Message(
+                    "held private local directory changed".into(),
+                ));
+            }
+            let binding = held.private_fixture_binding(
+                path,
+                PrivateFixtureAncestor {
+                    path: declared_local,
+                    volume_serial: identity.0,
+                    file_index: identity.1,
+                    attributes: metadata.attributes,
+                },
+                work,
+            )?;
+            binding.validate(&self.paths()).map_err(CiError::Message)?;
+            live(work)?;
+            Ok(binding)
+        }
+        /// Borrowing this Deployment keeps its prelaunch guards alive throughout
+        /// the synchronous root/peer execution, including failed retirement.
+        pub fn with_fixture_custody<T>(
+            &self,
+            binding: &memcordon_platform::windows_private_fixture_binding::PrivateFixtureBinding,
+            work: Instant,
+            operation: impl FnOnce() -> Result<T>,
+        ) -> Result<T> {
+            struct Custody<'a>(&'a Deployment);
+            let custody = Custody(self);
+            if custody.0.fixture_binding(work)? != *binding {
+                return Err(CiError::Message(
+                    "prelaunch fixture custody declaration differs".into(),
+                ));
+            }
+            let primary = operation();
+            let checked = custody.0.fixture_binding(work).and_then(|observed| {
+                if observed == *binding {
+                    Ok(())
+                } else {
+                    Err(CiError::Message(
+                        "postexecution fixture custody declaration differs".into(),
+                    ))
+                }
+            });
+            match (primary, checked) {
+                (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(secondary),
+                }),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(secondary)) => Err(secondary),
+                (Ok(value), Ok(())) => Ok(value),
+            }
         }
         pub fn launched(&mut self) {
             self.launched = true;

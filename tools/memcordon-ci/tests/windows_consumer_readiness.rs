@@ -125,6 +125,7 @@ fn descriptor() -> Descriptor {
         winsock_registry: None,
         provider_input_experiment: false,
         provider_input_paths: Vec::new(),
+        provider_input_binding: None,
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,
@@ -158,6 +159,233 @@ fn descriptor() -> Descriptor {
             target: "x86_64-pc-windows-msvc".into(),
         }),
     }
+}
+
+fn experiment_descriptor() -> Descriptor {
+    let mut value = descriptor();
+    value.case = Case::Joint;
+    value.cohort_gate = None;
+    value.generation_gate = None;
+    value.start_transport = descriptor::StartTransport::ControllerStdin {
+        version: descriptor::controller_start::REGISTRY_VERSION,
+    };
+    value.control_clock = Some(descriptor::ControlClock {
+        revision: 1,
+        work_cutoff_qpc: 1000,
+        qpc_frequency: 10,
+    });
+    value.winsock_registry = Some(descriptor::winsock_registry::Declaration {
+        version: descriptor::winsock_registry::VERSION,
+        view: descriptor::winsock_registry::View::Native,
+        sha256: [3; 32],
+    });
+    let parent = value.output_root.with_file_name("private-fixture-inputs");
+    let fixture = parent.join("fixture.exe");
+    let local = parent.join("fixture.exe.local");
+    let directory = |path, index| descriptor::PrivateFixtureAncestor {
+        path,
+        volume_serial: 7,
+        file_index: index,
+        attributes: 0x10,
+    };
+    let ancestors = fixture
+        .ancestors()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .enumerate()
+        .map(|(index, path)| directory(path.to_owned(), index as u64 + 1))
+        .collect();
+    value.provider_input_experiment = true;
+    value.provider_input_paths = vec![fixture.clone(), local.join("provider.dll")];
+    value.provider_input_binding = Some(descriptor::PrivateFixtureBinding {
+        revision: 1,
+        fixture,
+        volume_serial: 7,
+        file_index: 42,
+        attributes: 0x20,
+        links: 1,
+        bytes: 1000,
+        sha256: "ab".repeat(32),
+        native_path_utf16: r"\Device\Volume\private-fixture-inputs\fixture.exe"
+            .encode_utf16()
+            .collect(),
+        ancestors,
+        local_directory: directory(local, 100),
+    });
+    value
+}
+
+#[test]
+fn fixture_binding_is_experiment_only_and_part_of_the_original_bounded_descriptor() {
+    let valid = experiment_descriptor();
+    let bytes = serde_json::to_vec(&valid).unwrap();
+    let parsed = Descriptor::parse(&bytes).unwrap();
+    assert_eq!(parsed.provider_input_binding, valid.provider_input_binding);
+    let ordinary = serde_json::to_value(descriptor()).unwrap();
+    assert!(ordinary.get("provider_input_binding").is_none());
+    let mut missing = valid.clone();
+    missing.provider_input_binding = None;
+    assert!(Descriptor::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+    let mut unexpected = valid.clone();
+    unexpected.provider_input_experiment = false;
+    assert!(Descriptor::parse(&serde_json::to_vec(&unexpected).unwrap()).is_err());
+    let mut changed = valid.clone();
+    changed.provider_input_paths.swap(0, 1);
+    assert!(Descriptor::parse(&serde_json::to_vec(&changed).unwrap()).is_err());
+    let mut oversized = valid;
+    oversized.arguments = vec!["x".repeat(4096); 64];
+    assert!(Descriptor::parse(&serde_json::to_vec(&oversized).unwrap()).is_err());
+}
+
+#[test]
+fn peer_rehashes_exact_original_bytes_and_rejects_forwarded_context_substitution() {
+    let input = experiment_descriptor();
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let digest = descriptor::controller_start::descriptor_digest(&bytes);
+    let clock = input.control_clock.as_ref().unwrap();
+    let (parsed, fresh) = Descriptor::parse_authenticated_peer(
+        &bytes,
+        digest,
+        &input.challenge,
+        &input.output_root,
+        clock,
+    )
+    .unwrap();
+    assert_eq!(
+        fresh,
+        descriptor::controller_start::descriptor_digest(&bytes)
+    );
+    assert_eq!(parsed.provider_input_binding, input.provider_input_binding);
+    assert_eq!(parsed.provider_input_paths, input.provider_input_paths);
+    // Even identical parsed content must match the original exact bytes.
+    let mut whitespace = bytes.clone();
+    whitespace.push(b'\n');
+    assert!(Descriptor::parse(&whitespace).is_ok());
+    assert!(
+        Descriptor::parse_authenticated_peer(
+            &whitespace,
+            digest,
+            &input.challenge,
+            &input.output_root,
+            clock
+        )
+        .is_err()
+    );
+    let mut changed = input.clone();
+    changed.provider_input_binding.as_mut().unwrap().file_index += 1;
+    let forged_bytes = serde_json::to_vec(&changed).unwrap();
+    let forged_digest = descriptor::controller_start::descriptor_digest(&forged_bytes);
+    // A forged envelope can be internally consistent. It is still not the
+    // descriptor authenticated by the controller's original root START.
+    Descriptor::parse_authenticated_peer(
+        &forged_bytes,
+        forged_digest,
+        &input.challenge,
+        &input.output_root,
+        clock,
+    )
+    .unwrap();
+    let authentic_binding = descriptor::controller_start::Binding {
+        challenge: input.challenge.clone(),
+        descriptor_sha256: digest,
+        pid: 77,
+        birth: 88,
+    };
+    let registry = descriptor::controller_start::Capability {
+        version: 1,
+        handle: 0x320,
+        manifest_sha256: input.winsock_registry.as_ref().unwrap().sha256,
+    };
+    let mut wire = Vec::new();
+    descriptor::controller_start::Sender::with_registry(registry, false)
+        .send(
+            &mut wire,
+            &authentic_binding,
+            descriptor::controller_start::Phase::Start,
+            || Ok(()),
+        )
+        .unwrap();
+    let mut expected_forged = authentic_binding.clone();
+    expected_forged.descriptor_sha256 = forged_digest;
+    let mut receiver =
+        descriptor::controller_start::Receiver::with_registry(registry.manifest_sha256, false);
+    assert!(
+        receiver
+            .receive(
+                &mut std::io::Cursor::new(&wire),
+                &expected_forged,
+                || Ok(())
+            )
+            .is_err()
+    );
+    assert!(receiver.registry_capability().is_none());
+    let mut actual_receiver =
+        descriptor::controller_start::Receiver::with_registry(registry.manifest_sha256, false);
+    actual_receiver
+        .receive(&mut std::io::Cursor::new(&wire), &authentic_binding, || {
+            Ok(())
+        })
+        .unwrap();
+    assert!(actual_receiver.registry_capability().is_some());
+    assert!(
+        Descriptor::parse_authenticated_peer(
+            &forged_bytes,
+            digest,
+            &input.challenge,
+            &input.output_root,
+            clock
+        )
+        .is_err()
+    );
+    let mut wrong_clock = clock.clone();
+    wrong_clock.work_cutoff_qpc += 1;
+    for (challenge, output, clock) in [
+        (
+            &b"other challenge"[..],
+            input.output_root.clone(),
+            clock.clone(),
+        ),
+        (
+            input.challenge.as_slice(),
+            input.output_root.join("other"),
+            clock.clone(),
+        ),
+        (
+            input.challenge.as_slice(),
+            input.output_root.clone(),
+            wrong_clock,
+        ),
+    ] {
+        assert!(
+            Descriptor::parse_authenticated_peer(&bytes, digest, challenge, &output, &clock)
+                .is_err()
+        );
+    }
+    let mut wrong_digest = digest;
+    wrong_digest[0] ^= 1;
+    assert!(
+        Descriptor::parse_authenticated_peer(
+            &bytes,
+            wrong_digest,
+            &input.challenge,
+            &input.output_root,
+            clock
+        )
+        .is_err()
+    );
+    let oversized = vec![b' '; descriptor::MAX_DESCRIPTOR_BYTES + 1];
+    assert!(
+        Descriptor::parse_authenticated_peer(
+            &oversized,
+            digest,
+            &input.challenge,
+            &input.output_root,
+            clock
+        )
+        .is_err()
+    );
 }
 
 #[test]

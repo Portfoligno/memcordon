@@ -1,4 +1,4 @@
-//! Exact lexical guard evidence, never file identity or mutation authority.
+//! Namespace shape after native fixture binding; no constructor grants authority.
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
@@ -10,7 +10,8 @@ const TARGET_ERROR: &str =
 
 pub struct Context<'a> {
     pub paths: &'a [PathBuf],
-    pub executable: &'a Path,
+    /// Production contexts use only the native VerifiedPrivateFixture path.
+    pub fixture: &'a Path,
     pub output_root: &'a Path,
     pub parent: &'a Path,
     pub directory: &'a Path,
@@ -35,14 +36,15 @@ pub fn output_separate(context: &Context<'_>) -> bool {
         && !context.output_root.starts_with(context.parent)
 }
 
-/// Preserve the existing predicate order and exact path comparisons.
+/// Preserve namespace predicates and exact declared-path comparisons. The
+/// actual current image is authorized by the separate native capability.
 pub fn reject(context: &Context<'_>) -> Option<Rejection> {
     let reason = if context.paths.len() < 2 {
         Some(("target-count-below-two", None))
     } else if context.paths.len() > 9 {
         Some(("target-count-above-nine", None))
-    } else if !context.paths.iter().any(|path| path == context.executable) {
-        Some(("current-executable-not-in-declared-targets", None))
+    } else if !context.paths.iter().any(|path| path == context.fixture) {
+        Some(("verified-fixture-not-in-declared-targets", None))
     } else if !context.output_root.is_absolute() {
         Some(("output-not-absolute", None))
     } else if context.output_root.starts_with(context.directory) {
@@ -55,7 +57,7 @@ pub fn reject(context: &Context<'_>) -> Option<Rejection> {
                 Some(("target-not-absolute", Some(index)))
             } else if !no_dot_components(path) {
                 Some(("target-has-dot-component", Some(index)))
-            } else if path != context.executable && path.parent() != Some(context.directory) {
+            } else if path != context.fixture && path.parent() != Some(context.directory) {
                 Some(("target-not-immediate-current-local-leaf", Some(index)))
             } else {
                 None

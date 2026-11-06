@@ -10,6 +10,9 @@ pub mod windows_access_failure_probe;
 #[path = "windows_fileio.rs"]
 pub mod windows_fileio;
 #[cfg(windows)]
+#[path = "windows_private_fixture.rs"]
+pub mod windows_private_fixture;
+#[cfg(windows)]
 #[path = "windows_private_input.rs"]
 pub mod windows_private_input;
 #[cfg(windows)]

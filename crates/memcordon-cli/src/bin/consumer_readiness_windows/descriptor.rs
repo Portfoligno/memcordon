@@ -1,4 +1,7 @@
 //! Private owned workload inputs. These are never provider authorization.
+pub use memcordon_platform::windows_private_fixture_binding::{
+    PrivateFixtureAncestor, PrivateFixtureBinding,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -167,7 +170,7 @@ pub enum StartTransport {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlClock {
     pub revision: u32,
@@ -190,6 +193,8 @@ pub struct Descriptor {
     pub provider_input_experiment: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_input_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_input_binding: Option<PrivateFixtureBinding>,
     pub format: String,
     pub revision: u32,
     pub case: Case,
@@ -229,6 +234,41 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Descriptor {
+    /// Check exact candidate bytes and context. The caller must still authenticate
+    /// this freshly computed digest against the original owned START frame before
+    /// using any registry capability, fixture witness or mutation target. This
+    /// parsed data grants no native authority by itself.
+    pub fn parse_authenticated_peer(
+        bytes: &[u8],
+        expected_digest: [u8; 32],
+        challenge: &[u8],
+        output_root: &Path,
+        clock: &ControlClock,
+    ) -> Result<(Self, [u8; 32]), String> {
+        if bytes.len() > MAX_DESCRIPTOR_BYTES {
+            return Err("peer descriptor exceeds byte bound".into());
+        }
+        let actual_digest = controller_start::descriptor_digest(bytes);
+        if actual_digest != expected_digest {
+            return Err("peer original descriptor bytes differ".into());
+        }
+        let descriptor = Self::parse(bytes)?;
+        if descriptor.challenge != challenge
+            || descriptor.output_root != output_root
+            || descriptor.control_clock.as_ref() != Some(clock)
+            || descriptor.winsock_registry.is_none()
+            || !matches!(
+                descriptor.start_transport,
+                StartTransport::ControllerStdin {
+                    version: controller_start::REGISTRY_VERSION
+                }
+            )
+        {
+            return Err("peer original descriptor context differs".into());
+        }
+        Ok((descriptor, actual_digest))
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > MAX_DESCRIPTOR_BYTES {
             return Err("fixture descriptor exceeds byte bound".into());
@@ -248,6 +288,11 @@ impl Descriptor {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        memcordon_platform::windows_private_fixture_binding::validate_declaration(
+            self.provider_input_experiment,
+            &self.provider_input_paths,
+            self.provider_input_binding.as_ref(),
+        )?;
         if !self.provider_input_experiment && !self.provider_input_paths.is_empty() {
             return Err("provider input paths require explicit experiment".into());
         }

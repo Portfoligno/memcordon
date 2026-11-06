@@ -2430,6 +2430,7 @@ pub(crate) mod native {
                 winsock_registry: None,
                 provider_input_experiment: false,
                 provider_input_paths: Vec::new(),
+                provider_input_binding: None,
                 gate_access_diagnostic: None,
                 gate_precondition: None,
                 completion_gate: None,
@@ -6433,6 +6434,8 @@ pub(crate) mod native {
                 deployment.verify(deadlines.work)?;
                 input.descriptor.provider_input_experiment = true;
                 input.descriptor.provider_input_paths = deployment.paths();
+                let fixture_binding = deployment.fixture_binding(deadlines.work)?;
+                input.descriptor.provider_input_binding = Some(fixture_binding.clone());
                 publish(
                     &attempt_directory.join("declaration.json"),
                     &serde_json::json!({"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"registry_declaration_sha256":declaration_sha,"inputs":deployment.inventory,"diagnostic_only":true,"acceptance_authority":false}),
@@ -6458,20 +6461,23 @@ pub(crate) mod native {
                 phase = "original-joint-workload";
                 deployment.launched();
                 workload_launched = true;
-                let executed = execute_with_baseline_clocks(
-                    &selected,
-                    &input,
-                    &mut assessment,
-                    baseline,
-                    Vec::new(),
-                    None,
-                    ExecutionClocks {
-                        work: deadlines.work,
-                        cleanup: Some(deadlines.cleanup),
-                        registry: Some(Arc::clone(&projection)),
-                        projection_observation: Some(Arc::clone(&held_observation)),
-                    },
-                );
+                let executed =
+                    deployment.with_fixture_custody(&fixture_binding, deadlines.work, || {
+                        execute_with_baseline_clocks(
+                            &selected,
+                            &input,
+                            &mut assessment,
+                            baseline,
+                            Vec::new(),
+                            None,
+                            ExecutionClocks {
+                                work: deadlines.work,
+                                cleanup: Some(deadlines.cleanup),
+                                registry: Some(Arc::clone(&projection)),
+                                projection_observation: Some(Arc::clone(&held_observation)),
+                            },
+                        )
+                    });
                 if assessment.retirement.is_ok() {
                     deployment.retired();
                 }

@@ -22,7 +22,7 @@ fn exact_fixture_and_immediate_leaves_preserve_all_guard_refusals() {
     let evaluate = |paths: &[PathBuf], output: &std::path::Path| {
         reject(&Context {
             paths,
-            executable: &executable,
+            fixture: &executable,
             output_root: output,
             parent: &parent,
             directory: &directory,
@@ -39,7 +39,7 @@ fn exact_fixture_and_immediate_leaves_preserve_all_guard_refusals() {
         ),
         (
             vec![parent.join("other.exe"), valid[1].clone()],
-            "current-executable-not-in-declared-targets",
+            "verified-fixture-not-in-declared-targets",
             None,
         ),
         (
@@ -94,7 +94,7 @@ fn exact_fixture_and_immediate_leaves_preserve_all_guard_refusals() {
     }
     let context = Context {
         paths: &valid,
-        executable: &executable,
+        fixture: &executable,
         output_root: &output,
         parent: &parent,
         directory: &directory,

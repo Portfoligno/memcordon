@@ -96,6 +96,14 @@ fn read_descriptor(path: &Path) -> io::Result<Descriptor> {
 }
 
 fn read_descriptor_with_digest(path: &Path) -> io::Result<(Descriptor, [u8; 32])> {
+    let bytes = read_descriptor_bytes(path)?;
+    let digest = descriptor::controller_start::descriptor_digest(&bytes);
+    Descriptor::parse(&bytes)
+        .map(|descriptor| (descriptor, digest))
+        .map_err(io::Error::other)
+}
+
+fn read_descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -117,10 +125,7 @@ fn read_descriptor_with_digest(path: &Path) -> io::Result<(Descriptor, [u8; 32])
     Read::by_ref(&mut file)
         .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    let digest = descriptor::controller_start::descriptor_digest(&bytes);
-    Descriptor::parse(&bytes)
-        .map(|descriptor| (descriptor, digest))
-        .map_err(io::Error::other)
+    Ok(bytes)
 }
 
 fn child_command() -> io::Result<Command> {
@@ -252,13 +257,56 @@ fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Res
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeerRegistryInput {
-    #[serde(default)]
-    provider_input_experiment: bool,
-    #[serde(default)]
-    provider_input_paths: Vec<std::path::PathBuf>,
-    declaration: descriptor::winsock_registry::Declaration,
+    descriptor_path: std::path::PathBuf,
     descriptor_sha256: [u8; 32],
     clock: descriptor::ControlClock,
+}
+
+fn read_peer_descriptor(
+    input: &PeerRegistryInput,
+    challenge: &[u8],
+    output: &Path,
+) -> io::Result<(Descriptor, [u8; 32])> {
+    if !input.descriptor_path.is_absolute()
+        || input.descriptor_path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(io::Error::other(
+            "peer original descriptor path is not absolute ordinary input",
+        ));
+    }
+    let deadline = controller_start_input::deadline_from_clock(&input.clock)?;
+    let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(deadline)
+        .map_err(io::Error::other)?;
+    let read = (|| {
+        listener_trace::live(&input.clock)?;
+        let bytes = read_descriptor_bytes(&input.descriptor_path)?;
+        listener_trace::live(&input.clock)?;
+        let parsed = Descriptor::parse_authenticated_peer(
+            &bytes,
+            input.descriptor_sha256,
+            challenge,
+            output,
+            &input.clock,
+        )
+        .map_err(io::Error::other)?;
+        listener_trace::live(&input.clock)?;
+        Ok(parsed)
+    })();
+    let stopped = timer.finish().map_err(io::Error::other);
+    match (read, stopped) {
+        (Err(primary), Err(secondary)) => Err(peer_failures(primary, secondary)),
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(secondary)) => Err(secondary),
+        (Ok(parsed), Ok(())) => {
+            listener_trace::live(&input.clock)?;
+            Ok(parsed)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -430,6 +478,7 @@ fn joint(
     churn: bool,
     control: Option<&mut controller_start_input::Session>,
     token_envelope: &[u8],
+    descriptor_path: &Path,
 ) -> io::Result<()> {
     let registry = match (&descriptor.winsock_registry, control.as_deref()) {
         (Some(declaration), Some(session)) => {
@@ -473,9 +522,18 @@ fn joint(
                 control,
                 token_envelope,
                 Some(mapping),
+                descriptor_path,
             )
         }),
-        None => joint_mapped(descriptor, transcript, churn, control, token_envelope, None),
+        None => joint_mapped(
+            descriptor,
+            transcript,
+            churn,
+            control,
+            token_envelope,
+            None,
+            descriptor_path,
+        ),
     }
 }
 
@@ -486,6 +544,7 @@ fn joint_mapped(
     control: Option<&mut controller_start_input::Session>,
     token_envelope: &[u8],
     registry: Option<&winsock_registry::Mapping>,
+    descriptor_path: &Path,
 ) -> io::Result<()> {
     let trace = match (descriptor.control_clock.as_ref(), control.as_deref()) {
         (Some(clock), Some(session)) => Some(winsock_trace::Context {
@@ -504,15 +563,7 @@ fn joint_mapped(
                 "provider experiment requires authenticated controller START and installed registry mapping",
             ));
         }
-        provider_input_probes::run(
-            &descriptor.provider_input_paths,
-            descriptor
-                .control_clock
-                .as_ref()
-                .ok_or_else(|| io::Error::other("experiment clock absent"))?,
-            &descriptor.output_root,
-            false,
-        )?;
+        provider_input_probes::run(descriptor, false)?;
     }
     let _winsock = native::winsock_startup(trace)?;
     let listener = listener_trace::bind(trace.as_ref())?;
@@ -572,21 +623,20 @@ fn joint_mapped(
             .as_deref()
             .ok_or_else(|| io::Error::other("original registry session absent"))?;
         let peer_input = PeerRegistryInput {
-            provider_input_experiment: descriptor.provider_input_experiment,
-            provider_input_paths: descriptor.provider_input_paths.clone(),
-            declaration: descriptor
-                .winsock_registry
-                .clone()
-                .ok_or_else(|| io::Error::other("registry declaration absent"))?,
+            descriptor_path: descriptor_path.to_owned(),
             descriptor_sha256: session.original_binding().descriptor_sha256,
             clock: descriptor
                 .control_clock
                 .clone()
                 .ok_or_else(|| io::Error::other("original registry clock absent"))?,
         };
-        peer_command
-            .arg(serde_json::to_string(&peer_input).map_err(io::Error::other)?)
-            .stdin(Stdio::piped());
+        let peer_input = serde_json::to_string(&peer_input).map_err(io::Error::other)?;
+        if peer_input.len() > 4096 {
+            return Err(io::Error::other(
+                "peer original descriptor envelope exceeds argv bound",
+            ));
+        }
+        peer_command.arg(peer_input).stdin(Stdio::piped());
     }
     let mut peer = peer_command.spawn()?;
     if let Some(registry) = registry {
@@ -1031,19 +1081,21 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                         })?;
                     let input: PeerRegistryInput =
                         serde_json::from_str(input).map_err(io::Error::other)?;
+                    let (parsed, fresh_digest) =
+                        read_peer_descriptor(&input, &challenge, Path::new(&output_root))?;
+                    let declaration = parsed.winsock_registry.as_ref().ok_or_else(|| {
+                        io::Error::other("authenticated peer registry declaration absent")
+                    })?;
                     let identity = native::current_identity()?;
                     let binding = descriptor::controller_start::Binding {
                         challenge: challenge.clone(),
-                        descriptor_sha256: input.descriptor_sha256,
+                        descriptor_sha256: fresh_digest,
                         pid: identity.process_id,
                         birth: identity.creation_time_100ns,
                     };
-                    let mut session = controller_start_input::Session::peer(
-                        &input.clock,
-                        binding,
-                        &input.declaration,
-                    )?;
-                    let peer_token = if input.provider_input_experiment {
+                    let mut session =
+                        controller_start_input::Session::peer(&input.clock, binding, declaration)?;
+                    let peer_token = if parsed.provider_input_experiment {
                         listener_trace::live(&input.clock)?;
                         let token = native::token_observation()?;
                         listener_trace::live(&input.clock)?;
@@ -1051,6 +1103,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                     } else {
                         None
                     };
+                    // The root sender uses the digest admitted by its original
+                    // controller START. Fresh local bytes alone grant nothing:
+                    // this frame must match that digest and this exact peer.
                     session.receive(descriptor::controller_start::Phase::Start)?;
                     let capability = session
                         .registry_capability()
@@ -1064,40 +1119,38 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                     Some((
                         winsock_registry::Mapping::install(
                             key,
-                            &input.declaration,
+                            declaration,
                             session.original_deadline(),
                         )?,
                         session.original_deadline(),
-                        input.clock,
+                        parsed,
                         session.original_binding().clone(),
                         peer_token,
-                        input.provider_input_paths,
                     ))
                 }
                 None => None,
             };
             match _registry {
-                Some((mapping, deadline, clock, binding, token, paths)) => mapping.run(|_| {
+                Some((mapping, deadline, parsed, binding, token)) => mapping.run(|_| {
+                    let clock = parsed
+                        .control_clock
+                        .as_ref()
+                        .expect("authenticated peer clock checked");
                     let trace = token.as_ref().map(|token| winsock_trace::Context {
-                        clock: &clock,
+                        clock,
                         binding: &binding,
                         token_envelope: token,
-                        output_root: std::path::Path::new(&output_root),
+                        output_root: &parsed.output_root,
                         provider_input_experiment: true,
                         peer: true,
                     });
                     if token.is_some() {
-                        provider_input_probes::run(
-                            &paths,
-                            &clock,
-                            std::path::Path::new(&output_root),
-                            true,
-                        )?;
+                        provider_input_probes::run(&parsed, true)?;
                     }
                     tcp_peer(
                         port,
-                        &challenge,
-                        std::path::Path::new(&output_root),
+                        &parsed.challenge,
+                        &parsed.output_root,
                         Some(deadline),
                         trace.as_ref(),
                     )
@@ -1406,6 +1459,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             false,
             control.as_mut(),
             &envelope,
+            Path::new(&first),
         )?,
         Case::Churn => joint(
             &descriptor,
@@ -1413,6 +1467,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             true,
             control.as_mut(),
             &envelope,
+            Path::new(&first),
         )?,
         Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
         Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
