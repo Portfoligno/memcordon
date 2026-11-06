@@ -2865,6 +2865,12 @@ jobs:
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/reports/installed/raw/windows-installed/fixture-manifest-inventory.json
+            target/ci/reports/installed/raw/package-uninstall.stdout.bin
+            target/ci/reports/installed/raw/package-uninstall.stderr.bin
+            target/ci/reports/installed/raw/package-uninstall.capture.json
+            target/ci/reports/installed/raw/package-uninstall.invocation.json
+            target/ci/reports/installed/raw/recovery.stdout.bin
+            target/ci/reports/installed/raw/recovery.stderr.bin
           if-no-files-found: ignore
           retention-days: 7
       - *shared_step_92

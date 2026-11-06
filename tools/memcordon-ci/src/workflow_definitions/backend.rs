@@ -39,7 +39,14 @@ fn provider_input_experiment_job(mut job: Value) -> Value {
         text("name"),
         text("provider-input-experiment-${{ matrix.id }}"),
     );
-    with.insert(text("path"),text("target/ci/provider-input-experiment/cases/provider-input-experiment.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json"));
+    let mut paths = String::from(
+        "target/ci/provider-input-experiment/cases/provider-input-experiment.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json",
+    );
+    paths.push('\n');
+    paths.push_str(&crate::installed_failure_carriers::package_cleanup_paths(
+        "target/ci/provider-input-experiment/cases",
+    ));
+    with.insert(text("path"), text(&paths));
     with.insert(text("if-no-files-found"), text("warn"));
     let mut artifact = serde_yaml::Mapping::new();
     artifact.insert(

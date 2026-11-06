@@ -18,9 +18,28 @@ pub const RELATIVE_PATHS: [&str; 10] = [
     "windows-installed/fixture-manifest-inventory.json",
 ];
 
+/// These exact leaves are already written by bounded package/recovery capture.
+pub const PACKAGE_CLEANUP_PATHS: [&str; 6] = [
+    "package-uninstall.stdout.bin",
+    "package-uninstall.stderr.bin",
+    "package-uninstall.capture.json",
+    "package-uninstall.invocation.json",
+    "recovery.stdout.bin",
+    "recovery.stderr.bin",
+];
+
+pub fn package_cleanup_paths(prefix: &str) -> String {
+    PACKAGE_CLEANUP_PATHS
+        .iter()
+        .map(|relative| format!("{prefix}/{relative}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn paths(prefix: &str) -> String {
     RELATIVE_PATHS
         .iter()
+        .chain(PACKAGE_CLEANUP_PATHS.iter())
         .map(|relative| format!("{prefix}/{relative}"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -76,7 +95,7 @@ fn priority_file(source: &Path, relative: &str) -> io::Result<Option<PathBuf>> {
 pub fn select(source: &Path) -> io::Result<Vec<PathBuf>> {
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
-    for relative in RELATIVE_PATHS {
+    for relative in RELATIVE_PATHS.into_iter().chain(PACKAGE_CLEANUP_PATHS) {
         if let Some(path) = priority_file(source, relative)? {
             seen.insert(path.clone());
             selected.push(path);

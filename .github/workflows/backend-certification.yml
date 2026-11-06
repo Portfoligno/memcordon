@@ -2894,6 +2894,12 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.capture.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stderr.bin
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
@@ -3309,6 +3315,12 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.capture.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stderr.bin
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
@@ -6901,6 +6913,12 @@ jobs:
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json
+            target/ci/provider-input-experiment/cases/package-uninstall.stdout.bin
+            target/ci/provider-input-experiment/cases/package-uninstall.stderr.bin
+            target/ci/provider-input-experiment/cases/package-uninstall.capture.json
+            target/ci/provider-input-experiment/cases/package-uninstall.invocation.json
+            target/ci/provider-input-experiment/cases/recovery.stdout.bin
+            target/ci/provider-input-experiment/cases/recovery.stderr.bin
           if-no-files-found: warn
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
@@ -7299,6 +7317,12 @@ jobs:
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json
+            target/ci/provider-input-experiment/cases/package-uninstall.stdout.bin
+            target/ci/provider-input-experiment/cases/package-uninstall.stderr.bin
+            target/ci/provider-input-experiment/cases/package-uninstall.capture.json
+            target/ci/provider-input-experiment/cases/package-uninstall.invocation.json
+            target/ci/provider-input-experiment/cases/recovery.stdout.bin
+            target/ci/provider-input-experiment/cases/recovery.stderr.bin
           if-no-files-found: warn
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home

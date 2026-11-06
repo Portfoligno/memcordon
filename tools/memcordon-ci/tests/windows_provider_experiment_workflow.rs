@@ -28,7 +28,17 @@ fn provider_experiments_are_payload_ready_siblings_of_unchanged_mandatory_consum
                     .filter(|path| path.contains("provider-input-experiment.json"))
             })
             .unwrap();
-        assert_eq!(retained.lines().count(), 4);
+        assert_eq!(retained.lines().count(), 10);
+        for leaf in [
+            "package-uninstall.stdout.bin",
+            "package-uninstall.stderr.bin",
+            "package-uninstall.capture.json",
+            "package-uninstall.invocation.json",
+            "recovery.stdout.bin",
+            "recovery.stderr.bin",
+        ] {
+            assert!(retained.lines().any(|path|path == format!("target/ci/provider-input-experiment/cases/{leaf}")));
+        }
         assert!(!retained.contains("**"));
         let original_name = format!("windows-installed-{architecture}");
         let originals = workflow["jobs"][&original_name]["steps"]

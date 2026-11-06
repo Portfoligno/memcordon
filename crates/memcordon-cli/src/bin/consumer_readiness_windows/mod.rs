@@ -28,6 +28,7 @@ mod native_fixture_default_dacl;
 mod native_gate_precondition;
 mod own_thread_deadline_self_check;
 mod provider_input_probes;
+mod provider_input_target_record;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;

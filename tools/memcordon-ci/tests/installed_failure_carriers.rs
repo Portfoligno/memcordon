@@ -53,6 +53,24 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
         .unwrap();
     expected.push(inventory);
+    for name in [
+        "package-uninstall.stdout.bin",
+        "package-uninstall.stderr.bin",
+        "package-uninstall.capture.json",
+        "package-uninstall.invocation.json",
+        "recovery.stdout.bin",
+        "recovery.stderr.bin",
+    ] {
+        let path = root.path().join(name);
+        fs::write(&path, b"original cleanup capture").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        expected.push(path);
+    }
     for index in 0..180 {
         fs::write(
             root.path().join(format!("recent-{index:03}.json")),

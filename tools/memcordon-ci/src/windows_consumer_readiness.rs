@@ -6617,6 +6617,8 @@ pub(crate) mod native {
                     "peer-listener-call-trace.json",
                     "provider-input-probes.json",
                     "peer-provider-input-probes.json",
+                    "provider-input-target-rejection.json",
+                    "peer-provider-input-target-rejection.json",
                     "native-listener.json",
                     "native-tcp-peer.json",
                 ] {

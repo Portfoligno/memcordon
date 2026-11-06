@@ -122,6 +122,16 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
     paths.push(format!(
         "{prefix}/windows-installed/fixture-manifest-inventory.json"
     ));
+    for name in [
+        "package-uninstall.stdout.bin",
+        "package-uninstall.stderr.bin",
+        "package-uninstall.capture.json",
+        "package-uninstall.invocation.json",
+        "recovery.stdout.bin",
+        "recovery.stderr.bin",
+    ] {
+        paths.push(format!("{prefix}/{name}"));
+    }
     paths
 }
 
