@@ -7,6 +7,7 @@ pub mod native {
         windows_native_files::{self, HeldWindowsArtifact},
         windows_provider_projection_record::{Candidate, CatalogSnapshot, PrivateInput},
     };
+    use memcordon_platform::windows_private_input_record::{Context, ObjectRole};
     use std::{
         fs,
         os::windows::{
@@ -30,7 +31,14 @@ pub mod native {
             Ok(())
         }
     }
-    fn seal(path: &Path, directory: bool, sid: &str, work: Instant) -> Result<serde_json::Value> {
+    fn seal(
+        path: &Path,
+        directory: bool,
+        sid: &str,
+        work: Instant,
+        role: ObjectRole,
+        object_index: Option<u32>,
+    ) -> Result<serde_json::Value> {
         live(work)?;
         let _parents = windows_native_files::hold_ancestors(
             path.parent()
@@ -47,7 +55,17 @@ pub mod native {
         live(work)?;
         let mut record =
             memcordon_platform::test_support::windows_private_input::seal_read_execute(
-                &file, directory, sid, work,
+                &file,
+                directory,
+                sid,
+                work,
+                &Context {
+                    role,
+                    directory,
+                    object_index,
+                    volume_serial: Some(identity.0),
+                    file_index: Some(identity.1),
+                },
             )?;
         live(work)?;
         if windows_native_files::native_file_identity(&file, directory, path)? != identity {
@@ -213,19 +231,46 @@ pub mod native {
         }
         pub fn seal(&mut self, sid: &str, work: Instant) -> Result<()> {
             let mut security = Vec::new();
-            for (path, held) in &self.files {
+            for (index, (path, held)) in self.files.iter().enumerate() {
                 live(work)?;
-                security.push(seal(path, false, sid, work)?);
+                let object_index = u32::try_from(index)
+                    .map_err(|_| CiError::Message("private input object index overflow".into()))?;
+                security.push(seal(
+                    path,
+                    false,
+                    sid,
+                    work,
+                    if index == 0 {
+                        ObjectRole::Fixture
+                    } else {
+                        ObjectRole::Provider
+                    },
+                    Some(object_index),
+                )?);
                 windows_native_files::verify_named_artifact(held, path)?;
             }
-            security.push(seal(&self.local, true, sid, work)?);
-            security.push(seal(&self.input_root, true, sid, work)?);
+            security.push(seal(
+                &self.local,
+                true,
+                sid,
+                work,
+                ObjectRole::LocalDirectory,
+                None,
+            )?);
+            security.push(seal(
+                &self.input_root,
+                true,
+                sid,
+                work,
+                ObjectRole::InputDirectory,
+                None,
+            )?);
             // Declare the new owned ancestor too; host ancestors remain untouched.
             let base = self
                 .input_root
                 .parent()
                 .ok_or_else(|| CiError::Message("owned input ancestor absent".into()))?;
-            security.push(seal(base, true, sid, work)?);
+            security.push(seal(base, true, sid, work, ObjectRole::OwnedBase, None)?);
             self.inventory["security"] = serde_json::json!(security);
             self.inventory["sealed"] = serde_json::json!(true);
             live(work)

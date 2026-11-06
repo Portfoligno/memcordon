@@ -1,4 +1,5 @@
 //! Native read/execute sealing of an explicitly owned setup-file handle.
+use crate::windows_private_input_record::{Context, expected_sddl, readback_diagnostic};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -18,6 +19,63 @@ use windows_sys::Win32::{
         GetSecurityDescriptorLength, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     },
 };
+
+/// The strict comparison remains primary; diagnostics never substitute a policy.
+#[derive(Debug)]
+pub struct ReadbackFailure {
+    pub primary: io::Error,
+    pub diagnostic: serde_json::Value,
+}
+impl std::fmt::Display for ReadbackFailure {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "{}; owned-input-readback={}",
+            self.primary, self.diagnostic
+        )
+    }
+}
+impl std::error::Error for ReadbackFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+fn mismatch_diagnostic(
+    context: &Context,
+    expected: &[u8],
+    observed: &[u8],
+    control: u16,
+    revision: u32,
+    work: Instant,
+) -> serde_json::Value {
+    let mut value = if Instant::now() < work {
+        readback_diagnostic(context, expected, observed, control, revision)
+    } else {
+        serde_json::json!({"format":"memcordon.private-input-dacl-readback","revision":1,"context":context,"diagnostic_state":"unavailable-original-cutoff","protection_missing":control & SE_DACL_PROTECTED == 0,"raw_acl_equal":expected==observed,"acceptance_authority":false})
+    };
+    value["failure_branch"] = serde_json::json!(if control & SE_DACL_PROTECTED == 0 {
+        "protected-bit-missing"
+    } else {
+        "raw-acl-byte-mismatch"
+    });
+    value["failure_domain"] = serde_json::json!("semantic-readback-comparison");
+    value["set_security_info_status"] = serde_json::json!(0);
+    value["get_security_info_status"] = serde_json::json!(0);
+    value["get_descriptor_control_succeeded"] = serde_json::json!(true);
+    value["expected_protected_requested"] = serde_json::json!(true);
+    value["expected_native_control_queried"] = serde_json::json!(false);
+    value["original_loader_cause_proved"] = serde_json::json!(false);
+    value["completed_before_original_cutoff"] = serde_json::json!(Instant::now() < work);
+    if serde_json::to_vec(&value).map_or(true, |bytes| {
+        bytes.len() > crate::windows_private_input_record::RECORD_BYTES
+    }) {
+        value["expected"]["aces"] = serde_json::json!([]);
+        value["observed"]["aces"] = serde_json::json!([]);
+        value["ace_details_omitted_for_record_bound"] = serde_json::json!(true);
+    }
+    value
+}
 struct Descriptor(*mut std::ffi::c_void);
 impl Drop for Descriptor {
     fn drop(&mut self) {
@@ -70,6 +128,7 @@ pub fn seal_read_execute(
     directory: bool,
     sid: &str,
     work: Instant,
+    context: &Context,
 ) -> io::Result<serde_json::Value> {
     live(work)?;
     let metadata = file.metadata()?;
@@ -78,19 +137,10 @@ pub fn seal_read_execute(
             "owned input type or reparse state differs",
         ));
     }
-    if !sid.starts_with("S-1-")
-        || sid.len() > 184
-        || !sid
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'S' || byte == b'-')
-    {
-        return Err(io::Error::other("owned input SID malformed"));
+    if context.directory != directory {
+        return Err(io::Error::other("owned input diagnostic type differs"));
     }
-    let sddl = if directory {
-        format!("D:P(A;OICI;GRGX;;;OW)(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)")
-    } else {
-        format!("D:P(A;;GRGX;;;OW)(A;;GA;;;{sid})(A;;GRGX;;;RC)(A;;GA;;;SY)")
-    };
+    let sddl = expected_sddl(directory, sid).map_err(io::Error::other)?;
     let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut raw = std::ptr::null_mut();
     if unsafe {
@@ -157,7 +207,26 @@ pub fn seal_read_execute(
         return Err(io::Error::last_os_error());
     }
     if control & SE_DACL_PROTECTED == 0 || expected_bytes != observed_bytes {
-        return Err(io::Error::other("owned protected DACL readback differs"));
+        let primary = io::Error::other(if control & SE_DACL_PROTECTED == 0 {
+            "owned protected DACL readback differs: protection bit missing"
+        } else {
+            "owned protected DACL readback differs: raw ACL bytes differ"
+        });
+        let diagnostic = mismatch_diagnostic(
+            context,
+            &expected_bytes,
+            &observed_bytes,
+            control,
+            revision,
+            work,
+        );
+        return Err(io::Error::new(
+            primary.kind(),
+            ReadbackFailure {
+                primary,
+                diagnostic,
+            },
+        ));
     }
     live(work)?;
     let hash = Sha256::digest(&observed_bytes)
