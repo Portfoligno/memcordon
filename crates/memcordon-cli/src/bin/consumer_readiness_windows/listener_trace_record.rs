@@ -20,6 +20,61 @@ pub struct Request {
     pub frequency: u64,
     pub incoming_win32: u32,
     pub incoming_wsa: i32,
+    pub experiment_flags: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ImageReturn {
+    pub dependency_sequence: u64,
+    pub parent_listener_sequence: u64,
+    pub returned_base: u64,
+    pub allocation_base: u64,
+    pub started_qpc: u64,
+    pub finished_qpc: u64,
+    pub original_thread: u32,
+    pub domain: u32,
+    pub memory_type: u32,
+    pub state: u32,
+    pub virtual_query_error: u32,
+    pub mapped_name_error: u32,
+    pub mapped_path_units: u32,
+    pub flags: u32,
+    pub mapped_path: [u16; 512],
+}
+impl Default for ImageReturn {
+    fn default() -> Self {
+        Self {
+            dependency_sequence: 0,
+            parent_listener_sequence: 0,
+            returned_base: 0,
+            allocation_base: 0,
+            started_qpc: 0,
+            finished_qpc: 0,
+            original_thread: 0,
+            domain: 0,
+            memory_type: 0,
+            state: 0,
+            virtual_query_error: 0,
+            mapped_name_error: 0,
+            mapped_path_units: 0,
+            flags: 0,
+            mapped_path: [0; 512],
+        }
+    }
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct ReturnedImages {
+    pub version: u32,
+    pub enabled: u32,
+    pub count: u32,
+    pub dropped: u32,
+    pub attempts: u32,
+    pub incomplete: u32,
+    pub reserved: [u32; 2],
+    pub rows: [ImageReturn; 8],
 }
 
 #[repr(C)]
@@ -187,12 +242,15 @@ pub struct Packet {
     pub dependencies: DependencyPacket,
     pub returned_module: ReturnedModule,
     pub loader_owner: LoaderOwner,
+    pub returned_images: ReturnedImages,
 }
 
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<Outcome>() == 16);
-    assert!(size_of::<Request>() == 24);
+    assert!(size_of::<Request>() == 32);
+    assert!(size_of::<ImageReturn>() == 1104);
+    assert!(size_of::<ReturnedImages>() == 8864);
     assert!(size_of::<Entry>() == 176);
     assert!(offset_of!(Entry, completion_sequence) == 128);
     assert!(offset_of!(Entry, input_prefix) == 136);
@@ -210,7 +268,8 @@ const _: () = {
     assert!(offset_of!(LoaderOwner, window_count) == 12392);
     assert!(offset_of!(LoaderOwner, first_failure_window) == 12408);
     assert!(offset_of!(LoaderOwner, windows) == 12448);
-    assert!(size_of::<Packet>() == 41440);
+    assert!(size_of::<Packet>() == 50304);
+    assert!(offset_of!(Packet, returned_images) == 41440);
     assert!(offset_of!(Packet, owner) == 208);
     assert!(offset_of!(Packet, slots) == 400);
     assert!(offset_of!(Packet, first_failure) == 1168);
@@ -833,6 +892,132 @@ fn loader_owner(packet: &Packet, ordinals: &mut BTreeSet<u64>) -> (Value, bool, 
     (value, invalid, incomplete)
 }
 
+fn returned_images_diagnostic(packet: &Packet) -> Value {
+    if packet.version == 4 {
+        return json!({"recorded":false,"status":"unavailable-in-packet-version-4","complete":false,
+            "acceptance_authority":false,"original_file_identity_proved":false});
+    }
+    let images = &packet.returned_images;
+    let mut invalid = packet.version != 5
+        || images.version != 1
+        || images.enabled > 1
+        || images.count > 8
+        || images.incomplete > 1
+        || images.reserved != [0; 2]
+        || images.attempts != images.count.saturating_add(images.dropped);
+    let mut rows = Vec::new();
+    for (index, row) in images.rows[..(images.count as usize).min(8)]
+        .iter()
+        .enumerate()
+    {
+        let source = packet.dependencies.entries
+            [..(packet.dependencies.record_count as usize).min(16)]
+            .iter()
+            .filter(|entry| entry.sequence == row.dependency_sequence)
+            .collect::<Vec<_>>();
+        let parent = packet.entries[..(packet.record_count as usize).min(16)]
+            .iter()
+            .filter(|entry| entry.sequence == row.parent_listener_sequence)
+            .collect::<Vec<_>>();
+        let linked = packet.dependency_links[..(packet.dependency_link_count as usize).min(16)]
+            .iter()
+            .filter(|link| {
+                link.dependency_sequence == row.dependency_sequence
+                    && link.parent_listener_sequence == row.parent_listener_sequence
+                    && link.timeline_sequence > 0
+            })
+            .count()
+            == 1;
+        let original_load = source.first().map(|entry| {
+            let units=(entry.copied_name_units as usize).min(256);
+            let name=&entry.name[..units];
+            let complete=source.len()==1 && entry.name_flags==1 && units>0 && units<256
+                && entry.reported_name_bytes==entry.copied_name_units.saturating_mul(2)
+                && !name.contains(&0) && String::from_utf16(name).is_ok()
+                && entry.name[units..].iter().all(|unit|*unit==0);
+            json!({"complete":complete,"operation_code":entry.operation,"sequence":entry.sequence,
+                "thread_id":entry.thread_id,"raw_root":entry.raw_root,"raw_flags":entry.flags,
+                "raw_output":entry.raw_output,"name_utf16":name,"name_flags":entry.name_flags,
+                "entered":entry.entered,"returned":entry.returned,"output_flags":entry.output_flags,
+                "native_status_or_adapter_marker":entry.native_status,
+                "reported_name_bytes":entry.reported_name_bytes,"copied_name_units":entry.copied_name_units,
+                "process_identity_source":"outer-original_binding","acceptance_authority":false})
+        });
+        let source_valid = source.len() == 1
+            && source[0].operation == 12
+            && source[0].entered == 1
+            && source[0].returned == 1
+            && source[0].raw_output == row.returned_base
+            && source[0].output_flags == 3
+            && source[0].native_status == 0
+            && source[0].thread_id == row.original_thread
+            && source[0].raw_root == 0
+            && source[0].flags == 0
+            && source[0].scalar_flags == 4
+            && original_load
+                .as_ref()
+                .is_some_and(|source| source["complete"] == true);
+        let parent_valid = parent.len() == 1
+            && parent[0].operation == 2
+            && parent[0].entered == 1
+            && parent[0].returned == 1
+            && parent[0].thread_id == row.original_thread;
+        let units = (row.mapped_path_units as usize).min(512);
+        let path = &row.mapped_path[..units];
+        let path_valid = units > 0
+            && units < 512
+            && !path.contains(&0)
+            && String::from_utf16(path).is_ok()
+            && row.mapped_path[units..].iter().all(|unit| *unit == 0);
+        let clock_valid = row.started_qpc > 0
+            && row.started_qpc >= packet.started_qpc
+            && row.finished_qpc >= row.started_qpc
+            && row.finished_qpc <= packet.finished_qpc
+            && row.finished_qpc < packet.cutoff_qpc;
+        let row_invalid = row.domain != 0
+            || row.original_thread != packet.original_thread
+            || row.dependency_sequence == 0
+            || row.parent_listener_sequence == 0
+            || row.returned_base == 0
+            || !(1..=7).contains(&row.state)
+            || row.flags & !7 != 0
+            || images.rows[..index]
+                .iter()
+                .any(|other| other.dependency_sequence == row.dependency_sequence)
+            || !source_valid
+            || !parent_valid
+            || !linked
+            || (row.state == 1
+                && (row.flags != 7
+                    || !clock_valid
+                    || !path_valid
+                    || row.allocation_base != row.returned_base
+                    || row.memory_type != 0x0100_0000
+                    || row.virtual_query_error != 0
+                    || row.mapped_name_error != 0));
+        invalid |= row_invalid;
+        rows.push(json!({"dependency_sequence":row.dependency_sequence,"parent_listener_sequence":row.parent_listener_sequence,
+            "original_thread":row.original_thread,"domain":row.domain,"returned_base":row.returned_base,
+            "allocation_base":row.allocation_base,"memory_type":row.memory_type,"state":row.state,
+            "virtual_query_error":row.virtual_query_error,"mapped_name_error":row.mapped_name_error,
+            "started_qpc":row.started_qpc,"finished_qpc":row.finished_qpc,"flags":row.flags,
+            "mapped_path_utf16":path,"complete":row.state==1&&!row_invalid,"invalid_row":row_invalid,
+            "original_load":original_load,
+            "original_file_identity_proved":false,"acceptance_authority":false}));
+    }
+    if images.enabled == 0 {
+        invalid |= images.count != 0
+            || images.attempts != 0
+            || images.dropped != 0
+            || images.incomplete != 0;
+    }
+    json!({"version":images.version,"enabled":images.enabled==1,"attempts":images.attempts,
+        "count":images.count,"dropped":images.dropped,"invalid_record":invalid,
+        "complete":images.enabled==1&&images.count>0&&images.incomplete==0&&images.dropped==0&&!invalid&&images.rows[..(images.count as usize).min(8)].iter().all(|row|row.state==1),
+        "observation_incomplete":images.incomplete!=0||invalid,"rows":rows,
+        "diagnostic_only":true,"original_file_identity_proved":false,"acceptance_authority":false})
+}
+
 pub fn diagnostic(packet: &Packet) -> Value {
     let flags = [
         packet.called,
@@ -847,7 +1032,7 @@ pub fn diagnostic(packet: &Packet) -> Value {
         packet.dependency_scope_armed,
         packet.callback_raw_error_present,
     ];
-    let mut invalid = packet.version != 4
+    let mut invalid = !matches!(packet.version, 4 | 5)
         || packet.setup_stage > 9
         || packet.setup_stage == 8
         || flags.iter().any(|flag| *flag > 1)
@@ -1049,6 +1234,7 @@ pub fn diagnostic(packet: &Packet) -> Value {
     value["packet_version"] = json!(packet.version);
     value["returned_module"] = returned;
     value["loader_owner"] = loader;
+    value["returned_images"] = returned_images_diagnostic(packet);
     bounded(value)
 }
 
@@ -1139,8 +1325,15 @@ pub fn bounded(mut value: Value) -> Value {
     }
     let trace = value.get("trace").unwrap_or(&value);
     let mut summary = json!({"format":"memcordon.fixture-original-rust-listener","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target_identity_proved":false,"global_routes_complete":false,"coverage_inconclusive":true,"record_omitted_for_bound":true,"observation_incomplete":true});
+    summary["returned_images"] = match trace.get("returned_images") {
+        Some(images) if fits(images, 12 * 1024) => images.clone(),
+        _ => {
+            json!({"complete":false,"observation_incomplete":true,"omitted_for_bound":true,"acceptance_authority":false})
+        }
+    };
     for key in [
         "packet_version",
+        "original_rust_operation",
         "original_thread",
         "started_qpc",
         "finished_qpc",
@@ -1335,6 +1528,14 @@ pub fn bounded(mut value: Value) -> Value {
             result["post_original_loader_security"] =
                 security_terminal(security, "omitted-for-listener-envelope-bound");
         }
+    }
+    if !fits(&result, RECORD_BYTES) {
+        let trace = if result.get("trace").is_some() {
+            &mut result["trace"]
+        } else {
+            &mut result
+        };
+        trace["returned_images"] = json!({"complete":false,"observation_incomplete":true,"omitted_for_bound":true,"acceptance_authority":false});
     }
     result
 }

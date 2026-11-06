@@ -78,6 +78,63 @@ pub fn run_working_channel(
     )
 }
 
+#[cfg(windows)]
+pub fn run_provider_input_experiment(
+    root: &Path,
+    prepared: &Path,
+    destination: &Path,
+) -> Result<()> {
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
+    let started = Instant::now();
+    let cleanup = started + Duration::from_secs(150 * 60);
+    let work = cleanup - Duration::from_secs(15 * 60);
+    let native = prepared.join("native-payload");
+    let (bundle, _) = TargetBundle::load(&native)?;
+    bundle.source.recheck(root)?;
+    if !matches!(bundle.source, BuildSourceIdentity::Working { .. })
+        || bundle.distribution != selected_distribution(native_target()?)?
+    {
+        return Err(CiError::Message(
+            "provider experiment requires its exact current native payload".into(),
+        ));
+    }
+    installed_consumer::create_fresh_destination(destination)?;
+    let payload = installed_consumer::materialize_native(&native, destination)?;
+    installed_consumer::require_current_runtime(&payload)?;
+    let installed = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .ok_or_else(|| CiError::Message("native ProgramFiles missing".into()))?
+        .join("MemCordon");
+    let config = crate::windows_installed_cases::InstalledWindowsPayload::from_materialized(
+        payload.channel,
+        &payload.source,
+        &payload.distribution,
+        payload.selected_case_artifacts()?,
+        &payload.directory,
+        payload.fixture.clone(),
+        &installed,
+        std::path::absolute(destination.join("cases"))?,
+    )?;
+    let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;
+    let result = crate::windows_installed_cases::run_provider_input_experiment_from_source_until(
+        root, &config, deadlines,
+    );
+    if result.is_err() {
+        let _retained = payload.retain();
+    }
+    result
+}
+
+#[cfg(not(windows))]
+pub fn run_provider_input_experiment(_: &Path, _: &Path, _: &Path) -> Result<()> {
+    Err(CiError::Message(
+        "declared provider input experiment requires native Windows".into(),
+    ))
+}
+
 /// Sequential local compatibility. Workflow consumers use the separate channel
 /// entrypoint on fresh hosts and only their exact producer artifacts.
 pub fn run_working(root: &Path, destination: &Path) -> Result<()> {

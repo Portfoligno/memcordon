@@ -6,7 +6,7 @@ use std::{
     fmt,
     fs::OpenOptions,
     io::{self, Write},
-    net::{Ipv4Addr, TcpListener},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 };
 use windows_sys::Win32::{
@@ -48,6 +48,8 @@ impl ErrorPair {
 #[derive(Default)]
 struct Invocation {
     result: Option<io::Result<TcpListener>>,
+    stream: Option<io::Result<TcpStream>>,
+    connect: Option<SocketAddrV4>,
     panic: Option<Box<dyn Any + Send>>,
     invoked: bool,
 }
@@ -62,7 +64,10 @@ unsafe extern "C" fn invoke_listener(opaque: *mut c_void, outcome: *mut record::
     }
     state.invoked = true;
     let returned = catch_unwind(AssertUnwindSafe(|| {
-        let result = TcpListener::bind((Ipv4Addr::LOCALHOST, 0));
+        let result = match state.connect {
+            Some(address) => TcpStream::connect(address).map(OriginalSocket::Stream),
+            None => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map(OriginalSocket::Listener),
+        };
         let errors = ErrorPair::capture();
         (result, errors)
     }));
@@ -73,7 +78,22 @@ unsafe extern "C" fn invoke_listener(opaque: *mut c_void, outcome: *mut record::
                 outcome.raw_error_present = 1;
                 outcome.raw_error = code;
             }
-            state.result = Some(result); // The original Rust listener/error, never raw adoption.
+            match state.connect {
+                Some(_) => {
+                    state.stream = Some(result.map(|socket| match socket {
+                        OriginalSocket::Stream(stream) => stream,
+                        OriginalSocket::Listener(_) => {
+                            unreachable!("connect callback returned listener")
+                        }
+                    }))
+                }
+                None => {
+                    state.result = Some(result.map(|socket| match socket {
+                        OriginalSocket::Listener(listener) => listener,
+                        OriginalSocket::Stream(_) => unreachable!("bind callback returned stream"),
+                    }))
+                }
+            }
             errors
         }
         Err(payload) => {
@@ -84,6 +104,11 @@ unsafe extern "C" fn invoke_listener(opaque: *mut c_void, outcome: *mut record::
         }
     };
     errors.restore();
+}
+
+enum OriginalSocket {
+    Listener(TcpListener),
+    Stream(TcpStream),
 }
 
 pub(super) fn live(clock: &super::descriptor::ControlClock) -> io::Result<()> {
@@ -194,6 +219,13 @@ impl Captured {
     }
 }
 fn capture(clock: &super::descriptor::ControlClock) -> Captured {
+    capture_call(clock, None, false)
+}
+fn capture_call(
+    clock: &super::descriptor::ControlClock,
+    connect: Option<SocketAddrV4>,
+    experiment: bool,
+) -> Captured {
     // This must precede token queries, hashing, allocation and native setup.
     let incoming = ErrorPair::capture();
     let request = record::Request {
@@ -201,9 +233,14 @@ fn capture(clock: &super::descriptor::ControlClock) -> Captured {
         frequency: clock.qpc_frequency,
         incoming_win32: incoming.win32,
         incoming_wsa: incoming.wsa,
+        experiment_flags: u32::from(experiment),
+        reserved: 0,
     };
     let mut packet = record::Packet::default();
-    let mut invocation = Invocation::default();
+    let mut invocation = Invocation {
+        connect,
+        ..Invocation::default()
+    };
     let process_token = token(clock, false);
     let effective_token = token(clock, true);
     // SAFETY: fixed asserted ABI, private non-unwinding callback and stack slots
@@ -247,15 +284,23 @@ fn retain(
     use std::os::windows::fs::OpenOptionsExt;
     live(context.clock)?;
     let binding = context.binding;
+    let mut trace = record::diagnostic(&capture.packet);
+    trace["original_rust_operation"] = serde_json::json!(if context.peer {
+        "TcpStream::connect"
+    } else {
+        "TcpListener::bind"
+    });
     let envelope = record::bounded(serde_json::json!({
         "format":"memcordon.original-rust-listener-trace","revision":1,
         "original_binding":{"pid":binding.pid,"creation_time_100ns":binding.birth,
             "descriptor_sha256":binding.descriptor_sha256,
             "challenge_sha256":super::descriptor::controller_start::descriptor_digest(&binding.challenge),
-            "prior_admitted_token_envelope_sha256":super::descriptor::controller_start::descriptor_digest(context.token_envelope),
+            "prior_token_observation_sha256":super::descriptor::controller_start::descriptor_digest(context.token_envelope),
+            "prior_token_observation_scope":if context.peer {"peer-before-authenticated-start"} else {"root-admitted-token-envelope"},
+            "prior_admitted_token_envelope_sha256":(!context.peer).then(||super::descriptor::controller_start::descriptor_digest(context.token_envelope)),
             "current_process_token":capture.process_token,"current_effective_token":capture.effective_token,
             "cutoff_qpc":context.clock.work_cutoff_qpc,"qpc_frequency":context.clock.qpc_frequency,
-            "authority":false},"trace":record::diagnostic(&capture.packet),"post_original_loader_security":security
+            "authority":false},"trace":trace,"post_original_loader_security":security
     }));
     let mut bytes = Bounded(Vec::new());
     serde_json::to_writer(&mut bytes, &envelope).map_err(io::Error::other)?;
@@ -264,7 +309,11 @@ fn retain(
         .write(true)
         .create_new(true)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(context.output_root.join("listener-call-trace.json"))?;
+        .open(context.output_root.join(if context.peer {
+            "peer-listener-call-trace.json"
+        } else {
+            "listener-call-trace.json"
+        }))?;
     file.write_all(&bytes.0)?;
     file.sync_all()
 }
@@ -323,7 +372,7 @@ pub fn bind(context: Option<&Context<'_>>) -> io::Result<TcpListener> {
         return TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(super::native::tcp_bind_failure);
     };
-    let mut captured = capture(context.clock);
+    let mut captured = capture_call(context.clock, None, context.provider_input_experiment);
     let security = if captured.invocation.panic.is_none()
         && captured
             .invocation
@@ -349,6 +398,46 @@ pub fn bind(context: Option<&Context<'_>>) -> io::Result<TcpListener> {
     let result = result.map_err(|original| {
         // Catalog readbacks happen only after both native collectors disarm.
         let original = super::native::tcp_bind_failure(original);
+        io::Error::new(
+            original.kind(),
+            Failure {
+                original,
+                summary: summary(&captured.packet),
+                retention,
+            },
+        )
+    });
+    captured.outgoing.restore();
+    result
+}
+
+pub fn connect(context: &Context<'_>, address: SocketAddrV4) -> io::Result<TcpStream> {
+    let mut captured = capture_call(
+        context.clock,
+        Some(address),
+        context.provider_input_experiment,
+    );
+    let retention = retain(context, &captured, None).err();
+    if let Some(payload) = captured.invocation.panic.take() {
+        captured.outgoing.restore();
+        resume_unwind(payload);
+    }
+    let result = captured.invocation.stream.take().unwrap_or_else(|| {
+        Err(
+            if captured.packet.setup_stage == 2 && captured.packet.setup_error != 0 {
+                io::Error::from_raw_os_error(captured.packet.setup_error as i32)
+            } else {
+                io::Error::other("original connect callback was not invoked")
+            },
+        )
+    });
+    if let (true, Some(error)) = (result.is_ok(), &retention) {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "peer trace retention unavailable (diagnostic only): {error}"
+        );
+    }
+    let result = result.map_err(|original| {
         io::Error::new(
             original.kind(),
             Failure {

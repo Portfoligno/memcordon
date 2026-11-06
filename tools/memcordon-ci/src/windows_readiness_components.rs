@@ -330,6 +330,88 @@ pub fn control_service_loss_observation(
         })
 }
 
+pub const CONTROL_RECOVERY_CHECKS: &[&str] = &[
+    "response-reject-variant",
+    "authority-serialization",
+    "response-schema",
+    "delivery-consistency",
+    "delivery-attempt",
+    "delivery-nonce",
+    "delivery-request",
+    "delivery-terminal-digest",
+    "live-nonce",
+    "selected-fault",
+    "live-nonce-present",
+    "live-target-present",
+    "selected-site-binding",
+    "observed-selected-fault",
+    "rejection-consistency",
+    "provider-failure-present",
+    "guardian-receipt-present",
+    "terminal-receipt-present",
+    "failure-consistency",
+    "failure-provider",
+    "failure-attempt",
+    "failure-request",
+    "live-consistency",
+    "live-provider",
+    "live-attempt",
+    "live-request",
+    "guardian-identity",
+    "worker-identity",
+    "terminal-attempt",
+    "terminal-request",
+    "terminal-validation",
+    "terminal-root",
+    "terminal-nonce",
+    "frontend-trigger",
+    "monitor-failed-outcome",
+    "original-event-present",
+    "original-event-shape",
+    "secondary-selected-event",
+    "live-association-present",
+    "delivery-present",
+];
+
+#[derive(Default)]
+pub struct ControlServiceRecoveryAssessment {
+    pub accepted: bool,
+    checks: Vec<(&'static str, bool)>,
+    first_failed_check: Option<&'static str>,
+    missing_prerequisite: bool,
+    authority_bytes: Option<usize>,
+    authority_sha256: Option<String>,
+    delivery_terminal_bytes: Option<usize>,
+    delivery_terminal_sha256: Option<String>,
+}
+impl ControlServiceRecoveryAssessment {
+    fn check(&mut self, name: &'static str, passed: bool) -> bool {
+        self.checks.push((name, passed));
+        if !passed && self.first_failed_check.is_none() {
+            self.first_failed_check = Some(name);
+        }
+        passed
+    }
+    fn present(&mut self, name: &'static str, present: bool) -> bool {
+        if !present {
+            self.missing_prerequisite = true;
+        }
+        self.check(name, present)
+    }
+    pub fn diagnostic(&self) -> serde_json::Value {
+        let checks = self
+            .checks
+            .iter()
+            .map(|(name, passed)| ((*name).to_owned(), serde_json::json!(passed)))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::json!({"diagnostic_only":true,"acceptance_authority":false,"accepted":self.accepted,
+            "first_failed_check":self.first_failed_check,"first_failed_check_state":self.first_failed_check.map(|_|if self.missing_prerequisite {"missing-prerequisite"}else{"evaluated-false"}),
+            "evaluated_checks":self.checks.len(),"remaining_checks_not_evaluated":!self.accepted,
+            "checks":checks,"authority_bytes":self.authority_bytes,"authority_sha256":self.authority_sha256,
+            "delivery_terminal_bytes":self.delivery_terminal_bytes,"delivery_terminal_sha256":self.delivery_terminal_sha256})
+    }
+}
+
 pub fn control_service_guardian_injection_authority(
     rejection: &memcordon_core::WindowsProviderRejectionV3,
     selected: memcordon_core::WindowsSealedFault,
@@ -339,22 +421,55 @@ pub fn control_service_guardian_injection_authority(
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedControlServiceLoss,
 ) -> bool {
-    selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
-        && live.live_nonce.as_deref().is_some_and(|nonce| {
-            live.live_target_identity.as_ref().is_some_and(|target| {
-                observed
-                    .site
-                    .binds(attempt, nonce, request, selected, target.process_id)
-            })
-        })
-        && guardian_frontend_chain_authority(
+    evaluate_control_service_guardian(
+        rejection,
+        selected,
+        provider,
+        attempt,
+        request,
+        live,
+        (observed, &mut ControlServiceRecoveryAssessment::default()),
+    )
+}
+fn evaluate_control_service_guardian(
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observation: (
+        &ObservedControlServiceLoss,
+        &mut ControlServiceRecoveryAssessment,
+    ),
+) -> bool {
+    let (observed, assessment) = observation;
+    assessment.check(
+        "selected-fault",
+        selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization,
+    ) && assessment.present("live-nonce-present", live.live_nonce.is_some())
+        && assessment.present("live-target-present", live.live_target_identity.is_some())
+        && assessment.check(
+            "selected-site-binding",
+            observed.site.binds(
+                attempt,
+                live.live_nonce.as_deref().expect("checked nonce"),
+                request,
+                selected,
+                live.live_target_identity
+                    .as_ref()
+                    .expect("checked target")
+                    .process_id,
+            ),
+        )
+        && evaluate_guardian_frontend_chain(
             rejection,
             selected,
             provider,
             attempt,
             request,
             live,
-            &observed.frontend,
+            (&observed.frontend, assessment),
         )
 }
 
@@ -364,7 +479,17 @@ pub fn control_service_recovery_authority(
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedControlServiceLoss,
 ) -> bool {
+    control_service_recovery_assessment(response, delivery, live, observed).accepted
+}
+
+pub fn control_service_recovery_assessment(
+    response: &memcordon_core::WindowsProviderResponseV4,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observed: &ObservedControlServiceLoss,
+) -> ControlServiceRecoveryAssessment {
     use memcordon_core::*;
+    let mut assessment = ControlServiceRecoveryAssessment::default();
     let WindowsProviderResponseV4::Reject {
         schema_version,
         attempt_id,
@@ -373,28 +498,51 @@ pub fn control_service_recovery_authority(
         rejection,
     } = response
     else {
-        return false;
+        assessment.present("response-reject-variant", false);
+        return assessment;
     };
+    assessment.check("response-reject-variant", true);
     let Ok(authority) = response.terminal_authority_json() else {
-        return false;
+        assessment.check("authority-serialization", false);
+        return assessment;
     };
-    *schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
-        && delivery.is_consistent()
-        && delivery.attempt_id == *attempt_id
-        && delivery.nonce == *nonce
-        && delivery.request_sha256 == *request_sha256
-        && delivery.terminal_sha256
-            == crate::windows_causal_acceptance::sha256(authority.as_bytes())
-        && live.live_nonce.as_ref() == Some(nonce)
-        && control_service_guardian_injection_authority(
+    assessment.check("authority-serialization", true);
+    assessment.authority_bytes = Some(authority.len());
+    assessment.authority_sha256 = Some(crate::windows_causal_acceptance::sha256(
+        authority.as_bytes(),
+    ));
+    assessment.delivery_terminal_bytes = Some(delivery.terminal_sha256.len());
+    assessment.delivery_terminal_sha256 = (delivery.terminal_sha256.len() == 64
+        && delivery
+            .terminal_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| delivery.terminal_sha256.clone());
+    assessment.accepted = assessment.check(
+        "response-schema",
+        *schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+    ) && assessment.check("delivery-consistency", delivery.is_consistent())
+        && assessment.check("delivery-attempt", delivery.attempt_id == *attempt_id)
+        && assessment.check("delivery-nonce", delivery.nonce == *nonce)
+        && assessment.check(
+            "delivery-request",
+            delivery.request_sha256 == *request_sha256,
+        )
+        && assessment.check(
+            "delivery-terminal-digest",
+            Some(&delivery.terminal_sha256) == assessment.authority_sha256.as_ref(),
+        )
+        && assessment.check("live-nonce", live.live_nonce.as_ref() == Some(nonce))
+        && evaluate_control_service_guardian(
             rejection,
             WindowsSealedFault::ControlServiceKilledAfterAuthorization,
             &live.association.provider,
             attempt_id,
             request_sha256,
             live,
-            observed,
-        )
+            (observed, &mut assessment),
+        );
+    assessment
 }
 
 fn guardian_frontend_chain_authority(
@@ -406,68 +554,104 @@ fn guardian_frontend_chain_authority(
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedFrontendLoss,
 ) -> bool {
+    evaluate_guardian_frontend_chain(
+        rejection,
+        selected,
+        provider,
+        attempt,
+        request,
+        live,
+        (observed, &mut ControlServiceRecoveryAssessment::default()),
+    )
+}
+fn evaluate_guardian_frontend_chain(
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observation: (&ObservedFrontendLoss, &mut ControlServiceRecoveryAssessment),
+) -> bool {
     use memcordon_core::*;
-    if observed.selected != selected || !rejection.is_consistent() {
+    let (observed, assessment) = observation;
+    if !assessment.check("observed-selected-fault", observed.selected == selected)
+        || !assessment.check("rejection-consistency", rejection.is_consistent())
+    {
         return false;
     }
-    let (Some(failure), Some(guardian), Some(terminal)) = (
+    let prerequisites = (
         rejection.provider_failure.as_ref(),
         rejection.guardian_causal_receipt.as_ref(),
         rejection.terminal_receipt(),
-    ) else {
+    );
+    if !assessment.present("provider-failure-present", prerequisites.0.is_some())
+        || !assessment.present("guardian-receipt-present", prerequisites.1.is_some())
+        || !assessment.present("terminal-receipt-present", prerequisites.2.is_some())
+    {
         return false;
+    }
+    let (Some(failure), Some(guardian), Some(terminal)) = prerequisites else {
+        unreachable!("checked causal prerequisites")
     };
-    if !failure.is_consistent()
-        || &failure.provider_binding != provider
-        || String::from(failure.attempt_id.clone()) != attempt
-        || String::from(failure.request_sha256.clone()) != request
-        || !live.is_consistent()
-        || &live.association.provider != provider
-        || String::from(live.association.attempt_id.clone()) != attempt
-        || String::from(live.association.request_sha256.clone()) != request
-        || live.guardian_identity != guardian.guardian_identity
-        || live.worker_process_identity.as_ref() != Some(&guardian.worker_identity)
-        || terminal.attempt_id != attempt
-        || terminal.request_sha256 != request
-        || terminal.validate_for_attempt().is_err()
-        || terminal.process_observation.root_identity != live.live_target_identity
-        || live.live_nonce.as_ref() != Some(&terminal.nonce)
-        || !matches!(&guardian.cleanup_trigger, Some(WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, native_exit_status })
-            if frontend == &observed.identity && *native_exit_status == observed.native_status)
-        || !terminal
+    if !assessment.check("failure-consistency",failure.is_consistent())
+        || !assessment.check("failure-provider",&failure.provider_binding == provider)
+        || !assessment.check("failure-attempt",String::from(failure.attempt_id.clone()) == attempt)
+        || !assessment.check("failure-request",String::from(failure.request_sha256.clone()) == request)
+        || !assessment.check("live-consistency",live.is_consistent())
+        || !assessment.check("live-provider",&live.association.provider == provider)
+        || !assessment.check("live-attempt",String::from(live.association.attempt_id.clone()) == attempt)
+        || !assessment.check("live-request",String::from(live.association.request_sha256.clone()) == request)
+        || !assessment.check("guardian-identity",live.guardian_identity == guardian.guardian_identity)
+        || !assessment.check("worker-identity",live.worker_process_identity.as_ref() == Some(&guardian.worker_identity))
+        || !assessment.check("terminal-attempt",terminal.attempt_id == attempt)
+        || !assessment.check("terminal-request",terminal.request_sha256 == request)
+        || !assessment.check("terminal-validation",terminal.validate_for_attempt().is_ok())
+        || !assessment.check("terminal-root",terminal.process_observation.root_identity == live.live_target_identity)
+        || !assessment.check("terminal-nonce",live.live_nonce.as_ref() == Some(&terminal.nonce))
+        || !assessment.check("frontend-trigger",matches!(&guardian.cleanup_trigger, Some(WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, native_exit_status })
+            if frontend == &observed.identity && *native_exit_status == observed.native_status))
+        || !assessment.check("monitor-failed-outcome",terminal
             .execution()
-            .is_some_and(|(_, outcome, _)| matches!(outcome, RunOutcome::MonitorFailed { .. }))
+            .is_some_and(|(_, outcome, _)| matches!(outcome, RunOutcome::MonitorFailed { .. })))
     {
         return false;
     }
     let OriginalFailureV1::Observed { event: original } = &failure.original else {
+        assessment.present("original-event-present", false);
         return false;
     };
-    if original.sequence == 0
-        || original.origin != DiagnosticOriginV1::Launcher
-        || original.category != FailureCategoryV1::Monitor
-        || original.operation != FailureOperationV1::CheckGuardian
-        || original.code != FailureCodeV1::GuardianLoss
-        || original.observed_phase != AttemptObservationPhaseV1::Monitoring
-        || original.native_code.is_some()
-        || original.safe_detail != SafeDiagnosticDetailV1::NoAdditionalDetail
-    {
+    assessment.check("original-event-present", true);
+    if !assessment.check(
+        "original-event-shape",
+        !(original.sequence == 0
+            || original.origin != DiagnosticOriginV1::Launcher
+            || original.category != FailureCategoryV1::Monitor
+            || original.operation != FailureOperationV1::CheckGuardian
+            || original.code != FailureCodeV1::GuardianLoss
+            || original.observed_phase != AttemptObservationPhaseV1::Monitoring
+            || original.native_code.is_some()
+            || original.safe_detail != SafeDiagnosticDetailV1::NoAdditionalDetail),
+    ) {
         return false;
     }
-    failure.secondary.as_slice().iter().any(|event| {
-        event.sequence > original.sequence
-            && event.origin == DiagnosticOriginV1::Launcher
-            && event.category == FailureCategoryV1::Transport
-            && event.operation == FailureOperationV1::DeliverResponse
-            && event.code == FailureCodeV1::ControlTransport
-            && event.observed_phase == AttemptObservationPhaseV1::Cleaning
-            && matches!(
-                event.native_code,
-                Some(NativeFailureCodeV1::Win32(109 | 232 | 233))
-            )
-            && event.safe_detail
-                == (SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected })
-    })
+    assessment.check(
+        "secondary-selected-event",
+        failure.secondary.as_slice().iter().any(|event| {
+            event.sequence > original.sequence
+                && event.origin == DiagnosticOriginV1::Launcher
+                && event.category == FailureCategoryV1::Transport
+                && event.operation == FailureOperationV1::DeliverResponse
+                && event.code == FailureCodeV1::ControlTransport
+                && event.observed_phase == AttemptObservationPhaseV1::Cleaning
+                && matches!(
+                    event.native_code,
+                    Some(NativeFailureCodeV1::Win32(109 | 232 | 233))
+                )
+                && event.safe_detail
+                    == (SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected })
+        }),
+    )
 }
 
 pub fn fault_selectors() -> Vec<memcordon_core::WindowsSealedFault> {
@@ -2651,9 +2835,22 @@ mod native {
                             assessment["recovery"]["delivery_parse_error"] = serde_json::json!(delivery_parse.as_ref().and_then(|value|value.as_ref().err()).map(|error|format!("{:?}",error.classify())));
                         }
                         let delivery = delivery_parse.and_then(std::result::Result::ok);
-                        selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
-                            && association.as_ref().zip(delivery.as_ref()).is_some_and(|(association, delivery)|
-                                control_service_recovery_authority(&response, delivery, association, observed))
+                        let evaluated = if selected != memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization {
+                            let mut value=ControlServiceRecoveryAssessment::default();
+                            value.check("selected-fault",false);value
+                        } else if let Some((association,delivery))=association.as_ref().zip(delivery.as_ref()) {
+                            control_service_recovery_assessment(&response,delivery,association,observed)
+                        } else {
+                            let mut value=ControlServiceRecoveryAssessment::default();
+                            if value.present("live-association-present",association.is_some()) {
+                                value.present("delivery-present",delivery.is_some());
+                            }
+                            value
+                        };
+                        if let Some(assessment)=&mut control_assessment {
+                            assessment["recovery"]["authority_assessment"]=evaluated.diagnostic();
+                        }
+                        evaluated.accepted
                     } else { false };
                     if let Some(assessment) = &mut control_assessment {
                         if observed_control_service_loss.is_none() {

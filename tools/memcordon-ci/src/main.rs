@@ -21,6 +21,9 @@ struct Cli {
 enum TopLevel {
     #[cfg(windows)]
     #[command(hide = true)]
+    ProviderCatalogPreparation,
+    #[cfg(windows)]
+    #[command(hide = true)]
     AccessFailureConsumer,
     #[cfg(windows)]
     #[command(hide = true)]
@@ -267,6 +270,9 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     #[cfg(windows)]
     match &cli.command {
+        Some(TopLevel::ProviderCatalogPreparation) => {
+            return memcordon_ci::windows_provider_catalog::child().map_err(CiError::from);
+        }
         Some(TopLevel::AccessFailureConsumer) => {
             return memcordon_ci::windows_access_failure_probe::consumer_stdio()
                 .map_err(CiError::from);
@@ -313,6 +319,7 @@ fn run() -> Result<()> {
             command,
             memcordon_ci::release::ReleaseCommand::WorkingWindowsPrepare { .. }
                 | memcordon_ci::release::ReleaseCommand::WorkingWindowsConsumer { .. }
+                | memcordon_ci::release::ReleaseCommand::WorkingWindowsProviderExperiment { .. }
         ),
         _ => false,
     };
@@ -325,6 +332,7 @@ fn run() -> Result<()> {
         #[cfg(windows)]
         Some(
             TopLevel::LoaderFileioConsumer
+            | TopLevel::ProviderCatalogPreparation
             | TopLevel::AccessFailureConsumer
             | TopLevel::AccessFailureCalibration,
         ) => {

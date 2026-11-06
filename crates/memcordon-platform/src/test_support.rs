@@ -10,6 +10,12 @@ pub mod windows_access_failure_probe;
 #[path = "windows_fileio.rs"]
 pub mod windows_fileio;
 #[cfg(windows)]
+#[path = "windows_private_input.rs"]
+pub mod windows_private_input;
+#[cfg(windows)]
+#[path = "windows_provider_catalog.rs"]
+pub mod windows_provider_catalog;
+#[cfg(windows)]
 #[path = "windows_winsock_registry.rs"]
 pub mod windows_winsock_registry;
 
@@ -2164,6 +2170,27 @@ pub fn windows_process_candidate_for_image_until(
     pid: u32,
     deadline: std::time::Instant,
 ) -> io::Result<WindowsProcessCandidate> {
+    windows_process_candidate_with_access(image, pid, deadline, false)
+}
+
+/// Capability transfer to one positively published owned helper only. Open
+/// errors including87 remain failures; this is not a census or retirement API.
+#[cfg(windows)]
+pub fn windows_fixture_input_candidate_for_image_until(
+    image: &Path,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> io::Result<WindowsProcessCandidate> {
+    windows_process_candidate_with_access(image, pid, deadline, true)
+}
+
+#[cfg(windows)]
+fn windows_process_candidate_with_access(
+    image: &Path,
+    pid: u32,
+    deadline: std::time::Instant,
+    fixture_input: bool,
+) -> io::Result<WindowsProcessCandidate> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::FILETIME;
@@ -2190,10 +2217,17 @@ pub fn windows_process_candidate_for_image_until(
     }
     let expected = std::fs::canonicalize(image)?;
     live()?;
-    // SAFETY: this acquires a query/synchronize handle only, never inheritable.
+    // SAFETY: one published candidate, never inheritable; explicit helper input
+    // additionally requests duplicate capability without weakening error handling.
     let raw = unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_SYNCHRONIZE
+                | if fixture_input {
+                    windows_sys::Win32::System::Threading::PROCESS_DUP_HANDLE
+                } else {
+                    0
+                },
             0,
             pid,
         )
@@ -2204,8 +2238,13 @@ pub fn windows_process_candidate_for_image_until(
         None
     };
     if let Some(error) = original_error {
-        if crate::windows_process_candidate::classify(pid, true, false, false, error.raw_os_error())
-            == crate::windows_process_candidate::Acquisition::CandidateUnavailable
+        if crate::windows_process_candidate::classify(
+            pid,
+            !fixture_input,
+            false,
+            false,
+            error.raw_os_error(),
+        ) == crate::windows_process_candidate::Acquisition::CandidateUnavailable
         {
             live()?;
             return Ok(WindowsProcessCandidate::CandidateUnavailable {
@@ -2214,7 +2253,11 @@ pub fn windows_process_candidate_for_image_until(
             });
         }
         return Err(windows_process_observation_error(
-            "positive candidate OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)",
+            if fixture_input {
+                "positive helper OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE|DUP_HANDLE)"
+            } else {
+                "positive candidate OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)"
+            },
             Some(pid),
             error,
         ));

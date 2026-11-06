@@ -37,6 +37,10 @@ pub struct MaterializedPayload {
 }
 
 impl MaterializedPayload {
+    #[cfg(windows)]
+    pub(crate) fn retain(self) -> PathBuf {
+        self._owner.keep()
+    }
     pub fn selected_case_artifacts(&self) -> Result<Vec<SelectedArtifact>> {
         installed_case_artifacts(
             &self.artifacts,

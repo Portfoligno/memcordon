@@ -4,6 +4,7 @@
 #include <winternl.h>
 #include <winreg.h>
 #include <intrin.h>
+#include <psapi.h>
 #include <atomic>
 #include <type_traits>
 #include "detours.h"
@@ -242,6 +243,52 @@ static void returned_module_loaded(const WsaEntry*,bool,HMODULE,HANDLE,DWORD);
 struct LoaderCallScope {Collector previous;ListenerPacket* packet;bool managed;};
 static LoaderCallScope loader_owner_begin(const WsaEntry*,bool,void*);
 static void loader_owner_end(const LoaderCallScope&);
+struct ReturnedImageApis {
+    decltype(&VirtualQuery) query;
+    decltype(&K32GetMappedFileNameW) mapped_name;
+};
+static void returned_image(const WsaEntry* entry,bool active,HMODULE module,const ReturnedImageApis& api={&VirtualQuery,&K32GetMappedFileNameW}){
+    auto* packet=collector.timeline;
+    if(!active||!module||!packet||!packet->returned_images.enabled)return;
+    auto& output=packet->returned_images;
+    output.attempts=increment(output.attempts);
+    if(output.count>=8){output.dropped=increment(output.dropped);output.incomplete=1;return;}
+    const auto saved=errors();
+    auto& row=output.rows[output.count++];
+    row.dependency_sequence=entry->sequence;row.parent_listener_sequence=listener_parent();row.returned_base=reinterpret_cast<uintptr_t>(module);row.original_thread=GetCurrentThreadId();row.domain=0;row.state=7;
+    if(observer_setup_active||!row.parent_listener_sequence||!listener_collector.depth||listener_collector.operations[listener_collector.depth-1]!=2){output.incomplete=1;errors_restore(saved);return;}
+    {ObserverSetup suppress;
+        LARGE_INTEGER started={},finished={};
+        const BOOL clock=QueryPerformanceCounter(&started);
+        if(!clock||started.QuadPart<=0||static_cast<uint64_t>(started.QuadPart)>=packet->cutoff_qpc){row.state=2;output.incomplete=1;}
+        else {
+            row.started_qpc=static_cast<uint64_t>(started.QuadPart);
+            MEMORY_BASIC_INFORMATION info={};
+            const SIZE_T queried=api.query(module,&info,sizeof(info));
+            const DWORD query_error=queried?0:GetLastError();
+            row.allocation_base=reinterpret_cast<uintptr_t>(info.AllocationBase);row.memory_type=info.Type;
+            if(queried!=sizeof(info)){row.state=3;row.virtual_query_error=query_error;output.incomplete=1;}
+            else if(info.Type!=MEM_IMAGE||info.State!=MEM_COMMIT||info.AllocationBase!=module){row.state=4;output.incomplete=1;}
+            else {
+                row.flags=1;
+                LARGE_INTEGER before_name={};
+                if(!QueryPerformanceCounter(&before_name)||before_name.QuadPart<=0||static_cast<uint64_t>(before_name.QuadPart)>=packet->cutoff_qpc){row.state=2;output.incomplete=1;}
+                else {
+                const DWORD count=api.mapped_name(GetCurrentProcess(),module,reinterpret_cast<WCHAR*>(row.mapped_path),512);
+                const DWORD path_error=count?0:GetLastError();
+                if(!count){row.state=5;row.mapped_name_error=path_error;output.incomplete=1;}
+                else if(count>=512){row.state=6;row.mapped_path_units=512;output.incomplete=1;}
+                else {row.mapped_path_units=count;row.flags|=2;row.state=1;}
+                }
+            }
+        }
+        const BOOL ended=QueryPerformanceCounter(&finished);
+        if(ended&&finished.QuadPart>0)row.finished_qpc=static_cast<uint64_t>(finished.QuadPart);
+        if(!ended||!row.started_qpc||row.finished_qpc<row.started_qpc||row.finished_qpc>=packet->cutoff_qpc){row.state=2;output.incomplete=1;}
+        else row.flags|=4;
+    }
+    errors_restore(saved);
+}
 using NtOpen=NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES);
 template<unsigned Returned=0> static NTSTATUS NTAPI open_key(PHANDLE out,ACCESS_MASK access,POBJECT_ATTRIBUTES attr){
     if constexpr(Returned){if(!dependency_collector<Returned>().packet)return original<NtOpen,Returned>(1)(out,access,attr);}
@@ -371,6 +418,7 @@ template<unsigned Returned=0> static HMODULE WINAPI load_library(LPCWSTR value,H
     if constexpr(Returned==0)loader=loader_owner_begin(&entry,active,reinterpret_cast<void*>(original<decltype(&LoadLibraryExW),0>(12)));
     saved.forward(active);
     const auto result=original<decltype(&LoadLibraryExW),Returned>(12)(value,file,flags);const DWORD error=saved.returned();
+    if constexpr(Returned==0)returned_image(&entry,active,result);
     if constexpr(Returned==0)loader_owner_end(loader);
     entry.raw_output=reinterpret_cast<uintptr_t>(result);entry.output_flags=1|(result?2:0);finish<Returned>(&entry,active,result?0:1,error,!result);if constexpr(!Returned)returned_module_loaded(&entry,active,result,file,flags);SetLastError(error);return result;
 }
@@ -1559,7 +1607,8 @@ static void listener_invoke(ListenerPacket* packet,const ListenerRequest* reques
 }
 extern "C" void memcordon_listener_trace_call(ListenerPacket* packet,const ListenerRequest* request,ListenerInvoke callback,void* opaque){
     if(!packet||!request||!callback)__fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    *packet={};packet->version=4;packet->returned_module.version=1;packet->loader_owner.version=2;packet->scope_flags=1;
+    *packet={};packet->version=5;packet->returned_module.version=1;packet->loader_owner.version=2;packet->scope_flags=1;
+    packet->returned_images.version=1;packet->returned_images.enabled=(request->experiment_flags==1&&request->reserved==0)?1:0;
     packet->cutoff_qpc=request->cutoff_qpc;packet->frequency=request->frequency;
     packet->incoming_win32=request->incoming_win32;packet->incoming_wsa=request->incoming_wsa;
     packet->original_thread=GetCurrentThreadId();packet->listener_owner_anchor=reinterpret_cast<uintptr_t>(callback);
@@ -1729,6 +1778,47 @@ static void listener_mock_dependencies(ListenerPacket* packet){
     packet->dependencies={};packet->dependencies.version=1;
     packet->dependencies.cutoff_qpc=packet->cutoff_qpc;packet->dependencies.frequency=packet->frequency;
     collector={};collector.packet=&packet->dependencies;collector.timeline=packet;
+}
+struct ImageMock {uint32_t queries,names,mode;};
+static thread_local ImageMock image_mock={};
+static SIZE_T WINAPI image_mock_query(LPCVOID address,PMEMORY_BASIC_INFORMATION info,SIZE_T size){
+    ++image_mock.queries;SetLastError(87);WSASetLastError(10022);
+    if(image_mock.mode==1){SetLastError(5);return 0;}
+    if(size!=sizeof(*info))return 0;
+    *info={};info->AllocationBase=const_cast<void*>(address);info->Type=MEM_IMAGE;info->State=MEM_COMMIT;
+    if(image_mock.mode==2)info->Type=MEM_PRIVATE;
+    return sizeof(*info);
+}
+static DWORD WINAPI image_mock_name(HANDLE process,LPVOID,LPWSTR path,DWORD capacity){
+    ++image_mock.names;SetLastError(31);WSASetLastError(10013);
+    if(process!=GetCurrentProcess()||capacity!=512)return 0;
+    if(image_mock.mode==3){SetLastError(5);return 0;}
+    if(image_mock.mode==4)return capacity;
+    const WCHAR name[]=L"\\Device\\HarddiskVolume3\\private\\mswsock.dll";
+    const DWORD units=static_cast<DWORD>(sizeof(name)/sizeof(name[0])-1);
+    memcpy(path,name,units*sizeof(WCHAR));return units;
+}
+static uint32_t image_native_mock(ListenerPacket* packet,uint64_t cutoff,uint64_t frequency){
+    const ReturnedImageApis api={image_mock_query,image_mock_name};
+    errors_restore({0x12345678,10035});const auto incoming=errors();
+    WsaEntry entry={};entry.sequence=91;
+    for(uint32_t mode=0;mode!=5;++mode){
+        listener_mock_packet(packet,cutoff,frequency);listener_mock_dependencies(packet);
+        listener_collector.depth=1;listener_collector.parents[0]=42;listener_collector.operations[0]=2;
+        packet->returned_images.version=1;image_mock={0,0,mode};
+        errors_restore(incoming);returned_image(&entry,true,reinterpret_cast<HMODULE>(0x10000),api);
+        if(image_mock.queries||image_mock.names||packet->returned_images.count||!same_errors(errors(),incoming))return 35;
+        packet->returned_images.enabled=1;
+        returned_image(&entry,true,reinterpret_cast<HMODULE>(0x10000),api);
+        const auto& row=packet->returned_images.rows[0];
+        if(image_mock.queries!=1||image_mock.names!=(mode==1||mode==2?0u:1u)||packet->returned_images.count!=1||row.dependency_sequence!=91||row.parent_listener_sequence!=42||!same_errors(errors(),incoming))return 35;
+        const uint32_t expected[]={1,3,4,5,6};
+        if(row.state!=expected[mode]||(mode==0&&(row.flags!=7||row.mapped_path_units==0)))return 35;
+        packet->returned_images.count=8;const auto queried=image_mock.queries,named=image_mock.names;
+        returned_image(&entry,true,reinterpret_cast<HMODULE>(0x10000),api);
+        if(image_mock.queries!=queried||image_mock.names!=named||packet->returned_images.dropped!=1||!packet->returned_images.incomplete||!same_errors(errors(),incoming))return 35;
+    }
+    return 0;
 }
 static DWORD WINAPI listener_mock_thread(void*){
     auto* state=listener_mock.load(std::memory_order_acquire);errors_restore(state->incoming);
@@ -2139,5 +2229,6 @@ extern "C" uint32_t memcordon_listener_trace_mock(uint64_t cutoff,uint64_t frequ
     if(stopped.called||stopped.callback_outcome||stopped.callback_raw_error_present||stopped.setup_stage!=2||stopped.setup_error!=ERROR_TIMEOUT||state.calls[5]!=before+1||!same_errors(stopped_errors,state.incoming))return 16;
     for(const auto& original:listener_originals)if(original.load(std::memory_order_acquire))return 14;
     const auto returned_failed=returned_native_mock(&packet,&state,cutoff,frequency);if(returned_failed)return returned_failed;
+    const auto image_failed=image_native_mock(&packet,cutoff,frequency);if(image_failed)return image_failed;
     return 0;
 }

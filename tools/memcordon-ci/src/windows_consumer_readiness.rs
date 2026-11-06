@@ -1399,6 +1399,15 @@ pub fn run_installed_until(
 }
 
 #[cfg(windows)]
+pub fn run_provider_input_experiment_until(
+    root: &Path,
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+) -> Result<serde_json::Value> {
+    native::provider_input_experiment(root, config, deadlines)
+}
+
+#[cfg(windows)]
 pub fn run_installed_with_deadlines(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
     input_path: &Path,
@@ -2419,6 +2428,8 @@ pub(crate) mod native {
                 start_transport: super::expected_start_transport(&key),
                 control_clock: None,
                 winsock_registry: None,
+                provider_input_experiment: false,
+                provider_input_paths: Vec::new(),
                 gate_access_diagnostic: None,
                 gate_precondition: None,
                 completion_gate: None,
@@ -3820,6 +3831,7 @@ pub(crate) mod native {
                 work: work_deadline,
                 cleanup,
                 registry: None,
+                projection_observation: None,
             },
         )
     }
@@ -3868,6 +3880,7 @@ pub(crate) mod native {
                 work: work_deadline,
                 cleanup: None,
                 registry: None,
+                projection_observation: None,
             },
         )
     }
@@ -3876,6 +3889,13 @@ pub(crate) mod native {
         work: Instant,
         cleanup: Option<Instant>,
         registry: Option<Arc<Mutex<memcordon_testkit::WindowsWinsockRegistryProjection>>>,
+        projection_observation: Option<Arc<Mutex<ProjectionObservation>>>,
+    }
+
+    #[derive(Default)]
+    struct ProjectionObservation {
+        root: Option<(u32, u128, memcordon_core::WindowsCallerTokenEnvelopeV1)>,
+        peer: Option<(u32, u128, memcordon_core::WindowsCallerTokenEnvelopeV1)>,
     }
 
     fn execute_with_baseline_clocks(
@@ -3889,16 +3909,35 @@ pub(crate) mod native {
     ) -> Result<()> {
         let mut declared = input.clone();
         if needs_registry_input(&input.key, input.descriptor.case) {
-            let projection = memcordon_testkit::WindowsWinsockRegistryProjection::create(
-                &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
-                clocks.work,
-                clocks.cleanup.unwrap_or(clocks.work),
-            )?;
-            declared.descriptor.winsock_registry = Some(projection.declaration().clone());
-            declared.descriptor.start_transport = descriptor::StartTransport::ControllerStdin {
-                version: descriptor::controller_start::REGISTRY_VERSION,
-            };
-            clocks.registry = Some(Arc::new(Mutex::new(projection)));
+            if clocks.registry.is_some() && !input.descriptor.provider_input_experiment {
+                return Err(CiError::Message("provided registry owner is restricted to the separately declared input experiment".into()));
+            }
+            if clocks.registry.is_none() {
+                let projection = memcordon_testkit::WindowsWinsockRegistryProjection::create(
+                    &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
+                    clocks.work,
+                    clocks.cleanup.unwrap_or(clocks.work),
+                )?;
+                declared.descriptor.winsock_registry = Some(projection.declaration().clone());
+                declared.descriptor.start_transport = descriptor::StartTransport::ControllerStdin {
+                    version: descriptor::controller_start::REGISTRY_VERSION,
+                };
+                clocks.registry = Some(Arc::new(Mutex::new(projection)));
+            } else {
+                let owner = clocks
+                    .registry
+                    .as_ref()
+                    .expect("provided projection")
+                    .lock()
+                    .map_err(|_| {
+                        CiError::Message("provided registry input ownership poisoned".into())
+                    })?;
+                owner.verify_owned()?;
+                declared.descriptor.winsock_registry = Some(owner.declaration().clone());
+                declared.descriptor.start_transport = descriptor::StartTransport::ControllerStdin {
+                    version: descriptor::controller_start::REGISTRY_VERSION,
+                };
+            }
         }
         let registry = clocks.registry.clone();
         let result = execute_with_registry(
@@ -4255,6 +4294,7 @@ pub(crate) mod native {
         );
         let native_started_utc = std::time::SystemTime::now();
         let registry_recipient = clocks.registry.clone();
+        let projection_observation = clocks.projection_observation.clone();
         let fileio_requested = input.key.family == "W-JOINT"
             && input.key.scenario == "restricted"
             && input.descriptor.case == descriptor::Case::Joint;
@@ -4723,6 +4763,13 @@ pub(crate) mod native {
                             "native listener owner retired during observation",
                         ));
                     }
+                    if let Some(observation) = &projection_observation {
+                        let token = held[0].original_token_envelope(deadline)?;
+                        observation
+                            .lock()
+                            .map_err(|_| io::Error::other("experiment held observation poisoned"))?
+                            .root = Some((held[0].identity.pid, held[0].identity.birth, token));
+                    }
                     let bytes = serde_json::to_vec(&serde_json::json!({
                         "format": "memcordon.windows-native-listener", "revision": 1,
                         "root_pid": root_pid, "root_creation_time_100ns": held[0].identity.birth,
@@ -4797,6 +4844,15 @@ pub(crate) mod native {
                             "native_parent_edge_observed":true, "parent_and_child_held_live":true,
                         }))
                         .map_err(io::Error::other)?;
+                        if let Some(observation) = &projection_observation {
+                            let token = peer.original_token_envelope(deadline)?;
+                            observation
+                                .lock()
+                                .map_err(|_| {
+                                    io::Error::other("experiment held observation poisoned")
+                                })?
+                                .peer = Some((peer.identity.pid, peer.identity.birth, token));
+                        }
                         let path = directory.join("native-tcp-peer.json");
                         let mut file = OpenOptions::new()
                             .write(true)
@@ -6250,6 +6306,357 @@ pub(crate) mod native {
             (Err(primary), _) => Err(primary),
             (Ok(()), retirement) => retirement,
         }
+    }
+
+    pub fn provider_input_experiment(
+        root: &Path,
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+    ) -> Result<serde_json::Value> {
+        use crate::windows_provider_projection::native::Deployment;
+        use crate::windows_provider_projection_record::{self as facts, BindingExpectation};
+        use sha2::{Digest, Sha256};
+        fn json_file(path: &Path, maximum: usize) -> Result<serde_json::Value> {
+            let bytes = read(path, maximum)?;
+            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
+                .map_err(CiError::Message)?;
+            Ok(serde_json::from_slice(&bytes)?)
+        }
+        fn publish(path: &Path, value: &serde_json::Value) -> Result<()> {
+            let bytes = serde_json::to_vec(value)?;
+            if bytes.len() > 64 * 1024 {
+                return Err(CiError::Message(
+                    "provider experiment record exceeds64KiB; feasibility unproved".into(),
+                ));
+            }
+            let _parents = crate::windows_native_files::hold_ancestors(
+                path.parent()
+                    .ok_or_else(|| CiError::Message("experiment record parent absent".into()))?,
+            )?;
+            drop(crate::windows_native_files::publish_owned_file(
+                path, &bytes,
+            )?);
+            Ok(())
+        }
+        fn combine(primary: Result<()>, secondary: Result<()>) -> Result<()> {
+            match (primary, secondary) {
+                (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(secondary),
+                }),
+                (Err(primary), _) => Err(primary),
+                (Ok(()), other) => other,
+            }
+        }
+        let mut attempts = Vec::new();
+        for scenario in ["ordinary", "restricted"] {
+            provision_budget(deadlines.work)?;
+            let attempt_directory = config
+                .output_directory
+                .join("provider-input-experiment")
+                .join(scenario);
+            fs::create_dir_all(&attempt_directory)?;
+            let mut deployment = Deployment::create(
+                &config.fixture,
+                &config.target,
+                &attempt_directory,
+                deadlines.work,
+            )?;
+            let mut selected = config.clone();
+            selected.fixture = deployment.fixture.clone();
+            selected.output_directory = deployment.output_root.clone();
+            provision(root, &selected, deadlines.work)?;
+            let suite: SuiteInput = serde_json::from_slice(&read(
+                &selected
+                    .output_directory
+                    .join("windows-readiness-input.json"),
+                4 * 1024 * 1024,
+            )?)?;
+            validate_suite(&suite)?;
+            let mut input = suite
+                .cases
+                .iter()
+                .find(|case| case.key.family == "W-JOINT" && case.key.scenario == scenario)
+                .cloned()
+                .ok_or_else(|| CiError::Message("declared original Joint input absent".into()))?;
+            let sid = sid_text(&input.expected_token.user_sid)?;
+            let projection = Arc::new(Mutex::new(
+                memcordon_testkit::WindowsWinsockRegistryProjection::create(
+                    &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
+                    deadlines.work,
+                    deadlines.cleanup,
+                )?,
+            ));
+            let mut phase = "catalog-preparation";
+            let mut assessment = CaseAssessment {
+                key: input.key.clone(),
+                behavior: Err("experiment not run".into()),
+                collection: Err("experiment not collected".into()),
+                retirement: Err("experiment retirement unproved".into()),
+                descriptor_sha256: String::new(),
+                result_sha256: None,
+                stdout_sha256: None,
+                stderr_sha256: None,
+                transcript_sha256: None,
+                request_sha256: None,
+                terminal_observation_sha256: None,
+            };
+            let mut selected_images = serde_json::Value::Null;
+            let held_observation = Arc::new(Mutex::new(ProjectionObservation::default()));
+            let mut probe_created = false;
+            let mut workload_launched = false;
+            let attempted = (|| -> Result<()> {
+                let catalog = crate::windows_provider_catalog::collect(
+                    Arc::clone(&projection),
+                    crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
+                    deadlines.work,
+                    deadlines.cleanup,
+                )?;
+                let declaration_sha = projection
+                    .lock()
+                    .map_err(|_| CiError::Message("experiment registry owner poisoned".into()))?
+                    .declaration()
+                    .clone();
+                let declaration_sha = crate::windows_provider_catalog::digest(&declaration_sha)?;
+                let environment = fixture_environment::entries()?;
+                let root_name = "SystemRoot".encode_utf16().collect::<Vec<_>>();
+                let systemroot = environment
+                    .iter()
+                    .find(|entry| entry.name == root_name)
+                    .ok_or_else(|| CiError::Message("declared SystemRoot absent".into()))?;
+                facts::verify_expansion(&catalog, &systemroot.value).map_err(CiError::Message)?;
+                let candidates =
+                    facts::select(&catalog, &declaration_sha).map_err(CiError::Message)?;
+                phase = "private-copy-and-seal";
+                deployment.copy_providers(&candidates, &catalog, &config.target, deadlines.work)?;
+                deployment.seal(&sid, deadlines.work)?;
+                deployment.verify(deadlines.work)?;
+                input.descriptor.provider_input_experiment = true;
+                input.descriptor.provider_input_paths = deployment.paths();
+                publish(
+                    &attempt_directory.join("declaration.json"),
+                    &serde_json::json!({"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"registry_declaration_sha256":declaration_sha,"inputs":deployment.inventory,"diagnostic_only":true,"acceptance_authority":false}),
+                )?;
+                let provider_root = config.installed_agent.path.parent().ok_or_else(|| {
+                    CiError::Message("experiment installed provider root absent".into())
+                })?;
+                let provider_probe = provider_root.join("protected-readiness-probe");
+                fs::create_dir(&provider_probe)?;
+                probe_created = true;
+                set_directory_acl(
+                    &provider_probe,
+                    &format!(
+                        "D:P(D;OICI;GW;;;RC)(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)"
+                    ),
+                )?;
+                let baseline = GuardianBaseline::quiescent(
+                    &config.installed_agent.path,
+                    &config.installed_manifest.path,
+                    &config.installed_agent.sha256,
+                    &config.installed_manifest.sha256,
+                )?;
+                phase = "original-joint-workload";
+                deployment.launched();
+                workload_launched = true;
+                let executed = execute_with_baseline_clocks(
+                    &selected,
+                    &input,
+                    &mut assessment,
+                    baseline,
+                    Vec::new(),
+                    None,
+                    ExecutionClocks {
+                        work: deadlines.work,
+                        cleanup: Some(deadlines.cleanup),
+                        registry: Some(Arc::clone(&projection)),
+                        projection_observation: Some(Arc::clone(&held_observation)),
+                    },
+                );
+                if assessment.retirement.is_ok() {
+                    deployment.retired();
+                }
+                executed?;
+                if assessment.behavior.is_err()
+                    || assessment.collection.is_err()
+                    || assessment.retirement.is_err()
+                {
+                    return Err(CiError::Message(
+                        "declared Joint workload/collection/retirement did not complete".into(),
+                    ));
+                }
+                phase = "positive-original-image-witness";
+                deployment.verify(deadlines.work)?;
+                let root_observation = json_file(
+                    &input.descriptor.output_root.join("native-listener.json"),
+                    16 * 1024,
+                )?;
+                let peer_observation = json_file(
+                    &input.descriptor.output_root.join("native-tcp-peer.json"),
+                    16 * 1024,
+                )?;
+                let observed = held_observation
+                    .lock()
+                    .map_err(|_| CiError::Message("experiment held observation poisoned".into()))?;
+                let (root_pid, root_birth, root_token) =
+                    observed.root.as_ref().ok_or_else(|| {
+                        CiError::Message("actual held root observation absent".into())
+                    })?;
+                let (peer_pid, peer_birth, peer_token) =
+                    observed.peer.as_ref().ok_or_else(|| {
+                        CiError::Message("actual held peer observation absent".into())
+                    })?;
+                let root_birth = u64::try_from(*root_birth)
+                    .map_err(|_| CiError::Message("held root birth extent".into()))?;
+                let peer_birth = u64::try_from(*peer_birth)
+                    .map_err(|_| CiError::Message("held peer birth extent".into()))?;
+                let (root_pid, peer_pid) = (*root_pid, *peer_pid);
+                if root_token != peer_token
+                    || root_token.user_sid != sid
+                    || root_observation["root_pid"] != serde_json::json!(root_pid)
+                    || root_observation["root_creation_time_100ns"] != serde_json::json!(root_birth)
+                    || peer_observation["pid"] != serde_json::json!(peer_pid)
+                    || peer_observation["birth"] != serde_json::json!(peer_birth)
+                {
+                    return Err(CiError::Message(
+                        "retained root/peer identity or token join differs".into(),
+                    ));
+                }
+                let descriptor_sha: [u8; 32] = hex::decode(&assessment.descriptor_sha256)
+                    .map_err(|error| CiError::Message(error.to_string()))?
+                    .try_into()
+                    .map_err(|_| {
+                        CiError::Message("experimental descriptor digest extent".into())
+                    })?;
+                let challenge_sha: [u8; 32] = Sha256::digest(&input.descriptor.challenge).into();
+                let token_sha: [u8; 32] = Sha256::digest(serde_json::to_vec(
+                    &serde_json::to_value(&input.expected_token)?,
+                )?)
+                .into();
+                let paths = input
+                    .descriptor
+                    .provider_input_paths
+                    .iter()
+                    .map(|path| {
+                        use std::os::windows::ffi::OsStrExt;
+                        crate::windows_causal_acceptance::sha256(
+                            &path
+                                .as_os_str()
+                                .encode_wide()
+                                .flat_map(u16::to_le_bytes)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut images = Vec::new();
+                for (peer, pid, birth, trace_name, probe_name) in [
+                    (
+                        false,
+                        root_pid,
+                        root_birth,
+                        "listener-call-trace.json",
+                        "provider-input-probes.json",
+                    ),
+                    (
+                        true,
+                        peer_pid,
+                        peer_birth,
+                        "peer-listener-call-trace.json",
+                        "peer-provider-input-probes.json",
+                    ),
+                ] {
+                    let trace =
+                        json_file(&input.descriptor.output_root.join(trace_name), 64 * 1024)?;
+                    let probes =
+                        json_file(&input.descriptor.output_root.join(probe_name), 16 * 1024)?;
+                    facts::mutation_witness(
+                        &probes,
+                        pid,
+                        peer,
+                        input.expected_token.restricted,
+                        &paths,
+                    )
+                    .map_err(CiError::Message)?;
+                    images.push(
+                        facts::image_witness(
+                            &trace,
+                            &BindingExpectation {
+                                pid,
+                                birth,
+                                descriptor_sha256: descriptor_sha,
+                                challenge_sha256: challenge_sha,
+                                token_sha256: token_sha,
+                                peer,
+                            },
+                            deployment.witnesses(),
+                        )
+                        .map_err(CiError::Message)?,
+                    );
+                }
+                selected_images = serde_json::json!(images);
+                phase = "complete";
+                Ok(())
+            })();
+            let registry_retired = projection
+                .lock()
+                .map_err(|_| CiError::Message("experiment registry owner poisoned".into()))
+                .and_then(|mut owner| owner.retire_if_safe().map_err(CiError::from));
+            let attempted = match (attempted, registry_retired) {
+                (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(secondary),
+                }),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(()), other) => other,
+            };
+            // Copy only finite already-sanitized records while TempDir custody is live.
+            let retained = (|| -> Result<()> {
+                let facts_dir = attempt_directory.join("facts");
+                fs::create_dir(&facts_dir)?;
+                for name in [
+                    "listener-call-trace.json",
+                    "peer-listener-call-trace.json",
+                    "provider-input-probes.json",
+                    "peer-provider-input-probes.json",
+                    "native-listener.json",
+                    "native-tcp-peer.json",
+                ] {
+                    let path = input.descriptor.output_root.join(name);
+                    match fs::symlink_metadata(&path) {
+                        Ok(_) => {
+                            let held =
+                                crate::windows_native_files::hold_artifact(&path, None, 64 * 1024)?;
+                            drop(crate::windows_native_files::publish_owned_file(
+                                &facts_dir.join(name),
+                                &held.bytes,
+                            )?);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(())
+            })();
+            let cleanup = if !probe_created {
+                Ok(())
+            } else if !workload_launched || assessment.retirement.is_ok() {
+                cleanup_provider_probe(&selected)
+            } else {
+                Err(CiError::Message(
+                    "owned protected probe retained: family retirement unproved".into(),
+                ))
+            };
+            let namespace = deployment.finish(deadlines.cleanup);
+            let result = serde_json::json!({"scenario":scenario,"phase":phase,"feasibility_established":attempted.is_ok()&&cleanup.is_ok()&&namespace.is_ok()&&retained.is_ok(),"workload":assessment,"selected_images":selected_images,"changed_private_file_identities":true,"acceptance_authority":false,"private_namespace_cleanup_verified":namespace.is_ok(),"private_namespace_cleanup_error":namespace.as_ref().err().map(ToString::to_string),"error":attempted.as_ref().err().map(ToString::to_string)});
+            let published = publish(&attempt_directory.join("result.json"), &result);
+            attempts.push(result);
+            combine(
+                combine(combine(combine(attempted, retained), cleanup), namespace),
+                published,
+            )?;
+        }
+        Ok(
+            serde_json::json!({"format":"memcordon.declared-provider-input-experiment","revision":1,"diagnostic_only":true,"acceptance_authority":false,"feasibility_established":true,"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"attempts":attempts,"mandatory_unprojected_case_replaced":false,"historical_host_access_repaired":false}),
+        )
     }
 
     pub fn run(

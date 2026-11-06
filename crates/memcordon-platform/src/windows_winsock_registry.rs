@@ -1653,6 +1653,9 @@ impl Projection {
             Some(KEY_READ),
         )?;
         self.transferred = true;
+        // A previously retired preparation recipient cannot certify a later
+        // root/peer transfer. Every new target starts a fresh retirement debt.
+        self.recipients_retired = false;
         live(deadline)?;
         Ok(handle)
     }

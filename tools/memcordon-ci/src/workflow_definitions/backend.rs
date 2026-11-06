@@ -6,6 +6,54 @@ pub(super) fn definition() -> Value {
     node_0()
 }
 
+/// A sibling experiment keeps original mandatory consumers independent and
+/// reuses the same owned driver/payload preparation without new cache cases.
+fn provider_input_experiment_job(mut job: Value) -> Value {
+    job["strategy"]["matrix"]["include"]
+        .as_sequence_mut()
+        .expect("installed matrix")
+        .retain(|entry| entry["channel"].as_str() == Some("native"));
+    let steps = job["steps"].as_sequence_mut().expect("installed steps");
+    steps.retain(|step| {
+        !step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("working-windows-consumer --channel cargo"))
+            && !step["with"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("windows-installed"))
+    });
+    let selected = steps
+        .iter_mut()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("working-windows-consumer --channel native"))
+        })
+        .expect("native consumer step");
+    selected["id"] = text("provider-input-experiment");
+    selected["run"] = text(
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-input-experiment",
+    );
+    let mut with = serde_yaml::Mapping::new();
+    with.insert(
+        text("name"),
+        text("provider-input-experiment-${{ matrix.id }}"),
+    );
+    with.insert(text("path"),text("target/ci/provider-input-experiment/cases/provider-input-experiment.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json"));
+    with.insert(text("if-no-files-found"), text("warn"));
+    let mut artifact = serde_yaml::Mapping::new();
+    artifact.insert(
+        text("name"),
+        text("Retain finite declared provider experiment facts"),
+    );
+    artifact.insert(text("if"), text("!cancelled()"));
+    artifact.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    artifact.insert(text("timeout-minutes"), Value::Number(2.into()));
+    artifact.insert(text("with"), Value::Mapping(with));
+    steps.push(Value::Mapping(artifact));
+    job
+}
+
 fn installed_failure_carriers() -> Value {
     let mut inputs = serde_yaml::Mapping::new();
     inputs.insert(
@@ -64,6 +112,14 @@ fn node_4() -> Value {
     values.insert(text("current-contracts"), node_1504());
     values.insert(text("tooling-contracts"), node_1526());
     values.insert(text("macos-administrative-contracts"), node_1543());
+    values.insert(
+        text("windows-provider-input-experiment-x64"),
+        provider_input_experiment_job(node_602()),
+    );
+    values.insert(
+        text("windows-provider-input-experiment-arm64"),
+        provider_input_experiment_job(node_701()),
+    );
     Value::Mapping(values)
 }
 

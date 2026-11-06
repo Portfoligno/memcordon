@@ -123,6 +123,8 @@ fn descriptor() -> Descriptor {
         start_transport: descriptor::StartTransport::NamedEvent,
         control_clock: None,
         winsock_registry: None,
+        provider_input_experiment: false,
+        provider_input_paths: Vec::new(),
         gate_access_diagnostic: None,
         gate_precondition: None,
         completion_gate: None,

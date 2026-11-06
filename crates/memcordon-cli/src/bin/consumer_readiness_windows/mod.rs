@@ -27,6 +27,7 @@ mod native;
 mod native_fixture_default_dacl;
 mod native_gate_precondition;
 mod own_thread_deadline_self_check;
+mod provider_input_probes;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
@@ -167,6 +168,7 @@ fn tcp_peer(
     challenge: &[u8],
     output_root: &std::path::Path,
     deadline: Option<std::time::Instant>,
+    trace: Option<&winsock_trace::Context<'_>>,
 ) -> io::Result<()> {
     let check = || {
         if deadline.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
@@ -182,8 +184,14 @@ fn tcp_peer(
     let _winsock = native::winsock_startup(None)?;
     check()?;
     let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
-    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
-        .map_err(|error| context("connect", error))?;
+    let mut stream = match trace {
+        Some(trace) => listener_trace::connect(
+            trace,
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port),
+        ),
+        None => TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    }
+    .map_err(|error| context("connect", error))?;
     // The retained peer awaits server half-close through compiler/churn work;
     // the independently owned public deadline bounds that whole operation.
     stream
@@ -243,6 +251,10 @@ fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Res
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeerRegistryInput {
+    #[serde(default)]
+    provider_input_experiment: bool,
+    #[serde(default)]
+    provider_input_paths: Vec<std::path::PathBuf>,
     declaration: descriptor::winsock_registry::Declaration,
     descriptor_sha256: [u8; 32],
     clock: descriptor::ControlClock,
@@ -480,9 +492,27 @@ fn joint_mapped(
             output_root: &descriptor.output_root,
             binding: session.original_binding(),
             token_envelope,
+            provider_input_experiment: descriptor.provider_input_experiment,
+            peer: false,
         }),
         _ => None,
     };
+    if descriptor.provider_input_experiment {
+        if registry.is_none() || trace.is_none() {
+            return Err(io::Error::other(
+                "provider experiment requires authenticated controller START and installed registry mapping",
+            ));
+        }
+        provider_input_probes::run(
+            &descriptor.provider_input_paths,
+            descriptor
+                .control_clock
+                .as_ref()
+                .ok_or_else(|| io::Error::other("experiment clock absent"))?,
+            &descriptor.output_root,
+            false,
+        )?;
+    }
     let _winsock = native::winsock_startup(trace)?;
     let listener = listener_trace::bind(trace.as_ref())?;
     let address = listener.local_addr()?;
@@ -541,6 +571,8 @@ fn joint_mapped(
             .as_deref()
             .ok_or_else(|| io::Error::other("original registry session absent"))?;
         let peer_input = PeerRegistryInput {
+            provider_input_experiment: descriptor.provider_input_experiment,
+            provider_input_paths: descriptor.provider_input_paths.clone(),
             declaration: descriptor
                 .winsock_registry
                 .clone()
@@ -1010,6 +1042,14 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                         binding,
                         &input.declaration,
                     )?;
+                    let peer_token = if input.provider_input_experiment {
+                        listener_trace::live(&input.clock)?;
+                        let token = native::token_observation()?;
+                        listener_trace::live(&input.clock)?;
+                        Some(token)
+                    } else {
+                        None
+                    };
                     session.receive(descriptor::controller_start::Phase::Start)?;
                     let capability = session
                         .registry_capability()
@@ -1027,20 +1067,47 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                             session.original_deadline(),
                         )?,
                         session.original_deadline(),
+                        input.clock,
+                        session.original_binding().clone(),
+                        peer_token,
+                        input.provider_input_paths,
                     ))
                 }
                 None => None,
             };
             match _registry {
-                Some((mapping, deadline)) => mapping.run(|_| {
+                Some((mapping, deadline, clock, binding, token, paths)) => mapping.run(|_| {
+                    let trace = token.as_ref().map(|token| winsock_trace::Context {
+                        clock: &clock,
+                        binding: &binding,
+                        token_envelope: token,
+                        output_root: std::path::Path::new(&output_root),
+                        provider_input_experiment: true,
+                        peer: true,
+                    });
+                    if token.is_some() {
+                        provider_input_probes::run(
+                            &paths,
+                            &clock,
+                            std::path::Path::new(&output_root),
+                            true,
+                        )?;
+                    }
                     tcp_peer(
                         port,
                         &challenge,
                         std::path::Path::new(&output_root),
                         Some(deadline),
+                        trace.as_ref(),
                     )
                 })?,
-                None => tcp_peer(port, &challenge, std::path::Path::new(&output_root), None)?,
+                None => tcp_peer(
+                    port,
+                    &challenge,
+                    std::path::Path::new(&output_root),
+                    None,
+                    None,
+                )?,
             }
             return Ok(0);
         }

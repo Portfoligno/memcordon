@@ -146,6 +146,12 @@ pub enum ReleaseCommand {
         #[arg(long, value_enum)]
         channel: ConsumerChannel,
     },
+    WorkingWindowsProviderExperiment {
+        #[arg(long, default_value = "target/ci/windows-prepared")]
+        prepared: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     ConsumerCache {
         /// Stable ordinary preparation owns job-local sources; ephemeral only reports downloads.
         #[arg(long, value_enum, default_value = "ephemeral")]
@@ -405,6 +411,12 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 }
             },
         ),
+        ReleaseCommand::WorkingWindowsProviderExperiment {
+            prepared,
+            destination,
+        } => {
+            windows_installed_consumer::run_provider_input_experiment(root, &prepared, &destination)
+        }
         ReleaseCommand::ConsumerCache {
             layout,
             for_save,

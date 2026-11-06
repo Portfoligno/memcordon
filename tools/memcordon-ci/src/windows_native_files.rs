@@ -16,6 +16,34 @@ impl HeldWindowsArtifact {
     pub fn identity(&self, path: &Path) -> std::io::Result<(u32, u64)> {
         native_file_identity(&self._file, false, path)
     }
+
+    #[allow(unsafe_code)] // Bounded backing filename from this exact retained file handle.
+    pub fn native_path(&self) -> std::io::Result<Vec<u16>> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_NT};
+        let mut path = [0u16; 2048];
+        // SAFETY: owned live handle, fixed writable buffer with exact capacity.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                self._file.as_raw_handle().cast(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                VOLUME_NAME_NT,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if length as usize >= path.len()
+            || path[length as usize] != 0
+            || path[..length as usize].contains(&0)
+        {
+            return Err(std::io::Error::other(
+                "held private native backing path is truncated or malformed",
+            ));
+        }
+        Ok(path[..length as usize].to_vec())
+    }
 }
 
 /// Compare the named leaf and every retained directory to the original native

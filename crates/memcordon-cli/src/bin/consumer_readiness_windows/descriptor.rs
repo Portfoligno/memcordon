@@ -186,6 +186,10 @@ impl ControlClock {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Descriptor {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub provider_input_experiment: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_input_paths: Vec<PathBuf>,
     pub format: String,
     pub revision: u32,
     pub case: Case,
@@ -220,6 +224,10 @@ pub struct Descriptor {
     pub toolchain: Option<Toolchain>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Descriptor {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > MAX_DESCRIPTOR_BYTES {
@@ -240,6 +248,17 @@ impl Descriptor {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !self.provider_input_experiment && !self.provider_input_paths.is_empty() {
+            return Err("provider input paths require explicit experiment".into());
+        }
+        if self.provider_input_experiment
+            && (self.case != Case::Joint || !(2..=9).contains(&self.provider_input_paths.len()))
+        {
+            return Err(
+                "provider input experiment requires Joint and two to nine declared private inputs"
+                    .into(),
+            );
+        }
         if self.format != "memcordon.fixture-workload" || self.revision != DESCRIPTOR_REVISION {
             return Err("unsupported fixture workload format/revision".into());
         }

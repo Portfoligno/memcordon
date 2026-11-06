@@ -27,6 +27,7 @@ pub use memcordon_platform::test_support::{
     WindowsThreadActivitySample, WindowsWaitInherited, WindowsWaitObserver,
     WindowsWaitObserverRetirement, WindowsWaitObserverSnapshot, WindowsWaitThreadHandle,
     windows_available_memory_bytes, windows_console_host_path,
+    windows_fixture_input_candidate_for_image_until,
     windows_fixture_input_processes_for_image_until, windows_held_file_identity,
     windows_held_file_metadata, windows_native_work_cutoff,
     windows_observe_transferred_wait_cleanup, windows_open_synchronous_rename_source,

@@ -45,6 +45,7 @@ struct ListenerRequest {
     uint64_t cutoff_qpc,frequency;
     uint32_t incoming_win32;
     int32_t incoming_wsa;
+    uint32_t experiment_flags,reserved;
 };
 struct ListenerEntry {
     uint64_t sequence,parent_sequence,arguments[6],result;
@@ -110,15 +111,25 @@ struct ListenerPacket {
     WsaPacket dependencies;
     ListenerReturnedModule returned_module;
     ListenerLoaderOwner loader_owner;
+    struct ImageReturn {
+        uint64_t dependency_sequence,parent_listener_sequence,returned_base,allocation_base,started_qpc,finished_qpc;
+        uint32_t original_thread,domain,memory_type,state,virtual_query_error,mapped_name_error,mapped_path_units,flags;
+        uint16_t mapped_path[512];
+    };
+    struct ReturnedImages {
+        uint32_t version,enabled,count,dropped,attempts,incomplete,reserved[2];
+        ImageReturn rows[8];
+    } returned_images;
 };
 using ListenerInvoke=void(*)(void*,ListenerOutcome*);
 extern "C" void memcordon_listener_trace_call(ListenerPacket*,const ListenerRequest*,ListenerInvoke,void*);
 extern "C" uint32_t memcordon_listener_trace_mock(uint64_t,uint64_t);
-static_assert(sizeof(ListenerOutcome)==16 && sizeof(ListenerRequest)==24,"listener callback ABI v1");
+static_assert(sizeof(ListenerOutcome)==16 && sizeof(ListenerRequest)==32,"listener callback ABI v2");
 static_assert(sizeof(ListenerEntry)==176 && offsetof(ListenerEntry,completion_sequence)==128 && offsetof(ListenerEntry,input_prefix)==136,"listener entry ABI v1");
 static_assert(sizeof(ListenerDependencyLink)==24,"listener dependency link ABI v1");
 static_assert(sizeof(ListenerReturnedModule)==12136 && offsetof(ListenerReturnedModule,dependencies)==80 && offsetof(ListenerReturnedModule,first_failure_link)==11728 && offsetof(ListenerReturnedModule,links)==11752,"listener returned module ABI v1");
 static_assert(sizeof(ListenerLoaderLink)==40,"listener loader link ABI v1");
 static_assert(sizeof(ListenerLoaderWindow)==40,"listener loader window ABI v1");
 static_assert(sizeof(ListenerLoaderOwner)==13088 && offsetof(ListenerLoaderOwner,dependencies)==64 && offsetof(ListenerLoaderOwner,first_failure_link)==11712 && offsetof(ListenerLoaderOwner,links)==11752 && offsetof(ListenerLoaderOwner,window_count)==12392 && offsetof(ListenerLoaderOwner,first_failure_window)==12408 && offsetof(ListenerLoaderOwner,windows)==12448,"listener loader owner ABI v2");
-static_assert(sizeof(ListenerPacket)==41440 && offsetof(ListenerPacket,owner)==208 && offsetof(ListenerPacket,slots)==400 && offsetof(ListenerPacket,first_failure)==1168 && offsetof(ListenerPacket,entries)==1344 && offsetof(ListenerPacket,first_dependency_failure_link)==4160 && offsetof(ListenerPacket,dependency_links)==4184 && offsetof(ListenerPacket,dependencies)==4568 && offsetof(ListenerPacket,returned_module)==16216 && offsetof(ListenerPacket,loader_owner)==28352 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,window_count)==40744 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,first_failure_window)==40760 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,windows)==40800,"listener packet ABI v4");
+static_assert(sizeof(ListenerPacket::ImageReturn)==1104 && sizeof(ListenerPacket::ReturnedImages)==8864,"returned image ABI v1");
+static_assert(sizeof(ListenerPacket)==50304 && offsetof(ListenerPacket,owner)==208 && offsetof(ListenerPacket,slots)==400 && offsetof(ListenerPacket,first_failure)==1168 && offsetof(ListenerPacket,entries)==1344 && offsetof(ListenerPacket,first_dependency_failure_link)==4160 && offsetof(ListenerPacket,dependency_links)==4184 && offsetof(ListenerPacket,dependencies)==4568 && offsetof(ListenerPacket,returned_module)==16216 && offsetof(ListenerPacket,loader_owner)==28352 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,window_count)==40744 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,first_failure_window)==40760 && offsetof(ListenerPacket,loader_owner)+offsetof(ListenerLoaderOwner,windows)==40800 && offsetof(ListenerPacket,returned_images)==41440,"listener packet ABI v5");

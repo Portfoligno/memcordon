@@ -28,6 +28,9 @@ pub mod windows_listener_wait;
 pub mod windows_loader_fileio;
 pub mod windows_original_gate_failure;
 pub mod windows_pe_manifest;
+pub mod windows_provider_catalog;
+pub mod windows_provider_projection;
+pub mod windows_provider_projection_record;
 pub mod windows_status_streams;
 
 pub mod bootstrap_profile;

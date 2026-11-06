@@ -23,6 +23,8 @@ pub struct Context<'a> {
     pub output_root: &'a Path,
     pub binding: &'a super::descriptor::controller_start::Binding,
     pub token_envelope: &'a [u8],
+    pub provider_input_experiment: bool,
+    pub peer: bool,
 }
 pub struct Observed {
     pub packet: Packet,

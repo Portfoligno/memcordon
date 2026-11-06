@@ -7,6 +7,123 @@ mod winsock_trace_record;
 use record::{Entry, Packet, diagnostic};
 use serde_json::json;
 
+fn image_packet(sequence: u64) -> Packet {
+    let mut packet = base();
+    packet.version = 5;
+    packet.returned_images.version = 1;
+    packet.returned_images.enabled = 1;
+    packet.returned_images.count = 1;
+    packet.returned_images.attempts = 1;
+    packet.returned_images.rows[0] = record::ImageReturn {
+        dependency_sequence: sequence,
+        parent_listener_sequence: 42,
+        returned_base: 0x10000,
+        allocation_base: 0x10000,
+        started_qpc: 3,
+        finished_qpc: 4,
+        original_thread: 7,
+        memory_type: 0x0100_0000,
+        state: 1,
+        flags: 7,
+        ..record::ImageReturn::default()
+    };
+    let path: Vec<u16> = "\\Device\\HarddiskVolume3\\private\\mswsock.dll"
+        .encode_utf16()
+        .collect();
+    packet.returned_images.rows[0].mapped_path[..path.len()].copy_from_slice(&path);
+    packet.returned_images.rows[0].mapped_path_units = path.len() as u32;
+    packet.dependencies.record_count = 1;
+    packet.dependencies.entries[0] = winsock_trace_record::Entry {
+        sequence,
+        operation: 12,
+        thread_id: 7,
+        entered: 1,
+        returned: 1,
+        raw_output: 0x10000,
+        output_flags: 3,
+        scalar_flags: 4,
+        ..winsock_trace_record::Entry::default()
+    };
+    let original_name: Vec<u16> = "C:\\Windows\\system32\\mswsock.dll"
+        .encode_utf16()
+        .collect();
+    packet.dependencies.entries[0].name[..original_name.len()].copy_from_slice(&original_name);
+    packet.dependencies.entries[0].copied_name_units = original_name.len() as u32;
+    packet.dependencies.entries[0].reported_name_bytes = (original_name.len() * 2) as u32;
+    packet.dependencies.entries[0].name_flags = 1;
+    packet.record_count = 1;
+    packet.entries[0] = Entry {
+        sequence: 42,
+        operation: 2,
+        thread_id: 7,
+        entered: 1,
+        returned: 1,
+        ..Entry::default()
+    };
+    packet.dependency_link_count = 1;
+    packet.dependency_links[0] = record::DependencyLink {
+        dependency_sequence: sequence,
+        parent_listener_sequence: 42,
+        timeline_sequence: 2,
+    };
+    packet
+}
+
+#[test]
+fn returned_image_requires_actual_unique_original_and_parent_links() {
+    for sequence in [1, 2, 91] {
+        let mut packet = image_packet(sequence);
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], true);
+        packet.dependencies.entries[0].raw_output = 0;
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+        packet = image_packet(sequence);
+        packet.dependency_links[0].parent_listener_sequence = 43;
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+        packet = image_packet(sequence);
+        packet.returned_images.rows[0].mapped_path[0] = 0;
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+        packet = image_packet(sequence);
+        packet.dependency_link_count = 2;
+        packet.dependency_links[1] = packet.dependency_links[0];
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+        packet = image_packet(sequence);
+        packet.returned_images.rows[0].finished_qpc = packet.cutoff_qpc;
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+        packet = image_packet(sequence);
+        packet.dependencies.entries[0].name_flags = 5;
+        assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+    }
+}
+
+#[test]
+fn returned_image_failures_and_omission_cannot_be_complete_witnesses() {
+    assert_eq!(diagnostic(&base())["returned_images"]["recorded"], false);
+    let mut packet = image_packet(2);
+    packet.returned_images.rows[0].state = 6;
+    packet.returned_images.incomplete = 1;
+    assert_eq!(diagnostic(&packet)["returned_images"]["complete"], false);
+    let value =
+        record::bounded(json!({"trace":diagnostic(&image_packet(1)),"padding":"x".repeat(100000)}));
+    assert!(serde_json::to_vec(&value).unwrap().len() <= record::RECORD_BYTES);
+    let images = value
+        .get("trace")
+        .unwrap_or(&value)
+        .get("returned_images")
+        .unwrap();
+    assert!(images["complete"] == true || images["observation_incomplete"] == true);
+    if images["complete"] == true {
+        assert_eq!(images["rows"][0]["original_load"]["complete"], true);
+        assert_eq!(images["rows"][0]["original_load"]["raw_root"], 0);
+        assert_eq!(images["rows"][0]["original_load"]["raw_flags"], 0);
+        assert!(
+            !images["rows"][0]["original_load"]["name_utf16"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 fn base() -> Packet {
     let mut value = Packet {
         version: 4,
@@ -578,7 +695,7 @@ fn loader_observer_setup_errors_do_not_replace_original_failed_loader_errors() {
 #[test]
 fn appended_abi_and_historical_json_are_explicit_without_v1_reinterpretation() {
     use std::mem::{offset_of, size_of};
-    assert_eq!(size_of::<Packet>(), 41440);
+    assert_eq!(size_of::<Packet>(), 50304);
     assert_eq!(size_of::<record::ReturnedModule>(), 12136);
     assert_eq!(offset_of!(Packet, returned_module), 16216);
     assert_eq!(size_of::<record::LoaderLink>(), 40);

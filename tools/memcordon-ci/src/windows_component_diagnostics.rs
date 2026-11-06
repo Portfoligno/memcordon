@@ -49,12 +49,29 @@ enum Field {
     State,
     Fault,
     Mutant,
+    RecoveryCheck,
+    RecoveryChecks,
 }
 fn selected(value: &Value, kind: Field) -> Option<Value> {
     if value.is_null() {
         return Some(Value::Null);
     }
     match kind {
+        Field::RecoveryCheck => value
+            .as_str()
+            .filter(|name| {
+                crate::windows_readiness_components::CONTROL_RECOVERY_CHECKS.contains(name)
+            })
+            .map(|name| json!(name)),
+        Field::RecoveryChecks => {
+            let mut checks = Map::new();
+            for name in crate::windows_readiness_components::CONTROL_RECOVERY_CHECKS {
+                if let Some(passed) = value.get(*name).and_then(Value::as_bool) {
+                    checks.insert((*name).to_owned(), json!(passed));
+                }
+            }
+            Some(Value::Object(checks))
+        }
         Field::Boolean => value.as_bool().map(Value::Bool),
         Field::Number => value
             .as_i64()
@@ -85,6 +102,8 @@ fn selected(value: &Value, kind: Field) -> Option<Value> {
                 matches!(
                     *text,
                     "not-observed"
+                        | "missing-prerequisite"
+                        | "evaluated-false"
                         | "assessment-started"
                         | "assessed"
                         | "command-returned"
@@ -330,6 +349,31 @@ fn assessment_fields(value: &Value) -> Value {
             ("/recovery/response_variant", State),
             ("/recovery/receipt_present", Boolean),
             ("/recovery/selected_control_guardian_original", Boolean),
+            ("/recovery/authority_assessment/accepted", Boolean),
+            (
+                "/recovery/authority_assessment/first_failed_check",
+                RecoveryCheck,
+            ),
+            (
+                "/recovery/authority_assessment/first_failed_check_state",
+                State,
+            ),
+            ("/recovery/authority_assessment/evaluated_checks", Number),
+            (
+                "/recovery/authority_assessment/remaining_checks_not_evaluated",
+                Boolean,
+            ),
+            ("/recovery/authority_assessment/checks", RecoveryChecks),
+            ("/recovery/authority_assessment/authority_bytes", Number),
+            ("/recovery/authority_assessment/authority_sha256", Digest),
+            (
+                "/recovery/authority_assessment/delivery_terminal_bytes",
+                Number,
+            ),
+            (
+                "/recovery/authority_assessment/delivery_terminal_sha256",
+                Digest,
+            ),
             ("/recovery/skipped_reason", State),
         ],
     )
