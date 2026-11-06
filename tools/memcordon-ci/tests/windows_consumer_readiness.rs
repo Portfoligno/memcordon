@@ -360,7 +360,7 @@ fn experiment_descriptor() -> Descriptor {
     value.cohort_gate = None;
     value.generation_gate = None;
     value.start_transport = descriptor::StartTransport::ControllerStdin {
-        version: descriptor::controller_start::REGISTRY_VERSION,
+        version: descriptor::controller_start::PRIVATE_VERSION,
     };
     value.control_clock = Some(descriptor::ControlClock {
         revision: 1,
@@ -390,10 +390,19 @@ fn experiment_descriptor() -> Descriptor {
         .enumerate()
         .map(|(index, path)| directory(path.to_owned(), index as u64 + 1))
         .collect();
+    let output_ancestors = value
+        .output_root
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .enumerate()
+        .map(|(index, path)| directory(path.to_owned(), 200 + index as u64))
+        .collect();
     value.provider_input_experiment = true;
     value.provider_input_paths = vec![fixture.clone(), local.join("provider.dll")];
     value.provider_input_binding = Some(descriptor::PrivateFixtureBinding {
-        revision: 1,
+        revision: 2,
         fixture,
         volume_serial: 7,
         file_index: 42,
@@ -406,6 +415,7 @@ fn experiment_descriptor() -> Descriptor {
             .collect(),
         ancestors,
         local_directory: directory(local, 100),
+        output_ancestors,
     });
     value
 }
@@ -416,6 +426,11 @@ fn fixture_binding_is_experiment_only_and_part_of_the_original_bounded_descripto
     let bytes = serde_json::to_vec(&valid).unwrap();
     let parsed = Descriptor::parse(&bytes).unwrap();
     assert_eq!(parsed.provider_input_binding, valid.provider_input_binding);
+    let mut legacy = valid.clone();
+    legacy.start_transport = descriptor::StartTransport::ControllerStdin {
+        version: descriptor::controller_start::REGISTRY_VERSION,
+    };
+    assert!(Descriptor::parse(&serde_json::to_vec(&legacy).unwrap()).is_err());
     let ordinary = serde_json::to_value(descriptor()).unwrap();
     assert!(ordinary.get("provider_input_binding").is_none());
     let mut missing = valid.clone();

@@ -13,6 +13,13 @@ pub mod windows_fileio;
 #[path = "windows_private_fixture.rs"]
 pub mod windows_private_fixture;
 #[cfg(windows)]
+#[path = "windows_private_process.rs"]
+pub mod windows_private_process;
+#[cfg(windows)]
+pub use windows_private_process::{
+    WindowsPendingChildProcess, duplicate_directory_metadata_into_child,
+};
+#[cfg(windows)]
 #[path = "windows_private_input.rs"]
 pub mod windows_private_input;
 #[cfg(windows)]
@@ -969,9 +976,10 @@ fn windows_process_identity_is_live(identity: ProcessIdentity) -> io::Result<boo
 /// Query-only handles retained by the Windows installed-fixture leak observer.
 /// The unique staged image path keeps the observation specific to one case.
 #[cfg(windows)]
+#[derive(Clone)]
 pub struct WindowsImageProcess {
     pub identity: ProcessIdentity,
-    _handle: std::os::windows::io::OwnedHandle,
+    _handle: std::sync::Arc<std::os::windows::io::OwnedHandle>,
 }
 
 #[cfg(windows)]
@@ -1247,7 +1255,7 @@ impl WindowsImageProcess {
                         if !is_known && records.len() < 8 {
                             let candidate = WindowsImageProcess {
                                 identity,
-                                _handle: handle,
+                                _handle: std::sync::Arc::new(handle),
                             };
                             match candidate.native_parent_process_id() {
                                 Ok(parent) => {
@@ -2304,7 +2312,7 @@ fn windows_process_candidate_with_access(
             pid,
             birth: (u128::from(creation.dwHighDateTime) << 32) | u128::from(creation.dwLowDateTime),
         },
-        _handle: handle,
+        _handle: std::sync::Arc::new(handle),
     };
     live()?;
     let exited = process.has_exited()?;
@@ -2655,7 +2663,7 @@ fn windows_processes_for_image_inner(
                         birth: (u128::from(creation.dwHighDateTime) << 32)
                             | u128::from(creation.dwLowDateTime),
                     },
-                    _handle: handle,
+                    _handle: std::sync::Arc::new(handle),
                 };
                 match root {
                     Some(owner)

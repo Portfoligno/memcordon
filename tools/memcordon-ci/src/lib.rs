@@ -101,6 +101,10 @@ pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
 #[cfg(windows)]
+mod windows_private_custody;
+#[cfg(windows)]
+mod windows_private_peer_debt;
+#[cfg(windows)]
 mod windows_readiness_acl;
 pub mod windows_readiness_capacity;
 pub mod windows_readiness_components;

@@ -15,6 +15,7 @@ pub mod native {
             fs::OpenOptionsExt,
         },
         path::{Path, PathBuf},
+        sync::Arc,
         time::Instant,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -87,13 +88,17 @@ pub mod native {
         pub input_root: PathBuf,
         pub output_root: PathBuf,
         pub local: PathBuf,
-        files: Vec<(PathBuf, HeldWindowsArtifact)>,
+        files: Vec<(PathBuf, Arc<HeldWindowsArtifact>)>,
         witnesses: Vec<PrivateInput>,
-        directories: Vec<fs::File>,
+        directories: Vec<Arc<fs::File>>,
+        output_directories: Vec<Arc<fs::File>>,
+        declared_output: Option<PathBuf>,
+        custody: Option<Arc<crate::windows_private_custody::PrivateFixtureCustody>>,
         pub inventory: serde_json::Value,
         sealed: bool,
         launched: bool,
         retired: bool,
+        quarantined: bool,
     }
     impl Deployment {
         pub fn create(
@@ -163,12 +168,16 @@ pub mod native {
                 input_root,
                 output_root,
                 local,
-                files: vec![(path, held)],
+                files: vec![(path, Arc::new(held))],
                 witnesses: Vec::new(),
-                directories,
+                directories: directories.into_iter().map(Arc::new).collect(),
+                output_directories: Vec::new(),
+                declared_output: None,
+                custody: None,
                 inventory: serde_json::json!({"format":"memcordon.declared-provider-inputs","revision":1,"diagnostic_only":true,"acceptance_authority":false,"original_file_identities_preserved":false,"fixture_manifest":manifest,"sources":[],"sealed":false}),
                 launched: false,
                 retired: false,
+                quarantined: false,
                 sealed: false,
             })
         }
@@ -225,7 +234,7 @@ pub mod native {
                     sha256: copied.sha256.clone(),
                 });
                 records.push(serde_json::json!({"catalog_ids":candidate.catalog_ids,"provider_ids":candidate.provider_ids,"original_path_utf16":candidate.expanded_path,"original_volume_serial":source_identity.0,"original_file_index":source_identity.1,"borrowed_source_metadata":held.metadata,"source_exclusive_ownership_proved":false,"private_path_utf16":destination.as_os_str().encode_wide().collect::<Vec<_>>(),"private_native_path_utf16":native_path,"private_identity":private_identity,"bytes":copied.bytes.len(),"sha256":copied.sha256,"source_view":"native","changed_file_identity":true}));
-                self.files.push((destination, copied));
+                self.files.push((destination, Arc::new(copied)));
             }
             self.inventory["catalog"] = serde_json::to_value(catalog)?;
             self.inventory["sources"] = serde_json::json!(records);
@@ -307,6 +316,38 @@ pub mod native {
                 windows_private_fixture_binding::PrivateFixtureAncestor,
             };
             self.verify(work)?;
+            let output = self.declared_output.as_ref().ok_or_else(|| {
+                CiError::Message("private output custody was not prepared".into())
+            })?;
+            let output_paths = output.ancestors().collect::<Vec<_>>();
+            if output_paths.len() != self.output_directories.len() {
+                return Err(CiError::Message(
+                    "held private output chain extent differs".into(),
+                ));
+            }
+            let mut output_ancestors = Vec::new();
+            for (path, file) in output_paths.into_iter().rev().zip(&self.output_directories) {
+                live(work)?;
+                let identity = windows_native_files::native_file_identity(file, true, path)?;
+                let metadata = windows_held_file_metadata(file)?;
+                let named = fs::OpenOptions::new()
+                    .access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(path)?;
+                live(work)?;
+                if windows_native_files::native_file_identity(&named, true, path)? != identity {
+                    return Err(CiError::Message(
+                        "same-held private output ancestry changed".into(),
+                    ));
+                }
+                output_ancestors.push(PrivateFixtureAncestor {
+                    path: path.to_owned(),
+                    volume_serial: identity.0,
+                    file_index: identity.1,
+                    attributes: metadata.attributes,
+                });
+            }
             let (path, held) = self
                 .files
                 .first()
@@ -353,11 +394,91 @@ pub mod native {
                     file_index: identity.1,
                     attributes: metadata.attributes,
                 },
+                output_ancestors,
                 work,
             )?;
             binding.validate(&self.paths()).map_err(CiError::Message)?;
+            binding.validate_output(output).map_err(CiError::Message)?;
             live(work)?;
             Ok(binding)
+        }
+
+        pub(crate) fn prepare_fixture_custody(
+            &mut self,
+            output: &Path,
+            work: Instant,
+        ) -> Result<Arc<crate::windows_private_custody::PrivateFixtureCustody>> {
+            let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(work)
+                .map_err(std::io::Error::other)?;
+            let primary = self.prepare_fixture_custody_inner(output, work);
+            let settled = timer
+                .finish()
+                .map_err(std::io::Error::other)
+                .map_err(CiError::from);
+            match (primary, settled) {
+                (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(secondary),
+                }),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(secondary)) => Err(secondary),
+                (Ok(custody), Ok(())) => {
+                    live(work)?;
+                    Ok(custody)
+                }
+            }
+        }
+        fn prepare_fixture_custody_inner(
+            &mut self,
+            output: &Path,
+            work: Instant,
+        ) -> Result<Arc<crate::windows_private_custody::PrivateFixtureCustody>> {
+            live(work)?;
+            if self.custody.is_some()
+                || !output.starts_with(&self.output_root)
+                || output.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+                || output.ancestors().count() > 64
+            {
+                return Err(CiError::Message(
+                    "private output custody is not a fresh finite owned chain".into(),
+                ));
+            }
+            let _base = windows_native_files::hold_ancestors(&self.output_root)?;
+            live(work)?;
+            fs::create_dir_all(output)?;
+            live(work)?;
+            self.output_directories = windows_native_files::hold_ancestors(output)?
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+            self.declared_output = Some(output.to_owned());
+            let binding = self.fixture_binding(work)?;
+            let fixture = Arc::clone(
+                &self
+                    .files
+                    .first()
+                    .ok_or_else(|| {
+                        CiError::Message("original private fixture owner absent".into())
+                    })?
+                    .1,
+            );
+            let local =
+                Arc::clone(self.directories.last().ok_or_else(|| {
+                    CiError::Message("original private local owner absent".into())
+                })?);
+            let custody = Arc::new(crate::windows_private_custody::PrivateFixtureCustody::new(
+                fixture,
+                local,
+                self.output_directories.clone(),
+                binding,
+            ));
+            self.custody = Some(Arc::clone(&custody));
+            Ok(custody)
         }
         /// Borrowing this Deployment keeps its prelaunch guards alive throughout
         /// the synchronous root/peer execution, including failed retirement.
@@ -397,10 +518,20 @@ pub mod native {
         pub fn launched(&mut self) {
             self.launched = true;
         }
-        pub fn retired(&mut self) {
+        pub fn retired(&mut self, cleanup: Instant) -> Result<()> {
+            self.custody
+                .as_ref()
+                .ok_or_else(|| CiError::Message("original private family custody absent".into()))?
+                .prove_retired(cleanup)?;
             self.retired = true;
+            Ok(())
         }
         pub fn finish(&mut self, cleanup: Instant) -> Result<()> {
+            if self.quarantined {
+                return Err(CiError::Message(
+                    "private custody quarantine cannot be released by retry".into(),
+                ));
+            }
             if self.launched && !self.retired {
                 return Err(CiError::Message(
                     "private namespace retained because original retirement is unproved".into(),
@@ -411,8 +542,20 @@ pub mod native {
                     "original private namespace cleanup cutoff expired".into(),
                 ));
             }
+            if self
+                .custody
+                .as_ref()
+                .is_some_and(|custody| Arc::strong_count(custody) != 1)
+            {
+                self.quarantined = true;
+                return Err(CiError::Message(
+                    "private custody borrowers remain live after native retirement".into(),
+                ));
+            }
             self.files.clear();
             self.directories.clear();
+            self.custody.take();
+            self.output_directories.clear();
             if let Some(owner) = self.owner.take() {
                 owner.close()?;
             }
@@ -426,19 +569,25 @@ pub mod native {
     }
     impl Drop for Deployment {
         fn drop(&mut self) {
-            if self.launched && !self.retired {
+            if (self.launched && !self.retired) || self.quarantined {
                 // Bounded failed-attempt quarantine: retain the readonly leaf
                 // and no-delete ancestry guards until this controller exits.
                 // Releasing them here would unlock input while a root may live.
                 std::mem::forget(std::mem::take(&mut self.files));
                 std::mem::forget(std::mem::take(&mut self.directories));
+                std::mem::forget(std::mem::take(&mut self.output_directories));
+                if let Some(custody) = self.custody.take() {
+                    std::mem::forget(custody);
+                }
                 if let Some(owner) = self.owner.take() {
                     let _retained = owner.keep();
-                    let _=std::io::Write::write_all(&mut std::io::stderr().lock(),b"private provider inputs and guards retained: original family retirement unproved\n");
+                    let _=std::io::Write::write_all(&mut std::io::stderr().lock(),b"private provider inputs, directory guards and native process owners retained: family retirement or custody settlement unproved; controller-lifetime quarantine only\n");
                 }
             } else {
                 self.files.clear();
                 self.directories.clear();
+                self.custody.take();
+                self.output_directories.clear();
             }
         }
     }

@@ -19,6 +19,6 @@ pub(super) fn self_check() -> std::io::Result<i32> {
                 .arg(serde_json::to_string(&clock).map_err(std::io::Error::other)?);
             Ok(command)
         },
-        super::settle_peer_failure,
+        |child, error, deadline| super::settle_peer_failure(child, Vec::new(), error, deadline),
     )
 }

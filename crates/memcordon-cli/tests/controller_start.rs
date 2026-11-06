@@ -25,6 +25,226 @@ fn registry() -> start::Capability {
     }
 }
 
+fn directories(
+    input_count: u32,
+    output_count: u32,
+) -> (start::DirectoryExpectation, start::DirectoryTransfer) {
+    let expected = start::DirectoryExpectation {
+        manifest_sha256: [17; 32],
+        input_count,
+        output_count,
+    };
+    let transfer = start::DirectoryTransfer {
+        version: 1,
+        manifest_sha256: expected.manifest_sha256,
+        references: expected
+            .roles()
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, (role, index))| start::DirectoryReference {
+                role,
+                index,
+                handle: 0x1000 + slot as u64 * 4,
+                access_mask: 128,
+            })
+            .collect(),
+    };
+    (expected, transfer)
+}
+
+#[test]
+fn private_start_binds_all129_metadata_references_and_requires_peer_owner_ack_before_release() {
+    let mut binding = binding();
+    binding.challenge = vec![0xff; start::MAX_CHALLENGE];
+    let (expected, directories) = directories(64, 64);
+    let registry = registry();
+    let peer = start::PeerRecipient {
+        handle: 0x400,
+        pid: 9002,
+        birth: binding.birth + 1,
+    };
+    let mut sender = start::Sender::with_registry(registry, true)
+        .with_directories(directories.clone(), expected.clone())
+        .unwrap();
+    let mut bytes = Vec::new();
+    sender
+        .send(&mut bytes, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    assert_eq!(bytes.len(), start::MAX_FRAME_BYTES);
+    assert_eq!(bytes.len(), 6824);
+    let first = bytes.len();
+    sender
+        .send_peer_held(&mut bytes, &binding, &peer, || Ok(()))
+        .unwrap();
+    let ack = bytes.len();
+    sender
+        .send(
+            &mut bytes,
+            &binding,
+            start::Phase::ToolchainObserverRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    // Later phases carry no directory scalars that the recipient may have closed.
+    assert_eq!(bytes.len() - ack, 64 + 44 + binding.challenge.len());
+    let frame_extent = bytes.len();
+    bytes.extend([0, 255, 17]);
+    let mut reader = Cursor::new(bytes);
+    let mut receiver =
+        start::Receiver::with_directories(registry.manifest_sha256, expected.clone(), true)
+            .unwrap();
+    assert!(receiver.directory_transfer().is_none());
+    receiver.receive(&mut reader, &binding, || Ok(())).unwrap();
+    assert_eq!(reader.position(), first as u64);
+    assert_eq!(receiver.directory_transfer(), Some(&directories));
+    receiver
+        .receive_peer_held(&mut reader, &binding, &peer, || Ok(()))
+        .unwrap();
+    assert_eq!(reader.position(), ack as u64);
+    receiver
+        .receive_phase(
+            &mut reader,
+            &binding,
+            start::Phase::ToolchainObserverRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(reader.position(), frame_extent as u64);
+    let mut application = Vec::new();
+    reader.read_to_end(&mut application).unwrap();
+    assert_eq!(application, [0, 255, 17]);
+
+    let mut premature = start::Sender::with_registry(registry, true)
+        .with_directories(directories, expected)
+        .unwrap();
+    premature
+        .send(&mut Vec::new(), &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    assert!(
+        premature
+            .send(
+                &mut Vec::new(),
+                &binding,
+                start::Phase::ToolchainObserverRelease,
+                || Ok(())
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn private_frames_never_admit_partial_wrong_rights_roles_manifests_or_cross_owner_scalars() {
+    let binding = binding();
+    let registry = registry();
+    let (expected, directories) = directories(2, 2);
+    let mut sender = start::Sender::with_registry(registry, false)
+        .with_directories(directories.clone(), expected.clone())
+        .unwrap();
+    let mut bytes = Vec::new();
+    sender
+        .send(&mut bytes, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    for end in 0..bytes.len() {
+        let mut receiver =
+            start::Receiver::with_directories(registry.manifest_sha256, expected.clone(), false)
+                .unwrap();
+        assert!(
+            receiver
+                .receive(&mut Cursor::new(&bytes[..end]), &binding, || Ok(()))
+                .is_err()
+        );
+        assert!(receiver.directory_transfer().is_none());
+        assert!(receiver.registry_capability().is_none());
+    }
+    for case in 0..8 {
+        let mut changed = bytes.clone();
+        let start = 64 + 44;
+        match case {
+            0 => changed[8..12].copy_from_slice(&3u32.to_le_bytes()),
+            1 => changed[start + 4..start + 8].copy_from_slice(&130u32.to_le_bytes()),
+            2 => changed[start + 8] ^= 1,
+            3 => changed[start + 40..start + 44].copy_from_slice(&3u32.to_le_bytes()),
+            4 => changed[start + 40 + 16..start + 40 + 20]
+                .copy_from_slice(&0x100080u32.to_le_bytes()),
+            5 => changed[start + 40 + 8..start + 40 + 16]
+                .copy_from_slice(&registry.handle.to_le_bytes()),
+            6 => changed[start + 40 + 8..start + 40 + 16].copy_from_slice(&u64::MAX.to_le_bytes()),
+            _ => {
+                *changed.last_mut().unwrap() ^= 1;
+            }
+        }
+        let mut receiver =
+            start::Receiver::with_directories(registry.manifest_sha256, expected.clone(), false)
+                .unwrap();
+        assert!(
+            receiver
+                .receive(&mut Cursor::new(changed), &binding, || Ok(()))
+                .is_err(),
+            "case {case}"
+        );
+        assert!(receiver.directory_transfer().is_none());
+    }
+}
+
+#[test]
+fn held_peer_ack_and_pending_admission_require_exact_original_context_and_child() {
+    let binding = binding();
+    let registry = registry();
+    let (expected, directories) = directories(1, 1);
+    let peer = start::PeerRecipient {
+        handle: 0x400,
+        pid: 9002,
+        birth: binding.birth + 1,
+    };
+    let pending = start::PeerPendingAdmission {
+        version: 1,
+        binding: start::PeerAdmissionBinding::from_start(&binding),
+        recipient: peer,
+    };
+    pending.validate(&binding).unwrap();
+    let mut forged = pending.clone();
+    forged.binding.descriptor_sha256[0] ^= 1;
+    assert!(forged.validate(&binding).is_err());
+    for case in 0..5 {
+        let mut sender = start::Sender::with_registry(registry, true)
+            .with_directories(directories.clone(), expected.clone())
+            .unwrap();
+        let mut initial = Vec::new();
+        sender
+            .send(&mut initial, &binding, start::Phase::Start, || Ok(()))
+            .unwrap();
+        let mut ack = Vec::new();
+        sender
+            .send_peer_held(&mut ack, &binding, &peer, || Ok(()))
+            .unwrap();
+        let mut receiver =
+            start::Receiver::with_directories(registry.manifest_sha256, expected.clone(), true)
+                .unwrap();
+        receiver
+            .receive(&mut Cursor::new(initial), &binding, || Ok(()))
+            .unwrap();
+        let mut wanted = peer;
+        match case {
+            0 => wanted.handle += 4,
+            1 => wanted.pid += 1,
+            2 => wanted.birth += 1,
+            3 => {
+                ack.pop();
+            }
+            _ => {
+                ack[16] ^= 1;
+            }
+        }
+        assert!(
+            receiver
+                .receive_peer_held(&mut Cursor::new(ack), &binding, &wanted, || Ok(()))
+                .is_err()
+        );
+        assert!(receiver.directory_transfer().is_none());
+    }
+}
+
 #[test]
 fn registry_two_phase_session_binds_one_target_local_key_without_application_read_ahead() {
     let binding = binding();
@@ -98,7 +318,7 @@ fn registry_frames_reject_legacy_version_wrong_identity_digest_and_unowned_handl
     }
     // A valid but different scalar is acceptable only in the first bound
     // capability; native handle readback, not its number, checks key contents.
-    for handle in [0, u64::MAX] {
+    for handle in [0, u64::MAX, u64::MAX - 1] {
         let mut bad = bytes.clone();
         bad[68..76].copy_from_slice(&handle.to_le_bytes());
         assert!(

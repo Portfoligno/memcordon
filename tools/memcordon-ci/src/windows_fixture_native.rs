@@ -13,12 +13,18 @@ pub const WINSOCK_TEST_SELECTOR: &str =
     "restricted_owned_winsock_forwarding_preserves_arguments_results_and_tls_scope";
 pub const REGISTRY_TEST_SELECTOR: &str =
     "owned_registry_projection_preserves_restricted_reads_and_refuses_mutation";
-pub const TEST_SELECTORS: [&str; 5] = [
+pub const PRIVATE_FIXTURE_TEST_SELECTOR: &str =
+    "actual_main_image_requires_exact_object_content_ancestry_and_separate_output";
+pub const PRIVATE_PROCESS_TEST_SELECTOR: &str =
+    "held_child_admission_and_metadata_references_preserve_exact_owners_and_rights";
+pub const TEST_SELECTORS: [&str; 7] = [
     TEST_SELECTOR,
     TRACE_TEST_SELECTOR,
     DEADLINE_TEST_SELECTOR,
     WINSOCK_TEST_SELECTOR,
     REGISTRY_TEST_SELECTOR,
+    PRIVATE_FIXTURE_TEST_SELECTOR,
+    PRIVATE_PROCESS_TEST_SELECTOR,
 ];
 
 pub struct Command {
@@ -33,6 +39,8 @@ pub fn commands(compile: Duration, execute: Duration) -> [Command; 2] {
         TARGET_DIR,
         "--package",
         "memcordon",
+        "--package",
+        "memcordon-platform",
         "--test",
         "windows_namespace_primary",
         "--test",
@@ -43,6 +51,10 @@ pub fn commands(compile: Duration, execute: Duration) -> [Command; 2] {
         "windows_winsock_call_trace",
         "--test",
         "windows_winsock_registry",
+        "--test",
+        "windows_private_fixture_native",
+        "--test",
+        "windows_private_process_native",
         "--all-features",
     ];
     let mut compilation = base.clone();

@@ -234,6 +234,13 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Descriptor {
+    fn registry_start_version(&self) -> u32 {
+        if self.provider_input_experiment {
+            controller_start::PRIVATE_VERSION
+        } else {
+            controller_start::REGISTRY_VERSION
+        }
+    }
     /// Check exact candidate bytes and context. The caller must still authenticate
     /// this freshly computed digest against the original owned START frame before
     /// using any registry capability, fixture witness or mutation target. This
@@ -259,9 +266,8 @@ impl Descriptor {
             || descriptor.winsock_registry.is_none()
             || !matches!(
                 descriptor.start_transport,
-                StartTransport::ControllerStdin {
-                    version: controller_start::REGISTRY_VERSION
-                }
+                StartTransport::ControllerStdin { version }
+                    if version == descriptor.registry_start_version()
             )
         {
             return Err("peer original descriptor context differs".into());
@@ -293,6 +299,23 @@ impl Descriptor {
             &self.provider_input_paths,
             self.provider_input_binding.as_ref(),
         )?;
+        if let Some(binding) = &self.provider_input_binding {
+            binding.validate_output(&self.output_root)?;
+        }
+        if self.provider_input_experiment
+            && (self.winsock_registry.is_none()
+                || !matches!(
+                    self.start_transport,
+                    StartTransport::ControllerStdin {
+                        version: controller_start::PRIVATE_VERSION
+                    }
+                ))
+        {
+            return Err(
+                "private fixture transfer requires authenticated registry and directory START"
+                    .into(),
+            );
+        }
         if !self.provider_input_experiment && !self.provider_input_paths.is_empty() {
             return Err("provider input paths require explicit experiment".into());
         }
@@ -310,7 +333,9 @@ impl Descriptor {
         if let StartTransport::ControllerStdin { version } = self.start_transport {
             let declared = self.winsock_registry.is_some();
             if version
-                != if declared {
+                != if self.provider_input_experiment {
+                    controller_start::PRIVATE_VERSION
+                } else if declared {
                     controller_start::REGISTRY_VERSION
                 } else {
                     controller_start::VERSION
@@ -337,12 +362,11 @@ impl Descriptor {
             registry.validate()?;
             if !matches!(
                 self.start_transport,
-                StartTransport::ControllerStdin {
-                    version: controller_start::REGISTRY_VERSION
-                }
+                StartTransport::ControllerStdin { version }
+                    if version == self.registry_start_version()
             ) {
                 return Err(
-                    "Winsock registry dependency requires explicit version3 owned stdin".into(),
+                    "Winsock registry dependency requires its exact versioned owned stdin".into(),
                 );
             }
         }

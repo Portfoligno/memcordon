@@ -4,7 +4,7 @@ mod plan;
 use std::time::Duration;
 
 #[test]
-fn narrow_commands_select_all_five_actual_fixture_targets_and_exact_native_tests() {
+fn narrow_commands_select_original_five_and_two_platform_native_targets_without_new_budgets() {
     let compile_budget = Duration::from_secs(25 * 60);
     let execution_budget = Duration::from_secs(30 * 60);
     let [compile, execute] = plan::commands(compile_budget, execution_budget);
@@ -14,6 +14,8 @@ fn narrow_commands_select_all_five_actual_fixture_targets_and_exact_native_tests
         plan::TARGET_DIR,
         "--package",
         "memcordon",
+        "--package",
+        "memcordon-platform",
         "--test",
         "windows_namespace_primary",
         "--test",
@@ -24,6 +26,10 @@ fn narrow_commands_select_all_five_actual_fixture_targets_and_exact_native_tests
         "windows_winsock_call_trace",
         "--test",
         "windows_winsock_registry",
+        "--test",
+        "windows_private_fixture_native",
+        "--test",
+        "windows_private_process_native",
         "--all-features",
     ];
     assert_eq!(plan::TARGET_DIR, "target/ci/windows-fixture-native");
@@ -47,6 +53,14 @@ fn narrow_commands_select_all_five_actual_fixture_targets_and_exact_native_tests
         plan::REGISTRY_TEST_SELECTOR,
         "owned_registry_projection_preserves_restricted_reads_and_refuses_mutation"
     );
+    assert_eq!(
+        plan::PRIVATE_FIXTURE_TEST_SELECTOR,
+        "actual_main_image_requires_exact_object_content_ancestry_and_separate_output"
+    );
+    assert_eq!(
+        plan::PRIVATE_PROCESS_TEST_SELECTOR,
+        "held_child_admission_and_metadata_references_preserve_exact_owners_and_rights"
+    );
     assert_eq!(compile.arguments, [base.as_slice(), &["--no-run"]].concat());
     assert_eq!(
         execute.arguments,
@@ -60,7 +74,9 @@ fn narrow_commands_select_all_five_actual_fixture_targets_and_exact_native_tests
                 plan::TRACE_TEST_SELECTOR,
                 plan::DEADLINE_TEST_SELECTOR,
                 plan::WINSOCK_TEST_SELECTOR,
-                plan::REGISTRY_TEST_SELECTOR
+                plan::REGISTRY_TEST_SELECTOR,
+                plan::PRIVATE_FIXTURE_TEST_SELECTOR,
+                plan::PRIVATE_PROCESS_TEST_SELECTOR,
             ]
         ]
         .concat()
@@ -88,12 +104,14 @@ fn passed_output(filtered: usize) -> String {
         passed_harness(plan::DEADLINE_TEST_SELECTOR, 0),
         passed_harness(plan::WINSOCK_TEST_SELECTOR, 0),
         passed_harness(plan::REGISTRY_TEST_SELECTOR, 0),
+        passed_harness(plan::PRIVATE_FIXTURE_TEST_SELECTOR, 0),
+        passed_harness(plan::PRIVATE_PROCESS_TEST_SELECTOR, 0),
     ]
     .concat()
 }
 
 #[test]
-fn five_distinct_executions_preserve_prior_four_orders_and_each_registry_position() {
+fn seven_distinct_executions_preserve_prior_orders_and_accept_platform_targets_in_any_position() {
     for filtered in [0, 83] {
         let output = passed_output(filtered);
         plan::verify_selected_tests(output.as_bytes()).unwrap();
@@ -113,6 +131,8 @@ fn five_distinct_executions_preserve_prior_four_orders_and_each_registry_positio
                             .map(|index| passed_harness(plan::TEST_SELECTORS[index], filtered))
                             .concat(),
                         passed_harness(plan::REGISTRY_TEST_SELECTOR, filtered),
+                        passed_harness(plan::PRIVATE_FIXTURE_TEST_SELECTOR, filtered),
+                        passed_harness(plan::PRIVATE_PROCESS_TEST_SELECTOR, filtered),
                     ]
                     .concat();
                     plan::verify_selected_tests(reordered.as_bytes()).unwrap();
@@ -182,6 +202,21 @@ fn zero_wrong_duplicate_or_missing_execution_evidence_cannot_pass() {
     }
     assert!(plan::verify_selected_tests(&[0xff]).is_err());
     assert!(plan::verify_selected_tests(&vec![b'x'; 1024 * 1024 + 1]).is_err());
+    for selector in [
+        plan::PRIVATE_FIXTURE_TEST_SELECTOR,
+        plan::PRIVATE_PROCESS_TEST_SELECTOR,
+    ] {
+        assert!(plan::verify_selected_tests(passed_harness(selector, 0).as_bytes()).is_err());
+        let missing = valid.replace(&passed_harness(selector, 0), "");
+        assert!(plan::verify_selected_tests(missing.as_bytes()).is_err());
+        let duplicate = valid.replace(selector, plan::REGISTRY_TEST_SELECTOR);
+        assert!(plan::verify_selected_tests(duplicate.as_bytes()).is_err());
+        let ignored = valid.replace(
+            &format!("test {selector} ... ok"),
+            &format!("test {selector} ... ignored"),
+        );
+        assert!(plan::verify_selected_tests(ignored.as_bytes()).is_err());
+    }
 }
 
 #[test]

@@ -2087,7 +2087,7 @@ pub fn uninherited_self_check(deadline: Instant) -> io::Result<i32> {
 /// Native API regression; executed only by the early Windows fixture suite.
 pub fn self_check(
     mut child_command: impl FnMut(Instant) -> io::Result<std::process::Command>,
-    settle_child: impl Fn(&mut std::process::Child, io::Error, Instant) -> io::Error,
+    settle_child: impl Fn(std::process::Child, io::Error, Instant) -> io::Error,
 ) -> io::Result<i32> {
     use std::{
         os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
@@ -2397,7 +2397,7 @@ pub fn self_check(
                         }
                         Err(error) => {
                             return at(
-                                Err(settle_child(&mut child, error, deadline)),
+                                Err(settle_child(child, error, deadline)),
                                 "selfcheck/uninherited-child-settle",
                                 "settle_child",
                                 "boundary",
@@ -2407,7 +2407,7 @@ pub fn self_check(
                         Ok(None) if Instant::now() >= deadline => {
                             return at(
                                 Err(settle_child(
-                                    &mut child,
+                                    child,
                                     io::Error::new(
                                         io::ErrorKind::TimedOut,
                                         "original registry selfcheck cutoff exhausted",

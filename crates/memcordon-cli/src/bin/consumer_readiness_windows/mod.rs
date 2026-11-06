@@ -27,6 +27,7 @@ mod native;
 mod native_fixture_default_dacl;
 mod native_gate_precondition;
 mod own_thread_deadline_self_check;
+mod peer_retirement;
 mod provider_input_probes;
 mod provider_input_target_record;
 mod toolchain;
@@ -41,7 +42,7 @@ mod winsock_trace_record;
 use descriptor::{Case, Descriptor};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
@@ -333,54 +334,81 @@ fn peer_failures(primary: io::Error, secondary: io::Error) -> io::Error {
     io::Error::new(primary.kind(), RegistryPeerFailure { primary, secondary })
 }
 
+struct FailedPeerOwner {
+    child: std::process::Child,
+    _forwarding: Vec<File>,
+}
+struct UnsettledPeer {
+    error: io::Error,
+    // Quarantine for this root's remaining lifetime only. Controller holds an
+    // independent admitted process owner, or conservatively keeps uncertainty.
+    _owner: &'static FailedPeerOwner,
+}
+impl std::fmt::Debug for UnsettledPeer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("UnsettledPeer")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for UnsettledPeer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{}; original peer owner retained for root lifetime; retirement unproved",
+            self.error
+        )
+    }
+}
+impl std::error::Error for UnsettledPeer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 fn settle_peer_failure(
-    peer: &mut std::process::Child,
+    peer: std::process::Child,
+    forwarding: Vec<File>,
     primary: io::Error,
     cutoff: std::time::Instant,
 ) -> io::Error {
     use memcordon_platform::windows_registry_error::at;
-    peer.stdin.take();
-    let mut cleanup = at(
-        peer.kill(),
-        "peer/cleanup-kill",
-        "Child::kill",
-        "Win32",
-        None,
-    )
-    .err();
-    loop {
-        match at(
-            peer.try_wait(),
-            "peer/cleanup-wait",
-            "Child::try_wait",
-            "Win32",
-            None,
-        ) {
-            Ok(Some(_)) => break,
-            Err(error) => {
-                cleanup = Some(match cleanup {
-                    Some(previous) => peer_failures(previous, error),
-                    None => error,
-                });
-                break;
-            }
-            Ok(None) if std::time::Instant::now() >= cutoff => {
-                let error = io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "original registry peer retirement unproved at original cutoff",
-                );
-                cleanup = Some(match cleanup {
-                    Some(previous) => peer_failures(previous, error),
-                    None => error,
-                });
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    match cleanup {
-        Some(secondary) => peer_failures(primary, secondary),
-        None => primary,
+    let mut owner = FailedPeerOwner {
+        child: peer,
+        _forwarding: forwarding,
+    };
+    owner.child.stdin.take();
+    match peer_retirement::settle(
+        owner,
+        primary,
+        cutoff,
+        |owner| {
+            at(
+                owner.child.kill(),
+                "peer/cleanup-kill",
+                "Child::kill",
+                "Win32",
+                None,
+            )
+        },
+        |owner| {
+            at(
+                owner.child.try_wait(),
+                "peer/cleanup-wait",
+                "Child::try_wait",
+                "Win32",
+                None,
+            )
+            .map(|status| status.is_some())
+        },
+    ) {
+        peer_retirement::Outcome::Retired(error) => error,
+        peer_retirement::Outcome::Unsettled { owner, error } => io::Error::new(
+            error.kind(),
+            UnsettledPeer {
+                error,
+                _owner: Box::leak(Box::new(owner)),
+            },
+        ),
     }
 }
 
@@ -389,6 +417,7 @@ fn send_peer_registry(
     registry: &winsock_registry::Mapping,
     descriptor: &Descriptor,
     session: &controller_start_input::Session,
+    permit: Option<controller_start_input::PeerHandoffPermit>,
 ) -> io::Result<()> {
     use memcordon_platform::windows_registry_error::at;
     use std::os::windows::io::AsRawHandle;
@@ -408,68 +437,166 @@ fn send_peer_registry(
         }
     };
     check()?;
-    let identity = at(
-        native::child_identity(peer),
-        "peer/original-identity",
-        "child_identity",
-        "boundary",
-        None,
-    )?;
-    let mut handle = std::ptr::null_mut();
-    // SAFETY: source is the admitted read-only key; target is this exact owned
-    // Child, never a reopened PID. Its numeric result is target-local only.
-    if unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            registry.raw(),
-            peer.as_raw_handle(),
-            &mut handle,
-            KEY_READ,
-            0,
-            0,
-        )
-    } == 0
-    {
-        return at(
-            Err(io::Error::last_os_error()),
-            "peer/readonly-key-duplicate",
-            "DuplicateHandle",
-            "Win32",
-            Some(KEY_READ),
-        );
-    }
-    let binding = descriptor::controller_start::Binding {
-        challenge: descriptor.challenge.clone(),
-        descriptor_sha256: session.original_binding().descriptor_sha256,
-        pid: identity.process_id,
-        birth: identity.creation_time_100ns,
-    };
-    let capability = descriptor::controller_start::Capability {
-        version: 1,
-        handle: handle as usize as u64,
-        manifest_sha256: descriptor
-            .winsock_registry
-            .as_ref()
-            .ok_or_else(|| io::Error::other("peer registry declaration absent"))?
-            .sha256,
-    };
-    let mut sender = descriptor::controller_start::Sender::with_registry(capability, false);
+    // One watcher covers source metadata queries, every duplicate and START;
+    // it is settled before later application I/O, never renewed per reference.
     let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(deadline)
         .map_err(io::Error::other)?;
-    let written = match peer.stdin.take() {
-        Some(mut writer) => sender.send(
-            &mut writer,
-            &binding,
-            descriptor::controller_start::Phase::Start,
-            check,
-        ),
-        None => Err(io::Error::other("original registry peer stdin unavailable")),
-    };
+    let mut duplicated = 0u32;
+    let mut registry_duplicated = false;
+    let written = (|| -> io::Result<()> {
+        if descriptor.provider_input_experiment != permit.is_some() {
+            return Err(io::Error::other(
+                "provider peer requires the exact admitted recipient permit",
+            ));
+        }
+        if descriptor.provider_input_experiment {
+            session.private_directories()?.ok_or_else(|| {
+                io::Error::other("original private session is not admitted for forwarding")
+            })?;
+        }
+        let identity = at(
+            match &permit {
+                Some(permit) => permit.validate(peer, session.original_binding()),
+                None => native::child_identity(peer),
+            },
+            "peer/original-identity",
+            "child_identity",
+            "boundary",
+            None,
+        )?;
+        check()?;
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: source is the admitted read-only key; target is this exact owned
+        // Child, never a reopened PID. Its numeric result is target-local only.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                registry.raw(),
+                peer.as_raw_handle(),
+                &mut handle,
+                KEY_READ,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return at(
+                Err(io::Error::last_os_error()),
+                "peer/readonly-key-duplicate",
+                "DuplicateHandle",
+                "Win32",
+                Some(KEY_READ),
+            );
+        }
+        // A successful duplicate is already recipient debt before any cutoff check.
+        registry_duplicated = true;
+        check()?;
+        let binding = descriptor::controller_start::Binding {
+            challenge: descriptor.challenge.clone(),
+            descriptor_sha256: session.original_binding().descriptor_sha256,
+            pid: identity.process_id,
+            birth: identity.creation_time_100ns,
+        };
+        let capability = descriptor::controller_start::Capability {
+            version: 1,
+            handle: handle as usize as u64,
+            manifest_sha256: descriptor
+                .winsock_registry
+                .as_ref()
+                .ok_or_else(|| io::Error::other("peer registry declaration absent"))?
+                .sha256,
+        };
+        let mut sender = descriptor::controller_start::Sender::with_registry(capability, false);
+        if descriptor.provider_input_experiment {
+            let expected = descriptor
+                .provider_input_binding
+                .as_ref()
+                .ok_or_else(|| io::Error::other("peer private binding absent"))?
+                .directory_expectation()
+                .map_err(io::Error::other)?;
+            let directories = session
+                .private_directories()?
+                .ok_or_else(|| io::Error::other("root forwarding references absent"))?;
+            let files = directories
+                .input
+                .iter()
+                .chain(std::iter::once(directories.local))
+                .chain(directories.output.iter())
+                .collect::<Vec<_>>();
+            let roles = expected.roles().map_err(io::Error::other)?;
+            if roles.len() != files.len() {
+                return Err(io::Error::other("root forwarding role extent differs"));
+            }
+            let mut references = Vec::with_capacity(roles.len());
+            for ((role, index), file) in roles.into_iter().zip(files) {
+                let handle =
+                    memcordon_platform::test_support::duplicate_directory_metadata_into_child(
+                        peer,
+                        file,
+                        deadline,
+                        &mut duplicated,
+                    )?;
+                references.push(descriptor::controller_start::DirectoryReference {
+                    role,
+                    index,
+                    handle,
+                    access_mask: 128,
+                });
+            }
+            let transfer = descriptor::controller_start::DirectoryTransfer {
+                version: 1,
+                manifest_sha256: expected.manifest_sha256,
+                references,
+            };
+            sender = sender.with_directories(transfer, expected)?;
+        }
+        match peer.stdin.take() {
+            Some(mut writer) => sender.send(
+                &mut writer,
+                &binding,
+                descriptor::controller_start::Phase::Start,
+                check,
+            ),
+            None => Err(io::Error::other("original registry peer stdin unavailable")),
+        }
+    })();
     let stopped = timer.finish().map_err(io::Error::other);
-    match (written, stopped) {
+    let result = match (written, stopped) {
         (Err(primary), Err(secondary)) => Err(peer_failures(primary, secondary)),
         (Err(primary), _) => Err(primary),
-        (Ok(()), stopped) => stopped,
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => check(),
+    };
+    result.map_err(|primary| {
+        io::Error::new(
+            primary.kind(),
+            PeerTransferFailure {
+                primary,
+                duplicated: duplicated.saturating_add(u32::from(registry_duplicated)),
+                controller_recipient_admitted: permit.is_some(),
+            },
+        )
+    })
+}
+
+#[derive(Debug)]
+struct PeerTransferFailure {
+    primary: io::Error,
+    duplicated: u32,
+    controller_recipient_admitted: bool,
+}
+impl std::fmt::Display for PeerTransferFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{}; peer transferred references={}; controller-recipient-admitted={}; native recipient retirement remains required",
+            self.primary, self.duplicated, self.controller_recipient_admitted
+        )
+    }
+}
+impl std::error::Error for PeerTransferFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
     }
 }
 
@@ -542,16 +669,19 @@ fn joint_mapped(
     descriptor: &Descriptor,
     transcript: &mut Transcript,
     churn: bool,
-    control: Option<&mut controller_start_input::Session>,
+    mut control: Option<&mut controller_start_input::Session>,
     token_envelope: &[u8],
     registry: Option<&winsock_registry::Mapping>,
     descriptor_path: &Path,
 ) -> io::Result<()> {
-    let trace = match (descriptor.control_clock.as_ref(), control.as_deref()) {
-        (Some(clock), Some(session)) => Some(winsock_trace::Context {
+    let trace_binding = control
+        .as_deref()
+        .map(|session| session.original_binding().clone());
+    let trace = match (descriptor.control_clock.as_ref(), trace_binding.as_ref()) {
+        (Some(clock), Some(binding)) => Some(winsock_trace::Context {
             clock,
             output_root: &descriptor.output_root,
-            binding: session.original_binding(),
+            binding,
             token_envelope,
             provider_input_experiment: descriptor.provider_input_experiment,
             peer: false,
@@ -564,7 +694,15 @@ fn joint_mapped(
                 "provider experiment requires authenticated controller START and installed registry mapping",
             ));
         }
-        provider_input_probes::run(descriptor, false)?;
+        let prepared = provider_input_probes::prepare(
+            descriptor,
+            false,
+            control
+                .as_deref()
+                .expect("checked private session")
+                .private_directories()?,
+        )?;
+        provider_input_probes::run(descriptor, false, prepared)?;
     }
     let _winsock = native::winsock_startup(trace)?;
     let listener = listener_trace::bind(trace.as_ref())?;
@@ -639,97 +777,131 @@ fn joint_mapped(
         }
         peer_command.arg(peer_input).stdin(Stdio::piped());
     }
+    if descriptor.provider_input_experiment {
+        let binding = control
+            .as_deref()
+            .expect("checked private session")
+            .peer_admission_binding();
+        transcript.event(
+            "tcp-peer-spawn-intent",
+            None,
+            &serde_json::to_vec(&binding).map_err(io::Error::other)?,
+        )?;
+    }
     let mut peer = peer_command.spawn()?;
-    if let Some(registry) = registry {
-        let handed = send_peer_registry(
-            &mut peer,
-            registry,
-            descriptor,
-            control.as_deref().expect("checked registry control"),
-        );
-        if let Err(primary) = handed {
-            return Err(settle_peer_failure(
-                &mut peer,
-                primary,
-                control
-                    .as_deref()
-                    .expect("checked registry control")
-                    .original_deadline(),
-            ));
-        }
-    }
-    transcript.event(
-        "tcp-peer-created",
-        None,
-        &serde_json::to_vec(&native::child_identity(&peer)?).map_err(io::Error::other)?,
-    )?;
-    let (mut stream, _) = listener.accept()?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let header = read_http_header(&mut stream)?;
-    if header != b"GET /readiness HTTP/1.1\r\nHost: localhost\r\n\r\n" {
-        return Err(io::Error::other("HTTP request differs"));
-    }
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
-    let mut received = Vec::new();
-    frame_write(&mut received, &header)?;
-    for payload in [
-        Vec::new(),
-        vec![0, 255, 128, 10],
-        descriptor.challenge.clone(),
-    ] {
-        let actual = frame_read(&mut stream)?;
-        if actual != payload {
-            return Err(io::Error::other("TCP application frame differs"));
-        }
-        frame_write(&mut received, &actual)?;
-        frame_write(&mut stream, &payload)?;
-    }
-    fs::write(
-        descriptor.output_root.join("tcp-server-received.bin"),
-        &received,
-    )?;
-    let pipe = native::named_pipe_exchange(&descriptor.challenge)?;
-    fs::write(
-        descriptor
-            .output_root
-            .join("named-pipe-server-received.bin"),
-        &pipe.server_received,
-    )?;
-    fs::write(
-        descriptor
-            .output_root
-            .join("named-pipe-client-received.bin"),
-        &pipe.client_received,
-    )?;
-    transcript.event("named-pipe-while-tcp-owned", None, &descriptor.challenge)?;
-    binary_files(descriptor, transcript)?;
-    toolchain::execute(descriptor, transcript, control)?;
-    protected_write_probes(descriptor, transcript)?;
-    if churn {
-        process_churn(descriptor, transcript)?;
-    } else {
-        generation_chain(3, &descriptor.challenge)?;
-        transcript.event("descendants-complete", None, &descriptor.challenge)?;
-    }
-    if let Some(gate) = &descriptor.completion_gate {
-        native::wait_controller_gate(std::ffi::OsStr::new(gate), || {
+    // Every error after spawn retains/settles this original Child. In a private
+    // experiment the controller independently owns the peer before transfer,
+    // or keeps the unresolved spawn interval quarantined.
+    let worked = (|| -> io::Result<()> {
+        let permit = if descriptor.provider_input_experiment {
+            let session = control.as_deref_mut().expect("checked private session");
+            let pending = session.pending_peer(&peer)?;
             transcript.event(
-                "capacity-live-before-natural-completion",
+                "tcp-peer-pending-admission",
                 None,
-                &descriptor.challenge,
-            )
-        })?;
+                &serde_json::to_vec(&pending).map_err(io::Error::other)?,
+            )?;
+            Some(session.receive_peer_recipient(&pending)?)
+        } else {
+            None
+        };
+        if let Some(registry) = registry {
+            send_peer_registry(
+                &mut peer,
+                registry,
+                descriptor,
+                control.as_deref().expect("checked registry control"),
+                permit,
+            )?;
+            control
+                .as_deref_mut()
+                .expect("checked registry control")
+                .close_private_directories();
+        }
+        transcript.event(
+            "tcp-peer-created",
+            None,
+            &serde_json::to_vec(&native::child_identity(&peer)?).map_err(io::Error::other)?,
+        )?;
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let header = read_http_header(&mut stream)?;
+        if header != b"GET /readiness HTTP/1.1\r\nHost: localhost\r\n\r\n" {
+            return Err(io::Error::other("HTTP request differs"));
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+        let mut received = Vec::new();
+        frame_write(&mut received, &header)?;
+        for payload in [
+            Vec::new(),
+            vec![0, 255, 128, 10],
+            descriptor.challenge.clone(),
+        ] {
+            let actual = frame_read(&mut stream)?;
+            if actual != payload {
+                return Err(io::Error::other("TCP application frame differs"));
+            }
+            frame_write(&mut received, &actual)?;
+            frame_write(&mut stream, &payload)?;
+        }
+        fs::write(
+            descriptor.output_root.join("tcp-server-received.bin"),
+            &received,
+        )?;
+        let pipe = native::named_pipe_exchange(&descriptor.challenge)?;
+        fs::write(
+            descriptor
+                .output_root
+                .join("named-pipe-server-received.bin"),
+            &pipe.server_received,
+        )?;
+        fs::write(
+            descriptor
+                .output_root
+                .join("named-pipe-client-received.bin"),
+            &pipe.client_received,
+        )?;
+        transcript.event("named-pipe-while-tcp-owned", None, &descriptor.challenge)?;
+        binary_files(descriptor, transcript)?;
+        toolchain::execute(descriptor, transcript, control.as_deref_mut())?;
+        protected_write_probes(descriptor, transcript)?;
+        if churn {
+            process_churn(descriptor, transcript)?;
+        } else {
+            generation_chain(3, &descriptor.challenge)?;
+            transcript.event("descendants-complete", None, &descriptor.challenge)?;
+        }
+        if let Some(gate) = &descriptor.completion_gate {
+            native::wait_controller_gate(std::ffi::OsStr::new(gate), || {
+                transcript.event(
+                    "capacity-live-before-natural-completion",
+                    None,
+                    &descriptor.challenge,
+                )
+            })?;
+        }
+        let mut byte = [0];
+        if stream.read(&mut byte)? != 0 {
+            return Err(io::Error::other("TCP peer did not half-close"));
+        }
+        stream.shutdown(Shutdown::Write)?;
+        if !peer.wait()?.success() {
+            return Err(io::Error::other("TCP child failed"));
+        }
+        transcript.event("tcp-peer-complete", None, &descriptor.challenge)
+    })();
+    match worked {
+        Ok(()) => Ok(()),
+        Err(primary) => match control.as_deref_mut() {
+            Some(session) => {
+                let cutoff = session.original_deadline();
+                let forwarding = session.take_private_directory_files();
+                Err(settle_peer_failure(peer, forwarding, primary, cutoff))
+            }
+            None => Err(primary),
+        },
     }
-    let mut byte = [0];
-    if stream.read(&mut byte)? != 0 {
-        return Err(io::Error::other("TCP peer did not half-close"));
-    }
-    stream.shutdown(Shutdown::Write)?;
-    if !peer.wait()?.success() {
-        return Err(io::Error::other("TCP child failed"));
-    }
-    transcript.event("tcp-peer-complete", None, &descriptor.challenge)
 }
 
 fn protected_write_probes(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
@@ -1095,7 +1267,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                         birth: identity.creation_time_100ns,
                     };
                     let mut session =
-                        controller_start_input::Session::peer(&input.clock, binding, declaration)?;
+                        controller_start_input::Session::peer(&input.clock, binding, &parsed)?;
                     let peer_token = if parsed.provider_input_experiment {
                         listener_trace::live(&input.clock)?;
                         let token = native::token_observation()?;
@@ -1127,35 +1299,44 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                         parsed,
                         session.original_binding().clone(),
                         peer_token,
+                        session,
                     ))
                 }
                 None => None,
             };
             match _registry {
-                Some((mapping, deadline, parsed, binding, token)) => mapping.run(|_| {
-                    let clock = parsed
-                        .control_clock
-                        .as_ref()
-                        .expect("authenticated peer clock checked");
-                    let trace = token.as_ref().map(|token| winsock_trace::Context {
-                        clock,
-                        binding: &binding,
-                        token_envelope: token,
-                        output_root: &parsed.output_root,
-                        provider_input_experiment: true,
-                        peer: true,
-                    });
-                    if token.is_some() {
-                        provider_input_probes::run(&parsed, true)?;
-                    }
-                    tcp_peer(
-                        port,
-                        &parsed.challenge,
-                        &parsed.output_root,
-                        Some(deadline),
-                        trace.as_ref(),
-                    )
-                })?,
+                Some((mapping, deadline, parsed, binding, token, mut session)) => {
+                    mapping.run(|_| {
+                        let clock = parsed
+                            .control_clock
+                            .as_ref()
+                            .expect("authenticated peer clock checked");
+                        let trace = token.as_ref().map(|token| winsock_trace::Context {
+                            clock,
+                            binding: &binding,
+                            token_envelope: token,
+                            output_root: &parsed.output_root,
+                            provider_input_experiment: true,
+                            peer: true,
+                        });
+                        if token.is_some() {
+                            let prepared = provider_input_probes::prepare(
+                                &parsed,
+                                true,
+                                session.private_directories()?,
+                            )?;
+                            session.close_private_directories();
+                            provider_input_probes::run(&parsed, true, prepared)?;
+                        }
+                        tcp_peer(
+                            port,
+                            &parsed.challenge,
+                            &parsed.output_root,
+                            Some(deadline),
+                            trace.as_ref(),
+                        )
+                    })?
+                }
                 None => tcp_peer(
                     port,
                     &challenge,

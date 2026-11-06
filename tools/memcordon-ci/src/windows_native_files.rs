@@ -220,6 +220,9 @@ impl HeldWindowsArtifact {
         &self,
         path: &Path,
         local_directory: memcordon_platform::windows_private_fixture_binding::PrivateFixtureAncestor,
+        output_ancestors: Vec<
+            memcordon_platform::windows_private_fixture_binding::PrivateFixtureAncestor,
+        >,
         work: std::time::Instant,
     ) -> crate::Result<memcordon_platform::windows_private_fixture_binding::PrivateFixtureBinding>
     {
@@ -260,7 +263,7 @@ impl HeldWindowsArtifact {
         }
         provider_live(work)?;
         let binding = PrivateFixtureBinding {
-            revision: 1,
+            revision: 2,
             fixture: path.to_owned(),
             volume_serial: metadata.volume_serial,
             file_index: metadata.file_index,
@@ -271,9 +274,14 @@ impl HeldWindowsArtifact {
             native_path_utf16: self.native_path()?,
             ancestors,
             local_directory,
+            output_ancestors,
         };
         provider_live(work)?;
         Ok(binding)
+    }
+
+    pub(crate) fn private_ancestor_files(&self) -> &[std::fs::File] {
+        &self._ancestors
     }
 
     /// Query the same continuously held regular file, not a fresh path identity.

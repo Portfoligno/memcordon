@@ -89,12 +89,12 @@ struct RejectionEvidence<'a> {
     native_failure: Option<io::Error>,
     output: Option<&'a VerifiedOutput>,
 }
-fn reject_target(
+fn reject_target<T>(
     context: &Context<'_>,
     rejection: &Rejection,
     work: Instant,
     evidence: RejectionEvidence<'_>,
-) -> io::Result<()> {
+) -> io::Result<T> {
     let current = evidence
         .current_executable
         .map(|path| named_identity(path, work));
@@ -277,9 +277,23 @@ fn denied_authority(path: &Path, access: u32, work: Instant) -> io::Result<i32> 
     Ok(5)
 }
 
-/// These attempts are experiment assertions, never permission or product authority.
-pub fn run(descriptor: &Descriptor, peer: bool) -> io::Result<()> {
-    let _errors = Errors::capture();
+pub struct Prepared {
+    verified: binding_native::VerifiedPrivateFixture,
+    pid: u32,
+    current_executable: Option<std::path::PathBuf>,
+    work: Instant,
+    errors: Errors,
+}
+
+/// Complete verification while borrowing only the admitted metadata objects.
+/// The returned probe capability owns no metadata reference; its error guard
+/// spans the caller's explicit peer-reference close before mutation work.
+pub fn prepare(
+    descriptor: &Descriptor,
+    peer: bool,
+    directories: Option<binding_native::BorrowedPrivateDirectories<'_>>,
+) -> io::Result<Prepared> {
+    let errors = Errors::capture();
     let paths = &descriptor.provider_input_paths;
     let output_root = &descriptor.output_root;
     let clock = descriptor
@@ -301,10 +315,16 @@ pub fn run(descriptor: &Descriptor, peer: bool) -> io::Result<()> {
         .fixture
         .parent()
         .ok_or_else(|| io::Error::other("private fixture parent absent"))?;
-    let verified = match binding_native::verify(binding, paths, output_root, work) {
+    let verified = match directories
+        .ok_or_else(|| io::Error::other("authenticated private metadata references absent"))
+        .and_then(|directories| {
+            binding_native::verify(binding, paths, output_root, directories, work)
+        }) {
         Ok(verified) => verified,
         Err(primary) => {
-            let output = binding_native::verify_output(binding, output_root, work).ok();
+            let output = directories.and_then(|directories| {
+                binding_native::verify_output(binding, output_root, directories, work).ok()
+            });
             let context = Context {
                 paths,
                 fixture: &binding.fixture,
@@ -351,12 +371,49 @@ pub fn run(descriptor: &Descriptor, peer: bool) -> io::Result<()> {
             },
         );
     }
+    Ok(Prepared {
+        verified,
+        pid,
+        current_executable,
+        work,
+        errors,
+    })
+}
+
+/// These attempts are experiment assertions, never permission or product authority.
+pub fn run(descriptor: &Descriptor, peer: bool, prepared: Prepared) -> io::Result<()> {
+    let Prepared {
+        verified,
+        pid,
+        current_executable,
+        work,
+        errors: _errors,
+    } = prepared;
+    let paths = &descriptor.provider_input_paths;
+    let output_root = &descriptor.output_root;
+    let parent = verified
+        .fixture()
+        .parent()
+        .ok_or_else(|| io::Error::other("verified private fixture parent absent"))?;
+    let directory = verified.local_directory();
+    let mut binding_observation = verified.observation().clone();
+    binding_observation["metadata_receiver_role"] =
+        serde_json::json!(if peer { "peer" } else { "root" });
+    binding_observation["metadata_receiver_references_closed_before_mutations"] =
+        serde_json::json!(peer);
+    binding_observation["metadata_forwarding_references_may_remain_live"] =
+        serde_json::json!(!peer);
+    binding_observation["metadata_reference_lifetime"] = serde_json::json!(if peer {
+        "peer-session-closed-after-verification-before-mutations"
+    } else {
+        "root-session-retained-until-owned-peer-handoff"
+    });
     live(work)?;
     let token: super::descriptor::gate_precondition::TokenObservation =
         serde_json::from_slice(&super::native::effective_token_observation()?)
             .map_err(io::Error::other)?;
     if !token.restricted {
-        let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":pid,"peer":peer,"restricted":false,"performed":false,"state":"not-required-for-ordinary-baseline","complete":false,"rows":[],"fixture_binding":verified.observation(),"observed_current_executable":current_executable.as_ref().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true))})).map_err(io::Error::other)?;
+        let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":pid,"peer":peer,"restricted":false,"performed":false,"state":"not-required-for-ordinary-baseline","complete":false,"rows":[],"fixture_binding":binding_observation,"observed_current_executable":current_executable.as_ref().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true))})).map_err(io::Error::other)?;
         live(work)?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -456,7 +513,7 @@ pub fn run(descriptor: &Descriptor, peer: bool) -> io::Result<()> {
         }
         live(work)
     })();
-    let report=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":pid,"peer":peer,"restricted":true,"performed":true,"complete":attempted.is_ok(),"rows":rows,"directory_authority":directory_authority,"fixture_binding":verified.observation(),"observed_current_executable":current_executable.as_ref().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true)),"failure":attempted.as_ref().err().map(|error|error.to_string())})).map_err(io::Error::other);
+    let report=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-provider-input-mutation-probes","revision":1,"diagnostic_only":true,"acceptance_authority":false,"pid":pid,"peer":peer,"restricted":true,"performed":true,"complete":attempted.is_ok(),"rows":rows,"directory_authority":directory_authority,"fixture_binding":binding_observation,"observed_current_executable":current_executable.as_ref().map(|path|target_record::path_record(path.as_os_str().encode_wide(),true)),"failure":attempted.as_ref().err().map(|error|error.to_string())})).map_err(io::Error::other);
     let retained = report.and_then(|bytes| {
         if bytes.len() > 16 * 1024 {
             return Err(io::Error::other("private mutation report bound"));

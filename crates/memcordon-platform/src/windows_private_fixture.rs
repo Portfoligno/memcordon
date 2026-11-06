@@ -31,6 +31,15 @@ use windows_sys::Win32::{
     },
 };
 
+/// Actual receiver-owned objects admitted by the authenticated START session.
+/// Borrowing grants no raw-handle adoption or relative-open operation.
+#[derive(Clone, Copy)]
+pub struct BorrowedPrivateDirectories<'a> {
+    pub input: &'a [File],
+    pub local: &'a File,
+    pub output: &'a [File],
+}
+
 /// No file, directory, mapping or sharing restriction survives in this value.
 /// Only the native verifier below can construct it.
 pub struct VerifiedPrivateFixture {
@@ -80,6 +89,7 @@ struct Progress {
     count: usize,
     substage: &'static str,
     requested_win32_mask: u32,
+    observed_granted_access: Option<u32>,
     cutoff_before: Option<bool>,
     cutoff_after: Option<bool>,
 }
@@ -184,6 +194,7 @@ pub fn failure_record(error: &io::Error) -> serde_json::Value {
         serde_json::json!({"phase":refusal.phase,"native_code":native_code(&refusal.primary),
             "progress":{"role":refusal.progress.role,"index":refusal.progress.index,"count":refusal.progress.count,
                 "substage":refusal.progress.substage,"requested_win32_mask":refusal.progress.requested_win32_mask,
+                "observed_granted_access":refusal.progress.observed_granted_access,
                 "cutoff_before":refusal.progress.cutoff_before,"cutoff_after":refusal.progress.cutoff_after,
                 "cutoff_scope":"existing checks around current query/compare; null means not reached"},
             "error":refusal.primary.to_string(),"mutation_authority":false})
@@ -252,12 +263,54 @@ fn directory_matches(
     expected: &PrivateFixtureAncestor,
     cutoff: Instant,
     progress: &mut Progress,
-) -> io::Result<()> {
+) -> io::Result<WindowsHeldFileMetadata> {
+    use windows_sys::{
+        Wdk::Foundation::{NtQueryObject, ObjectBasicInformation},
+        Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION,
+    };
+    progress.requested_win32_mask = FILE_READ_ATTRIBUTES;
+    noninheritable(file, cutoff, progress)?;
+    progress.step("granted-access-query");
+    progress.before(cutoff)?;
+    let mut basic = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+    let provided = std::mem::size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>() as u32;
+    let mut returned = 0;
+    // SAFETY: borrowed original receiver-owned reference and exact documented
+    // ObjectBasicInformation buffer. No path or object access is acquired here.
+    let status = unsafe {
+        NtQueryObject(
+            file.as_raw_handle().cast(),
+            ObjectBasicInformation,
+            (&raw mut basic).cast(),
+            provided,
+            &raw mut returned,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "private metadata granted-access query failed: NTSTATUS={status} ({status:#010x}); provided={provided}; returned={returned}"
+        )));
+    }
+    progress.after(cutoff)?;
+    if returned != provided {
+        return Err(io::Error::other(
+            "private metadata granted-access response extent differs",
+        ));
+    }
+    progress.observed_granted_access = Some(basic.GrantedAccess);
+    progress.substage = "granted-access-compare";
+    if basic.GrantedAccess != FILE_READ_ATTRIBUTES {
+        return Err(io::Error::other(
+            "private metadata reference lacks exact FILE_READ_ATTRIBUTES-only rights",
+        ));
+    }
     progress.step("identity-metadata-query");
     progress.before(cutoff)?;
     let metadata = windows_held_file_metadata(file)?;
     progress.substage = "identity-compare";
-    if metadata.volume_serial != expected.volume_serial
+    if metadata.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.volume_serial != expected.volume_serial
         || metadata.file_index != expected.file_index
         || metadata.attributes != expected.attributes
     {
@@ -265,7 +318,8 @@ fn directory_matches(
             "private fixture directory identity or attributes differ",
         ));
     }
-    progress.after(cutoff)
+    progress.after(cutoff)?;
+    Ok(metadata)
 }
 fn file_matches(
     metadata: &WindowsHeldFileMetadata,
@@ -374,11 +428,12 @@ fn main_image(cutoff: Instant) -> io::Result<(usize, Vec<u16>)> {
 pub fn verify_output(
     binding: &PrivateFixtureBinding,
     output: &Path,
+    directories: BorrowedPrivateDirectories<'_>,
     cutoff: Instant,
 ) -> io::Result<VerifiedOutput> {
     let mut progress = Progress::default();
     with_deadline(cutoff, || {
-        verify_output_inner(binding, output, cutoff, &mut progress)
+        verify_output_inner(binding, output, directories, cutoff, &mut progress)
     })
     .map_err(|primary| {
         io::Error::new(
@@ -394,12 +449,19 @@ pub fn verify_output(
 fn verify_output_inner(
     binding: &PrivateFixtureBinding,
     output: &Path,
+    directories: BorrowedPrivateDirectories<'_>,
     cutoff: Instant,
     progress: &mut Progress,
 ) -> io::Result<VerifiedOutput> {
     progress.object("output-ancestor", 0, 0);
     progress.step("output-path-validation");
     progress.before(cutoff)?;
+    binding.validate_output(output).map_err(io::Error::other)?;
+    if directories.output.len() != binding.output_ancestors.len() {
+        return Err(io::Error::other(
+            "admitted output metadata role count differs",
+        ));
+    }
     if !output.is_absolute()
         || output
             .components()
@@ -418,15 +480,14 @@ fn verify_output_inner(
         .ancestors
         .last()
         .ok_or_else(|| io::Error::other("private fixture parent absent"))?;
-    let mut handles = Vec::new();
     let count = paths.len();
     for (index, path) in paths.into_iter().rev().enumerate() {
         progress.object("output-ancestor", index, count);
-        let handle = open(path, true, cutoff, progress)?;
-        progress.step("output-identity-metadata-query");
-        progress.before(cutoff)?;
-        let metadata = windows_held_file_metadata(&handle)?;
-        progress.after(cutoff)?;
+        let expected = &binding.output_ancestors[index];
+        if path != expected.path.as_path() {
+            return Err(io::Error::other("admitted output path order differs"));
+        }
+        let metadata = directory_matches(&directories.output[index], expected, cutoff, progress)?;
         progress.substage = "output-alias-compare";
         for input in [parent, &binding.local_directory] {
             if metadata.volume_serial == input.volume_serial
@@ -437,10 +498,8 @@ fn verify_output_inner(
                 ));
             }
         }
-        handles.push(handle);
     }
-    let ancestors = handles.len();
-    drop(handles);
+    let ancestors = count;
     live(cutoff)?;
     Ok(VerifiedOutput {
         path: output.to_owned(),
@@ -449,12 +508,15 @@ fn verify_output_inner(
 }
 
 /// Bind the actual main mapping to authenticated descriptor data while the
-/// controller's original custody scope is active. All new handles share read,
-/// write and delete, are noninheritable, and close before the capability returns.
+/// controller's original custody scope is active. Borrowed metadata references
+/// preserve their original controller file objects/sharing and may remain live
+/// for root forwarding. Only the new named fixture read handle shares all and
+/// closes before capability return; the receiver owns metadata lifetimes.
 pub fn verify(
     binding: &PrivateFixtureBinding,
     paths: &[PathBuf],
     output: &Path,
+    directories: BorrowedPrivateDirectories<'_>,
     cutoff: Instant,
 ) -> io::Result<VerifiedPrivateFixture> {
     let mut phase = "declaration";
@@ -462,20 +524,28 @@ pub fn verify(
     let attempted = with_deadline(cutoff, || {
         live(cutoff)?;
         binding.validate(paths).map_err(io::Error::other)?;
+        binding.validate_output(output).map_err(io::Error::other)?;
+        if directories.input.len() != binding.ancestors.len()
+            || directories.output.len() != binding.output_ancestors.len()
+        {
+            return Err(io::Error::other(
+                "admitted private metadata role counts differ",
+            ));
+        }
         phase = "actual-main-image";
         let (base, mapped_name) = main_image(cutoff)?;
         phase = "held-ancestry-join";
-        let mut directories = Vec::new();
         for (index, ancestor) in binding.ancestors.iter().enumerate() {
             progress.object("input-ancestor", index, binding.ancestors.len());
-            let file = open(&ancestor.path, true, cutoff, &mut progress)?;
-            directory_matches(&file, ancestor, cutoff, &mut progress)?;
-            directories.push(file);
+            directory_matches(&directories.input[index], ancestor, cutoff, &mut progress)?;
         }
         progress.object("local-directory", 0, 1);
-        let local = open(&binding.local_directory.path, true, cutoff, &mut progress)?;
-        directory_matches(&local, &binding.local_directory, cutoff, &mut progress)?;
-        directories.push(local);
+        directory_matches(
+            directories.local,
+            &binding.local_directory,
+            cutoff,
+            &mut progress,
+        )?;
         phase = "held-fixture-identity";
         progress.object("fixture", 0, 1);
         let mut file = open(&binding.fixture, false, cutoff, &mut progress)?;
@@ -523,10 +593,9 @@ pub fn verify(
             ));
         }
         phase = "output-ancestry-separation";
-        let output = verify_output_inner(binding, output, cutoff, &mut progress)?;
+        let output = verify_output_inner(binding, output, directories, cutoff, &mut progress)?;
         let output_count = output.ancestors;
         drop(file);
-        drop(directories);
         live(cutoff)?;
         Ok(VerifiedPrivateFixture {
             fixture: binding.fixture.clone(),
@@ -535,7 +604,10 @@ pub fn verify(
             observation: serde_json::json!({"main_allocation_base":base,"main_mapping_mem_image":true,
                 "native_backing_name_join":true,"volume_serial":binding.volume_serial,"file_index":binding.file_index,
                 "bytes":total,"sha256":hash,"ancestor_count":binding.ancestors.len(),"output_ancestor_count":output_count,
-                "temporary_query_handles_closed":true,"temporary_query_handles_share_all":true,"temporary_query_handles_noninheritable":true,
+                "named_fixture_query_handle_closed":true,"named_fixture_query_handle_share_all":true,
+                "metadata_references_borrowed_from_authenticated_session":true,"metadata_references_noninheritable":true,
+                "metadata_granted_access":FILE_READ_ATTRIBUTES,"metadata_forwarding_references_may_remain_live":true,
+                "metadata_references_share_original_controller_file_objects":true,
                 "synchronous_io_deadline_settled_before_capability":true,
                 "scope":"authenticated-descriptor-and-live-trusted-controller-private-sealed-custody",
                 "hostile_host_ancestor_mutation_excluded":false,"in_memory_image_byte_integrity_proved":false,
