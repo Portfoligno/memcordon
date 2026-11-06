@@ -1,6 +1,7 @@
 //! Bounded historical producer observations. Never cleanup or retirement authority.
 use super::writer_lifecycle::{
-    self as model, Availability, Binding, History, Owner, Stage, ThreadObservation, WriterSnapshot,
+    self as model, Availability, Binding, DriverOutcome, DriverPhase, History, Owner, Stage,
+    ThreadObservation, WriterSnapshot,
 };
 use std::{
     collections::VecDeque,
@@ -132,6 +133,59 @@ pub(super) fn stage_cell(cell: &Cell, stage: Stage, native_code: Option<u32>) {
 pub(super) fn stage_weak(cell: &Option<Weak<Cell>>, stage: Stage, native_code: Option<u32>) {
     if let Some(cell) = cell.as_ref().and_then(Weak::upgrade) {
         stage_cell(&cell, stage, native_code);
+    }
+}
+
+/// Only a weak diagnostic cell survives across the existing driver operation.
+/// This cannot keep a writer, sender, lease or native thread alive.
+pub(super) struct DriverObservation {
+    cell: Option<Weak<Cell>>,
+    phase: DriverPhase,
+}
+
+pub(super) fn driver(
+    attempt_id: &str,
+    request_sha256: &str,
+    phase: DriverPhase,
+) -> DriverObservation {
+    let observation = DriverObservation {
+        cell: get(attempt_id).and_then(|cell| {
+            let matches = match cell.state.try_lock() {
+                Ok(state) => state.history.snapshot().binding.request_sha256 == request_sha256,
+                Err(_) => {
+                    dropped();
+                    false
+                }
+            };
+            matches.then(|| Arc::downgrade(&cell))
+        }),
+        phase,
+    };
+    observation.record(DriverOutcome::Attempted);
+    observation
+}
+
+impl DriverObservation {
+    fn record(&self, outcome: DriverOutcome) {
+        if let Some(cell) = self.cell.as_ref().and_then(Weak::upgrade) {
+            if let Ok(mut state) = cell.state.try_lock() {
+                state.history.driver_transition(self.phase, outcome);
+                changed();
+            } else {
+                dropped();
+            }
+        }
+    }
+
+    /// Preserve the operation and its exact error; observations cannot decide it.
+    pub(super) fn run<T, E>(self, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let result = operation();
+        self.record(if result.is_ok() {
+            DriverOutcome::Succeeded
+        } else {
+            DriverOutcome::Failed
+        });
+        result
     }
 }
 

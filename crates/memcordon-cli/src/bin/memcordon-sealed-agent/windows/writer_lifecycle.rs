@@ -44,6 +44,41 @@ pub enum Stage {
     AdmissionRetired,
     AdmissionRetireFailed,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DriverPhase {
+    RecordRetire,
+    CleanupCompletion,
+    TerminalOutboxStage,
+    TerminalDelivery,
+    TerminalAckWait,
+    AckValidation,
+    AckCommit,
+    AckTombstoneStage,
+    JobAdmissionRetire,
+    GuardianReceiptRemove,
+    WriterRetire,
+    PublicationGuardAcquire,
+    AttemptRecordRemove,
+    AckTombstoneComplete,
+    RetirementReceiptDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DriverOutcome {
+    Attempted,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DriverEvent {
+    pub sequence: u64,
+    pub phase: DriverPhase,
+    pub outcome: DriverOutcome,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub sequence: u64,
@@ -66,6 +101,8 @@ pub struct HistoryRecord {
     pub registered: bool,
     pub removed: bool,
     pub admission_retired: bool,
+    pub last_driver_event: Option<DriverEvent>,
+    pub first_driver_failure: Option<DriverEvent>,
 }
 pub struct History {
     record: HistoryRecord,
@@ -90,6 +127,8 @@ impl History {
                 registered: false,
                 removed: false,
                 admission_retired: false,
+                last_driver_event: None,
+                first_driver_failure: None,
             },
             events: VecDeque::new(),
         };
@@ -154,6 +193,19 @@ impl History {
         let mut record = self.record.clone();
         record.events = self.events.iter().cloned().collect();
         record
+    }
+
+    pub fn driver_transition(&mut self, phase: DriverPhase, outcome: DriverOutcome) {
+        self.bump();
+        let event = DriverEvent {
+            sequence: self.record.sequence,
+            phase,
+            outcome,
+        };
+        if outcome == DriverOutcome::Failed && self.record.first_driver_failure.is_none() {
+            self.record.first_driver_failure = Some(event.clone());
+        }
+        self.record.last_driver_event = Some(event);
     }
 }
 
@@ -285,6 +337,17 @@ fn correlation(snapshot: &Snapshot, token: &str) -> Value {
         "historical_filename_correlation_only":true,"current_file_binding":false,"retirement_proof":false})
 }
 
+/// Filename text is historical correlation, never current object identity.
+pub fn filename_correlations(snapshot: &Snapshot, tokens: &[String]) -> Value {
+    json!({"name_sample":"last-successful-admission-name-sample",
+        "name_sample_order_relative_to_later_unproved":true,
+        "diagnostic_only":true,"current_file_binding":false,"retirement_proof":false,
+        "later_history_state":snapshot.history,"later_evicted":snapshot.evicted,"later_dropped":snapshot.dropped,
+        "later_sample_changed":snapshot.changed,"later_completed_before_original_cutoff":snapshot.completed_before_cutoff,
+        "names":tokens.iter().take(NAME_TOKENS).map(|token|correlation(snapshot,token)).collect::<Vec<_>>(),
+        "names_omitted":tokens.len().saturating_sub(NAME_TOKENS)})
+}
+
 /// Inputs are primitive copies from a bounded nonblocking observation, never lanes or handles.
 pub fn diagnostic(snapshot: &Snapshot, writer_tokens: &[String]) -> Value {
     let mut rows = Vec::new();
@@ -314,6 +377,7 @@ pub fn diagnostic(snapshot: &Snapshot, writer_tokens: &[String]) -> Value {
             json!({"binding":history.binding,"generation":history.generation,"sequence":history.sequence,
                 "stage":history.stage,"last_native_error":history.last_native_error,"last_native_error_stage":history.last_native_error_stage,
                 "first_failed_transition":history.first_failure_event,
+                "last_driver_event":history.last_driver_event,"first_driver_failure":history.first_driver_failure,
                 "reservation_published":history.reservation_published,"registered":history.registered,
                 "registry_removed":history.removed,"admission_retirement_returned_ok":history.admission_retired,
                 "events_omitted":history.omitted_events.saturating_add(history.events.len() as u64),
@@ -352,6 +416,117 @@ pub fn diagnostic(snapshot: &Snapshot, writer_tokens: &[String]) -> Value {
         let omitted = value["records_omitted"]
             .as_u64()
             .expect("fixed omission count");
+        value["records_omitted"] = json!(omitted.saturating_add(1));
+    }
+    value
+}
+
+/// Compare copied historical observations only; missing rows never prove absence.
+pub fn temporal_comparison(first: &Snapshot, later: &Snapshot) -> Value {
+    fn thread_identity(thread: &ThreadObservation) -> Option<(u32, u64)> {
+        match thread {
+            ThreadObservation::Running { tid, birth }
+            | ThreadObservation::Exited { tid, birth }
+                if *tid > 0 && *birth > 0 =>
+            {
+                Some((*tid, *birth))
+            }
+            _ => None,
+        }
+    }
+    let mut rows = Vec::new();
+    let bounded = &first.records[..first.records.len().min(JOURNAL_RECORDS)];
+    let prioritized = bounded
+        .iter()
+        .filter(|row| row.registry_present == Some(true))
+        .chain(
+            bounded
+                .iter()
+                .filter(|row| row.registry_present != Some(true)),
+        );
+    for row in prioritized.take(OUTPUT_ROWS) {
+        let history = &row.history;
+        if !valid(history) {
+            rows.push(json!({"classification":"unbound-invalid-first-record"}));
+            continue;
+        }
+        let matches = later
+            .records
+            .iter()
+            .take(JOURNAL_RECORDS)
+            .filter(|candidate| {
+                candidate.history.binding == history.binding
+                    && candidate.history.generation == history.generation
+            })
+            .collect::<Vec<_>>();
+        let matching = (matches.len() == 1).then(|| matches[0]);
+        let same_thread = matching.is_some_and(|candidate| {
+            thread_identity(&row.thread).is_some()
+                && thread_identity(&row.thread) == thread_identity(&candidate.thread)
+        });
+        let reason = if !first.completed_before_cutoff || !later.completed_before_cutoff {
+            "unbound-original-cutoff"
+        } else if first.history != Availability::Available
+            || later.history != Availability::Available
+        {
+            "unbound-history-unavailable"
+        } else if first.dropped > 0 || later.dropped > 0 {
+            "unbound-diagnostic-loss"
+        } else if first.changed || later.changed || row.changed || history.binding_changed {
+            "unbound-sample-changed"
+        } else if matches.len() > 1 {
+            "unbound-ambiguous-generation"
+        } else if let Some(candidate) = matching {
+            if !valid(&candidate.history) || candidate.changed || candidate.history.binding_changed
+            {
+                "unbound-later-record-changed-or-invalid"
+            } else if history.binding.owner.is_none() {
+                "unbound-producer-incarnation"
+            } else if candidate.history.sequence < history.sequence {
+                "unbound-sequence-regressed"
+            } else if !same_thread {
+                "unbound-retained-thread-identity"
+            } else {
+                "same-generation-and-retained-thread-observed"
+            }
+        } else if later.records.iter().take(JOURNAL_RECORDS).any(|candidate| {
+            candidate.history.binding.attempt_id == history.binding.attempt_id
+                && candidate.history.generation != history.generation
+        }) {
+            "different-generation-observed"
+        } else if later.evicted > first.evicted {
+            "unavailable-source-not-retained-after-eviction"
+        } else {
+            "unavailable-source-not-retained"
+        };
+        rows.push(json!({"binding":history.binding,"classification":reason,
+            "same_generation_tuple_observed":matching.is_some(),"same_retained_thread_identity_observed":same_thread,
+            "first_sequence":history.sequence,"later_sequence":matching.map(|candidate|candidate.history.sequence),
+            "first_writer_stage":history.stage,"later_writer_stage":matching.map(|candidate|candidate.history.stage),
+            "first_driver_event":history.last_driver_event,
+            "later_driver_event":matching.and_then(|candidate|candidate.history.last_driver_event.as_ref()),
+            "first_driver_failure":matching.and_then(|candidate|candidate.history.first_driver_failure.as_ref()),
+            "continuous_thread_liveness_proved":false,"current_file_binding":false,"retirement_proof":false}));
+    }
+    let mut value = json!({"format":"memcordon.writer-lifecycle-temporal-observation","revision":1,
+        "diagnostic_only":true,"acceptance_authority":false,"retirement_proof":false,"current_file_binding":false,
+        "independent_samples_not_atomic":true,"first_evicted":first.evicted,"later_evicted":later.evicted,
+        "first_dropped":first.dropped,"later_dropped":later.dropped,"records":rows,
+        "records_omitted":first.records.len().saturating_sub(OUTPUT_ROWS)});
+    while serde_json::to_vec(&value)
+        .expect("fixed temporal JSON")
+        .len()
+        > RECORD_BYTES
+    {
+        if value["records"]
+            .as_array_mut()
+            .expect("fixed rows")
+            .pop()
+            .is_none()
+        {
+            break;
+        }
+        let omitted = value["records_omitted"].as_u64().expect("fixed count");
         value["records_omitted"] = json!(omitted.saturating_add(1));
     }
     value

@@ -35,6 +35,8 @@ use super::job::{BoundedProcessSnapshot, Job, JobNotification};
 use super::pipe::{self, OwnedHandle, PipeListener, PipePreparationError};
 use super::process::{GuardianProcess, StreamSet, SuspendedTarget};
 use super::security::{SecurityDescriptor, private_pipe_sddl};
+use super::writer_lifecycle::{self, DriverPhase};
+use super::writer_observation::driver;
 
 #[path = "settlement_observation.rs"]
 mod settlement_observation;
@@ -1342,6 +1344,7 @@ fn handle_control(
                     let diagnostic = super::writer_lifecycle::diagnostic(&snapshot, names);
                     settlement_observation::WriterStatus::LocalSnapshot {
                         detail:serde_json::to_string(&diagnostic).unwrap_or_else(|_| "{\"state\":\"serialization-unavailable\",\"retirement_proof\":false}".into()),
+                        snapshot: Box::new(snapshot),
                     }
                 });
                 if let Some(observed) = observed {
@@ -1359,6 +1362,12 @@ fn handle_control(
                 Err(error) => {
                     let mut detail = error.clone();
                     if let Some(observed) = writer_observation.detail() {
+                        detail.push_str("; ");
+                        detail.push_str(&observed);
+                    }
+                    if let Some(observed) = admission_snapshot.as_ref().and_then(|snapshot| {
+                        writer_observation.final_name_detail(&snapshot.writer_tokens)
+                    }) {
                         detail.push_str("; ");
                         detail.push_str(&observed);
                     }
@@ -1891,7 +1900,8 @@ fn handle_control(
                             let terminal_transport = pipe::SynchronousIoDeadline::start(
                                 Instant::now() + Duration::from_secs(30),
                             )?;
-                            pipe::write_frame(connection, &response).map_err(|secondary| {
+                            driver(&attempt_id, &request_sha256, DriverPhase::TerminalDelivery)
+                                .run(|| pipe::write_frame(connection, &response)).map_err(|secondary| {
                                 format!(
                                     "{primary_detail}; secondary bound rejection delivery failure: {secondary}"
                                 )
@@ -1921,11 +1931,11 @@ fn handle_control(
                                         "{primary_detail}; secondary terminal retirement failure: {secondary}"
                                     )
                                 })?;
-                                pipe::write_frame_until(
+                                driver(&attempt_id, &request_sha256, DriverPhase::RetirementReceiptDelivery).run(|| pipe::write_frame_until(
                                     connection,
                                     &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
                                     terminal_cutoff,
-                                )
+                                ))
                                 .map_err(|secondary| {
                                     format!(
                                         "{primary_detail}; secondary terminal retirement receipt failure: {secondary}"
@@ -4101,7 +4111,12 @@ fn launch_attempt(
             pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))
                 .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
         (|| -> Result<(), String> {
-            pipe::write_frame(connection, &response)?;
+            driver(
+                &request.attempt_id,
+                &request.request_sha256,
+                DriverPhase::TerminalDelivery,
+            )
+            .run(|| pipe::write_frame(connection, &response))?;
             Ok(())
         })()
         .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
@@ -4125,11 +4140,18 @@ fn launch_attempt(
         let retired = record
             .completed_terminal_retired_receipt()
             .map_err(|error| LaunchAttemptError::terminal_transport("retirement-receipt", error))?;
-        pipe::write_frame_until(
-            connection,
-            &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
-            terminal_cutoff,
+        driver(
+            &request.attempt_id,
+            &request.request_sha256,
+            DriverPhase::RetirementReceiptDelivery,
         )
+        .run(|| {
+            pipe::write_frame_until(
+                connection,
+                &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+                terminal_cutoff,
+            )
+        })
         .map_err(|error| LaunchAttemptError::terminal_transport("retirement-delivery", error))?;
     }
     Ok(())
@@ -4797,32 +4819,35 @@ fn wait_for_terminal_acknowledgment(
     request_sha256: &str,
     terminal_response_sha256: &str,
 ) -> Result<(), String> {
-    let transport = pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))?;
-    let result = (|| match pipe::read_frame::<WindowsLauncherRequestV4>(connection)? {
-        WindowsLauncherRequestV4::TerminalAcknowledged {
-            schema_version,
-            attempt_id: received_attempt_id,
-            nonce: received_nonce,
-            request_sha256: received_request_sha256,
-            terminal_response_sha256: received_response_sha256,
-        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
-            && received_attempt_id == attempt_id
-            && received_nonce == nonce
-            && received_request_sha256 == request_sha256
-            && received_response_sha256 == terminal_response_sha256 =>
-        {
-            Ok(())
+    driver(attempt_id, request_sha256, DriverPhase::TerminalAckWait).run(|| {
+        let transport =
+            pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))?;
+        let result = (|| match pipe::read_frame::<WindowsLauncherRequestV4>(connection)? {
+            WindowsLauncherRequestV4::TerminalAcknowledged {
+                schema_version,
+                attempt_id: received_attempt_id,
+                nonce: received_nonce,
+                request_sha256: received_request_sha256,
+                terminal_response_sha256: received_response_sha256,
+            } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
+                && received_attempt_id == attempt_id
+                && received_nonce == nonce
+                && received_request_sha256 == request_sha256
+                && received_response_sha256 == terminal_response_sha256 =>
+            {
+                Ok(())
+            }
+            _ => Err("control did not acknowledge the bound terminal response".to_owned()),
+        })();
+        let settlement = transport.finish();
+        match (result, settlement) {
+            (Err(primary), Err(secondary)) => {
+                Err(format!("{primary}; terminal transport: {secondary}"))
+            }
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
         }
-        _ => Err("control did not acknowledge the bound terminal response".to_owned()),
-    })();
-    let settlement = transport.finish();
-    match (result, settlement) {
-        (Err(primary), Err(secondary)) => {
-            Err(format!("{primary}; terminal transport: {secondary}"))
-        }
-        (Err(primary), _) => Err(primary),
-        (Ok(()), result) => result,
-    }
+    })
 }
 
 fn certify_cleanup_process_creation(

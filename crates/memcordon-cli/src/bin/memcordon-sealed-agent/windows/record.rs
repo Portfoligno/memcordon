@@ -31,6 +31,8 @@ use windows_sys::Win32::System::Threading::{
 
 use super::package;
 use super::pipe::OwnedHandle;
+use super::writer_lifecycle::DriverPhase;
+use super::writer_observation::driver;
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
@@ -621,23 +623,62 @@ impl WindowsAttemptRecordV1 {
     }
 
     pub fn retire(&mut self) -> Result<(), String> {
-        self.transition(WindowsAttemptStateV1::Empty)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::RecordRetire,
+        )
+        .run(|| self.transition(WindowsAttemptStateV1::Empty))?;
         self.cleanup_state.termination_requested = true;
         self.cleanup_state.active_processes_zero = true;
         self.cleanup_state.guardian_reaped = true;
         self.cleanup_state.final_handles_closed = true;
-        self.store()?;
-        super::attempt_store::retire(&self.attempt_id)?;
-        let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::CleanupCompletion,
+        )
+        .run(|| self.store())?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::WriterRetire,
+        )
+        .run(|| super::attempt_store::retire(&self.attempt_id))?;
+        let _owner = driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::PublicationGuardAcquire,
+        )
+        .run(|| super::attempt_store::PublicationGuard::acquire(&self.attempt_id))?;
 
-        fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
-        remove_guardian_receipt(&self.attempt_id)
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AttemptRecordRemove,
+        )
+        .run(|| {
+            fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())
+        })?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::GuardianReceiptRemove,
+        )
+        .run(|| remove_guardian_receipt(&self.attempt_id))
     }
 
     pub fn complete_retirement(&mut self) -> Result<(), String> {
-        self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)?;
-        self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
-        self.store()
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::CleanupCompletion,
+        )
+        .run(|| {
+            self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)?;
+            self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
+            self.store()
+        })
     }
 
     pub fn stage_terminal_proof(
@@ -994,10 +1035,17 @@ impl WindowsAttemptRecordV1 {
         &mut self,
         response: &memcordon_core::WindowsLauncherResponseV4,
     ) -> Result<(), String> {
-        self.stage_terminal_response_with_store(response, &mut |record| record.store())?;
-        // The exact relay event remains queryable until the outbox and its
-        // completed proof are durable. It no longer needs a service owner then.
-        super::launcher_service::retire_relay_retirement_event(&self.attempt_id)
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::TerminalOutboxStage,
+        )
+        .run(|| {
+            self.stage_terminal_response_with_store(response, &mut |record| record.store())?;
+            // The exact relay event remains queryable until the outbox and its
+            // completed proof are durable. It no longer needs a service owner then.
+            super::launcher_service::retire_relay_retirement_event(&self.attempt_id)
+        })
     }
 
     fn stage_terminal_response_with_store<F>(
@@ -1315,26 +1363,75 @@ impl WindowsAttemptRecordV1 {
     }
 
     pub fn acknowledge_terminal_response(&mut self) -> Result<(), String> {
-        if self.terminal_response_json.is_none() {
-            return Err("attempt has no durable terminal outbox to acknowledge".to_owned());
-        }
-        let retired = self.terminal_retired_receipt(&self.nonce)?;
-        // Validate the exact disposition's checked authority before committing ACK.
-        let tombstone = ack_tombstone_for(self, &retired)?;
+        let tombstone = driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AckValidation,
+        )
+        .run(|| {
+            if self.terminal_response_json.is_none() {
+                return Err("attempt has no durable terminal outbox to acknowledge".to_owned());
+            }
+            let retired = self.terminal_retired_receipt(&self.nonce)?;
+            // Validate the exact disposition's checked authority before committing ACK.
+            ack_tombstone_for(self, &retired)
+        })?;
         if self.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::AckCommitted {
             self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::AckCommitted;
-            self.store()?;
+            driver(
+                &self.attempt_id,
+                &self.request_sha256,
+                DriverPhase::AckCommit,
+            )
+            .run(|| self.store())?;
         }
-        stage_ack_tombstone(self, tombstone)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AckTombstoneStage,
+        )
+        .run(|| stage_ack_tombstone(self, tombstone))?;
         if self.job_closure_contract.is_some() {
-            retire_admission(&self.attempt_id)?;
+            driver(
+                &self.attempt_id,
+                &self.request_sha256,
+                DriverPhase::JobAdmissionRetire,
+            )
+            .run(|| retire_admission(&self.attempt_id))?;
         }
-        remove_guardian_receipt(&self.attempt_id)?;
-        super::attempt_store::retire(&self.attempt_id)?;
-        let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::GuardianReceiptRemove,
+        )
+        .run(|| remove_guardian_receipt(&self.attempt_id))?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::WriterRetire,
+        )
+        .run(|| super::attempt_store::retire(&self.attempt_id))?;
+        let _owner = driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::PublicationGuardAcquire,
+        )
+        .run(|| super::attempt_store::PublicationGuard::acquire(&self.attempt_id))?;
 
-        fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
-        complete_ack_tombstone(&self.attempt_id, &self.request_sha256)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AttemptRecordRemove,
+        )
+        .run(|| {
+            fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())
+        })?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AckTombstoneComplete,
+        )
+        .run(|| complete_ack_tombstone(&self.attempt_id, &self.request_sha256))?;
         Ok(())
     }
 
@@ -5204,8 +5301,10 @@ pub fn acknowledge_terminal_response(
     nonce: &str,
     request_sha256: &str,
 ) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
-    let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
-    acknowledge_terminal_response_reserved(attempt_id, nonce, request_sha256)
+    driver(attempt_id, request_sha256, DriverPhase::AckValidation).run(|| {
+        let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
+        acknowledge_terminal_response_reserved(attempt_id, nonce, request_sha256)
+    })
 }
 
 fn acknowledge_terminal_response_reserved(

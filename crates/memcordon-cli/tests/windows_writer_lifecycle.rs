@@ -61,6 +61,188 @@ fn registered() -> History {
 }
 
 #[test]
+fn driver_progress_preserves_writer_state_and_first_failure() {
+    let mut history = registered();
+    history.transition(Stage::PublicationCompleted, None);
+    let before = history.snapshot();
+    history.driver_transition(DriverPhase::TerminalAckWait, DriverOutcome::Attempted);
+    history.driver_transition(DriverPhase::TerminalAckWait, DriverOutcome::Failed);
+    history.driver_transition(DriverPhase::AckValidation, DriverOutcome::Failed);
+    history.driver_transition(DriverPhase::WriterRetire, DriverOutcome::Succeeded);
+    let after = history.snapshot();
+    assert_eq!(after.stage, before.stage);
+    assert_eq!(after.registered, before.registered);
+    assert!(!after.removed);
+    assert!(!after.admission_retired);
+    assert!(after.first_failure_event.is_none());
+    assert_eq!(after.sequence, before.sequence + 4);
+    assert_eq!(
+        after.first_driver_failure.unwrap().phase,
+        DriverPhase::TerminalAckWait
+    );
+    assert_eq!(
+        after.last_driver_event.unwrap().outcome,
+        DriverOutcome::Succeeded
+    );
+    let mut all_phases = registered();
+    for phase in [
+        DriverPhase::RecordRetire,
+        DriverPhase::CleanupCompletion,
+        DriverPhase::TerminalOutboxStage,
+        DriverPhase::TerminalDelivery,
+        DriverPhase::TerminalAckWait,
+        DriverPhase::AckValidation,
+        DriverPhase::AckCommit,
+        DriverPhase::AckTombstoneStage,
+        DriverPhase::JobAdmissionRetire,
+        DriverPhase::GuardianReceiptRemove,
+        DriverPhase::WriterRetire,
+        DriverPhase::PublicationGuardAcquire,
+        DriverPhase::AttemptRecordRemove,
+        DriverPhase::AckTombstoneComplete,
+        DriverPhase::RetirementReceiptDelivery,
+    ] {
+        all_phases.driver_transition(phase, DriverOutcome::Attempted);
+        all_phases.driver_transition(phase, DriverOutcome::Succeeded);
+        let record = all_phases.snapshot();
+        assert_eq!(record.last_driver_event.as_ref().unwrap().phase, phase);
+        assert_eq!(record.stage, Stage::Registered);
+        assert!(!record.removed && !record.admission_retired);
+        assert!(record.first_driver_failure.is_none());
+        assert!(serde_json::to_value(&record.last_driver_event).unwrap()["phase"].is_string());
+    }
+    let value = diagnostic(&snapshot(vec![row(history)]), &[]);
+    assert_eq!(value["records"][0]["stage"], "publication-completed");
+    assert_eq!(
+        value["records"][0]["last_driver_event"]["phase"],
+        "writer-retire"
+    );
+    assert_eq!(value["retirement_proof"], false);
+}
+
+#[test]
+fn temporal_progress_requires_exact_generation_binding_and_retained_thread() {
+    let mut history = registered();
+    let first = snapshot(vec![row(registered())]);
+    history.driver_transition(DriverPhase::AckCommit, DriverOutcome::Attempted);
+    history.driver_transition(DriverPhase::AckCommit, DriverOutcome::Failed);
+    let mut later_row = row(history);
+    later_row.thread = ThreadObservation::Exited { tid: 7, birth: 789 };
+    let later = snapshot(vec![later_row]);
+    let value = temporal_comparison(&first, &later);
+    assert_eq!(
+        value["records"][0]["classification"],
+        "same-generation-and-retained-thread-observed"
+    );
+    assert_eq!(
+        value["records"][0]["later_driver_event"]["phase"],
+        "ack-commit"
+    );
+    assert_eq!(
+        value["records"][0]["first_driver_failure"]["outcome"],
+        "failed"
+    );
+    assert_eq!(
+        value["records"][0]["continuous_thread_liveness_proved"],
+        false
+    );
+    assert_eq!(value["current_file_binding"], false);
+    assert_eq!(value["retirement_proof"], false);
+
+    let mut changed = later.clone();
+    changed.records[0].thread = ThreadObservation::Exited { tid: 7, birth: 790 };
+    assert_eq!(
+        temporal_comparison(&first, &changed)["records"][0]["classification"],
+        "unbound-retained-thread-identity"
+    );
+    changed = later.clone();
+    changed.records[0].history.binding.request_sha256 =
+        memcordon_core::hash_bytes(b"different request").into();
+    assert_eq!(
+        temporal_comparison(&first, &changed)["records"][0]["same_generation_tuple_observed"],
+        false
+    );
+    changed = later.clone();
+    changed.records[0].history.generation += 1;
+    changed.records[0].history.binding.generation += 1;
+    assert_eq!(
+        temporal_comparison(&first, &changed)["records"][0]["classification"],
+        "different-generation-observed"
+    );
+    changed = later.clone();
+    changed.records[0].history.binding.owner = Some(Owner {
+        pid: 123,
+        birth: 457,
+    });
+    assert_eq!(
+        temporal_comparison(&first, &changed)["records"][0]["same_generation_tuple_observed"],
+        false
+    );
+}
+
+#[test]
+fn temporal_missing_loss_cutoff_and_contention_never_become_absence_proof() {
+    let first = snapshot(vec![row(registered())]);
+    let mut later = snapshot(Vec::new());
+    assert_eq!(
+        temporal_comparison(&first, &later)["records"][0]["classification"],
+        "unavailable-source-not-retained"
+    );
+    later.evicted = 1;
+    assert_eq!(
+        temporal_comparison(&first, &later)["records"][0]["classification"],
+        "unavailable-source-not-retained-after-eviction"
+    );
+    later = first.clone();
+    later.dropped = 1;
+    let value = temporal_comparison(&first, &later);
+    assert_eq!(
+        value["records"][0]["classification"],
+        "unbound-diagnostic-loss"
+    );
+    assert_eq!(value["records"][0]["same_generation_tuple_observed"], true);
+    later.dropped = 0;
+    later.history = Availability::Busy;
+    assert_eq!(
+        temporal_comparison(&first, &later)["records"][0]["classification"],
+        "unbound-history-unavailable"
+    );
+    later.completed_before_cutoff = false;
+    assert_eq!(
+        temporal_comparison(&first, &later)["records"][0]["classification"],
+        "unbound-original-cutoff"
+    );
+    let many = snapshot(
+        (0..100)
+            .map(|seed| row(History::new(binding(seed))))
+            .collect(),
+    );
+    let value = temporal_comparison(&many, &many);
+    assert!(value["records"].as_array().unwrap().len() <= OUTPUT_ROWS);
+    assert!(serde_json::to_vec(&value).unwrap().len() <= RECORD_BYTES);
+    assert!(value["records_omitted"].as_u64().unwrap() >= 92);
+    let mut retained = (0..16)
+        .map(|seed| row(History::new(binding(seed))))
+        .collect::<Vec<_>>();
+    for row in retained.iter_mut().take(15) {
+        row.registry_present = Some(false);
+    }
+    let prioritized = snapshot(retained);
+    let value = temporal_comparison(&prioritized, &prioritized);
+    assert_eq!(value["records"][0]["binding"]["generation"], 16);
+    let tokens = vec![binding(15).attempt_id; 100];
+    let names = filename_correlations(&prioritized, &tokens);
+    assert_eq!(names["names"].as_array().unwrap().len(), NAME_TOKENS);
+    assert_eq!(names["names_omitted"], 100 - NAME_TOKENS);
+    assert_eq!(
+        names["names"][0]["classification"],
+        "unbound-local-state-unavailable"
+    );
+    assert_eq!(names["name_sample_order_relative_to_later_unproved"], true);
+    assert_eq!(names["current_file_binding"], false);
+}
+
+#[test]
 fn healthy_pending_and_removed_lifecycle_are_distinct_and_never_retirement_authority() {
     let live = snapshot(vec![row(registered())]);
     let token = live.records[0].history.binding.attempt_id.clone();

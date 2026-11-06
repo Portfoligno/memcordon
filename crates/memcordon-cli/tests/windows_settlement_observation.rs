@@ -2,6 +2,8 @@
 mod observation;
 #[path = "../src/bin/memcordon-sealed-agent/windows/settlement.rs"]
 mod settlement;
+#[path = "../src/bin/memcordon-sealed-agent/windows/writer_lifecycle.rs"]
+pub mod writer_lifecycle;
 use observation::{Observation, WriterStatus};
 use std::{
     cell::Cell,
@@ -18,6 +20,7 @@ fn local_lifecycle_detail_is_one_bounded_historical_sample_without_changing_quie
         assert!(!observed.observe(false, deadline, || {
             calls.set(calls.get() + 1);
             WriterStatus::LocalSnapshot {
+                snapshot: Box::default(),
                 detail: "界".repeat(10000),
             }
         }));
@@ -46,6 +49,7 @@ fn true_quiescence_is_unchanged_and_false_queries_only_once() {
         assert!(!observation.observe(false, cutoff, || {
             calls.set(calls.get() + 1);
             WriterStatus::LocalSnapshot {
+                snapshot: Box::default(),
                 detail: "no-quarantined-lane-observed".into(),
             }
         }));
@@ -88,6 +92,7 @@ fn contended_owned_registry_is_unavailable_without_waiting_or_reclassification()
             match registry.try_lock() {
                 Ok(_) => panic!("registry should remain held"),
                 Err(_) => WriterStatus::LocalSnapshot {
+                    snapshot: Box::default(),
                     detail: "unavailable-nonblocking-query".into(),
                 },
             }
@@ -108,6 +113,7 @@ fn actual_native_error_and_unicode_detail_are_bounded_and_never_retirement_proof
     assert!(
         !observation.observe(false, Instant::now() + Duration::from_secs(1), || {
             WriterStatus::LocalSnapshot {
+                snapshot: Box::default(),
                 detail: format!("publisher_native_code=5; {}", "界".repeat(10000)),
             }
         })
@@ -117,4 +123,76 @@ fn actual_native_error_and_unicode_detail_are_bounded_and_never_retirement_proof
     assert!(text.contains("detail-truncated=true"));
     assert!(text.contains("retirement-proof=false"));
     assert!(text.len() < 8700);
+}
+
+#[test]
+fn later_sample_is_separate_bounded_and_never_collected_after_original_cutoff() {
+    let now = Instant::now();
+    let cutoff = now + Duration::from_secs(20);
+    let mut observation = Observation::default();
+    let calls = Cell::new(0);
+    let query = || {
+        calls.set(calls.get() + 1);
+        WriterStatus::LocalSnapshot {
+            detail: format!("query={}", calls.get()),
+            snapshot: Box::default(),
+        }
+    };
+    assert!(!observation.observe_at(now, false, cutoff, query));
+    assert!(!observation.observe_at(now + Duration::from_secs(14), false, cutoff, query));
+    assert_eq!(calls.get(), 1);
+    assert!(!observation.observe_at(now + Duration::from_secs(15), false, cutoff, query));
+    assert_eq!(calls.get(), 2);
+    for sampled in [now + Duration::from_secs(19), cutoff] {
+        assert!(!observation.observe_at(sampled, false, cutoff, || panic!("only two queries")));
+    }
+    let text = observation.detail().unwrap();
+    assert!(text.contains("first-false-quiescence=[sample-ordinal=1"));
+    assert!(text.contains("later-pre-cutoff=[sample-ordinal=2; sampled-after-first-ms=15000"));
+    assert!(text.contains("query=1"));
+    assert!(text.contains("query=2"));
+    assert!(text.contains("temporal-comparison="));
+    assert!(text.len() < 26 * 1024);
+    let final_names = observation.final_name_detail(&[]).unwrap();
+    assert!(final_names.contains("last-successful-admission-name-sample"));
+    assert!(final_names.contains("current-file-binding=false"));
+
+    let mut missed = Observation::default();
+    assert!(!missed.observe_at(now, false, cutoff, query));
+    assert!(!missed.observe_at(cutoff, false, cutoff, || panic!("post-cutoff query")));
+    let text = missed.detail().unwrap();
+    assert!(text.contains("query=3"));
+    assert!(text.contains("later-pre-cutoff=[sample-ordinal=2; sampled-after-first-ms=20000; owned-writer-registry=unavailable-original-cutoff"));
+    assert!(!text.contains("temporal-comparison="));
+    assert!(
+        missed
+            .final_name_detail(&[])
+            .unwrap()
+            .contains("unavailable-original-cutoff")
+    );
+}
+
+#[test]
+fn a_changed_cutoff_cannot_renew_the_diagnostic_window() {
+    let now = Instant::now();
+    let cutoff = now + Duration::from_secs(20);
+    let mut observation = Observation::default();
+    assert!(
+        !observation.observe_at(now, false, cutoff, || WriterStatus::LocalSnapshot {
+            detail: "first".into(),
+            snapshot: Box::default()
+        })
+    );
+    assert!(!observation.observe_at(
+        now + Duration::from_secs(16),
+        false,
+        cutoff + Duration::from_secs(20),
+        || panic!("renewed window")
+    ));
+    assert!(
+        observation
+            .detail()
+            .unwrap()
+            .contains("unavailable-cutoff-changed")
+    );
 }
