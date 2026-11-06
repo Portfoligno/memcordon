@@ -338,10 +338,19 @@ pub struct Binding {
     pub cutoff_qpc: u64,
     pub frequency: u64,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetentionMode {
+    #[default]
+    Prefix,
+    RollingCompleted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsumerSpec {
     pub version: u32,
+    pub retention: RetentionMode,
     pub session_name: String,
     pub session_guid: [u8; 16],
     pub pid: u32,
@@ -350,7 +359,7 @@ pub struct ConsumerSpec {
 }
 impl ConsumerSpec {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1
+        if self.version != 2
             || self.pid == 0
             || self.birth == 0
             || self.binding.frequency == 0
@@ -438,6 +447,8 @@ pub struct History {
     pub timestamp_regression: bool,
     pub dropped_creates: u64,
     pub earliest_dropped_create_qpc: Option<u64>,
+    pub evicted_pairs: u64,
+    pub maximum_evicted_pair_qpc: Option<u64>,
 }
 impl History {
     fn record(&mut self, qpc: u64) {
@@ -450,6 +461,15 @@ impl History {
         self.earliest_dropped_create_qpc = Some(
             self.earliest_dropped_create_qpc
                 .map_or(qpc, |previous| previous.min(qpc)),
+        );
+    }
+    fn evicted(&mut self, create: u64, completion: u64) {
+        self.evicted_pairs = self.evicted_pairs.saturating_add(1);
+        self.maximum_evicted_pair_qpc = Some(
+            self.maximum_evicted_pair_qpc
+                .unwrap_or(0)
+                .max(create)
+                .max(completion),
         );
     }
 }
@@ -470,7 +490,7 @@ pub struct Observation {
 impl Observation {
     pub fn validate(&self) -> Result<(), String> {
         self.spec.validate()?;
-        if self.version != 3 || self.rows.len() > MAX_ROWS {
+        if self.version != 4 || self.rows.len() > MAX_ROWS {
             return Err("FileIo record bound/version differs".into());
         }
         let history = &self.history;
@@ -484,6 +504,17 @@ impl Observation {
             || (history.dropped_creates == 0) != history.earliest_dropped_create_qpc.is_none()
             || history.dropped_creates > history.decoded_events
             || retained_events.saturating_add(history.dropped_creates) > history.decoded_events
+            || history.evicted_pairs
+                > history
+                    .decoded_events
+                    .saturating_sub(retained_events.saturating_add(history.dropped_creates))
+                    / 2
+            || (history.evicted_pairs == 0) != history.maximum_evicted_pair_qpc.is_none()
+            || (self.spec.retention == RetentionMode::Prefix && history.evicted_pairs != 0)
+            || (history.evicted_pairs != 0 && self.rows.len() != MAX_ROWS)
+            || history
+                .maximum_evicted_pair_qpc
+                .is_some_and(|qpc| qpc == 0 || qpc > history.maximum_qpc)
             || history
                 .earliest_dropped_create_qpc
                 .is_some_and(|qpc| qpc == 0 || qpc > history.maximum_qpc)
@@ -547,7 +578,7 @@ impl Collector {
         spec.validate()?;
         Ok(Self {
             observation: Observation {
-                version: 3,
+                version: 4,
                 spec,
                 rows: vec![],
                 counters: Counters::default(),
@@ -674,18 +705,53 @@ impl Collector {
             counters.ambiguous = counters.ambiguous.saturating_add(1);
             return;
         }
-        if self.pending.len() == MAX_PENDING || self.observation.rows.len() == MAX_ROWS {
+        let reusable = if self.observation.spec.retention == RetentionMode::RollingCompleted
+            && self.observation.rows.len() == MAX_ROWS
+        {
+            self.observation
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    let completion = row.completion.as_ref()?;
+                    (!row.ambiguous
+                        && !self.pending.contains_key(&row.create.irp)
+                        && !self.pending.values().any(|pending| *pending == Some(index)))
+                    .then_some((index, completion.qpc, row.create.qpc))
+                })
+                .min_by_key(|(index, completion, create)| (*completion, *create, *index))
+                .map(|(index, _, _)| index)
+        } else {
+            None
+        };
+        if self.pending.len() == MAX_PENDING
+            || (self.observation.rows.len() == MAX_ROWS && reusable.is_none())
+        {
             counters.overflow = counters.overflow.saturating_add(1);
             self.observation.history.dropped(create.qpc);
             return;
         }
-        let index = self.observation.rows.len();
+        let index = reusable.unwrap_or(self.observation.rows.len());
         self.pending.insert(create.irp, Some(index));
-        self.observation.rows.push(Row {
+        let row = Row {
             create,
             completion: None,
             ambiguous,
-        });
+        };
+        if let Some(index) = reusable {
+            let evicted = &self.observation.rows[index];
+            self.observation.history.evicted(
+                evicted.create.qpc,
+                evicted
+                    .completion
+                    .as_ref()
+                    .expect("completed reusable slot")
+                    .qpc,
+            );
+            self.observation.rows[index] = row;
+        } else {
+            self.observation.rows.push(row);
+        }
     }
     pub fn completion(&mut self, end: Completion) {
         self.observation.history.record(end.qpc);
@@ -765,18 +831,31 @@ pub fn correlate(
             &&window.started_qpc!=0&&window.started_qpc<=window.finished_qpc&&window.finished_qpc<=binding.cutoff_qpc
             &&row.create.ttid==original_thread&&row.create.qpc>=window.started_qpc
             &&row.completion.as_ref().is_some_and(|end|end.qpc>=row.create.qpc&&end.qpc<=window.finished_qpc)).collect::<Vec<_>>();
-        let prefix = matched.len()==1 && (observation.counters.overflow==0
+        let before_drop = matched.len()==1 && (observation.counters.overflow==0
             || observation.history.earliest_dropped_create_qpc.is_some_and(|frontier|matched[0].finished_qpc<frontier));
+        let after_eviction = matched.len()==1 && (observation.history.evicted_pairs==0
+            || observation.history.maximum_evicted_pair_qpc.is_some_and(|frontier|matched[0].started_qpc>frontier));
+        let interval = before_drop && after_eviction;
         let strict_pair = row.completion.as_ref().is_some_and(|end| row.create.qpc<end.qpc);
-        let attributed=complete&&prefix&&strict_pair&&!row.ambiguous&&row.create.irp!=0&&matched.len()==1;
-        json!({"create":row.create,"completion":row.completion,"ambiguous":row.ambiguous,"temporal_original_call_association":attributed,"association_scope":if attributed{Some(if observation.counters.overflow==0{"retained-decoded-history"}else{"retained-prefix-before-first-dropped-create"})}else{None},"capacity_truncation_blocks_window":matched.len()==1&&!prefix,"window":if attributed{Some(matched[0])}else{None},"observed_failed_create":attributed&&row.completion.as_ref().is_some_and(|end|end.ntstatus<0),"denied_object_proved":false})
+        let attributed=complete&&interval&&strict_pair&&!row.ambiguous&&row.create.irp!=0&&matched.len()==1;
+        let scope=if observation.spec.retention==RetentionMode::RollingCompleted && observation.history.evicted_pairs!=0 {"retained-decoded-interval-between-loss-frontiers"}
+            else if observation.counters.overflow==0 {"retained-decoded-history"} else {"retained-prefix-before-first-dropped-create"};
+        json!({"create":row.create,"completion":row.completion,"ambiguous":row.ambiguous,"temporal_original_call_association":attributed,"association_scope":if attributed{Some(scope)}else{None},"capacity_truncation_blocks_window":matched.len()==1&&!interval,"eviction_frontier_blocks_window":matched.len()==1&&!after_eviction,"dropped_create_frontier_blocks_window":matched.len()==1&&!before_drop,"window":if attributed{Some(matched[0])}else{None},"observed_failed_create":attributed&&row.completion.as_ref().is_some_and(|end|end.ntstatus<0),"denied_object_proved":false})
     }).collect::<Vec<_>>()
     } else {
         vec![]
     };
-    // Keep the first associated failed create when bounded output omits later rows.
-    rows.sort_by_key(|row| !row["observed_failed_create"].as_bool().unwrap_or(false));
-    let mut result = json!({"format":"memcordon.loader-fileio-observation","revision":3,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"valid_binding_and_record":valid,"consumer_side_header_pid_filter":true,"header_pid_may_miss_requestor_context":true,"absence_proves_no_file_activity":false,"counters":observation.counters,"history":observation.history,"capacity_truncated":observation.counters.overflow!=0,"timestamp_regression_prevents_association":observation.history.timestamp_regression,"decode":decode_diagnostic(&observation.decode),"unsupported_history_prevents_association":observation.counters.unsupported!=0,"process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,"consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,"rows":rows,"rows_omitted":0});
+    // Keep associated failures, then associated successes, ahead of context.
+    rows.sort_by_key(|row| {
+        (
+            !row["observed_failed_create"].as_bool().unwrap_or(false),
+            observation.spec.retention == RetentionMode::RollingCompleted
+                && !row["temporal_original_call_association"]
+                    .as_bool()
+                    .unwrap_or(false),
+        )
+    });
+    let mut result = json!({"format":"memcordon.loader-fileio-observation","revision":4,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"valid_binding_and_record":valid,"consumer_side_header_pid_filter":true,"header_pid_may_miss_requestor_context":true,"absence_proves_no_file_activity":false,"retention_mode":observation.spec.retention,"retained_interval":{"strictly_after_evicted_pair_qpc":observation.history.maximum_evicted_pair_qpc,"strictly_before_dropped_create_qpc":observation.history.earliest_dropped_create_qpc,"global_completeness":false},"counters":observation.counters,"history":observation.history,"capacity_truncated":observation.counters.overflow!=0||observation.history.evicted_pairs!=0,"timestamp_regression_prevents_association":observation.history.timestamp_regression,"decode":decode_diagnostic(&observation.decode),"unsupported_history_prevents_association":observation.counters.unsupported!=0,"process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,"consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,"rows":rows,"rows_omitted":0});
     let mut omitted = 0;
     while serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > CORRELATION_BYTES) {
         let Some(rows) = result["rows"].as_array_mut() else {

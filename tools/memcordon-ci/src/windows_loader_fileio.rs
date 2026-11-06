@@ -1,5 +1,5 @@
 //! Optional, owned FileIo observation; never positive workload authority.
-use memcordon_platform::windows_fileio_record::{ConsumerSpec, Observation, Window};
+use memcordon_platform::windows_fileio_record::{ConsumerSpec, Observation, StopRecord, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io;
@@ -18,9 +18,131 @@ struct Ready {
     spec: ConsumerSpec,
 }
 
-#[cfg(windows)]
 fn detail(error: impl std::fmt::Display) -> String {
     error.to_string().chars().take(1024).collect()
+}
+
+#[derive(Default)]
+pub struct Captured {
+    pub spec: Option<ConsumerSpec>,
+    pub ready: bool,
+    pub stop: Option<StopRecord>,
+    pub helper_settled: bool,
+    pub error: Option<String>,
+    pub observation: Option<Observation>,
+}
+
+fn omit_last_row(value: &mut Value) -> bool {
+    let key = if value["candidate_records"].is_array() {
+        "candidate_records"
+    } else {
+        "rows"
+    };
+    if value[key].as_array_mut().and_then(Vec::pop).is_none() {
+        return false;
+    }
+    value["rows_omitted"] = json!(
+        value["rows_omitted"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(1)
+    );
+    true
+}
+
+fn unassociated(observation: &Observation, reason: &'static str, error: Option<String>) -> Value {
+    let valid = observation.validate().is_ok();
+    let rows = if valid {
+        observation.rows.iter().map(|row| json!({
+        "create":row.create,"completion":row.completion,"ambiguous":row.ambiguous,
+        "temporal_original_call_association":false,"window":null,"denied_object_proved":false,
+    })).collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+    let mut value = json!({"state":"incomplete-unassociated","reason":reason,"error":error,
+        "spec":observation.spec.validate().is_ok().then_some(&observation.spec),"valid_record":valid,
+        "counters":observation.counters,"history":observation.history,
+        "decode":memcordon_platform::windows_fileio_record::decode_diagnostic(&observation.decode),
+        "candidate_records":rows,"rows_omitted":if valid{0}else{observation.rows.len()},
+        "process_trace_status":observation.process_trace_status,"close_trace_status":observation.close_trace_status,
+        "consumer_completed":observation.consumer_completed,"cutoff_reached":observation.cutoff_reached,
+        "temporal_original_call_association":false,"acceptance_authority":false,
+        "global_routes_complete":false,"absence_proves_no_file_activity":false,"denied_object_proved":false});
+    while serde_json::to_vec(&value).map_or(true, |bytes| {
+        bytes.len() > memcordon_platform::windows_fileio_record::CORRELATION_BYTES
+    }) {
+        if !omit_last_row(&mut value) {
+            break;
+        }
+    }
+    value
+}
+
+/// Render existing capture state only; missing listener data never supplies a
+/// thread/window, original-call association or fixture/selection authority.
+pub fn render_record(state: &Captured, listener: io::Result<Vec<u8>>) -> Value {
+    use sha2::Digest;
+    let mut value = json!({"format":"memcordon.original-loader-fileio","revision":1,
+        "diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,
+        "absence_proves_no_file_activity":false,"denied_object_proved":false,
+        "spec":state.spec.as_ref().filter(|spec|spec.validate().is_ok()),
+        "ready":state.ready,"stop":state.stop,"helper_settled":state.helper_settled,
+        "error":state.error.as_ref().map(detail)});
+    value["observation"] = match (&state.spec, &state.observation, listener) {
+        (Some(spec), Some(observation), Ok(bytes)) => {
+            value["listener_sha256"] = json!(hex::encode(sha2::Sha256::digest(&bytes)));
+            let loss_free = state.helper_settled
+                && observation.consumer_completed
+                && observation.process_trace_status == 0
+                && observation.close_trace_status == 0
+                && !observation.cutoff_reached
+                && state.stop.as_ref().is_some_and(|stop| {
+                    stop.stopped
+                        && stop.events_lost == 0
+                        && stop.log_buffers_lost == 0
+                        && stop.realtime_buffers_lost == 0
+                });
+            if !loss_free {
+                unassociated(
+                    observation,
+                    "session loss, cutoff or consumer retirement is unproved",
+                    None,
+                )
+            } else {
+                match listener_windows(&bytes, spec) {
+                    Ok((thread, windows)) => memcordon_platform::windows_fileio_record::correlate(
+                        observation,
+                        spec,
+                        thread,
+                        &windows,
+                    ),
+                    Err(error) => unassociated(
+                        observation,
+                        "original listener is invalid",
+                        Some(detail(error)),
+                    ),
+                }
+            }
+        }
+        (_, Some(observation), Err(error)) => unassociated(
+            observation,
+            "original listener is unavailable",
+            Some(detail(error)),
+        ),
+        (_, Some(observation), Ok(_)) => {
+            unassociated(observation, "consumer/session binding unavailable", None)
+        }
+        (_, None, listener) => {
+            json!({"state":"unavailable","error":listener.err().map(detail).unwrap_or_else(||"consumer/session observation unavailable".into()),"acceptance_authority":false,"absence_proves_no_file_activity":false})
+        }
+    };
+    while serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > RECORD_BYTES) {
+        if !omit_last_row(&mut value["observation"]) {
+            break;
+        }
+    }
+    value
 }
 
 fn readiness(bytes: &[u8]) -> io::Result<Option<Ready>> {
@@ -158,7 +280,6 @@ mod native {
     use memcordon_platform::test_support::windows_fileio::{
         OwnedFileIoSession, PreparedFileIoSession,
     };
-    use memcordon_platform::windows_fileio_record::StopRecord;
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::{
@@ -169,15 +290,6 @@ mod native {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    #[derive(Default)]
-    pub struct Captured {
-        pub spec: Option<ConsumerSpec>,
-        pub ready: bool,
-        pub stop: Option<StopRecord>,
-        pub helper_settled: bool,
-        pub error: Option<String>,
-        pub observation: Option<Observation>,
-    }
     pub type Shared = Arc<Mutex<Captured>>;
 
     fn update(state: &Shared, write: impl FnOnce(&mut Captured)) {
@@ -433,57 +545,12 @@ mod native {
         let state = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut value = json!({"format":"memcordon.original-loader-fileio","revision":1,"diagnostic_only":true,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false,"spec":state.spec,"ready":state.ready,"stop":state.stop,"helper_settled":state.helper_settled,"error":state.error});
-        value["observation"] = match (&state.spec, &state.observation, listener) {
-            (Some(spec), Some(observation), Ok(bytes)) => {
-                value["listener_sha256"] = json!(hex::encode(sha2::Sha256::digest(&bytes)));
-                let loss_free = state.helper_settled
-                    && observation.consumer_completed
-                    && observation.process_trace_status == 0
-                    && observation.close_trace_status == 0
-                    && !observation.cutoff_reached
-                    && state.stop.as_ref().is_some_and(|stop| {
-                        stop.stopped
-                            && stop.events_lost == 0
-                            && stop.log_buffers_lost == 0
-                            && stop.realtime_buffers_lost == 0
-                    });
-                if !loss_free {
-                    json!({"state":"incomplete-unassociated","reason":"session loss, cutoff or consumer retirement is unproved","counters":observation.counters,"history":observation.history,"decode":memcordon_platform::windows_fileio_record::decode_diagnostic(&observation.decode),"candidate_records":observation.rows,"acceptance_authority":false,"global_routes_complete":false,"denied_object_proved":false})
-                } else {
-                    match listener_windows(&bytes, spec) {
-                        Ok((thread, windows)) => {
-                            memcordon_platform::windows_fileio_record::correlate(
-                                observation,
-                                spec,
-                                thread,
-                                &windows,
-                            )
-                        }
-                        Err(error) => {
-                            json!({"state":"unavailable","error":detail(error),"acceptance_authority":false})
-                        }
-                    }
-                }
-            }
-            (_, _, Err(error)) => {
-                json!({"state":"unavailable","error":detail(error),"acceptance_authority":false})
-            }
-            _ => {
-                json!({"state":"unavailable","error":"consumer/session observation unavailable","acceptance_authority":false})
-            }
-        };
-        if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > RECORD_BYTES) {
-            value["observation"] =
-                json!({"state":"omitted-for-envelope-bound","acceptance_authority":false});
-        }
-        value
+        render_record(&state, listener)
     }
-    use sha2::Digest;
 }
 
 #[cfg(windows)]
 pub use native::{
-    Capture, Captured, OwnedCapture, Shared, callback_guard, consume_stdio, finish, record,
-    stop_collection, unavailable,
+    Capture, OwnedCapture, Shared, callback_guard, consume_stdio, finish, record, stop_collection,
+    unavailable,
 };

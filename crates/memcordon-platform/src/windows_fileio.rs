@@ -113,6 +113,7 @@ pub struct PreparedFileIoSession {
     binding: Binding,
     work: Instant,
     cleanup: Instant,
+    retention: RetentionMode,
 }
 #[derive(Debug)]
 struct StopFailure {
@@ -177,6 +178,7 @@ impl OwnedFileIoSession {
             binding,
             work,
             cleanup,
+            retention: RetentionMode::Prefix,
         })
     }
     pub fn consumer_spec(&self) -> &ConsumerSpec {
@@ -216,6 +218,10 @@ impl OwnedFileIoSession {
     }
 }
 impl PreparedFileIoSession {
+    pub fn with_retention_mode(mut self, retention: RetentionMode) -> Self {
+        self.retention = retention;
+        self
+    }
     pub fn start(self) -> io::Result<OwnedFileIoSession> {
         let Self {
             pid,
@@ -223,6 +229,7 @@ impl PreparedFileIoSession {
             binding,
             work,
             cleanup,
+            retention,
         } = self;
         live(work)?;
         let nonce = tempfile::Builder::new().prefix("mc-fileio-").tempdir()?;
@@ -232,7 +239,8 @@ impl PreparedFileIoSession {
         unique.copy_from_slice(&digest[..16]);
         let name = format!("Memcordon-FileIo-{:032x}", u128::from_be_bytes(unique));
         let spec = ConsumerSpec {
-            version: 1,
+            version: 2,
+            retention,
             session_name: name,
             session_guid: unique,
             pid,

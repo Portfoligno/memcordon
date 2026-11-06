@@ -3,7 +3,8 @@ use memcordon_platform::windows_fileio_record::*;
 
 fn spec() -> ConsumerSpec {
     ConsumerSpec {
-        version: 1,
+        version: 2,
+        retention: RetentionMode::Prefix,
         session_name: "Memcordon-FileIo-test".into(),
         session_guid: [1; 16],
         pid: 7,
@@ -49,6 +50,287 @@ fn windows() -> Vec<Window> {
         started_qpc: 10,
         finished_qpc: 30,
     }]
+}
+
+fn mode_spec(retention: RetentionMode) -> ConsumerSpec {
+    ConsumerSpec {
+        retention,
+        ..spec()
+    }
+}
+fn successful_pair(collector: &mut Collector, irp: u64, qpc: u64) {
+    collector.create(create(irp, qpc));
+    let mut completion = end(irp, qpc + 1);
+    completion.ntstatus = 0;
+    collector.completion(completion);
+}
+fn provider_shape(retention: RetentionMode) -> Observation {
+    let mut collector = Collector::new(mode_spec(retention)).unwrap();
+    for index in 0..31 {
+        successful_pair(&mut collector, index + 1, 10 + index * 2);
+    }
+    let mut root = create(1000, 110);
+    root.share_access = 0;
+    collector.create(root);
+    let mut completion = end(1000, 111);
+    completion.ntstatus = 0;
+    collector.completion(completion);
+    for index in 0..27 {
+        successful_pair(&mut collector, 2000 + index, 112 + index * 2);
+    }
+    collector.finish(0, false)
+}
+fn provider_window() -> Vec<Window> {
+    vec![Window {
+        started_qpc: 100,
+        finished_qpc: 160,
+        ..windows()[0].clone()
+    }]
+}
+
+#[test]
+fn rolling_completed_retains_the_observed_59_create_loader_interval_at_the_same_capacity() {
+    for retention in [RetentionMode::Prefix, RetentionMode::RollingCompleted] {
+        let observation = provider_shape(retention);
+        assert!(observation.validate().is_ok());
+        assert_eq!(observation.rows.len(), MAX_ROWS);
+        assert_eq!(observation.history.decoded_events, 118);
+        let value = correlate(&observation, &mode_spec(retention), 11, &provider_window());
+        assert_eq!(value["capacity_truncated"], true);
+        assert_eq!(value["absence_proves_no_file_activity"], false);
+        assert_eq!(value["global_routes_complete"], false);
+        if retention == RetentionMode::RollingCompleted {
+            assert_eq!(observation.history.evicted_pairs, 27);
+            assert_eq!(observation.history.maximum_evicted_pair_qpc, Some(63));
+            assert_eq!(observation.counters.overflow, 0);
+            assert!(row_associated(&value, 1000));
+            let root = value["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["create"]["irp"] == 1000)
+                .unwrap();
+            assert_eq!(root["create"]["create_options"], 0);
+            assert_eq!(root["create"]["file_attributes"], 0);
+            assert_eq!(root["create"]["share_access"], 0);
+            assert_eq!(
+                value["rows"][0]["association_scope"],
+                "retained-decoded-interval-between-loss-frontiers"
+            );
+        } else {
+            assert_eq!(observation.history.evicted_pairs, 0);
+            assert_eq!(observation.history.earliest_dropped_create_qpc, Some(112));
+            assert_eq!(observation.counters.overflow, 27);
+            assert!(!row_associated(&value, 1000));
+        }
+    }
+}
+
+#[test]
+fn rolling_windows_must_be_strictly_inside_both_loss_frontiers() {
+    let observation = provider_shape(RetentionMode::RollingCompleted);
+    for start in [62, 63, 64] {
+        let mut window = provider_window();
+        window[0].started_qpc = start;
+        let value = correlate(&observation, &observation.spec, 11, &window);
+        assert_eq!(row_associated(&value, 1000), start > 63);
+        let row = value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["create"]["irp"] == 1000)
+            .unwrap();
+        assert_eq!(row["eviction_frontier_blocks_window"], start <= 63);
+    }
+    for mutation in 0..4 {
+        let mut bad = observation.clone();
+        match mutation {
+            0 => bad.history.timestamp_regression = true,
+            1 => bad.counters.malformed = 1,
+            2 => bad.consumer_completed = false,
+            _ => bad.cutoff_reached = true,
+        }
+        assert!(!row_associated(
+            &correlate(&bad, &bad.spec, 11, &provider_window()),
+            1000
+        ));
+    }
+    let mut collector = Collector::new(mode_spec(RetentionMode::RollingCompleted)).unwrap();
+    for index in 0..31 {
+        successful_pair(&mut collector, index + 1, 10 + index * 2);
+    }
+    collector.create(create(1000, 110));
+    for index in 0..31 {
+        collector.create(create(2000 + index, 111 + index));
+    }
+    collector.create(create(9000, 142));
+    collector.completion(end(1000, 150));
+    let observation = collector.finish(0, false);
+    assert!(observation.validate().is_ok());
+    assert_eq!(observation.rows.len(), MAX_ROWS);
+    assert_eq!(observation.history.evicted_pairs, 31);
+    assert_eq!(observation.counters.overflow, 1);
+    assert_eq!(observation.history.earliest_dropped_create_qpc, Some(142));
+    let value = correlate(&observation, &observation.spec, 11, &provider_window());
+    assert!(!row_associated(&value, 1000));
+    let row = value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["create"]["irp"] == 1000)
+        .unwrap();
+    assert_eq!(row["dropped_create_frontier_blocks_window"], true);
+    assert_eq!(row["eviction_frontier_blocks_window"], false);
+}
+
+#[test]
+fn rolling_reuses_stable_completed_slots_without_overwriting_pending_or_ambiguous_irps() {
+    let mut collector = Collector::new(mode_spec(RetentionMode::RollingCompleted)).unwrap();
+    collector.create(create(1000, 5));
+    for index in 0..31 {
+        successful_pair(&mut collector, index + 1, 10 + index * 2);
+    }
+    for index in 0..200 {
+        successful_pair(&mut collector, 2000 + index, 100 + index * 2);
+    }
+    collector.completion(end(1000, 600));
+    let observation = collector.finish(0, false);
+    assert!(observation.validate().is_ok());
+    assert_eq!(observation.rows.len(), MAX_ROWS);
+    assert_eq!(observation.history.evicted_pairs, 200);
+    assert_eq!(observation.counters.unmatched, 0);
+    assert_eq!(observation.rows[0].create.irp, 1000);
+    assert_eq!(observation.rows[0].completion.as_ref().unwrap().qpc, 600);
+
+    for case in 0..5 {
+        let mut collector = Collector::new(mode_spec(RetentionMode::RollingCompleted)).unwrap();
+        successful_pair(&mut collector, 2, 10);
+        successful_pair(&mut collector, 1, 20);
+        for index in 0..30 {
+            successful_pair(&mut collector, 3 + index, 30 + index * 2);
+        }
+        collector.create(create(1, 200));
+        collector.create(create(999, 201));
+        if case == 4 {
+            collector.create(create(1, 202));
+        }
+        let qpc = match case {
+            2 => 200,
+            3 => 199,
+            _ => 203,
+        };
+        collector.completion(end(1, qpc));
+        if case == 1 {
+            collector.completion(end(1, qpc));
+        }
+        let observation = collector.finish(0, false);
+        assert!(observation.validate().is_ok());
+        assert!(
+            observation
+                .rows
+                .iter()
+                .any(|row| row.create.irp == 1 && row.create.qpc == 20)
+        );
+        let window = vec![Window {
+            started_qpc: 190,
+            finished_qpc: 210,
+            ..windows()[0].clone()
+        }];
+        let value = correlate(&observation, &observation.spec, 11, &window);
+        let row = value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["create"]["qpc"] == 200)
+            .unwrap();
+        assert_eq!(row["temporal_original_call_association"], case == 0);
+    }
+}
+
+#[test]
+fn rolling_schema_and_eviction_frontiers_cannot_be_mixed_with_prefix_or_old_records() {
+    let observation = provider_shape(RetentionMode::RollingCompleted);
+    for mutation in 0..7 {
+        let mut bad = observation.clone();
+        match mutation {
+            0 => bad.spec.retention = RetentionMode::Prefix,
+            1 => bad.history.evicted_pairs = 0,
+            2 => bad.history.maximum_evicted_pair_qpc = None,
+            3 => bad.history.maximum_evicted_pair_qpc = Some(0),
+            4 => bad.history.maximum_evicted_pair_qpc = Some(1001),
+            5 => bad.history.evicted_pairs += 1,
+            _ => {
+                bad.rows.pop();
+            }
+        }
+        assert!(bad.validate().is_err(), "mutation {mutation}");
+    }
+    let mut old = spec();
+    old.version = 1;
+    assert!(Collector::new(old).is_err());
+    let mut missing = serde_json::to_value(spec()).unwrap();
+    missing.as_object_mut().unwrap().remove("retention");
+    assert!(serde_json::from_value::<ConsumerSpec>(missing).is_err());
+    let mut invalid = serde_json::to_value(spec()).unwrap();
+    invalid["retention"] = serde_json::json!("unbounded");
+    assert!(serde_json::from_value::<ConsumerSpec>(invalid).is_err());
+    let mut missing = serde_json::to_value(observation).unwrap();
+    missing["history"]
+        .as_object_mut()
+        .unwrap()
+        .remove("evicted_pairs");
+    assert!(serde_json::from_value::<Observation>(missing).is_err());
+}
+
+#[test]
+fn associated_success_survives_bounded_context_trimming_with_rolling_history() {
+    let mut observation = provider_shape(RetentionMode::RollingCompleted);
+    let base = u64::MAX - 1000;
+    observation.spec.pid = u32::MAX;
+    observation.spec.birth = u64::MAX;
+    observation.spec.binding.frequency = u64::MAX;
+    observation.spec.binding.cutoff_qpc = u64::MAX;
+    observation.history.maximum_qpc += base;
+    observation.history.maximum_evicted_pair_qpc = observation
+        .history
+        .maximum_evicted_pair_qpc
+        .map(|qpc| qpc + base);
+    for row in &mut observation.rows {
+        row.create.qpc += base;
+        row.create.irp += u64::MAX - 10000;
+        row.create.header_pid = u32::MAX;
+        row.create.header_tid = u32::MAX;
+        row.create.ttid = u32::MAX;
+        row.create.file_object = u64::MAX;
+        row.create.create_options = u32::MAX;
+        row.create.file_attributes = u32::MAX;
+        row.create.share_access = u32::MAX;
+        row.create.path_prefix = vec![65535; 128];
+        row.create.path_units = 32767;
+        row.create.path_truncated = true;
+        row.create.path_sha256 = Some([255; 32]);
+        let completion = row.completion.as_mut().unwrap();
+        completion.irp = row.create.irp;
+        completion.qpc += base;
+        completion.extra_info = u64::MAX;
+    }
+    assert!(observation.validate().is_ok());
+    assert!(serde_json::to_vec(&observation).unwrap().len() <= RECORD_BYTES);
+    let window = vec![Window {
+        started_qpc: base + 100,
+        finished_qpc: base + 112,
+        ..windows()[0].clone()
+    }];
+    let rendered = correlate(&observation, &observation.spec, u32::MAX, &window);
+    assert!(rendered["rows_omitted"].as_u64().unwrap() > 0);
+    assert_eq!(rendered["rows"][0]["create"]["qpc"], base + 110);
+    assert_eq!(
+        rendered["rows"][0]["temporal_original_call_association"],
+        true
+    );
+    assert_eq!(rendered["rows"][0]["observed_failed_create"], false);
+    assert!(serde_json::to_vec(&rendered).unwrap().len() <= CORRELATION_BYTES);
+    assert_eq!(rendered["history"]["evicted_pairs"], 27);
 }
 
 fn rejection(opcode: u8, version: u8, stage: RejectStage) -> RejectSample {
@@ -225,7 +507,7 @@ fn malformed_schema_previews_and_stage_totals_are_rejected_without_interpreting_
 }
 
 #[test]
-fn version_three_requires_history_and_telemetry_without_reinterpreting_older_records() {
+fn version_four_requires_retention_history_and_telemetry_without_reinterpreting_older_records() {
     let mut collector = Collector::new(spec()).unwrap();
     for _ in 0..2 {
         collector.received(64);
@@ -234,8 +516,8 @@ fn version_three_requires_history_and_telemetry_without_reinterpreting_older_rec
     collector.received(76);
     collector.decoded(76);
     let observed = collector.finish(0, false);
-    assert_eq!(observed.version, 3);
-    assert_eq!(observed.spec.version, 1);
+    assert_eq!(observed.version, 4);
+    assert_eq!(observed.spec.version, 2);
     assert!(observed.validate().is_ok());
     assert_eq!(observed.decode.samples.len(), 1);
     assert!(observed.decode.samples[0].metadata.is_none());
@@ -249,7 +531,7 @@ fn version_three_requires_history_and_telemetry_without_reinterpreting_older_rec
         serde_json::from_slice(&serde_json::to_vec(&observed).unwrap()).unwrap();
     assert!(roundtrip.validate().is_ok());
     let mut old = roundtrip.clone();
-    old.version = 2;
+    old.version = 3;
     assert!(old.validate().is_err());
     let mut missing_history = serde_json::to_value(&roundtrip).unwrap();
     missing_history.as_object_mut().unwrap().remove("history");

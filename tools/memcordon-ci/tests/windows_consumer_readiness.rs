@@ -10,7 +10,10 @@ mod current_fixture;
 
 #[test]
 fn fileio_capture_keeps_restricted_joint_and_only_adds_ordinary_provider_joint() {
-    use memcordon_ci::windows_consumer_readiness::{CaseKey, loader_fileio_requested};
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, loader_fileio_requested, loader_fileio_retention,
+    };
+    use memcordon_platform::windows_fileio_record::RetentionMode;
     for (family, scenario, case, experiment, expected) in [
         ("W-JOINT", "restricted", Case::Joint, false, true),
         ("W-JOINT", "restricted", Case::Joint, true, true),
@@ -31,6 +34,16 @@ fn fileio_capture_keeps_restricted_joint_and_only_adds_ordinary_provider_joint()
             loader_fileio_requested(&key, case, experiment),
             expected,
             "{family}/{scenario}/{case:?}/experiment={experiment}"
+        );
+        let expected_mode =
+            if (family, scenario, case, experiment) == ("W-JOINT", "ordinary", Case::Joint, true) {
+                RetentionMode::RollingCompleted
+            } else {
+                RetentionMode::Prefix
+            };
+        assert_eq!(
+            loader_fileio_retention(&key, case, experiment),
+            expected_mode
         );
     }
 }

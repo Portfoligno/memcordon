@@ -102,6 +102,23 @@ pub fn loader_fileio_requested(
             || (provider_input_experiment && key.scenario == "ordinary"))
 }
 
+pub fn loader_fileio_retention(
+    key: &CaseKey,
+    case: descriptor::Case,
+    provider_input_experiment: bool,
+) -> memcordon_platform::windows_fileio_record::RetentionMode {
+    use memcordon_platform::windows_fileio_record::RetentionMode;
+    if key.family == "W-JOINT"
+        && case == descriptor::Case::Joint
+        && key.scenario == "ordinary"
+        && provider_input_experiment
+    {
+        RetentionMode::RollingCompleted
+    } else {
+        RetentionMode::Prefix
+    }
+}
+
 /// Finite experiment facts, retaining the producer's original trust domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderExperimentRecord {
@@ -4496,6 +4513,11 @@ pub(crate) mod native {
             input.descriptor.case,
             input.descriptor.provider_input_experiment,
         );
+        let fileio_retention = loader_fileio_retention(
+            &input.key,
+            input.descriptor.case,
+            input.descriptor.provider_input_experiment,
+        );
         let fileio_state = Arc::new(Mutex::new(crate::windows_loader_fileio::Captured::default()));
         let callback_fileio = Arc::clone(&fileio_state);
         let fileio_owner: crate::windows_loader_fileio::OwnedCapture = Arc::new(Mutex::new(None));
@@ -4847,7 +4869,7 @@ pub(crate) mod native {
                                     },
                                     work_deadline,
                                     cleanup_deadline,
-                                )
+                                ).map(|prepared| prepared.with_retention_mode(fileio_retention))
                             })();
                             match prepared {
                                 Ok(prepared) => {
