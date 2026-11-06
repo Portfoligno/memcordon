@@ -9,6 +9,44 @@ use memcordon_ci::windows_consumer_readiness::{
 mod current_fixture;
 
 #[test]
+fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, ProviderExperimentRecord as Record, controller_case_directory,
+    };
+    use std::{collections::BTreeSet, fs};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let controller = temporary.path().join("controller");
+    let key = CaseKey {
+        family: "W-JOINT".into(),
+        scenario: "ordinary".into(),
+    };
+    // These are the actual execute report parent and descriptor output layouts.
+    let native = controller.join("W-JOINT/ordinary");
+    let fixture = controller.join("candidate-outputs/W-JOINT/ordinary");
+    fs::create_dir_all(&native).unwrap();
+    fs::create_dir_all(&fixture).unwrap();
+    assert_eq!(controller_case_directory(&controller, &key), native);
+    let mut leaves = BTreeSet::new();
+    for record in Record::ALL {
+        assert!(leaves.insert(record.leaf()));
+        let (producer, decoy, expected) = match record {
+            Record::NativeListener | Record::NativeTcpPeer => {
+                (&native, &fixture, b"controller".as_slice())
+            }
+            _ => (&fixture, &native, b"fixture".as_slice()),
+        };
+        fs::write(producer.join(record.leaf()), expected).unwrap();
+        fs::write(decoy.join(record.leaf()), b"wrong trust domain").unwrap();
+        let selected = record.source_path(&controller, &key, &fixture);
+        assert_eq!(selected.parent().unwrap(), producer);
+        assert_eq!(fs::read(selected).unwrap(), expected);
+    }
+    assert!(leaves.contains("winsock-startup-trace.json"));
+    assert!(leaves.contains("peer-winsock-startup-trace.json"));
+}
+
+#[test]
 fn completed_released_native_failure_cannot_wait_for_a_positive_fixture() {
     let result = current_fixture::completed_loader_failure();
     let provider = result.provider.clone().unwrap();

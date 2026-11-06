@@ -35,6 +35,7 @@ mod toolchain_diagnostics;
 mod winsock_registry;
 mod winsock_startup;
 mod winsock_trace;
+mod winsock_trace_path;
 mod winsock_trace_record;
 
 use descriptor::{Case, Descriptor};
@@ -187,7 +188,7 @@ fn tcp_peer(
         }
     };
     check()?;
-    let _winsock = native::winsock_startup(None)?;
+    let _winsock = native::winsock_startup(trace.copied())?;
     check()?;
     let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
     let mut stream = match trace {

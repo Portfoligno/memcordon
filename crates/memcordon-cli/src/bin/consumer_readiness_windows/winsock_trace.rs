@@ -1,5 +1,8 @@
 //! Diagnostic-only capture of the original checked WSAStartup call.
-use super::winsock_trace_record::{self, Packet};
+use super::{
+    winsock_trace_path::startup_trace_leaf,
+    winsock_trace_record::{self, Packet},
+};
 use std::{
     fmt,
     fs::OpenOptions,
@@ -30,6 +33,7 @@ pub struct Observed {
     pub packet: Packet,
     retention: Option<io::Error>,
     binding: serde_json::Value,
+    record_leaf: &'static str,
 }
 #[derive(Debug)]
 struct Failure {
@@ -64,7 +68,7 @@ impl Observed {
             "armed":packet.armed,"slots":packet.slot_count,"calls":packet.total_calls,"failures":packet.total_failures,"dropped":packet.dropped,"incomplete":packet.incomplete,
             "first_observed_failure_is_not_a_cause_claim":true,"first_failure_present":packet.first_failure_present,
             "first_failure":{"sequence":first.sequence,"operation":first.operation,"status_or_marker":first.native_status,"outgoing_error":first.outgoing_error,"access_or_memory_protection":first.desired_access,"raw_size":first.requested_size,"scalar_flags":first.scalar_flags,"name_prefix_units":&first.name[..(first.copied_name_units as usize).min(32)],"name_reported_bytes":first.reported_name_bytes,"name_flags":first.name_flags},
-            "full_record":"winsock-startup-trace.json"
+            "full_record":self.record_leaf
         });
         io::Error::new(
             original.kind(),
@@ -81,6 +85,7 @@ impl Observed {
             Foundation::SetLastError, Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
         };
         // Capture is already disarmed. No catalog call is included in these records.
+        self.record_leaf = startup_trace_leaf(context.peer);
         let binding = context.binding;
         self.binding = serde_json::json!({"pid":binding.pid,"creation_time_100ns":binding.birth,"descriptor_sha256":binding.descriptor_sha256,
         "challenge_sha256":super::descriptor::controller_start::descriptor_digest(&binding.challenge),
@@ -96,7 +101,7 @@ impl Observed {
                 "incoming_last_error":self.packet.incoming_error,"outgoing_last_error":self.packet.outgoing_error,"first_failure_present":self.packet.first_failure_present,
                 "first_failure_operation":self.packet.first_failure.operation,"first_failure_status_or_marker":self.packet.first_failure.native_status}))?,
         };
-        let mut file=OpenOptions::new().write(true).create_new(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(context.output_root.join("winsock-startup-trace.json"))?;
+        let mut file=OpenOptions::new().write(true).create_new(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(context.output_root.join(self.record_leaf))?;
         file.write_all(&bytes)?;file.sync_all()?;Ok(())
     })().err();
         self.packet.retention_error = retention
@@ -124,6 +129,7 @@ pub fn call(original: usize, cutoff: u64, frequency: u64) -> Observed {
         packet,
         retention: None,
         binding: serde_json::Value::Null,
+        record_leaf: startup_trace_leaf(false),
     }
 }
 struct Bounded(Vec<u8>);

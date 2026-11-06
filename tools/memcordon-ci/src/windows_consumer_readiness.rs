@@ -87,6 +87,69 @@ pub struct CaseKey {
     pub scenario: String,
 }
 
+pub fn controller_case_directory(output_directory: &Path, key: &CaseKey) -> PathBuf {
+    output_directory.join(&key.family).join(&key.scenario)
+}
+
+/// Finite experiment facts, retaining the producer's original trust domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderExperimentRecord {
+    ListenerTrace,
+    PeerListenerTrace,
+    StartupTrace,
+    PeerStartupTrace,
+    InputProbes,
+    PeerInputProbes,
+    InputRejection,
+    PeerInputRejection,
+    NativeListener,
+    NativeTcpPeer,
+}
+
+impl ProviderExperimentRecord {
+    pub const ALL: [Self; 10] = [
+        Self::ListenerTrace,
+        Self::PeerListenerTrace,
+        Self::StartupTrace,
+        Self::PeerStartupTrace,
+        Self::InputProbes,
+        Self::PeerInputProbes,
+        Self::InputRejection,
+        Self::PeerInputRejection,
+        Self::NativeListener,
+        Self::NativeTcpPeer,
+    ];
+
+    pub fn leaf(self) -> &'static str {
+        match self {
+            Self::ListenerTrace => "listener-call-trace.json",
+            Self::PeerListenerTrace => "peer-listener-call-trace.json",
+            Self::StartupTrace => "winsock-startup-trace.json",
+            Self::PeerStartupTrace => "peer-winsock-startup-trace.json",
+            Self::InputProbes => "provider-input-probes.json",
+            Self::PeerInputProbes => "peer-provider-input-probes.json",
+            Self::InputRejection => "provider-input-target-rejection.json",
+            Self::PeerInputRejection => "peer-provider-input-target-rejection.json",
+            Self::NativeListener => "native-listener.json",
+            Self::NativeTcpPeer => "native-tcp-peer.json",
+        }
+    }
+
+    pub fn source_path(
+        self,
+        controller_output: &Path,
+        key: &CaseKey,
+        fixture_output: &Path,
+    ) -> PathBuf {
+        match self {
+            Self::NativeListener | Self::NativeTcpPeer => {
+                controller_case_directory(controller_output, key).join(self.leaf())
+            }
+            _ => fixture_output.join(self.leaf()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaseInput {
@@ -4100,11 +4163,8 @@ pub(crate) mod native {
                 input.descriptor.case,
                 descriptor::Case::DeadlineDemand | descriptor::Case::MemoryDemand
             );
-        let report = config
-            .output_directory
-            .join(&input.key.family)
-            .join(&input.key.scenario)
-            .join("result.json");
+        let report =
+            controller_case_directory(&config.output_directory, &input.key).join("result.json");
         fs::create_dir_all(report.parent().expect("case report has parent"))?;
         if report.try_exists()?
             || input.descriptor_path.try_exists()?
@@ -4777,7 +4837,7 @@ pub(crate) mod native {
                         "address": "127.0.0.1", "port": port, "held_owner_live": true,
                         "native_table_owner_observed_before_and_after": true, "conflicting_bind_win32_code": refusal.raw_os_error(),
                     })).map_err(io::Error::other)?;
-                    let path = directory.join("native-listener.json");
+                    let path = directory.join(ProviderExperimentRecord::NativeListener.leaf());
                     let mut file = OpenOptions::new()
                         .write(true)
                         .create_new(true)
@@ -4854,7 +4914,7 @@ pub(crate) mod native {
                                 })?
                                 .peer = Some((peer.identity.pid, peer.identity.birth, token));
                         }
-                        let path = directory.join("native-tcp-peer.json");
+                        let path = directory.join(ProviderExperimentRecord::NativeTcpPeer.leaf());
                         let mut file = OpenOptions::new()
                             .write(true)
                             .create_new(true)
@@ -6317,11 +6377,19 @@ pub(crate) mod native {
         use crate::windows_provider_projection::native::Deployment;
         use crate::windows_provider_projection_record::{self as facts, BindingExpectation};
         use sha2::{Digest, Sha256};
-        fn json_file(path: &Path, maximum: usize) -> Result<serde_json::Value> {
-            let bytes = read(path, maximum)?;
-            memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
-                .map_err(CiError::Message)?;
-            Ok(serde_json::from_slice(&bytes)?)
+        fn json_file(path: &Path, maximum: usize, phase: &str) -> Result<serde_json::Value> {
+            (|| {
+                let bytes = read(path, maximum)?;
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
+                    .map_err(CiError::Message)?;
+                Ok(serde_json::from_slice(&bytes)?)
+            })()
+            .map_err(|error: CiError| {
+                error.context(format!(
+                    "provider experiment phase={phase}; artifact={}",
+                    path.display()
+                ))
+            })
         }
         fn publish(path: &Path, value: &serde_json::Value) -> Result<()> {
             let bytes = serde_json::to_vec(value)?;
@@ -6491,14 +6559,28 @@ pub(crate) mod native {
                     ));
                 }
                 phase = "positive-original-image-witness";
-                deployment.verify(deadlines.work)?;
+                deployment.verify(deadlines.work).map_err(|error| {
+                    error.context(format!(
+                        "provider experiment phase={phase}; deployment custody verification"
+                    ))
+                })?;
                 let root_observation = json_file(
-                    &input.descriptor.output_root.join("native-listener.json"),
+                    &ProviderExperimentRecord::NativeListener.source_path(
+                        &selected.output_directory,
+                        &input.key,
+                        &input.descriptor.output_root,
+                    ),
                     16 * 1024,
+                    phase,
                 )?;
                 let peer_observation = json_file(
-                    &input.descriptor.output_root.join("native-tcp-peer.json"),
+                    &ProviderExperimentRecord::NativeTcpPeer.source_path(
+                        &selected.output_directory,
+                        &input.key,
+                        &input.descriptor.output_root,
+                    ),
                     16 * 1024,
+                    phase,
                 )?;
                 let observed = held_observation
                     .lock()
@@ -6570,10 +6652,16 @@ pub(crate) mod native {
                         "peer-provider-input-probes.json",
                     ),
                 ] {
-                    let trace =
-                        json_file(&input.descriptor.output_root.join(trace_name), 64 * 1024)?;
-                    let probes =
-                        json_file(&input.descriptor.output_root.join(probe_name), 16 * 1024)?;
+                    let trace = json_file(
+                        &input.descriptor.output_root.join(trace_name),
+                        64 * 1024,
+                        phase,
+                    )?;
+                    let probes = json_file(
+                        &input.descriptor.output_root.join(probe_name),
+                        16 * 1024,
+                        phase,
+                    )?;
                     facts::mutation_witness(
                         &probes,
                         pid,
@@ -6618,17 +6706,13 @@ pub(crate) mod native {
             let retained = (|| -> Result<()> {
                 let facts_dir = attempt_directory.join("facts");
                 fs::create_dir(&facts_dir)?;
-                for name in [
-                    "listener-call-trace.json",
-                    "peer-listener-call-trace.json",
-                    "provider-input-probes.json",
-                    "peer-provider-input-probes.json",
-                    "provider-input-target-rejection.json",
-                    "peer-provider-input-target-rejection.json",
-                    "native-listener.json",
-                    "native-tcp-peer.json",
-                ] {
-                    let path = input.descriptor.output_root.join(name);
+                for record in ProviderExperimentRecord::ALL {
+                    let name = record.leaf();
+                    let path = record.source_path(
+                        &selected.output_directory,
+                        &input.key,
+                        &input.descriptor.output_root,
+                    );
                     match fs::symlink_metadata(&path) {
                         Ok(_) => {
                             let held =

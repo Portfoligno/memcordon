@@ -2,8 +2,41 @@
 mod gate_entry_route;
 #[path = "../src/bin/consumer_readiness_windows/winsock_trace_record.rs"]
 mod record;
+#[path = "../src/bin/consumer_readiness_windows/winsock_trace_path.rs"]
+mod trace_path;
 use record::{Entry, Node, Packet, Slot, diagnostic};
 use std::mem::{offset_of, size_of};
+
+#[test]
+fn root_and_peer_startup_records_coexist_without_overwrite() {
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join(trace_path::startup_trace_leaf(false));
+    let peer = temporary.path().join(trace_path::startup_trace_leaf(true));
+    assert_ne!(root, peer);
+    for (path, bytes) in [(&root, b"root".as_slice()), (&peer, b"peer".as_slice())] {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        assert_eq!(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+    }
+    assert_eq!(fs::read(root).unwrap(), b"root");
+    assert_eq!(fs::read(peer).unwrap(), b"peer");
+}
 
 fn ready() -> Packet {
     let mut value = Packet {
