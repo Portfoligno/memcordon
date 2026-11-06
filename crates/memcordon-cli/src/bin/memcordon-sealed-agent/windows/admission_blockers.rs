@@ -8,6 +8,8 @@ pub struct Observation {
     pub launch_names: usize,
     pub reader_names: usize,
     pub writer_names: usize,
+    pub writer_tokens: Vec<String>,
+    pub writer_tokens_omitted: usize,
     pub unknown_names: usize,
     pub sampled: usize,
     pub truncated: bool,
@@ -51,10 +53,12 @@ impl Observation {
             }
         };
         format!(
-            "filename-shape-only; record-binding=unavailable-before-exclusive-settlement; launch-names={}; reader-names={}; writer-names={}; unknown-names={}; sampled={}; truncated={}; unavailable={unavailable}",
+            "filename-shape-only; record-binding=unavailable-before-exclusive-settlement; launch-names={}; reader-names={}; writer-names={}; writer-tokens-retained={}; writer-tokens-omitted={}; unknown-names={}; sampled={}; truncated={}; unavailable={unavailable}",
             self.launch_names,
             self.reader_names,
             self.writer_names,
+            self.writer_tokens.len(),
+            self.writer_tokens_omitted,
             self.unknown_names,
             self.sampled,
             self.truncated
@@ -95,12 +99,19 @@ pub fn observe_names(
                 && identity
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-            .then_some(kind)
+            .then_some((kind, identity))
         });
         match classified {
-            Some(0) => observed.launch_names += 1,
-            Some(1) => observed.reader_names += 1,
-            Some(2) => observed.writer_names += 1,
+            Some((0, _)) => observed.launch_names += 1,
+            Some((1, _)) => observed.reader_names += 1,
+            Some((2, token)) => {
+                observed.writer_names += 1;
+                if observed.writer_tokens.len() < 8 {
+                    observed.writer_tokens.push(token.to_owned());
+                } else {
+                    observed.writer_tokens_omitted += 1;
+                }
+            }
             _ => observed.unknown_names += 1,
         }
     }

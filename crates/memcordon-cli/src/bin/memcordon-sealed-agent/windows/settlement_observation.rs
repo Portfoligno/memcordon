@@ -2,12 +2,7 @@
 use std::time::Instant;
 
 pub enum WriterStatus {
-    NoQuarantinedObserved,
-    Unavailable,
-    Unconfirmed {
-        detail: String,
-        native_code: Option<u32>,
-    },
+    LocalSnapshot { detail: String },
 }
 
 enum Sample {
@@ -53,18 +48,13 @@ impl Observation {
             Sample::Observed { status, completed_before_cutoff } => (status, completed_before_cutoff),
         };
         let text = match status {
-            WriterStatus::NoQuarantinedObserved => "no-quarantined-lane-observed".into(),
-            WriterStatus::Unavailable => "unavailable-nonblocking-query".into(),
-            WriterStatus::Unconfirmed {
-                detail,
-                native_code,
-            } => {
-                let mut end = detail.len().min(4096);
+            WriterStatus::LocalSnapshot { detail } => {
+                let mut end = detail.len().min(8192);
                 while !detail.is_char_boundary(end) {
                     end -= 1;
                 }
                 format!(
-                    "unconfirmed; recorded-publisher-win32-code={native_code:?}; detail-truncated={}; detail={}",
+                    "local-lifecycle-snapshot; historical-filename-correlation-only=true; detail-truncated={}; detail={}",
                     end != detail.len(),
                     &detail[..end]
                 )

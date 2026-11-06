@@ -3867,44 +3867,99 @@ fn reserve_writer_admission_at(
 ) -> Result<(), String> {
     validate_attempt_id(attempt_id)?;
     validate_attempt_id(request_sha256)?;
-    let path = root.join(attempt_id).with_extension("writer.json");
-    if path.exists() {
-        let old: AdmissionRecordV1 =
-            serde_json::from_slice(&read_record_bounded(&path).map_err(|error| error.to_string())?)
+    super::writer_observation::begin(attempt_id, request_sha256);
+    let result = (|| {
+        let path = root.join(attempt_id).with_extension("writer.json");
+        if path.exists() {
+            let old: AdmissionRecordV1 =
+                serde_json::from_slice(&read_record_bounded(&path).map_err(|error| {
+                    super::writer_observation::stage(
+                        attempt_id,
+                        super::writer_lifecycle::Stage::ReservationFailed,
+                        error.raw_os_error().map(|code| code as u32),
+                    );
+                    error.to_string()
+                })?)
                 .map_err(|error| error.to_string())?;
-        if old.attempt_id != attempt_id || old.request_sha256 != request_sha256 {
-            return Err("writer reservation binding differs".to_owned());
-        }
-        for owner in old.owner_process_identities {
-            if process_identity_is_live(owner)? {
-                return Err("another live process owns the writer reservation".to_owned());
+            if old.attempt_id != attempt_id || old.request_sha256 != request_sha256 {
+                return Err("writer reservation binding differs".to_owned());
             }
+            for owner in old.owner_process_identities {
+                if process_identity_is_live(owner)? {
+                    return Err("another live process owns the writer reservation".to_owned());
+                }
+            }
+            fs::remove_file(&path).map_err(|error| {
+                super::writer_observation::stage(
+                    attempt_id,
+                    super::writer_lifecycle::Stage::ReservationFailed,
+                    error.raw_os_error().map(|code| code as u32),
+                );
+                error.to_string()
+            })?;
         }
-        fs::remove_file(&path).map_err(|error| error.to_string())?;
-    }
-    enforce_budget()?;
-    // SAFETY: the pseudo handle denotes this service process for identity capture.
-    let owner = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let record = AdmissionRecordV1 {
-        format: AdmissionRecordFormat::Native,
-        revision: Default::default(),
-        attempt_id: attempt_id.to_owned(),
-        request_sha256: request_sha256.to_owned(),
-        owner_process_identities: vec![owner],
-        workload_reservation: true,
-    };
-    let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())
+        enforce_budget()?;
+        // SAFETY: the pseudo handle denotes this service process for identity capture.
+        let owner = super::process::process_identity(unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentProcess()
+        })?;
+        super::writer_observation::bind_owner(
+            attempt_id,
+            super::writer_lifecycle::Owner {
+                pid: owner.process_id,
+                birth: owner.creation_time_100ns,
+            },
+        );
+        let record = AdmissionRecordV1 {
+            format: AdmissionRecordFormat::Native,
+            revision: Default::default(),
+            attempt_id: attempt_id.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            owner_process_identities: vec![owner],
+            workload_reservation: true,
+        };
+        let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                super::writer_observation::stage(
+                    attempt_id,
+                    super::writer_lifecycle::Stage::ReservationFailed,
+                    error.raw_os_error().map(|code| code as u32),
+                );
+                error.to_string()
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::ReservationFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            error.to_string()
+        })?;
+        file.sync_all().map_err(|error| {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::ReservationFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            error.to_string()
+        })
+    })();
+    super::writer_observation::stage(
+        attempt_id,
+        if result.is_ok() {
+            super::writer_lifecycle::Stage::ReservationPublished
+        } else {
+            super::writer_lifecycle::Stage::ReservationFailed
+        },
+        None,
+    );
+    result
 }
 
 pub(super) fn retire_writer_admission(
@@ -3928,7 +3983,14 @@ fn retire_writer_admission_at(
     let bytes = match read_record_bounded(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::AdmissionRetireFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            return Err(error.to_string());
+        }
     };
     let admission: AdmissionRecordV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -3953,7 +4015,14 @@ fn retire_writer_admission_at(
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::AdmissionRetireFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            Err(error.to_string())
+        }
     }
 }
 

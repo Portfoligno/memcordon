@@ -1331,24 +1331,20 @@ fn handle_control(
             let settlement = SETTLEMENT.settle_until(deadline, || {
                 terminate_active_jobs(deadline)?;
                 let empty = super::record::admissions_empty()?;
+                let observed = if !empty {
+                    Some(super::record::admission_blocker_observation(deadline))
+                } else {
+                    None
+                };
                 let empty = writer_observation.observe(empty, deadline, || {
-                    use settlement_observation::WriterStatus;
-                    match super::attempt_store::ensure_no_quarantined_writer() {
-                        Ok(()) => WriterStatus::NoQuarantinedObserved,
-                        Err(super::attempt_store::WriterRegistryCheckError::Unavailable) => {
-                            WriterStatus::Unavailable
-                        }
-                        Err(super::attempt_store::WriterRegistryCheckError::Unconfirmed {
-                            detail,
-                            native_code,
-                        }) => WriterStatus::Unconfirmed {
-                            detail,
-                            native_code,
-                        },
+                    let snapshot = super::attempt_store::lifecycle_snapshot(deadline);
+                    let names = observed.as_ref().map(|value|value.writer_tokens.as_slice()).unwrap_or_default();
+                    let diagnostic = super::writer_lifecycle::diagnostic(&snapshot, names);
+                    settlement_observation::WriterStatus::LocalSnapshot {
+                        detail:serde_json::to_string(&diagnostic).unwrap_or_else(|_| "{\"state\":\"serialization-unavailable\",\"retirement_proof\":false}".into()),
                     }
                 });
-                if !empty {
-                    let observed = super::record::admission_blocker_observation(deadline);
+                if let Some(observed) = observed {
                     if observed.unavailable.is_none() {
                         admission_snapshot = Some(observed);
                         admission_unavailable = None;

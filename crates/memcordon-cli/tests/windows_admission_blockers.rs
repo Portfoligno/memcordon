@@ -39,6 +39,10 @@ fn ordinary_fixture_names_are_sampled_without_claiming_record_authority() {
         (1, 1, 1, 1)
     );
     assert_eq!(observation.sampled, 4);
+    assert_eq!(
+        observation.writer_tokens.as_slice(),
+        std::slice::from_ref(&identity)
+    );
     assert!(!observation.truncated);
     assert!(observation.unavailable.is_none());
     let detail = observation.detail();
@@ -50,6 +54,23 @@ fn ordinary_fixture_names_are_sampled_without_claiming_record_authority() {
             .path()
             .join(format!("{identity}.writer.json"))
             .is_file()
+    );
+}
+
+#[test]
+fn writer_tokens_are_validated_bounded_names_not_current_record_bindings() {
+    let entries = (0u64..12).map(|value| {
+        let token = String::from(memcordon_core::hash_bytes(&value.to_le_bytes()));
+        Ok(OsString::from(format!("{token}.writer.json")))
+    });
+    let observed = blockers::observe_names(entries, cutoff());
+    assert_eq!(observed.writer_names, 12);
+    assert_eq!(observed.writer_tokens.len(), 8);
+    assert_eq!(observed.writer_tokens_omitted, 4);
+    assert!(
+        observed
+            .detail()
+            .contains("record-binding=unavailable-before-exclusive-settlement")
     );
 }
 

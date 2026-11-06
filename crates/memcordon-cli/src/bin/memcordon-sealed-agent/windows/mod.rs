@@ -31,6 +31,8 @@ mod startup_diagnostics;
 mod support_loader_diagnostic;
 pub mod token;
 pub mod user_api;
+mod writer_lifecycle;
+mod writer_observation;
 
 pub fn control() -> Result<(), String> {
     control_service::run()

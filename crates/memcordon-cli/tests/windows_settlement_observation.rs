@@ -10,6 +10,30 @@ use std::{
 };
 
 #[test]
+fn local_lifecycle_detail_is_one_bounded_historical_sample_without_changing_quiescence() {
+    let mut observed = Observation::default();
+    let calls = Cell::new(0);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for _ in 0..3 {
+        assert!(!observed.observe(false, deadline, || {
+            calls.set(calls.get() + 1);
+            WriterStatus::LocalSnapshot {
+                detail: "界".repeat(10000),
+            }
+        }));
+    }
+    assert_eq!(calls.get(), 1);
+    let detail = observed.detail().unwrap();
+    assert!(detail.contains("historical-filename-correlation-only=true"));
+    assert!(detail.contains("detail-truncated=true"));
+    assert!(detail.contains("retirement-proof=false"));
+    assert!(detail.len() < 8700);
+    assert!(observed.observe(true, Instant::now(), || panic!(
+        "must not retry or block true"
+    )));
+}
+
+#[test]
 fn true_quiescence_is_unchanged_and_false_queries_only_once() {
     let mut observation = Observation::default();
     let calls = Cell::new(0);
@@ -21,7 +45,9 @@ fn true_quiescence_is_unchanged_and_false_queries_only_once() {
     for _ in 0..4 {
         assert!(!observation.observe(false, cutoff, || {
             calls.set(calls.get() + 1);
-            WriterStatus::NoQuarantinedObserved
+            WriterStatus::LocalSnapshot {
+                detail: "no-quarantined-lane-observed".into(),
+            }
         }));
     }
     assert_eq!(calls.get(), 1);
@@ -61,7 +87,9 @@ fn contended_owned_registry_is_unavailable_without_waiting_or_reclassification()
         !observation.observe(false, Instant::now() + Duration::from_secs(1), || {
             match registry.try_lock() {
                 Ok(_) => panic!("registry should remain held"),
-                Err(_) => WriterStatus::Unavailable,
+                Err(_) => WriterStatus::LocalSnapshot {
+                    detail: "unavailable-nonblocking-query".into(),
+                },
             }
         })
     );
@@ -79,15 +107,14 @@ fn actual_native_error_and_unicode_detail_are_bounded_and_never_retirement_proof
     let mut observation = Observation::default();
     assert!(
         !observation.observe(false, Instant::now() + Duration::from_secs(1), || {
-            WriterStatus::Unconfirmed {
-                native_code: Some(5),
-                detail: "界".repeat(10000),
+            WriterStatus::LocalSnapshot {
+                detail: format!("publisher_native_code=5; {}", "界".repeat(10000)),
             }
         })
     );
     let text = observation.detail().unwrap();
-    assert!(text.contains("recorded-publisher-win32-code=Some(5)"));
+    assert!(text.contains("publisher_native_code=5"));
     assert!(text.contains("detail-truncated=true"));
     assert!(text.contains("retirement-proof=false"));
-    assert!(text.len() < 4600);
+    assert!(text.len() < 8700);
 }
