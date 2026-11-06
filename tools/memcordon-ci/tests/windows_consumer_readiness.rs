@@ -9,6 +9,33 @@ use memcordon_ci::windows_consumer_readiness::{
 mod current_fixture;
 
 #[test]
+fn fileio_capture_keeps_restricted_joint_and_only_adds_ordinary_provider_joint() {
+    use memcordon_ci::windows_consumer_readiness::{CaseKey, loader_fileio_requested};
+    for (family, scenario, case, experiment, expected) in [
+        ("W-JOINT", "restricted", Case::Joint, false, true),
+        ("W-JOINT", "restricted", Case::Joint, true, true),
+        ("W-JOINT", "ordinary", Case::Joint, true, true),
+        ("W-JOINT", "ordinary", Case::Joint, false, false),
+        ("W-JOINT", "ordinary", Case::Toolchain, true, false),
+        ("W-JOINT", "ordinary", Case::Churn, true, false),
+        ("W-JOINT", "restricted", Case::Toolchain, true, false),
+        ("W-OTHER", "ordinary", Case::Joint, true, false),
+        ("W-OTHER", "restricted", Case::Joint, false, false),
+        ("W-JOINT", "future-experiment", Case::Joint, true, false),
+    ] {
+        let key = CaseKey {
+            family: family.into(),
+            scenario: scenario.into(),
+        };
+        assert_eq!(
+            loader_fileio_requested(&key, case, experiment),
+            expected,
+            "{family}/{scenario}/{case:?}/experiment={experiment}"
+        );
+    }
+}
+
+#[test]
 fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     use memcordon_ci::windows_consumer_readiness::{
         CaseKey, ProviderExperimentRecord as Record, controller_case_directory,
@@ -31,7 +58,7 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     for record in Record::ALL {
         assert!(leaves.insert(record.leaf()));
         let (producer, decoy, expected) = match record {
-            Record::NativeListener | Record::NativeTcpPeer => {
+            Record::NativeListener | Record::NativeTcpPeer | Record::LoaderFileIo => {
                 (&native, &fixture, b"controller".as_slice())
             }
             _ => (&fixture, &native, b"fixture".as_slice()),
@@ -44,6 +71,7 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     }
     assert!(leaves.contains("winsock-startup-trace.json"));
     assert!(leaves.contains("peer-winsock-startup-trace.json"));
+    assert!(leaves.contains("result.loader-fileio.json"));
 }
 
 #[test]

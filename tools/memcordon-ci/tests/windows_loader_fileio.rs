@@ -117,3 +117,36 @@ fn original_loader_windows_cannot_be_replaced_by_global_listener_time_or_foreign
         );
     }
 }
+
+#[test]
+fn successful_loader_window_remains_observable_without_a_failure_window() {
+    let expected = spec();
+    let mut success = packet(&expected);
+    success["trace"]["loader_owner"]["first_failure_window"] = serde_json::Value::Null;
+    let encode = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
+    let (thread, windows) = listener_windows(&encode(&success), &expected).unwrap();
+    assert_eq!(thread, 12);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].dependency_sequence, 1);
+    assert_eq!(windows[0].loader_dependency_sequence, 2);
+    assert_eq!(
+        (windows[0].started_qpc, windows[0].finished_qpc),
+        (100, 200)
+    );
+
+    for (field, value) in [
+        ("finished_qpc", expected.binding.cutoff_qpc),
+        ("finished_qpc", 99),
+        ("started_qpc", 0),
+    ] {
+        let mut invalid = success.clone();
+        invalid["trace"]["loader_owner"]["windows"][0][field] = json!(value);
+        assert!(
+            listener_windows(&encode(&invalid), &expected)
+                .unwrap()
+                .1
+                .is_empty(),
+            "{field}={value}"
+        );
+    }
+}

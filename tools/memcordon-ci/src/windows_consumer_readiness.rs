@@ -91,6 +91,17 @@ pub fn controller_case_directory(output_directory: &Path, key: &CaseKey) -> Path
     output_directory.join(&key.family).join(&key.scenario)
 }
 
+pub fn loader_fileio_requested(
+    key: &CaseKey,
+    case: descriptor::Case,
+    provider_input_experiment: bool,
+) -> bool {
+    key.family == "W-JOINT"
+        && case == descriptor::Case::Joint
+        && (key.scenario == "restricted"
+            || (provider_input_experiment && key.scenario == "ordinary"))
+}
+
 /// Finite experiment facts, retaining the producer's original trust domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderExperimentRecord {
@@ -104,10 +115,11 @@ pub enum ProviderExperimentRecord {
     PeerInputRejection,
     NativeListener,
     NativeTcpPeer,
+    LoaderFileIo,
 }
 
 impl ProviderExperimentRecord {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::ListenerTrace,
         Self::PeerListenerTrace,
         Self::StartupTrace,
@@ -118,6 +130,7 @@ impl ProviderExperimentRecord {
         Self::PeerInputRejection,
         Self::NativeListener,
         Self::NativeTcpPeer,
+        Self::LoaderFileIo,
     ];
 
     pub fn leaf(self) -> &'static str {
@@ -132,6 +145,7 @@ impl ProviderExperimentRecord {
             Self::PeerInputRejection => "peer-provider-input-target-rejection.json",
             Self::NativeListener => "native-listener.json",
             Self::NativeTcpPeer => "native-tcp-peer.json",
+            Self::LoaderFileIo => "result.loader-fileio.json",
         }
     }
 
@@ -142,7 +156,7 @@ impl ProviderExperimentRecord {
         fixture_output: &Path,
     ) -> PathBuf {
         match self {
-            Self::NativeListener | Self::NativeTcpPeer => {
+            Self::NativeListener | Self::NativeTcpPeer | Self::LoaderFileIo => {
                 controller_case_directory(controller_output, key).join(self.leaf())
             }
             _ => fixture_output.join(self.leaf()),
@@ -4356,9 +4370,11 @@ pub(crate) mod native {
         let native_started_utc = std::time::SystemTime::now();
         let registry_recipient = clocks.registry.clone();
         let projection_observation = clocks.projection_observation.clone();
-        let fileio_requested = input.key.family == "W-JOINT"
-            && input.key.scenario == "restricted"
-            && input.descriptor.case == descriptor::Case::Joint;
+        let fileio_requested = loader_fileio_requested(
+            &input.key,
+            input.descriptor.case,
+            input.descriptor.provider_input_experiment,
+        );
         let fileio_state = Arc::new(Mutex::new(crate::windows_loader_fileio::Captured::default()));
         let callback_fileio = Arc::clone(&fileio_state);
         let fileio_owner: crate::windows_loader_fileio::OwnedCapture = Arc::new(Mutex::new(None));
