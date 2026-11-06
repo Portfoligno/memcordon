@@ -31,6 +31,7 @@ pub mod windows_pe_manifest;
 pub mod windows_provider_catalog;
 pub mod windows_provider_projection;
 pub mod windows_provider_projection_record;
+pub mod windows_provider_source_record;
 pub mod windows_status_streams;
 
 pub mod bootstrap_profile;

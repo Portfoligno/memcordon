@@ -83,7 +83,7 @@ pub fn listener_windows(bytes: &[u8], expected: &ConsumerSpec) -> io::Result<(u3
         || binding["challenge_sha256"] != json!(expected.binding.challenge_sha256)
         || binding["cutoff_qpc"] != expected.binding.cutoff_qpc
         || binding["qpc_frequency"] != expected.binding.frequency
-        || trace["packet_version"] != 4
+        || trace["packet_version"] != 5
         || trace["invalid_packet"] != false
         || trace["frequency"] != expected.binding.frequency
         || trace["cutoff_qpc"] != expected.binding.cutoff_qpc

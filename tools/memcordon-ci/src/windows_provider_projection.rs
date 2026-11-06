@@ -169,7 +169,7 @@ pub mod native {
             for candidate in candidates {
                 live(work)?;
                 let source = PathBuf::from(std::ffi::OsString::from_wide(&candidate.expanded_path));
-                let held = windows_native_files::hold_artifact(&source, None, 64 * 1024 * 1024)?;
+                let held = windows_native_files::HeldProviderSource::hold(&source, work)?;
                 live(work)?;
                 bytes = bytes
                     .checked_add(held.bytes.len())
@@ -179,13 +179,12 @@ pub mod native {
                 }
                 crate::release::target::validate_executable(&held.bytes, target)?;
                 live(work)?;
-                let source_identity = held.identity(&source)?;
+                let source_identity = (held.metadata.volume_serial, held.metadata.file_index);
                 live(work)?;
                 let destination = self.local.join(&candidate.basename);
-                let copied =
-                    windows_native_files::copy_owned_artifact(&source, &destination, &held.sha256)?;
+                let copied = held.publish(&destination, work)?;
                 live(work)?;
-                windows_native_files::verify_named_artifact(&held, &source)?;
+                held.verify(work)?;
                 live(work)?;
                 if copied.bytes != held.bytes {
                     return Err(CiError::Message(
@@ -205,7 +204,7 @@ pub mod native {
                     bytes: copied.bytes.len() as u64,
                     sha256: copied.sha256.clone(),
                 });
-                records.push(serde_json::json!({"catalog_ids":candidate.catalog_ids,"provider_ids":candidate.provider_ids,"original_path_utf16":candidate.expanded_path,"original_volume_serial":source_identity.0,"original_file_index":source_identity.1,"private_path_utf16":destination.as_os_str().encode_wide().collect::<Vec<_>>(),"private_native_path_utf16":native_path,"private_identity":private_identity,"bytes":copied.bytes.len(),"sha256":copied.sha256,"source_view":"native","changed_file_identity":true}));
+                records.push(serde_json::json!({"catalog_ids":candidate.catalog_ids,"provider_ids":candidate.provider_ids,"original_path_utf16":candidate.expanded_path,"original_volume_serial":source_identity.0,"original_file_index":source_identity.1,"borrowed_source_metadata":held.metadata,"source_exclusive_ownership_proved":false,"private_path_utf16":destination.as_os_str().encode_wide().collect::<Vec<_>>(),"private_native_path_utf16":native_path,"private_identity":private_identity,"bytes":copied.bytes.len(),"sha256":copied.sha256,"source_view":"native","changed_file_identity":true}));
                 self.files.push((destination, copied));
             }
             self.inventory["catalog"] = serde_json::to_value(catalog)?;

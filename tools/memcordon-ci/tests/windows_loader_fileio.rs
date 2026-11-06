@@ -64,12 +64,13 @@ fn packet(spec: &ConsumerSpec) -> serde_json::Value {
     let window = json!({"namespace":"loader_owner","operation":"LdrLoadDll","clock_domain":"original-QPC","thread_id":12,"invalid_window":false,"observation_incomplete":false,
         "dependency_sequence":1,"loader_dependency_sequence":2,"parent_listener_sequence":3,"started_qpc":100,"finished_qpc":200});
     json!({"format":"memcordon.original-rust-listener-trace","revision":1,"original_binding":{"pid":spec.pid,"creation_time_100ns":spec.birth,"descriptor_sha256":spec.binding.descriptor_sha256,"challenge_sha256":spec.binding.challenge_sha256,"cutoff_qpc":spec.binding.cutoff_qpc,"qpc_frequency":spec.binding.frequency},
-        "trace":{"packet_version":4,"invalid_packet":false,"frequency":spec.binding.frequency,"cutoff_qpc":spec.binding.cutoff_qpc,"original_thread":12,"loader_owner":{"version":2,"invalid_scope":false,"first_failure_window":window,"windows":[window]}}})
+        "trace":{"packet_version":5,"invalid_packet":false,"frequency":spec.binding.frequency,"cutoff_qpc":spec.binding.cutoff_qpc,"original_thread":12,"loader_owner":{"version":2,"invalid_scope":false,"first_failure_window":window,"windows":[window]}}})
 }
 #[test]
 fn original_loader_windows_cannot_be_replaced_by_global_listener_time_or_foreign_binding() {
     let expected = spec();
     let original = packet(&expected);
+    assert_eq!(original["trace"]["packet_version"], 5);
     let encode = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
     let (thread, windows) = listener_windows(&encode(&original), &expected).unwrap();
     assert_eq!(thread, 12);
@@ -90,9 +91,14 @@ fn original_loader_windows_cannot_be_replaced_by_global_listener_time_or_foreign
             "{field}"
         );
     }
-    let mut historical = original.clone();
-    historical["trace"]["packet_version"] = json!(3);
-    assert!(listener_windows(&encode(&historical), &expected).is_err());
+    for version in [0, 3, 4, 6, u32::MAX] {
+        let mut historical = original.clone();
+        historical["trace"]["packet_version"] = json!(version);
+        assert!(
+            listener_windows(&encode(&historical), &expected).is_err(),
+            "version {version}"
+        );
+    }
     for (field, replacement) in [
         ("invalid_window", json!(true)),
         ("thread_id", json!(13)),
