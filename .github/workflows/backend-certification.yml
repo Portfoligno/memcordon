@@ -2894,12 +2894,17 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stdout.bin
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stderr.bin
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.capture.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.invocation.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stdout.bin
-            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.capture.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stderr.bin
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
@@ -3315,12 +3320,17 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stdout.bin
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.stderr.bin
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.capture.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/package-uninstall.invocation.json
-            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stdout.bin
-            target/ci/windows-installed/${{ matrix.channel }}/cases/recovery.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.capture.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stdout.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stderr.bin
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact

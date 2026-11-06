@@ -123,6 +123,17 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
         "{prefix}/windows-installed/fixture-manifest-inventory.json"
     ));
     for name in [
+        "result.guardian-query.json",
+        "result.guardian-query.stdout.bin",
+        "result.guardian-query.stderr.bin",
+        "result.callback-failure.json",
+        "result.stderr.bin",
+    ] {
+        paths.push(format!(
+            "{prefix}/windows-installed/C-IO/native-argv/{name}"
+        ));
+    }
+    for name in [
         "package-uninstall.stdout.bin",
         "package-uninstall.stderr.bin",
         "package-uninstall.capture.json",
@@ -130,7 +141,7 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
         "recovery.stdout.bin",
         "recovery.stderr.bin",
     ] {
-        paths.push(format!("{prefix}/{name}"));
+        paths.push(format!("{prefix}/windows-installed/{name}"));
     }
     paths
 }

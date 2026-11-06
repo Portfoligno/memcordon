@@ -1,4 +1,7 @@
-use memcordon_ci::installed_failure_carriers::select;
+use memcordon_ci::{
+    installed_failure_carriers::{package_cleanup_paths, paths, select},
+    release::installed_consumer::windows_case_output_directory,
+};
 use std::{
     collections::BTreeSet,
     fs,
@@ -8,6 +11,9 @@ use std::{
 #[test]
 fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
     let root = tempfile::tempdir().unwrap();
+    // Use the production directory seam, not the retention helper's relative list.
+    let producer_output = windows_case_output_directory(root.path());
+    assert_eq!(producer_output, root.path().join("windows-installed"));
     let mut expected = Vec::new();
     for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
         for file in [
@@ -53,6 +59,26 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
         .unwrap();
     expected.push(inventory);
+    let report = producer_output.join("C-IO/native-argv/result");
+    fs::create_dir_all(report.parent().unwrap()).unwrap();
+    for extension in [
+        "guardian-query.json",
+        "guardian-query.stdout.bin",
+        "guardian-query.stderr.bin",
+        "callback-failure.json",
+        "stderr.bin",
+    ] {
+        // Match the actual query/callback producer's report.with_extension seam.
+        let path = report.with_extension(extension);
+        fs::write(&path, b"original native argv diagnostic").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        expected.push(path);
+    }
     for name in [
         "package-uninstall.stdout.bin",
         "package-uninstall.stderr.bin",
@@ -61,7 +87,7 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         "recovery.stdout.bin",
         "recovery.stderr.bin",
     ] {
-        let path = root.path().join(name);
+        let path = producer_output.join(name);
         fs::write(&path, b"original cleanup capture").unwrap();
         fs::OpenOptions::new()
             .write(true)
@@ -71,6 +97,24 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
             .unwrap();
         expected.push(path);
     }
+    let uploaded = paths(root.path().to_str().unwrap())
+        .lines()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    assert_eq!(uploaded, expected);
+    assert!(uploaded.iter().all(|path| path.is_file()));
+    // The provider experiment uses its own output directory directly.
+    let provider_output = tempfile::tempdir().unwrap();
+    let direct = package_cleanup_paths(provider_output.path().to_str().unwrap())
+        .lines()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    assert_eq!(direct.len(), 6);
+    for path in &direct {
+        assert_eq!(path.parent(), Some(provider_output.path()));
+        fs::write(path, b"direct provider capture").unwrap();
+    }
+    assert!(direct.iter().all(|path| path.is_file()));
     for index in 0..180 {
         fs::write(
             root.path().join(format!("recent-{index:03}.json")),

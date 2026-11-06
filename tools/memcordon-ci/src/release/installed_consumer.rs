@@ -25,6 +25,13 @@ use crate::{
     windows_installed_cases::SelectedArtifact,
 };
 
+/// Shared producer layout for the Windows installed-consumer output and carriers.
+pub const WINDOWS_CASE_DIRECTORY: &str = "windows-installed";
+
+pub fn windows_case_output_directory(output: &Path) -> PathBuf {
+    output.join(WINDOWS_CASE_DIRECTORY)
+}
+
 pub struct MaterializedPayload {
     pub channel: InstalledChannel,
     pub source: BuildSourceIdentity,
@@ -1476,7 +1483,7 @@ pub fn run_materialized_channel_until(
             &payload.directory,
             payload.fixture.clone(),
             &installed,
-            output.join("windows-installed"),
+            windows_case_output_directory(output),
         )?;
         fs::create_dir_all(&config.output_directory)?;
         let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;

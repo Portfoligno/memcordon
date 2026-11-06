@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RELATIVE_PATHS: [&str; 10] = [
+pub const RELATIVE_PATHS: [&str; 15] = [
     "windows-installed/C-IO/empty-message/result.callback-failure.json",
     "windows-installed/C-IO/empty-message/result.stderr.bin",
     "windows-installed/C-IO/empty-message/result.winsock-startup-trace.json",
@@ -16,6 +16,11 @@ pub const RELATIVE_PATHS: [&str; 10] = [
     "windows-installed/W-JOINT/restricted/result.listener-call-trace.json",
     "windows-installed/W-JOINT/restricted/result.loader-fileio.json",
     "windows-installed/fixture-manifest-inventory.json",
+    "windows-installed/C-IO/native-argv/result.guardian-query.json",
+    "windows-installed/C-IO/native-argv/result.guardian-query.stdout.bin",
+    "windows-installed/C-IO/native-argv/result.guardian-query.stderr.bin",
+    "windows-installed/C-IO/native-argv/result.callback-failure.json",
+    "windows-installed/C-IO/native-argv/result.stderr.bin",
 ];
 
 /// These exact leaves are already written by bounded package/recovery capture.
@@ -37,12 +42,22 @@ pub fn package_cleanup_paths(prefix: &str) -> String {
 }
 
 pub fn paths(prefix: &str) -> String {
-    RELATIVE_PATHS
-        .iter()
-        .chain(PACKAGE_CLEANUP_PATHS.iter())
+    installed_relative_paths()
         .map(|relative| format!("{prefix}/{relative}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn installed_relative_paths() -> impl Iterator<Item = String> {
+    RELATIVE_PATHS
+        .iter()
+        .map(|relative| (*relative).to_owned())
+        .chain(PACKAGE_CLEANUP_PATHS.iter().map(|leaf| {
+            format!(
+                "{}/{leaf}",
+                crate::release::installed_consumer::WINDOWS_CASE_DIRECTORY
+            )
+        }))
 }
 
 fn unlinked(metadata: &std::fs::Metadata) -> bool {
@@ -95,8 +110,8 @@ fn priority_file(source: &Path, relative: &str) -> io::Result<Option<PathBuf>> {
 pub fn select(source: &Path) -> io::Result<Vec<PathBuf>> {
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
-    for relative in RELATIVE_PATHS.into_iter().chain(PACKAGE_CLEANUP_PATHS) {
-        if let Some(path) = priority_file(source, relative)? {
+    for relative in installed_relative_paths() {
+        if let Some(path) = priority_file(source, &relative)? {
             seen.insert(path.clone());
             selected.push(path);
         }
