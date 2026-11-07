@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RELATIVE_PATHS: [&str; 21] = [
+pub const RELATIVE_PATHS: [&str; 23] = [
     "windows-installed/C-IO/empty-message/result.callback-failure.json",
     "windows-installed/C-IO/empty-message/result.failed-frontend.json",
     "windows-installed/C-IO/empty-message/result.failed-terminal-observation.json",
@@ -13,6 +13,7 @@ pub const RELATIVE_PATHS: [&str; 21] = [
     "windows-installed/C-IO/empty-message/result.winsock-startup-trace.json",
     "windows-installed/C-IO/empty-message/result.listener-call-trace.json",
     "windows-installed/C-IO/empty-message/result.listener-native-file-requests.json",
+    "windows-installed/C-IO/empty-message/result.peer-spawn-call-trace.json",
     "windows-installed/W-JOINT/restricted/result.callback-failure.json",
     "windows-installed/W-JOINT/restricted/result.failed-frontend.json",
     "windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json",
@@ -20,6 +21,7 @@ pub const RELATIVE_PATHS: [&str; 21] = [
     "windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json",
     "windows-installed/W-JOINT/restricted/result.listener-call-trace.json",
     "windows-installed/W-JOINT/restricted/result.listener-native-file-requests.json",
+    "windows-installed/W-JOINT/restricted/result.peer-spawn-call-trace.json",
     "windows-installed/W-JOINT/restricted/result.loader-fileio.json",
     "windows-installed/fixture-manifest-inventory.json",
     "windows-installed/C-IO/native-argv/result.guardian-query.json",

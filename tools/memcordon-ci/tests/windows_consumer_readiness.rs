@@ -93,6 +93,7 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     assert!(leaves.contains("peer-winsock-startup-trace.json"));
     assert!(leaves.contains("listener-native-file-requests.json"));
     assert!(leaves.contains("peer-listener-native-file-requests.json"));
+    assert!(leaves.contains("peer-spawn-call-trace.json"));
     assert!(leaves.contains("result.loader-fileio.json"));
     assert!(leaves.contains("result.callback-failure.json"));
     assert!(leaves.contains("result.guardian-query.stderr.bin"));

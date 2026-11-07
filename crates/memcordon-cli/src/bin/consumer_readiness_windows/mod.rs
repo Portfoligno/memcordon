@@ -34,6 +34,8 @@ mod provider_input_probes;
 mod provider_input_target_record;
 mod provider_loader_policy;
 mod provider_loader_policy_native;
+mod spawn_trace;
+mod spawn_trace_record;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
@@ -820,7 +822,10 @@ fn joint_mapped(
             ),
         )?;
     }
-    let mut peer = context(Operation::PeerCommandSpawn, peer_command.spawn())?;
+    let mut peer = context(
+        Operation::PeerCommandSpawn,
+        spawn_trace::spawn(&mut peer_command, trace.as_ref()),
+    )?;
     // Every error after spawn retains/settles this original Child. In a private
     // experiment the controller independently owns the peer before transfer,
     // or keeps the unresolved spawn interval quarantined.

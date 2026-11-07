@@ -2862,6 +2862,7 @@ jobs:
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.winsock-startup-trace.json
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.listener-native-file-requests.json
+            target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.peer-spawn-call-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.callback-failure.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.failed-frontend.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json
@@ -2869,6 +2870,7 @@ jobs:
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.listener-native-file-requests.json
+            target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.peer-spawn-call-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/reports/installed/raw/windows-installed/fixture-manifest-inventory.json
             target/ci/reports/installed/raw/windows-installed/C-IO/native-argv/result.guardian-query.json

@@ -152,6 +152,8 @@ fn build_gate_call_trace() {
     println!("cargo:rerun-if-changed=native/winsock_call_trace.h");
     println!("cargo:rerun-if-changed=native/native_file_request_trace.h");
     println!("cargo:rerun-if-changed=native/native_file_request_trace.inc");
+    println!("cargo:rerun-if-changed=native/spawn_call_trace.h");
+    println!("cargo:rerun-if-changed=native/spawn_call_trace.inc");
     cc::Build::new()
         .cpp(true)
         .static_crt(true)

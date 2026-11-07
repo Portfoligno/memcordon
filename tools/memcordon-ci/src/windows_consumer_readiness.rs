@@ -126,6 +126,7 @@ pub enum ProviderExperimentRecord {
     PeerListenerTrace,
     NativeFileRequests,
     PeerNativeFileRequests,
+    PeerSpawnTrace,
     StartupTrace,
     PeerStartupTrace,
     InputProbes,
@@ -144,11 +145,12 @@ pub enum ProviderExperimentRecord {
 }
 
 impl ProviderExperimentRecord {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ListenerTrace,
         Self::PeerListenerTrace,
         Self::NativeFileRequests,
         Self::PeerNativeFileRequests,
+        Self::PeerSpawnTrace,
         Self::StartupTrace,
         Self::PeerStartupTrace,
         Self::InputProbes,
@@ -172,6 +174,7 @@ impl ProviderExperimentRecord {
             Self::PeerListenerTrace => "peer-listener-call-trace.json",
             Self::NativeFileRequests => "listener-native-file-requests.json",
             Self::PeerNativeFileRequests => "peer-listener-native-file-requests.json",
+            Self::PeerSpawnTrace => "peer-spawn-call-trace.json",
             Self::StartupTrace => "winsock-startup-trace.json",
             Self::PeerStartupTrace => "peer-winsock-startup-trace.json",
             Self::InputProbes => "provider-input-probes.json",
@@ -6295,6 +6298,11 @@ pub(crate) mod native {
                         "memcordon.original-native-file-requests",
                     )
                     .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
+                    let peer_spawn_trace = trace_carrier(
+                        "peer-spawn-call-trace.json",
+                        "memcordon.original-peer-spawn-trace",
+                    )
+                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
                     let product_context = if *capture_complete && cleanup.is_ok() {
                         retain_callback_product_context(&public_report, &report, &config.provider)
                             .map_err(|error| error.to_string())
@@ -6310,6 +6318,7 @@ pub(crate) mod native {
                         "winsock_trace":winsock_trace,
                         "listener_trace":listener_trace,
                         "native_file_requests":native_file_requests,
+                        "peer_spawn_trace":peer_spawn_trace,
                     }))?;
                     for (extension, bytes) in [
                         ("stdout.bin", stdout.as_slice()),

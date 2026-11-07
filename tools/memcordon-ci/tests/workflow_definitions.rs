@@ -115,6 +115,7 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
             "result.winsock-startup-trace.json",
             "result.listener-call-trace.json",
             "result.listener-native-file-requests.json",
+            "result.peer-spawn-call-trace.json",
         ] {
             paths.push(format!("{prefix}/windows-installed/{case}/{name}"));
         }

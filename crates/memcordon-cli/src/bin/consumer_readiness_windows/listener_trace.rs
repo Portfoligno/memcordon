@@ -28,8 +28,8 @@ unsafe extern "C" {
 
 #[derive(Clone, Copy)]
 pub(super) struct ErrorPair {
-    win32: u32,
-    wsa: i32,
+    pub(super) win32: u32,
+    pub(super) wsa: i32,
 }
 impl ErrorPair {
     pub(super) fn capture() -> Self {
@@ -572,6 +572,7 @@ pub fn self_check() -> io::Result<i32> {
             "native file request forwarding selfcheck {failed}"
         )));
     }
+    super::spawn_trace::self_check(&clock)?;
     let before = checked_token(&clock, false)?;
     live(&clock)?;
     let mut first = capture(&clock);

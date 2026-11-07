@@ -10,6 +10,7 @@
 #include "detours.h"
 #include "winsock_call_trace.h"
 #include "native_file_request_trace.h"
+#include "spawn_call_trace.h"
 
 static_assert(sizeof(void*)==8 && sizeof(WCHAR)==2 && sizeof(NTSTATUS)==4,"WSA trace native ABI");
 static_assert(sizeof(OBJECT_ATTRIBUTES)==48 && offsetof(OBJECT_ATTRIBUTES,ObjectName)==16,"WSA native object attributes ABI");
@@ -1354,6 +1355,7 @@ static bool returned_publish(WsaPacket* packet,const Image& mapped,const WsaNode
     restore(pages,count,packet);return success;
 }
 #include "native_file_request_trace.inc"
+#include "spawn_call_trace.inc"
 static void returned_failure(ListenerReturnedModule* section,uint32_t stage,DWORD error,uint32_t reason){
     section->setup_stage=stage;section->setup_error=error?error:ERROR_INVALID_DATA;section->setup_reason=reason;
     section->scope_flags|=2;section->incomplete=1;
