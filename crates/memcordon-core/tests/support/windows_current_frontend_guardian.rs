@@ -1,6 +1,6 @@
 use memcordon_core::*;
 #[path = "windows_current_postauthorization.rs"]
-mod postauthorization;
+pub(crate) mod postauthorization;
 
 pub fn fixture() -> (
     WindowsProviderRejectionV3,

@@ -2,8 +2,7 @@
 mod frontend_support;
 #[path = "../src/sealed/windows_rejection_retirement.rs"]
 mod retirement;
-#[path = "../../memcordon-core/tests/support/windows_current_postauthorization.rs"]
-mod support;
+use frontend_support::postauthorization as support;
 
 use memcordon_core::*;
 use retirement::{RejectionContext, complete_rejection_ack, complete_terminal_ack};
