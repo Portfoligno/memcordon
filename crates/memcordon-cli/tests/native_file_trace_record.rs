@@ -187,7 +187,8 @@ fn maximum_rows_and_pinned_failure_fit_without_silent_field_omission() {
     let bytes = bounded(serde_json::json!({
         "trace":diagnostic(&packet),
         "original_binding":{"pid":u32::MAX,"birth":u64::MAX,"descriptor_sha256":([255u8;32]).as_slice(),"challenge_sha256":([255u8;32]).as_slice()},
-        "provider_loader_policies":{"bounded_snapshot_budget":"x".repeat(4096)}
+        "provider_loader_policies":{"bounded_snapshot_budget":"x".repeat(4096)},
+        "provider_loader_context":{"bounded_snapshot_budget":"x".repeat(8192)}
     })).unwrap();
     assert!(bytes.len() <= record::RECORD_BYTES);
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

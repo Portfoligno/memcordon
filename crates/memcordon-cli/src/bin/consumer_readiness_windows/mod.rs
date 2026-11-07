@@ -32,6 +32,8 @@ mod own_thread_deadline_self_check;
 mod peer_retirement;
 mod provider_input_probes;
 mod provider_input_target_record;
+mod provider_loader_context;
+mod provider_loader_context_native;
 mod provider_loader_policy;
 mod provider_loader_policy_native;
 mod spawn_trace;

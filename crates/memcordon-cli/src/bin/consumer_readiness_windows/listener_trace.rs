@@ -194,6 +194,7 @@ struct Captured {
     packet: record::Packet,
     native_files: native_file_trace_record::Packet,
     loader_policies: Option<serde_json::Value>,
+    loader_context: Option<serde_json::Value>,
     invocation: Invocation,
     process_token: serde_json::Value,
     effective_token: serde_json::Value,
@@ -249,6 +250,8 @@ fn capture_call(
     let process_token = token(clock, false);
     let effective_token = token(clock, true);
     let loader_policies = experiment.then(|| super::provider_loader_policy_native::capture(clock));
+    let loader_context = experiment
+        .then(|| super::provider_loader_context_native::capture(clock, connect.is_some()));
     // SAFETY: fixed asserted ABI, private non-unwinding callback and stack slots
     // live throughout this synchronous call. C++ never receives socket ownership.
     unsafe {
@@ -265,6 +268,7 @@ fn capture_call(
         packet,
         native_files,
         loader_policies,
+        loader_context,
         invocation,
         process_token,
         effective_token,
@@ -319,6 +323,7 @@ fn retain_native_files(context: &Context<'_>, capture: &Captured) -> io::Result<
             "peer":context.peer,"authority":false},
         "trace":native_file_trace_record::diagnostic(&capture.native_files),
         "provider_loader_policies":capture.loader_policies.clone().map(|snapshot|super::provider_loader_policy::bind(snapshot,binding.pid,binding.birth)),
+        "provider_loader_context":capture.loader_context.clone().map(|snapshot|super::provider_loader_context::bind(snapshot,binding.pid,binding.birth)),
         "acceptance_authority":false
     }))?;
     live(context.clock)?;
