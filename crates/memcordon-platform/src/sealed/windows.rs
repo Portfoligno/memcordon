@@ -114,7 +114,9 @@ const TOKEN_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
 #[path = "windows_rejection_retirement.rs"]
 mod rejection_retirement;
-use rejection_retirement::{RejectionContext, complete_rejection_ack, observed_terminal_delivery};
+use rejection_retirement::{
+    RejectionContext, complete_rejection_ack, complete_terminal_ack, observed_terminal_delivery,
+};
 
 fn recovery_challenge() -> Result<String, String> {
     let mut random = [0_u8; 16];
@@ -189,7 +191,7 @@ pub fn recover_windows_attempt_with_request(
         challenge: challenge.clone(),
     };
     write_frame_until(pipe.raw(), &request, cutoff)?;
-    let (response, authority_raw) =
+    let (response, _authority_raw) =
         read_frame_with_raw_until::<WindowsProviderResponseV4>(pipe.raw(), cutoff, &mut || Ok(()))
             .map_err(|error| error.to_string())?;
     match &response {
@@ -245,29 +247,24 @@ pub fn recover_windows_attempt_with_request(
         }
         _ => return Err("recovery response is not bound to the requested attempt".to_owned()),
     }
-    let authority_sha256 = digest_bytes(
-        response
-            .terminal_authority_json()
-            .map_err(|error| error.to_string())?
-            .as_bytes(),
-    );
-    let retired_raw = acknowledge_terminal_retirement(
-        pipe.raw(),
+    let context = RejectionContext {
         attempt_id,
         nonce,
         request_sha256,
-        &authority_sha256,
-        &provider_binding,
-        cutoff,
-    )
-    .map_err(|error| error.to_string())?;
-    let delivery = observed_terminal_delivery(
-        attempt_id,
-        nonce,
-        request_sha256,
-        &authority_raw,
-        &retired_raw,
-    )
+        provider: &provider_binding,
+    };
+    let delivery = complete_terminal_ack(&response, &context, |authority_sha256| {
+        acknowledge_terminal_retirement(
+            pipe.raw(),
+            attempt_id,
+            nonce,
+            request_sha256,
+            authority_sha256,
+            &provider_binding,
+            cutoff,
+        )
+        .map_err(Box::new)
+    })
     .map_err(|error| error.to_string())?;
     Ok((response, Some(delivery), request))
 }
