@@ -1252,6 +1252,14 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             }
             return listener_trace::self_check();
         }
+        Some("peer-spawn-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "peer spawn trace self-check takes no operands",
+                ));
+            }
+            return spawn_trace::standalone_self_check();
+        }
         Some("own-thread-deadline-self-check") => {
             if args.next().is_some() {
                 return Err(io::Error::other(

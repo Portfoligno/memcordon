@@ -170,3 +170,33 @@ pub fn self_check(clock: &super::descriptor::ControlClock) -> io::Result<()> {
     }
     super::listener_trace::live(clock)
 }
+
+/// Run only this observer's permanent-IAT checks in a fresh fixture process.
+pub fn standalone_self_check() -> io::Result<i32> {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let mut now = 0i64;
+    let mut frequency = 0i64;
+    // SAFETY: fixed writable outputs for this finite native selfcheck clock.
+    if unsafe { QueryPerformanceCounter(&mut now) } == 0
+        || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let frequency = u64::try_from(frequency).map_err(io::Error::other)?;
+    let cutoff = u64::try_from(now)
+        .map_err(io::Error::other)?
+        .checked_add(
+            frequency
+                .checked_mul(5)
+                .ok_or_else(|| io::Error::other("peer spawn selfcheck clock overflow"))?,
+        )
+        .ok_or_else(|| io::Error::other("peer spawn selfcheck cutoff overflow"))?;
+    self_check(&super::descriptor::ControlClock {
+        revision: 1,
+        work_cutoff_qpc: cutoff,
+        qpc_frequency: frequency,
+    })?;
+    Ok(0)
+}
