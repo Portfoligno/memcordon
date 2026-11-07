@@ -3412,6 +3412,31 @@ pub(crate) mod native {
         Ok(())
     }
 
+    #[allow(unsafe_code)] // Query-only creation time of the original borrowed Child handle.
+    fn native_child_birth(child: &std::process::Child) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+        let mut birth = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: Child retains this process handle for the query; all four
+        // output pointers refer to initialized, correctly aligned FILETIMEs.
+        if unsafe {
+            GetProcessTimes(
+                child.as_raw_handle(),
+                &mut birth,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((u64::from(birth.dwHighDateTime) << 32) | u64::from(birth.dwLowDateTime))
+    }
+
     #[allow(unsafe_code)] // Query-only native TCP table; bounded aligned output buffer.
     fn native_listener_owner(pid: u32, port: u16) -> io::Result<()> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -4829,29 +4854,8 @@ pub(crate) mod native {
                 let child = command.spawn()?;
                 if matched_spawn {
                     let observed = (|| -> io::Result<(u32, u64)> {
-                        use std::os::windows::io::AsRawHandle;
-                        use windows_sys::Win32::{
-                            Foundation::FILETIME, System::Threading::GetProcessTimes,
-                        };
                         provision_budget(work_deadline).map_err(io::Error::other)?;
-                        let mut birth = FILETIME::default();
-                        let mut exit = FILETIME::default();
-                        let mut kernel = FILETIME::default();
-                        let mut user = FILETIME::default();
-                        if unsafe {
-                            GetProcessTimes(
-                                child.as_raw_handle(),
-                                &mut birth,
-                                &mut exit,
-                                &mut kernel,
-                                &mut user,
-                            )
-                        } == 0
-                        {
-                            return Err(io::Error::last_os_error());
-                        }
-                        let birth = (u64::from(birth.dwHighDateTime) << 32)
-                            | u64::from(birth.dwLowDateTime);
+                        let birth = native_child_birth(&child)?;
                         provision_budget(work_deadline).map_err(io::Error::other)?;
                         if child.id() == 0 || birth == 0 {
                             return Err(io::Error::other(
@@ -8031,7 +8035,7 @@ pub(crate) mod native {
                 drop(held);
                 set_directory_acl(probe, &protected_acl)?;
             }
-            let request=memcordon_core::workload_request::WorkloadRequestV1::parse(br#"{"format":"memcordon.workload-request","revision":1,"runtime":{"kind":"windows-sealed","profile":"windows-sealed-current-token-v1"},"requirements":[]}"#).map_err(CiError::Message)?;
+            let request=memcordon_core::workload_request::WorkloadRequestV1::parse(br#"{"format":"memcordon.workload-request","revision":1,"runtime":{"kind":"windows-sealed","profile":"windows-sealed-current-token-v1"},"requirements":[]}"#).map_err(|error| CiError::Message(error.to_string()))?;
             let request = request
                 .canonical_bytes()
                 .map_err(|error| CiError::Message(error.to_string()))?;

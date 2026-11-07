@@ -25,6 +25,60 @@ fn live(cutoff: Instant) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(unsafe_code)] // One bounded query of this already owned native file handle.
+fn security_extent(file: &File, storage: &mut [u64; 1024]) -> io::Result<u32> {
+    let capacity = u32::try_from(std::mem::size_of_val(storage)).map_err(io::Error::other)?;
+    let mut required = 0;
+    // SAFETY: File owns the live handle, the aligned array covers capacity bytes,
+    // and required is a writable native output for this synchronous query.
+    if unsafe {
+        GetKernelObjectSecurity(
+            file.as_raw_handle(),
+            23,
+            storage.as_mut_ptr().cast(),
+            capacity,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(required)
+}
+
+#[allow(unsafe_code)] // One disposition on the caller's identity-checked held leaf.
+fn mark_empty_directory(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: File owns the live handle; the fixed native input remains valid
+    // throughout the synchronous call. The OS rejects a nonempty directory.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)] // Consume exactly one owned handle only on observed native close success.
+fn close_file(file: File) -> Result<(), (io::Error, File)> {
+    // SAFETY: File exclusively owns this live handle. Success is followed by
+    // forget so Rust cannot close it again; failure returns the original owner.
+    if unsafe { windows_sys::Win32::Foundation::CloseHandle(file.as_raw_handle()) } == 0 {
+        return Err((io::Error::last_os_error(), file));
+    }
+    std::mem::forget(file);
+    Ok(())
+}
+
 pub fn hold_chain(path: &Path, cutoff: Instant) -> io::Result<Vec<File>> {
     if !path.is_absolute()
         || path
@@ -77,29 +131,20 @@ pub fn observe_directory(
         ));
     }
     let mut storage = [0u64; 1024];
-    let mut required = 0u32;
-    let returned = unsafe {
-        GetKernelObjectSecurity(
-            file.as_raw_handle(),
-            23,
-            storage.as_mut_ptr().cast(),
-            8192,
-            &mut required,
-        )
-    };
-    if returned == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let required = security_extent(file, &mut storage)?;
     live(cutoff)?;
-    if required == 0 || required > 8192 {
+    if required == 0 || required as usize > std::mem::size_of_val(&storage) {
         return Err(io::Error::other(
             "matched directory security extent is unavailable or oversized",
         ));
     }
-    let bytes =
-        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), required as usize) };
+    let bytes: Vec<u8> = storage
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .take(required as usize)
+        .collect();
     use sha2::{Digest, Sha256};
-    let security_sha256 = Sha256::digest(bytes).into();
+    let security_sha256 = Sha256::digest(&bytes).into();
     live(cutoff)?;
     Ok(Directory {
         role,
@@ -118,12 +163,6 @@ pub fn remove_empty_directory(
     expected: (u32, u64),
     cutoff: Instant,
 ) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        Storage::FileSystem::{
-            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-        },
-    };
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("matched probe parent absent"))?;
@@ -148,26 +187,13 @@ pub fn remove_empty_directory(
     let mut attempted = false;
     let removed = (|| {
         live(cutoff)?;
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
         attempted = true;
-        if unsafe {
-            SetFileInformationByHandle(
-                owned.as_ref().expect("held probe").as_raw_handle(),
-                FileDispositionInfo,
-                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        mark_empty_directory(owned.as_ref().expect("held probe"))?;
         live(cutoff)?;
-        if unsafe { CloseHandle(owned.as_ref().expect("held deletion owner").as_raw_handle()) } == 0
-        {
-            return Err(io::Error::last_os_error());
+        if let Err((error, file)) = close_file(owned.take().expect("held deletion owner")) {
+            owned = Some(file);
+            return Err(error);
         }
-        // The one successful native close consumed this exact local handle.
-        std::mem::forget(owned.take().expect("closed probe owner"));
         live(cutoff)?;
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
