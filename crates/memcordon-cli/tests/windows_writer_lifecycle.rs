@@ -226,7 +226,12 @@ fn transport_substage_is_last_observed_for_exact_tuple_and_keeps_outer_driver_an
         TransportUpdate {
             progress: attempted,
             outer_cutoff: outer,
-            inner_cutoff: inner
+            inner_cutoff: inner,
+            executing_thread: ExecutingThread::Observed {
+                tid: 42,
+                birth: 123
+            },
+            observed_at: Some(sampled - Duration::from_millis(7)),
         }
     ));
     let after = history.snapshot();
@@ -254,7 +259,18 @@ fn transport_substage_is_last_observed_for_exact_tuple_and_keeps_outer_driver_an
     assert!(value["last_observed"]["stage_qpc"].is_null());
     assert_eq!(value["current_blocking_api_proved"], false);
     assert_eq!(value["retained_worker_thread_is_context_only"], true);
-    assert!(value["executing_io_thread_identity"].is_null());
+    assert_eq!(value["executing_io_thread_identity"]["tid"], 42);
+    assert_eq!(
+        value["last_observed"]["executing_io_thread_identity"]["birth"],
+        123
+    );
+    assert_eq!(value["last_observed"]["event_age_millis_at_sample"], 7);
+    assert_eq!(
+        value["last_observed"]["event_clock_domain"],
+        "same-process-Instant"
+    );
+    assert_eq!(value["last_observed"]["source_api_label"], "WriteFile");
+    assert_eq!(value["last_observed"]["native_api_entry_observed"], false);
     observed.sampled_at = Some(inner + Duration::from_secs(1));
     observed.completed_before_cutoff = false;
     let value = transport_diagnostic(&observed, &observed.records[0]);
@@ -269,6 +285,77 @@ fn transport_substage_is_last_observed_for_exact_tuple_and_keeps_outer_driver_an
     assert_eq!(value["sample_completed_before_original_cutoff"], false);
     observed.sampled_at = None;
     assert!(transport_diagnostic(&observed,&observed.records[0])["last_observed"]["inner_cutoff_expired_at_sample"].is_null());
+    let value = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(
+        value["last_observed"]["event_age_state"],
+        "sample-time-unavailable"
+    );
+    observed.sampled_at = Some(sampled - Duration::from_secs(1));
+    let value = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(
+        value["last_observed"]["event_age_state"],
+        "sample-before-event"
+    );
+    assert!(value["last_observed"]["event_age_millis_at_sample"].is_null());
+}
+
+#[test]
+fn drain_source_boundary_age_and_return_do_not_prove_a_current_block_or_retirement() {
+    use frame_write::{ProgressOutcome, ProgressPhase, WriteProgress};
+    use std::time::{Duration, Instant};
+    let entered = Instant::now();
+    let cutoff = entered + Duration::from_secs(30);
+    let mut history = registered();
+    let binding = history.snapshot().binding;
+    let mut update = TransportUpdate {
+        progress: WriteProgress {
+            phase: ProgressPhase::Drain,
+            outcome: ProgressOutcome::Attempted,
+            expected_bytes: None,
+            transferred_bytes: 0,
+            native_code: None,
+            observed_write_count: None,
+            native_call_succeeded: None,
+        },
+        outer_cutoff: cutoff,
+        inner_cutoff: cutoff,
+        executing_thread: ExecutingThread::Observed { tid: 71, birth: 91 },
+        observed_at: Some(entered),
+    };
+    assert!(history.transport_transition(&binding, update));
+    let mut observed = snapshot(vec![row(registered())]);
+    observed.records[0].history = history.snapshot();
+    observed.sampled_at = Some(entered + Duration::from_millis(12));
+    observed.dropped = 1;
+    let attempted = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(
+        attempted["last_observed"]["source_api_label"],
+        "FlushFileBuffers"
+    );
+    assert_eq!(attempted["last_observed"]["event_age_millis_at_sample"], 12);
+    assert_eq!(
+        attempted["last_observed"]["native_api_entry_observed"],
+        false
+    );
+    assert_eq!(attempted["current_blocking_api_proved"], false);
+    assert_eq!(attempted["updates_complete"], false);
+    update.progress.outcome = ProgressOutcome::ReturnedOk;
+    update.observed_at = Some(entered + Duration::from_millis(5));
+    assert!(history.transport_transition(&binding, update));
+    observed.records = vec![row(history)];
+    let returned = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(
+        returned["last_observed"]["progress"]["outcome"],
+        "returned-ok"
+    );
+    assert_eq!(returned["last_observed"]["event_age_millis_at_sample"], 7);
+    assert_eq!(
+        returned["last_observed"]["stage_timestamp_unavailable"],
+        false
+    );
+    assert_eq!(returned["last_observed"]["stage_qpc_unavailable"], true);
+    assert_eq!(returned["retirement_proof"], false);
+    assert!(!observed.records[0].history.admission_retired);
 }
 
 #[test]
@@ -291,6 +378,11 @@ fn transport_partial_failure_and_foreign_or_dropped_updates_never_mint_completio
         progress: failure,
         outer_cutoff: cutoff,
         inner_cutoff: cutoff,
+        executing_thread: ExecutingThread::Unavailable {
+            tid: 43,
+            native_code: 5,
+        },
+        observed_at: None,
     };
     assert!(history.transport_transition(&source, update));
     for field in ["request", "attempt", "generation", "owner"] {
@@ -338,6 +430,20 @@ fn transport_partial_failure_and_foreign_or_dropped_updates_never_mint_completio
     assert_eq!(value["updates_rejected"], 4);
     assert_eq!(value["global_diagnostic_updates_dropped"], 3);
     assert_eq!(value["updates_complete"], false);
+    assert_eq!(
+        value["first_failure"]["executing_io_thread_identity"]["state"],
+        "unavailable"
+    );
+    assert_eq!(
+        value["first_failure"]["executing_io_thread_identity"]["native_code"],
+        5
+    );
+    assert_eq!(
+        value["first_failure"]["event_age_state"],
+        "event-time-unavailable"
+    );
+    assert!(value["last_observed"]["source_api_label"].is_null());
+    assert_eq!(value["driver_thread_identity_unavailable"], true);
     assert_eq!(value["retirement_proof"], false);
     assert!(!observed.records[0].history.admission_retired);
     assert!(observed.records[0].history.last_driver_event.is_none());

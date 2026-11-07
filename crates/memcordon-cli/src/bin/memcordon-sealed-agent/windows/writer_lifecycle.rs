@@ -82,11 +82,19 @@ pub struct DriverEvent {
     pub phase: DriverPhase,
     pub outcome: DriverOutcome,
 }
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum ExecutingThread {
+    Observed { tid: u32, birth: u64 },
+    Unavailable { tid: u32, native_code: u32 },
+}
 #[derive(Clone, Copy, Debug)]
 pub struct TransportUpdate {
     pub progress: WriteProgress,
     pub outer_cutoff: Instant,
     pub inner_cutoff: Instant,
+    pub executing_thread: ExecutingThread,
+    pub observed_at: Option<Instant>,
 }
 #[derive(Clone, Debug)]
 pub struct TransportEvent {
@@ -468,13 +476,37 @@ pub fn transport_diagnostic(snapshot: &Snapshot, row: &WriterSnapshot) -> Value 
             sampled
                 .and_then(|at| u64::try_from(cutoff.saturating_duration_since(at).as_millis()).ok())
         };
+        let age = sampled
+            .zip(value.update.observed_at)
+            .and_then(|(sample, event)| sample.checked_duration_since(event))
+            .and_then(|age| u64::try_from(age.as_millis()).ok());
+        let age_state = match (sampled, value.update.observed_at, age) {
+            (_, None, _) => "event-time-unavailable",
+            (None, _, _) => "sample-time-unavailable",
+            (_, _, Some(_)) => "observed",
+            (Some(sample), Some(event), _) if sample < event => "sample-before-event",
+            _ => "age-unrepresentable",
+        };
+        let api = match value.update.progress.phase {
+            super::frame_write::ProgressPhase::HeaderWrite
+            | super::frame_write::ProgressPhase::PayloadWrite => Some("WriteFile"),
+            super::frame_write::ProgressPhase::Drain => Some("FlushFileBuffers"),
+            _ => None,
+        };
         json!({"sequence":value.sequence,"progress":value.update.progress,
+            "executing_io_thread_identity":value.update.executing_thread,
+            "identity_source":"executing-caller-before-transport",
+            "native_thread_lifetime_proved":false,
+            "event_clock_domain":"same-process-Instant","event_age_millis_at_sample":age,
+            "event_age_state":age_state,"source_api_label":api,
+            "native_api_entry_observed":false,"current_blocking_api_proved":false,
             "selected_outer_cutoff_remaining_millis_at_sample":remaining(value.update.outer_cutoff),
             "selected_inner_cutoff_remaining_millis_at_sample":remaining(value.update.inner_cutoff),
             "outer_cutoff_expired_at_sample":sampled.map(|at|at>=value.update.outer_cutoff),
             "inner_cutoff_expired_at_sample":sampled.map(|at|at>=value.update.inner_cutoff),
             "outer_cutoff_not_after_inner":value.update.outer_cutoff<=value.update.inner_cutoff,
-            "stage_qpc":null,"stage_timestamp_unavailable":true})
+            "stage_qpc":null,"stage_qpc_unavailable":true,
+            "stage_timestamp_unavailable":value.update.observed_at.is_none()})
     }
     let history = &row.history;
     if !valid(history)
@@ -501,7 +533,8 @@ pub fn transport_diagnostic(snapshot: &Snapshot, row: &WriterSnapshot) -> Value 
         "first_failure":event(history.first_transport_failure.as_ref(),snapshot.sampled_at),
         "updates_observed":history.transport_updates,"updates_omitted":history.transport_updates.saturating_sub(retained),
         "updates_rejected":history.transport_updates_rejected,"global_diagnostic_updates_dropped":snapshot.dropped,"updates_complete":false,
-        "executing_io_thread_identity":null,"driver_thread_identity_unavailable":true,
+        "executing_io_thread_identity":history.last_transport_event.as_ref().map(|event|event.update.executing_thread),
+        "driver_thread_identity_unavailable":history.last_transport_event.as_ref().is_none_or(|event|matches!(event.update.executing_thread,ExecutingThread::Unavailable{..})),
         "retained_worker_thread_is_context_only":true,"current_blocking_api_proved":false,
         "sample_changed":snapshot.changed||row.changed,"sample_completed_before_original_cutoff":snapshot.completed_before_cutoff,
         "registry_state":snapshot.registry,"history_state":snapshot.history,

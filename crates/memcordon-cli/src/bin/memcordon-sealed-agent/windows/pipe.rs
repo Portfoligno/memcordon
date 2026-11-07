@@ -1459,11 +1459,49 @@ pub(super) fn write_frame_observed<T: Serialize>(
 ) -> Result<(), String> {
     // This is the original independently selected inner write_frame budget.
     let inner_cutoff = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // Capture on this executing caller, never on the cancellation watcher or
+    // by reopening a numeric TID. Observation cannot change last-error/result.
+    let executing_thread = unsafe {
+        use super::writer_lifecycle::ExecutingThread;
+        use windows_sys::Win32::Foundation::{FILETIME, GetLastError, SetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetCurrentThreadId, GetThreadTimes,
+        };
+        let saved = GetLastError();
+        let tid = GetCurrentThreadId();
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let result = GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        );
+        let identity = if result == 0 {
+            ExecutingThread::Unavailable {
+                tid,
+                native_code: GetLastError(),
+            }
+        } else {
+            ExecutingThread::Observed {
+                tid,
+                birth: (u64::from(creation.dwHighDateTime) << 32)
+                    | u64::from(creation.dwLowDateTime),
+            }
+        };
+        SetLastError(saved);
+        identity
+    };
     write_frame_detailed_observed_until(handle, value, inner_cutoff, &mut |progress| {
         observe(super::writer_lifecycle::TransportUpdate {
             progress,
             outer_cutoff,
             inner_cutoff,
+            executing_thread,
+            observed_at: Some(std::time::Instant::now()),
         });
     })
     .map_err(|error| error.to_string())
