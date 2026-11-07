@@ -296,11 +296,14 @@ fn held_child_admission_and_metadata_references_preserve_exact_owners_and_rights
     assert!(duplicate_directory_metadata_into_child(&child, &marker, cutoff, &mut count).is_err());
     assert!(duplicate_marker_metadata_into_child(&child, &source, cutoff, &mut count).is_err());
     assert_eq!(count, 0);
-    duplicate_marker_metadata_into_child(&child, &marker, cutoff, &mut count).unwrap();
-    let transferred = admitted
+    let transferred =
+        duplicate_marker_metadata_into_child(&child, &marker, cutoff, &mut count).unwrap();
+    // Admission preserves a query/liveness witness, not PROCESS_DUP_HANDLE.
+    let refused = admitted
         .duplicate_marker_metadata(&marker, cutoff, &mut count)
-        .unwrap();
-    assert_eq!(count, 2);
+        .unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(5));
+    assert_eq!(count, 1);
     let mut input = child.stdin.take().unwrap();
     input.write_all(&transferred.to_le_bytes()).unwrap();
     input
