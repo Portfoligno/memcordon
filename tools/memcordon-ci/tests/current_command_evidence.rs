@@ -30,6 +30,70 @@ fn callback() -> ProcessTestError {
         cleanup: Err("owned retirement remains uncertain".into()),
     }
 }
+
+#[test]
+fn application_error_preserves_natural_or_unsettled_capture_without_passing_work() {
+    for natural in [false, true] {
+        let settlement = if natural {
+            Ok(Box::new(memcordon_testkit::ObservedOutput {
+                status: exited(2),
+                stdout: vec![0, 255, 10],
+                stderr: b"fixture usage rejection".to_vec(),
+                elapsed: std::time::Duration::from_millis(4),
+            }))
+        } else {
+            Err(Box::new(callback()))
+        };
+        let error = ProcessTestError::ApplicationEnded {
+            error: io::Error::from_raw_os_error(5),
+            settlement,
+        };
+        let command = tempfile::tempdir().unwrap();
+        retain_failure(command.path(), &error, 1024).unwrap();
+        let query = tempfile::tempdir().unwrap();
+        let result = Err(error);
+        memcordon_ci::windows_component_query_evidence::retain_result(query.path(), &result)
+            .unwrap();
+        for (directory, record, stream) in [
+            (command.path(), "command-failure.json", "stdout.bin"),
+            (
+                query.path(),
+                "live-association-query-result.json",
+                "live-association-query.stdout.bin",
+            ),
+        ] {
+            assert_eq!(fs::read(directory.join(stream)).unwrap(), [0, 255, 10]);
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.join(record)).unwrap()).unwrap();
+            let observed = &metadata["observation"];
+            assert_eq!(observed["kind"], "application-ended");
+            assert_eq!(observed["raw_os_error"], 5);
+            assert_eq!(
+                observed["settlement"]["kind"],
+                if natural { "natural-exit" } else { "callback" }
+            );
+            if !natural {
+                assert_eq!(observed["settlement"]["capture_complete"], false);
+                assert_eq!(
+                    observed["settlement"]["cleanup"]["Err"],
+                    "owned retirement remains uncertain"
+                );
+            }
+        }
+        let outcome = memcordon_ci::work_outcome::WorkOutcome::<()>::from_result(
+            result.map(|_| ()).map_err(memcordon_ci::CiError::Process),
+        );
+        assert_eq!(
+            outcome.writers(),
+            if natural {
+                memcordon_ci::work_outcome::WriterSettlement::Settled
+            } else {
+                memcordon_ci::work_outcome::WriterSettlement::Unknown
+            }
+        );
+        assert!(outcome.into_result().is_err());
+    }
+}
 #[test]
 fn callback_keeps_binary_streams_statuses_capture_and_cleanup_before_returning_failure() {
     let directory = tempfile::tempdir().unwrap();

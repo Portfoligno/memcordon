@@ -25,8 +25,22 @@ fn retain(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()
 }
-pub fn retain_failure(directory: &Path, error: &ProcessTestError, limit: usize) -> io::Result<()> {
-    let (streams, observation) = match error {
+type CapturedStreams<'a> = Option<(&'a [u8], &'a [u8])>;
+fn failure_evidence(error: &ProcessTestError) -> (CapturedStreams<'_>, Value) {
+    match error {
+        ProcessTestError::ApplicationEnded { error, settlement } => {
+            let (streams, observation) = match settlement {
+                Ok(output) => (
+                    Some((output.stdout.as_slice(), output.stderr.as_slice())),
+                    json!({"kind":"natural-exit","status":status(output.status),"elapsed_ms":output.elapsed.as_millis(),"capture_complete":true}),
+                ),
+                Err(secondary) => failure_evidence(secondary),
+            };
+            (
+                streams,
+                json!({"kind":"application-ended","error":error.to_string(),"raw_os_error":error.raw_os_error(),"settlement":observation}),
+            )
+        }
         ProcessTestError::Callback {
             error,
             stdout,
@@ -80,7 +94,10 @@ pub fn retain_failure(directory: &Path, error: &ProcessTestError, limit: usize) 
             None,
             json!({"kind":"output","error":error.to_string(),"raw_os_error":error.raw_os_error()}),
         ),
-    };
+    }
+}
+pub fn retain_failure(directory: &Path, error: &ProcessTestError, limit: usize) -> io::Result<()> {
+    let (streams, observation) = failure_evidence(error);
     let metadata = serde_json::to_vec(
         &json!({"format":"memcordon.current-command-failure","revision":1,"streams_available":streams.is_some(),"stream_bound":limit,"observation":observation}),
     )?;

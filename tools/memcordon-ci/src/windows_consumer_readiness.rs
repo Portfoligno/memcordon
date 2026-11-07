@@ -1550,6 +1550,34 @@ pub fn validate_retirement(result: &ResultV3) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_ended_application_settlement(
+    result_bytes: &[u8],
+    frontend_status: i32,
+    ended: crate::windows_listener_wait::ApplicationEnd,
+    expected: &memcordon_core::execution_facts::ProviderAttemptAssociationV1,
+) -> Result<()> {
+    let result = ResultV3::parse(result_bytes).map_err(CiError::Message)?;
+    let target = current_native(&result)?.target_identity.as_ref();
+    if result.release != ReleaseKnowledgeV3::Released
+        || result.outcome.kind != OutcomeKindV1::Completed
+        || result.outcome.wrapper_status != frontend_status
+        || !result.diagnostics.as_slice().is_empty()
+        || current_association(&result)? != expected
+        || !matches!(target, Some(target) if target.process_id == ended.identity.pid
+            && u128::from(target.creation_time_100ns) == ended.identity.birth)
+        || !(matches!(result.outcome.native_termination.as_ref(),
+            Some(ChildTermination::WindowsStatus { status }) if *status == ended.status)
+            || matches!(result.outcome.native_termination.as_ref(),
+                Some(ChildTermination::ExitCode { code }) if i64::from(*code) == i64::from(ended.status)))
+    {
+        return Err(CiError::Message(
+            "naturally settled frontend result differs from the original held application exit"
+                .into(),
+        ));
+    }
+    validate_retirement(&result)
+}
+
 pub fn accepted(records: &[CaseAssessment]) -> bool {
     let keys: BTreeSet<_> = records.iter().map(|record| record.key.clone()).collect();
     keys == positive_keys()
@@ -4623,6 +4651,11 @@ pub(crate) mod native {
             input.descriptor.case,
             descriptor::Case::Joint | descriptor::Case::Churn | descriptor::Case::EndpointMismatch
         );
+        let released_listener_prefix = input.descriptor.case == descriptor::Case::Joint
+            && !input.descriptor.provider_input_experiment
+            && input.descriptor.completion_gate.is_none()
+            && input.descriptor.descendant_gate.is_none();
+        let prefix_token = input.expected_token.clone();
         let native_started_utc = std::time::SystemTime::now();
         let registry_recipient = clocks.registry.clone();
         let projection_observation = clocks.projection_observation.clone();
@@ -4647,48 +4680,50 @@ pub(crate) mod native {
                 "original Windows work deadline exhausted during observer preparation".into(),
             ));
         }
-        let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
+        let output = memcordon_testkit::run_until_owned_spawn_with_io_output_limit_outcome(
             command,
-            work_budget,
+            work_deadline,
             4 * 1024 * 1024,
             |mut command| command.spawn(),
             move |wrapper_pid, mut stdin, _| {
-                let mut control_session = None;
-                let _fileio_guard = crate::windows_loader_fileio::callback_guard(Arc::clone(
-                    &callback_fileio_owner,
-                ));
-                let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
-                let mut candidate_unavailable = None;
-                let (held, root_pid) = loop {
-                    if barrier_report.try_exists()? {
-                        super::check_positive_barrier_result(
-                            &read(
-                                &barrier_report,
-                                crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+                let mut application_ended = false;
+                let callback = (|| -> io::Result<()> {
+                    let mut control_session = None;
+                    let _fileio_guard = crate::windows_loader_fileio::callback_guard(Arc::clone(
+                        &callback_fileio_owner,
+                    ));
+                    let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
+                    let mut candidate_unavailable = None;
+                    let (held, root_pid) = loop {
+                        if barrier_report.try_exists()? {
+                            super::check_positive_barrier_result(
+                                &read(
+                                    &barrier_report,
+                                    crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+                                )
+                                .map_err(io::Error::other)?,
+                                &expected_provider,
                             )
-                            .map_err(io::Error::other)?,
-                            &expected_provider,
-                        )
-                        .map_err(|error| {
-                            io::Error::other(format!(
-                                "{error}; retained-result={}",
-                                barrier_report.display()
-                            ))
-                        })?;
-                    }
-                    if transcript.is_file() {
-                        let published = super::live_events(
-                            &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
-                        )
-                        .map_err(io::Error::other)?;
-                        if let Some(started) = published.first() {
-                            let mut held = if registry_recipient.is_some() {
-                                // Capability-transfer acquisition retains its strict census contract.
-                                memcordon_testkit::windows_fixture_input_processes_for_image_until(
+                            .map_err(|error| {
+                                io::Error::other(format!(
+                                    "{error}; retained-result={}",
+                                    barrier_report.display()
+                                ))
+                            })?;
+                        }
+                        if transcript.is_file() {
+                            let published = super::live_events(
+                                &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
+                            )
+                            .map_err(io::Error::other)?;
+                            if let Some(started) = published.first() {
+                                let mut held = if registry_recipient.is_some() {
+                                    // Capability-transfer acquisition retains its strict census contract.
+                                    memcordon_testkit::windows_fixture_input_processes_for_image_until(
                                     &fixture, deadline,
                                 )?
-                            } else {
-                                match memcordon_testkit::windows_process_candidate_for_image_until(
+                                } else {
+                                    match memcordon_testkit::windows_process_candidate_for_image_until(
                                     &fixture, started.pid, deadline,
                                 )? {
                                     memcordon_testkit::WindowsProcessCandidate::Held(process) => vec![process],
@@ -4703,287 +4738,242 @@ pub(crate) mod native {
                                         Vec::new()
                                     },
                                 }
-                            };
-                            held.retain(|process| process.identity.pid == started.pid);
-                            if held.len() == 1 && !held[0].has_exited()? {
-                                break (held, started.pid);
+                                };
+                                held.retain(|process| process.identity.pid == started.pid);
+                                if held.len() == 1 && !held[0].has_exited()? {
+                                    break (held, started.pid);
+                                }
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(io::Error::other(format!(
+                                "native held fixture barrier unavailable; candidate-observation={candidate_unavailable:?}"
+                            )));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    let root_identity = held
+                        .first()
+                        .expect("one original held fixture admitted")
+                        .identity
+                        .clone();
+                    if capture_gate_diagnostic {
+                        let root = held
+                            .first()
+                            .expect("one original held fixture was admitted");
+                        let observation = serde_json::json!({
+                            "pid":root.identity.pid,"birth":root.identity.birth.to_string(),
+                            "binding":"same original held fixture admitted by existing barrier",
+                            "retired_at_query":gate_query_result(root.has_exited()),
+                            "token_envelope":gate_query_result(root.original_token_envelope(work_deadline)),
+                        });
+                        match callback_gate_root_diagnostic.lock() {
+                            Ok(mut value) => *value = Some(observation),
+                            Err(poisoned) => {
+                                *poisoned.into_inner() = Some(
+                                    serde_json::json!({"state":"unavailable","stage":"diagnostic-lock-poisoned"}),
+                                )
                             }
                         }
                     }
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::other(format!(
-                            "native held fixture barrier unavailable; candidate-observation={candidate_unavailable:?}"
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                };
-                let root_identity = held
-                    .first()
-                    .expect("one original held fixture admitted")
-                    .identity
-                    .clone();
-                if capture_gate_diagnostic {
-                    let root = held
-                        .first()
-                        .expect("one original held fixture was admitted");
-                    let observation = serde_json::json!({
-                        "pid":root.identity.pid,"birth":root.identity.birth.to_string(),
-                        "binding":"same original held fixture admitted by existing barrier",
-                        "retired_at_query":gate_query_result(root.has_exited()),
-                        "token_envelope":gate_query_result(root.original_token_envelope(work_deadline)),
-                    });
-                    match callback_gate_root_diagnostic.lock() {
-                        Ok(mut value) => *value = Some(observation),
-                        Err(poisoned) => {
-                            *poisoned.into_inner() = Some(
-                                serde_json::json!({"state":"unavailable","stage":"diagnostic-lock-poisoned"}),
-                            )
-                        }
-                    }
-                }
-                *held_family
-                    .lock()
-                    .map_err(|_| io::Error::other("fixture ownership poisoned"))? = held;
-                if capture_frontend_identity {
-                    let mut selected = Vec::new();
-                    for process in
-                        memcordon_testkit::windows_processes_for_image_until(&cli, deadline)?
-                    {
-                        if process.native_parent_process_id()? == wrapper_pid
-                            && !process.has_exited()?
-                        {
-                            selected.push(process);
-                        }
-                    }
-                    if selected.len() != 1 {
-                        return Err(io::Error::other(
-                            "status fixture lacks one original held frontend child",
-                        ));
-                    }
-                    *held_frontend
+                    *held_family
                         .lock()
-                        .map_err(|_| io::Error::other("frontend ownership poisoned"))? =
-                        selected.pop();
-                }
-                let guardian = baseline
-                    .hold_new_guardian_excluding(&excluded)
-                    .map_err(io::Error::other)?;
-                let guardian_identity = guardian.identity.clone();
-                let adopted = super::guardian_query::adopt(&observed_guardian_owner, guardian);
-                super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.guardian(serde_json::json!(guardian_identity));
-                    trace.stage(if adopted.is_ok() {
-                        "command-materialization"
-                    } else {
-                        "guardian-adoption-failed"
-                    });
-                });
-                adopted?;
-                let query_started = Instant::now();
-                let query_cutoff = work_deadline.min(query_started + Duration::from_secs(30));
-                let query_budget = query_cutoff.saturating_duration_since(query_started);
-                if query_budget.is_zero() {
-                    return Err(io::Error::other(
-                        "original Windows work deadline exhausted before association query",
-                    ));
-                }
-                let mut query = CommandSpec::new(&cli, &directory, query_budget)
-                    .args([
-                        OsString::from("__observe-windows-guardian"),
-                        guardian_identity.process_id.to_string().into(),
-                        guardian_identity.creation_time_100ns.to_string().into(),
-                    ])
-                    .materialize()
-                    .map_err(io::Error::other)?;
-                let query_budget = query_cutoff
-                    .saturating_duration_since(Instant::now())
-                    .min(work_deadline.saturating_duration_since(Instant::now()));
-                if query_budget.is_zero() {
-                    return Err(io::Error::other(
-                        "original Windows work deadline exhausted during association query setup",
-                    ));
-                }
-                super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.stage("command-capture")
-                });
-                let observed = memcordon_testkit::run_with_deadline_output_limit(
-                    &mut query,
-                    query_budget,
-                    super::guardian_query::STREAM_BOUND,
-                )
-                .map_err(io::Error::other)?;
-                let observed_stdout = observed.stdout.clone();
-                let failure = super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.captured(observed);
-                    trace.stage("returned-output");
-                    trace.failure()
-                });
-                if let Some(failure) = failure {
-                    return Err(failure);
-                }
-                super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.stage("association-parse")
-                });
-                let observed: memcordon_core::WindowsGuardianAttemptObservation =
-                    serde_json::from_slice(&observed_stdout).map_err(io::Error::other)?;
-                super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.stage("association-validation")
-                });
-                if !observed.is_consistent()
-                    || observed.association.provider != expected_provider
-                    || observed.guardian_identity.process_id != guardian_identity.process_id
-                    || observed.guardian_identity.creation_time_100ns
-                        != guardian_identity.creation_time_100ns
-                {
-                    return Err(io::Error::other(
-                        "positive native guardian association differs",
-                    ));
-                }
-                if matches!(
-                    start_transport,
-                    descriptor::StartTransport::ControllerStdin { .. }
-                ) && observed.live_target_identity.as_ref().is_none_or(|target| {
-                    target.process_id != root_identity.pid
-                        || u128::from(target.creation_time_100ns) != root_identity.birth
-                }) {
-                    return Err(io::Error::other(
-                        "START guardian association does not name the original held target",
-                    ));
-                }
-                let expected = memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
-                    provider: observed.association.provider.clone(),
-                    attempt_id: observed.association.attempt_id.clone(),
-                    request_sha256: observed.association.request_sha256.clone(),
-                };
-                *held_association
-                    .lock()
-                    .map_err(|_| io::Error::other("association ownership poisoned"))? =
-                    Some(expected);
-                super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.stage("association-publication")
-                });
-                let observation_path = directory.join("live-observation.json");
-                let staging = directory.join("live-observation.pending");
-                let bytes = serde_json::to_vec(&observed).map_err(io::Error::other)?;
-                let mut publication = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staging)?;
-                publication.write_all(&bytes)?;
-                publication.sync_all()?;
-                drop(publication);
-                fs::rename(&staging, &observation_path)?;
-                if read(&observation_path, 32 * 1024).map_err(io::Error::other)? != bytes {
-                    return Err(io::Error::other(
-                        "live native association named publication differs",
-                    ));
-                }
-                let identity_path = directory.join("live-held-guardian.json");
-                let staging = directory.join("live-held-guardian.pending");
-                let bytes = serde_json::to_vec(&guardian_identity).map_err(io::Error::other)?;
-                let mut publication = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staging)?;
-                publication.write_all(&bytes)?;
-                publication.sync_all()?;
-                drop(publication);
-                fs::rename(&staging, &identity_path)?;
-                super::guardian_query::update(&callback_guardian_query, |trace| {
-                    trace.stage("association-admitted")
-                });
-                match start_transport {
-                    descriptor::StartTransport::NamedEvent => {
-                        signal(callback_gate.as_deref().ok_or_else(|| {
-                            io::Error::other("original named START owner unavailable")
-                        })?)?
-                    }
-                    descriptor::StartTransport::ControllerStdin { .. } => {
-                        use std::io::{Read, Seek, SeekFrom};
-                        provision_budget(work_deadline).map_err(io::Error::other)?;
-                        descriptor_owner.seek(SeekFrom::Start(0))?;
-                        let mut actual_bytes = Vec::new();
-                        Read::by_ref(&mut descriptor_owner)
-                            .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
-                            .read_to_end(&mut actual_bytes)?;
-                        let actual = descriptor::Descriptor::parse(&actual_bytes)
-                            .map_err(io::Error::other)?;
-                        // The existing measured frontend changes only its sentinel
-                        // inventory before launching this original target. Bind the
-                        // frame to those final bytes through the same held file.
-                        let mut expected = start_descriptor;
-                        expected.sentinel_handles = actual.sentinel_handles.clone();
-                        if serde_json::to_value(&actual).map_err(io::Error::other)?
-                            != serde_json::to_value(&expected).map_err(io::Error::other)?
+                        .map_err(|_| io::Error::other("fixture ownership poisoned"))? = held;
+                    if capture_frontend_identity {
+                        let mut selected = Vec::new();
+                        for process in
+                            memcordon_testkit::windows_processes_for_image_until(&cli, deadline)?
                         {
+                            if process.native_parent_process_id()? == wrapper_pid
+                                && !process.has_exited()?
+                            {
+                                selected.push(process);
+                            }
+                        }
+                        if selected.len() != 1 {
                             return Err(io::Error::other(
-                                "original START descriptor changed beyond measured sentinel inventory",
+                                "status fixture lacks one original held frontend child",
                             ));
                         }
-                        let writer = stdin.take().ok_or_else(|| {
-                            io::Error::other("original controller START stdin writer unavailable")
-                        })?;
-                        let binding = descriptor::controller_start::Binding {
-                            challenge: start_challenge,
-                            descriptor_sha256: descriptor::controller_start::descriptor_digest(
-                                &actual_bytes,
-                            ),
-                            pid: root_identity.pid,
-                            birth: u64::try_from(root_identity.birth).map_err(io::Error::other)?,
-                        };
-                        let joint = start_descriptor_case_is_joint;
-                        let sender = if let Some(owner) = &registry_recipient {
-                            let mut owner = owner.lock().map_err(|_| {
-                                io::Error::other("registry input ownership poisoned")
-                            })?;
-                            let recipient = {
-                                let held = held_family
-                                    .lock()
-                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                                if held.len() != 1 || held[0].identity != root_identity {
-                                    return Err(io::Error::other(
-                                        "original registry recipient identity differs",
-                                    ));
-                                }
-                                held[0].clone()
-                            };
-                            let handle = owner.duplicate_into(&recipient, work_deadline)?;
-                            let sender = descriptor::controller_start::Sender::with_registry(
-                                descriptor::controller_start::Capability {
-                                    version: 1,
-                                    handle,
-                                    manifest_sha256: owner.declaration().sha256,
-                                },
-                                joint,
-                            );
-                            if let Some(custody) = &callback_private_custody {
-                                sender.with_directories(
-                                    custody
-                                        .duplicate_into(&recipient, work_deadline)
-                                        .map_err(io::Error::other)?,
-                                    custody
-                                        .binding()
-                                        .directory_expectation()
-                                        .map_err(io::Error::other)?,
-                                )?
-                            } else {
-                                sender
-                            }
-                        } else if joint {
-                            descriptor::controller_start::Sender::joint()
+                        *held_frontend
+                            .lock()
+                            .map_err(|_| io::Error::other("frontend ownership poisoned"))? =
+                            selected.pop();
+                    }
+                    let guardian = baseline
+                        .hold_new_guardian_excluding(&excluded)
+                        .map_err(io::Error::other)?;
+                    let guardian_identity = guardian.identity.clone();
+                    let adopted = super::guardian_query::adopt(&observed_guardian_owner, guardian);
+                    super::guardian_query::update(&callback_guardian_query, |trace| {
+                        trace.guardian(serde_json::json!(guardian_identity));
+                        trace.stage(if adopted.is_ok() {
+                            "command-materialization"
                         } else {
-                            descriptor::controller_start::Sender::default()
-                        };
-                        let mut session = ControlSession {
-                            writer: Some(writer),
-                            binding,
-                            sender,
-                            deadline: work_deadline,
-                        };
-                        if fileio_requested {
-                            let prepared = (|| -> io::Result<_> {
-                                let clock = actual.control_clock.as_ref().ok_or_else(|| {
-                                    io::Error::other("original FileIo work clock unavailable")
+                            "guardian-adoption-failed"
+                        });
+                    });
+                    adopted?;
+                    let query_started = Instant::now();
+                    let query_cutoff = work_deadline.min(query_started + Duration::from_secs(30));
+                    let query_budget = query_cutoff.saturating_duration_since(query_started);
+                    if query_budget.is_zero() {
+                        return Err(io::Error::other(
+                            "original Windows work deadline exhausted before association query",
+                        ));
+                    }
+                    let mut query = CommandSpec::new(&cli, &directory, query_budget)
+                        .args([
+                            OsString::from("__observe-windows-guardian"),
+                            guardian_identity.process_id.to_string().into(),
+                            guardian_identity.creation_time_100ns.to_string().into(),
+                        ])
+                        .materialize()
+                        .map_err(io::Error::other)?;
+                    let query_budget = query_cutoff
+                        .saturating_duration_since(Instant::now())
+                        .min(work_deadline.saturating_duration_since(Instant::now()));
+                    if query_budget.is_zero() {
+                        return Err(io::Error::other(
+                            "original Windows work deadline exhausted during association query setup",
+                        ));
+                    }
+                    super::guardian_query::update(&callback_guardian_query, |trace| {
+                        trace.stage("command-capture")
+                    });
+                    let observed = memcordon_testkit::run_with_deadline_output_limit(
+                        &mut query,
+                        query_budget,
+                        super::guardian_query::STREAM_BOUND,
+                    )
+                    .map_err(io::Error::other)?;
+                    let observed_stdout = observed.stdout.clone();
+                    let failure =
+                        super::guardian_query::update(&callback_guardian_query, |trace| {
+                            trace.captured(observed);
+                            trace.stage("returned-output");
+                            trace.failure()
+                        });
+                    if let Some(failure) = failure {
+                        return Err(failure);
+                    }
+                    super::guardian_query::update(&callback_guardian_query, |trace| {
+                        trace.stage("association-parse")
+                    });
+                    let observed: memcordon_core::WindowsGuardianAttemptObservation =
+                        serde_json::from_slice(&observed_stdout).map_err(io::Error::other)?;
+                    super::guardian_query::update(&callback_guardian_query, |trace| {
+                        trace.stage("association-validation")
+                    });
+                    if !observed.is_consistent()
+                        || observed.association.provider != expected_provider
+                        || observed.guardian_identity.process_id != guardian_identity.process_id
+                        || observed.guardian_identity.creation_time_100ns
+                            != guardian_identity.creation_time_100ns
+                    {
+                        return Err(io::Error::other(
+                            "positive native guardian association differs",
+                        ));
+                    }
+                    if matches!(
+                        start_transport,
+                        descriptor::StartTransport::ControllerStdin { .. }
+                    ) && observed.live_target_identity.as_ref().is_none_or(|target| {
+                        target.process_id != root_identity.pid
+                            || u128::from(target.creation_time_100ns) != root_identity.birth
+                    }) {
+                        return Err(io::Error::other(
+                            "START guardian association does not name the original held target",
+                        ));
+                    }
+                    let expected = memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
+                        provider: observed.association.provider.clone(),
+                        attempt_id: observed.association.attempt_id.clone(),
+                        request_sha256: observed.association.request_sha256.clone(),
+                    };
+                    *held_association
+                        .lock()
+                        .map_err(|_| io::Error::other("association ownership poisoned"))? =
+                        Some(expected);
+                    super::guardian_query::update(&callback_guardian_query, |trace| {
+                        trace.stage("association-publication")
+                    });
+                    let observation_path = directory.join("live-observation.json");
+                    let staging = directory.join("live-observation.pending");
+                    let bytes = serde_json::to_vec(&observed).map_err(io::Error::other)?;
+                    let mut publication = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&staging)?;
+                    publication.write_all(&bytes)?;
+                    publication.sync_all()?;
+                    drop(publication);
+                    fs::rename(&staging, &observation_path)?;
+                    if read(&observation_path, 32 * 1024).map_err(io::Error::other)? != bytes {
+                        return Err(io::Error::other(
+                            "live native association named publication differs",
+                        ));
+                    }
+                    let identity_path = directory.join("live-held-guardian.json");
+                    let staging = directory.join("live-held-guardian.pending");
+                    let bytes = serde_json::to_vec(&guardian_identity).map_err(io::Error::other)?;
+                    let mut publication = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&staging)?;
+                    publication.write_all(&bytes)?;
+                    publication.sync_all()?;
+                    drop(publication);
+                    fs::rename(&staging, &identity_path)?;
+                    super::guardian_query::update(&callback_guardian_query, |trace| {
+                        trace.stage("association-admitted")
+                    });
+                    match start_transport {
+                        descriptor::StartTransport::NamedEvent => {
+                            signal(callback_gate.as_deref().ok_or_else(|| {
+                                io::Error::other("original named START owner unavailable")
+                            })?)?
+                        }
+                        descriptor::StartTransport::ControllerStdin { .. } => {
+                            use std::io::{Read, Seek, SeekFrom};
+                            provision_budget(work_deadline).map_err(io::Error::other)?;
+                            descriptor_owner.seek(SeekFrom::Start(0))?;
+                            let mut actual_bytes = Vec::new();
+                            Read::by_ref(&mut descriptor_owner)
+                                .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
+                                .read_to_end(&mut actual_bytes)?;
+                            let actual = descriptor::Descriptor::parse(&actual_bytes)
+                                .map_err(io::Error::other)?;
+                            // The existing measured frontend changes only its sentinel
+                            // inventory before launching this original target. Bind the
+                            // frame to those final bytes through the same held file.
+                            let mut expected = start_descriptor;
+                            expected.sentinel_handles = actual.sentinel_handles.clone();
+                            if serde_json::to_value(&actual).map_err(io::Error::other)?
+                                != serde_json::to_value(&expected).map_err(io::Error::other)?
+                            {
+                                return Err(io::Error::other(
+                                    "original START descriptor changed beyond measured sentinel inventory",
+                                ));
+                            }
+                            let writer = stdin.take().ok_or_else(|| {
+                                io::Error::other(
+                                    "original controller START stdin writer unavailable",
+                                )
+                            })?;
+                            let binding = descriptor::controller_start::Binding {
+                                challenge: start_challenge,
+                                descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                                    &actual_bytes,
+                                ),
+                                pid: root_identity.pid,
+                                birth: u64::try_from(root_identity.birth)
+                                    .map_err(io::Error::other)?,
+                            };
+                            let joint = start_descriptor_case_is_joint;
+                            let sender = if let Some(owner) = &registry_recipient {
+                                let mut owner = owner.lock().map_err(|_| {
+                                    io::Error::other("registry input ownership poisoned")
                                 })?;
                                 let recipient = {
                                     let held = held_family.lock().map_err(|_| {
@@ -4991,12 +4981,61 @@ pub(crate) mod native {
                                     })?;
                                     if held.len() != 1 || held[0].identity != root_identity {
                                         return Err(io::Error::other(
-                                            "original FileIo recipient identity differs",
+                                            "original registry recipient identity differs",
                                         ));
                                     }
                                     held[0].clone()
                                 };
-                                memcordon_platform::test_support::windows_fileio::OwnedFileIoSession::prepare(
+                                let handle = owner.duplicate_into(&recipient, work_deadline)?;
+                                let sender = descriptor::controller_start::Sender::with_registry(
+                                    descriptor::controller_start::Capability {
+                                        version: 1,
+                                        handle,
+                                        manifest_sha256: owner.declaration().sha256,
+                                    },
+                                    joint,
+                                );
+                                if let Some(custody) = &callback_private_custody {
+                                    sender.with_directories(
+                                        custody
+                                            .duplicate_into(&recipient, work_deadline)
+                                            .map_err(io::Error::other)?,
+                                        custody
+                                            .binding()
+                                            .directory_expectation()
+                                            .map_err(io::Error::other)?,
+                                    )?
+                                } else {
+                                    sender
+                                }
+                            } else if joint {
+                                descriptor::controller_start::Sender::joint()
+                            } else {
+                                descriptor::controller_start::Sender::default()
+                            };
+                            let mut session = ControlSession {
+                                writer: Some(writer),
+                                binding,
+                                sender,
+                                deadline: work_deadline,
+                            };
+                            if fileio_requested {
+                                let prepared = (|| -> io::Result<_> {
+                                    let clock = actual.control_clock.as_ref().ok_or_else(|| {
+                                        io::Error::other("original FileIo work clock unavailable")
+                                    })?;
+                                    let recipient = {
+                                        let held = held_family.lock().map_err(|_| {
+                                            io::Error::other("fixture ownership poisoned")
+                                        })?;
+                                        if held.len() != 1 || held[0].identity != root_identity {
+                                            return Err(io::Error::other(
+                                                "original FileIo recipient identity differs",
+                                            ));
+                                        }
+                                        held[0].clone()
+                                    };
+                                    memcordon_platform::test_support::windows_fileio::OwnedFileIoSession::prepare(
                                     &recipient,
                                     memcordon_platform::windows_fileio_record::Binding {
                                         descriptor_sha256: session.binding.descriptor_sha256,
@@ -5007,117 +5046,180 @@ pub(crate) mod native {
                                     work_deadline,
                                     cleanup_deadline,
                                 ).map(|prepared| prepared.with_retention_mode(fileio_retention))
-                            })();
-                            match prepared {
-                                Ok(prepared) => {
-                                    // prepare only borrowed the held object; no family
-                                    // mutex is held across ETW startup or helper waits.
-                                    let capture = crate::windows_loader_fileio::Capture::begin(
-                                        prepared,
-                                        work_deadline,
-                                        cleanup_deadline,
-                                        Arc::clone(&callback_fileio),
-                                    );
-                                    *callback_fileio_owner
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                        Some(capture);
+                                })();
+                                match prepared {
+                                    Ok(prepared) => {
+                                        // prepare only borrowed the held object; no family
+                                        // mutex is held across ETW startup or helper waits.
+                                        let capture = crate::windows_loader_fileio::Capture::begin(
+                                            prepared,
+                                            work_deadline,
+                                            cleanup_deadline,
+                                            Arc::clone(&callback_fileio),
+                                        );
+                                        *callback_fileio_owner
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some(capture);
+                                    }
+                                    Err(error) => crate::windows_loader_fileio::unavailable(
+                                        &callback_fileio,
+                                        error,
+                                    ),
                                 }
-                                Err(error) => crate::windows_loader_fileio::unavailable(
-                                    &callback_fileio,
-                                    error,
-                                ),
                             }
+                            if let Some(custody) = &callback_private_custody {
+                                // Releasing this root permits its later original
+                                // spawn. Missing/partial transcript publication or
+                                // root exit cannot erase that interval's debt.
+                                custody.note_spawn_uncertainty().map_err(io::Error::other)?;
+                            }
+                            session.release(descriptor::controller_start::Phase::Start)?;
+                            control_session = Some(session);
+                            super::guardian_query::update(&callback_guardian_query, |trace| {
+                                trace.stage("stdin-start-published")
+                            });
                         }
-                        if let Some(custody) = &callback_private_custody {
-                            // Releasing this root permits its later original
-                            // spawn. Missing/partial transcript publication or
-                            // root exit cannot erase that interval's debt.
-                            custody.note_spawn_uncertainty().map_err(io::Error::other)?;
-                        }
-                        session.release(descriptor::controller_start::Phase::Start)?;
-                        control_session = Some(session);
-                        super::guardian_query::update(&callback_guardian_query, |trace| {
-                            trace.stage("stdin-start-published")
-                        });
                     }
-                }
-                if owns_tcp {
-                    let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
-                    let port = loop {
-                        use crate::windows_listener_wait::{Identity, Owner, Publication};
-                        let port = crate::windows_listener_wait::poll(
-                            Identity {
-                                pid: root_identity.pid,
-                                birth: root_identity.birth,
-                            },
-                            deadline,
-                            Instant::now,
-                            || {
-                                let held = held_family
-                                    .lock()
-                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                                if held.len() != 1 {
-                                    return Err(io::Error::other(
-                                        "original listener root ownership differs",
-                                    ));
-                                }
-                                let root = &held[0];
-                                Ok(Owner {
-                                    identity: Identity {
-                                        pid: root.identity.pid,
-                                        birth: root.identity.birth,
-                                    },
-                                    exit_status: root.native_exit_status()?,
-                                })
-                            },
-                            || {
-                                let bytes =
-                                    read(&transcript, 16 * 1024 * 1024).map_err(
-                                        |error| match error {
-                                            CiError::Io(error) => error,
-                                            error => io::Error::other(error),
+                    if owns_tcp {
+                        let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
+                        let port = loop {
+                            use crate::windows_listener_wait::{Identity, Owner, Publication};
+                            let port = crate::windows_listener_wait::poll(
+                                Identity {
+                                    pid: root_identity.pid,
+                                    birth: root_identity.birth,
+                                },
+                                deadline,
+                                Instant::now,
+                                || {
+                                    let held = held_family.lock().map_err(|_| {
+                                        io::Error::other("fixture ownership poisoned")
+                                    })?;
+                                    if held.len() != 1 {
+                                        return Err(io::Error::other(
+                                            "original listener root ownership differs",
+                                        ));
+                                    }
+                                    let root = &held[0];
+                                    Ok(Owner {
+                                        identity: Identity {
+                                            pid: root.identity.pid,
+                                            birth: root.identity.birth,
                                         },
-                                    );
-                                let Some(bytes) =
-                                    crate::windows_listener_wait::transcript_bytes(bytes)?
-                                else {
-                                    return Ok(None);
-                                };
-                                let events =
-                                    super::live_events(&bytes).map_err(io::Error::other)?;
-                                Ok(events
-                                    .into_iter()
-                                    .find(|event| event.stage == "tcp-listener-owned")
-                                    .map(|event| Publication {
-                                        pid: event.pid,
-                                        value: event.value,
-                                    }))
-                            },
-                        )?;
-                        if let Some(port) = port {
-                            break port;
+                                        exit_status: root.native_exit_status()?,
+                                    })
+                                },
+                                || {
+                                    let bytes =
+                                        read(&transcript, 16 * 1024 * 1024).map_err(|error| {
+                                            match error {
+                                                CiError::Io(error) => error,
+                                                error => io::Error::other(error),
+                                            }
+                                        });
+                                    let Some(bytes) =
+                                        crate::windows_listener_wait::transcript_bytes(bytes)?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    let events =
+                                        super::live_events(&bytes).map_err(io::Error::other)?;
+                                    Ok(events
+                                        .into_iter()
+                                        .find(|event| event.stage == "tcp-listener-owned")
+                                        .map(|event| Publication {
+                                            pid: event.pid,
+                                            value: event.value,
+                                        }))
+                                },
+                            );
+                            let port = match port {
+                                Ok(port) => port,
+                                Err(error) => {
+                                    if released_listener_prefix
+                                        && callback_private_custody.is_none()
+                                        && Instant::now() < work_deadline
+                                    {
+                                        if let Some(failure @ crate::windows_listener_wait::Failure::Retired { .. }) =
+                                        error.get_ref().and_then(|source| source.downcast_ref::<crate::windows_listener_wait::Failure>())
+                                    {
+                                        let held = held_family.lock().map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                        if held.len() != 1 {
+                                            return Err(io::Error::other("retired listener root ownership differs"));
+                                        }
+                                        let root = held[0].clone();
+                                        drop(held);
+                                        let owner = Owner { identity: Identity { pid: root.identity.pid, birth: root.identity.birth }, exit_status: root.native_exit_status()? };
+                                        // The retired original Joint prefix cannot create a peer or
+                                        // compiler before listener publication. A complete transcript
+                                        // excludes later phases; no missing record supplies that proof.
+                                        let bytes = read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?;
+                                        let events = super::events(&bytes).map_err(io::Error::other)?;
+                                        let stages: Vec<_> = events.iter().map(|event| event.stage.as_str()).collect();
+                                        let bound_start = control_session.as_ref().is_some_and(|session| {
+                                            session.binding.pid == root_identity.pid
+                                                && u128::from(session.binding.birth) == root_identity.birth
+                                                && events.iter().all(|event| event.pid == root_identity.pid)
+                                                && events.first().is_some_and(|event| event.value == session.binding.challenge)
+                                                && events.last().is_some_and(|event| event.value == session.binding.challenge)
+                                        });
+                                        let eligible = crate::windows_listener_wait::application_end(
+                                            Identity { pid: root_identity.pid, birth: root_identity.birth },
+                                            owner, failure, bound_start, &stages, Some(0), Some(false),
+                                        ).is_some();
+                                        if eligible {
+                                            use std::io::{Read, Seek, SeekFrom};
+                                            let session = control_session.as_ref().expect("eligible bound START");
+                                            descriptor_owner.seek(SeekFrom::Start(0))?;
+                                            let mut original = Vec::new();
+                                            Read::by_ref(&mut descriptor_owner).take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64).read_to_end(&mut original)?;
+                                            if descriptor::controller_start::descriptor_digest(&original) != session.binding.descriptor_sha256 {
+                                                return Err(io::Error::other("retired listener START descriptor bytes changed"));
+                                            }
+                                            let declared = descriptor::Descriptor::parse(&original).map_err(io::Error::other)?;
+                                            let payload = |stage| events.iter().find(|event| event.stage == stage).expect("eligible complete prefix").value.as_slice();
+                                            let argv = serde_json::to_vec(&serde_json::json!({"encoding":"windows_utf16","values":declared.arguments.iter().map(|argument|argument.encode_utf16().collect::<Vec<_>>()).collect::<Vec<_>>()})).map_err(io::Error::other)?;
+                                            let token: TokenObservation = serde_json::from_slice(payload("token-envelope")).map_err(io::Error::other)?;
+                                            if payload("native-argv-observed") != argv
+                                                || payload("sentinel-handles-excluded") != u32::try_from(declared.sentinel_handles.len()).map_err(io::Error::other)?.to_le_bytes()
+                                                || token != prefix_token
+                                            {
+                                                return Err(io::Error::other("retired listener prefix argv, sentinel or token readback differs"));
+                                            }
+                                        }
+                                        provision_budget(work_deadline).map_err(io::Error::other)?;
+                                        application_ended = eligible;
+                                    }
+                                    }
+                                    return Err(error);
+                                }
+                            };
+                            if let Some(port) = port {
+                                break port;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        };
+                        crate::windows_loader_fileio::stop_collection(&callback_fileio_owner);
+                        let root_owner = {
+                            let held = held_family
+                                .lock()
+                                .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                            if held.len() != 1 {
+                                return Err(io::Error::other(
+                                    "native listener root cardinality differs",
+                                ));
+                            }
+                            held[0].clone()
+                        };
+                        if root_owner.has_exited()? {
+                            return Err(io::Error::other("native listener root is not held live"));
                         }
-                        std::thread::sleep(Duration::from_millis(10));
-                    };
-                    crate::windows_loader_fileio::stop_collection(&callback_fileio_owner);
-                    let root_owner = {
-                        let held = held_family
-                            .lock()
-                            .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                        if held.len() != 1 {
-                            return Err(io::Error::other(
-                                "native listener root cardinality differs",
-                            ));
-                        }
-                        held[0].clone()
-                    };
-                    if root_owner.has_exited()? {
-                        return Err(io::Error::other("native listener root is not held live"));
-                    }
-                    native_listener_owner(root_pid, port)?;
-                    let refusal =
-                        match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                        native_listener_owner(root_pid, port)?;
+                        let refusal = match std::net::TcpListener::bind((
+                            std::net::Ipv4Addr::LOCALHOST,
+                            port,
+                        )) {
                             Ok(_) => {
                                 return Err(io::Error::other(
                                     "controller acquired held fixture endpoint",
@@ -5125,237 +5227,32 @@ pub(crate) mod native {
                             }
                             Err(error) => error,
                         };
-                    if refusal.raw_os_error() != Some(10048) {
-                        return Err(refusal);
-                    }
-                    native_listener_owner(root_pid, port)?;
-                    if root_owner.has_exited()? {
-                        return Err(io::Error::other(
-                            "native listener owner retired during observation",
-                        ));
-                    }
-                    if let Some(observation) = &projection_observation {
-                        let token = root_owner.original_token_envelope(deadline)?;
-                        observation
-                            .lock()
-                            .map_err(|_| io::Error::other("experiment held observation poisoned"))?
-                            .root =
-                            Some((root_owner.identity.pid, root_owner.identity.birth, token));
-                    }
-                    let bytes = serde_json::to_vec(&serde_json::json!({
-                        "format": "memcordon.windows-native-listener", "revision": 1,
-                        "root_pid": root_pid, "root_creation_time_100ns": root_owner.identity.birth,
-                        "address": "127.0.0.1", "port": port, "held_owner_live": true,
-                        "native_table_owner_observed_before_and_after": true, "conflicting_bind_win32_code": refusal.raw_os_error(),
-                    })).map_err(io::Error::other)?;
-                    let path = directory.join(ProviderExperimentRecord::NativeListener.leaf());
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)?;
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-                    if read(&path, 16 * 1024).map_err(io::Error::other)? != bytes {
-                        return Err(io::Error::other("native listener named readback differs"));
-                    }
-                    if let Some(endpoint_event) = endpoint_event {
-                        signal(&endpoint_event)?;
-                    } else {
-                        if let Some(custody) = &callback_private_custody {
-                            let start_binding = control_session
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    io::Error::other("private peer admission START session absent")
-                                })?
-                                .binding
-                                .clone();
-                            let root = held_family
-                                .lock()
-                                .map_err(|_| io::Error::other("private root ownership poisoned"))?
-                                .first()
-                                .cloned()
-                                .ok_or_else(|| io::Error::other("private original root absent"))?;
-                            let pending = loop {
-                                let events = super::live_events(
-                                    &read(&transcript, 16 * 1024 * 1024)
-                                        .map_err(io::Error::other)?,
-                                )
-                                .map_err(io::Error::other)?;
-                                let intent = events
-                                    .iter()
-                                    .filter(|event| event.stage == "tcp-peer-spawn-intent")
-                                    .collect::<Vec<_>>();
-                                let pending = events
-                                    .iter()
-                                    .filter(|event| event.stage == "tcp-peer-pending-admission")
-                                    .collect::<Vec<_>>();
-                                if intent.len() > 1 || pending.len() > 1 {
-                                    custody.mark_unknown_spawn();
-                                    return Err(io::Error::other(
-                                        "private peer admission marker replay",
-                                    ));
-                                }
-                                if let Some(intent) = intent.first() {
-                                    custody.note_spawn_uncertainty().map_err(io::Error::other)?;
-                                    if intent.pid != root_pid || intent.value.len() > 1024 {
-                                        return Err(io::Error::other(
-                                            "private peer spawn-intent binding extent differs",
-                                        ));
-                                    }
-                                    let observed:descriptor::controller_start::PeerAdmissionBinding = serde_json::from_slice(&intent.value).map_err(io::Error::other)?;
-                                    if observed != descriptor::controller_start::PeerAdmissionBinding::from_start(&start_binding) {
-                                        return Err(io::Error::other("private peer spawn-intent binding differs"));
-                                    }
-                                }
-                                if let Some(pending) = pending.first() {
-                                    custody.note_spawn_uncertainty().map_err(io::Error::other)?;
-                                    if intent.len() != 1
-                                        || pending.sequence <= intent[0].sequence
-                                        || pending.pid != root_pid
-                                        || pending.value.len() > 1024
-                                    {
-                                        return Err(io::Error::other(
-                                            "private pending peer lacks bound prior spawn intent",
-                                        ));
-                                    }
-                                    let pending:descriptor::controller_start::PeerPendingAdmission = serde_json::from_slice(&pending.value).map_err(io::Error::other)?;
-                                    pending.validate(&start_binding)?;
-                                    break pending;
-                                }
-                                if root.has_exited()? {
-                                    return Err(io::Error::other(
-                                        "private root retired before peer admission",
-                                    ));
-                                }
-                                if Instant::now() >= deadline {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::TimedOut,
-                                        "original peer admission deadline exhausted",
-                                    ));
-                                }
-                                std::thread::sleep(Duration::from_millis(10));
-                            };
-                            let expected = memcordon_platform::test_support::ProcessIdentity {
-                                pid: pending.recipient.pid,
-                                birth: u128::from(pending.recipient.birth),
-                            };
-                            let _held_peer = custody
-                                .admit_peer(
-                                    &root,
-                                    pending.recipient.handle,
-                                    expected,
-                                    &fixture,
-                                    deadline,
-                                )
-                                .map_err(io::Error::other)?;
-                            // Native owner insertion is complete, and no family
-                            // mutex remains held across this authenticated ACK.
-                            control_session
-                                .as_mut()
-                                .expect("checked original private session")
-                                .peer_held(&pending.recipient)?;
+                        if refusal.raw_os_error() != Some(10048) {
+                            return Err(refusal);
                         }
-                        let peer_identity = loop {
-                            let published = super::live_events(
-                                &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
-                            )
-                            .map_err(io::Error::other)?;
-                            if callback_private_custody.is_some()
-                                && published
-                                    .iter()
-                                    .filter(|event| event.stage == "tcp-peer-created")
-                                    .count()
-                                    > 1
-                            {
-                                return Err(io::Error::other(
-                                    "private TCP peer publication count differs",
-                                ));
-                            }
-                            if let Some(peer) = published
-                                .iter()
-                                .find(|event| event.stage == "tcp-peer-created")
-                            {
-                                if peer.pid != root_pid {
-                                    return Err(io::Error::other(
-                                        "TCP peer publisher differs from held root",
-                                    ));
-                                }
-                                break serde_json::from_slice::<
-                                    memcordon_core::WindowsProcessIdentityV1,
-                                >(&peer.value)
-                                .map_err(io::Error::other)?;
-                            }
-                            if Instant::now() >= deadline {
-                                return Err(io::Error::other(
-                                    "native TCP peer publication deadline expired",
-                                ));
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        };
-                        let peer = if let Some(custody) = &callback_private_custody {
-                            custody
-                                .admitted_peer(memcordon_platform::test_support::ProcessIdentity {
-                                    pid: peer_identity.process_id,
-                                    birth: u128::from(peer_identity.creation_time_100ns),
-                                })
-                                .map_err(io::Error::other)?
-                        } else {
-                            memcordon_testkit::windows_processes_for_image_until(
-                                &fixture, deadline,
-                            )?
-                            .into_iter()
-                            .find(|process| process.identity.pid == peer_identity.process_id)
-                            .ok_or_else(|| io::Error::other("native TCP peer handle unavailable"))?
-                        };
-                        let (family_count, root) = {
-                            let held = held_family
-                                .lock()
-                                .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                            (
-                                held.len(),
-                                held.first().cloned().ok_or_else(|| {
-                                    io::Error::other("original root owner absent")
-                                })?,
-                            )
-                        };
-                        let parent_matches = if callback_private_custody.is_some() {
-                            peer.native_parent_process_id()? == root_pid
-                        } else {
-                            process_parents()?.get(&peer.identity.pid) == Some(&root_pid)
-                        };
-                        if family_count
-                            != (if callback_private_custody.is_some() {
-                                2
-                            } else {
-                                1
-                            })
-                            || root.has_exited()?
-                            || peer.has_exited()?
-                            || peer.identity.birth != u128::from(peer_identity.creation_time_100ns)
-                            || root.identity.birth > peer.identity.birth
-                            || !parent_matches
-                        {
+                        native_listener_owner(root_pid, port)?;
+                        if root_owner.has_exited()? {
                             return Err(io::Error::other(
-                                "native held TCP peer identity or live ancestry differs",
+                                "native listener owner retired during observation",
                             ));
                         }
-                        let bytes = serde_json::to_vec(&serde_json::json!({
-                            "format":"memcordon.windows-native-tcp-peer", "revision":1,
-                            "pid":peer.identity.pid, "birth":peer.identity.birth,
-                            "parent_pid":root_pid, "parent_birth":root.identity.birth,
-                            "native_parent_edge_observed":true, "parent_and_child_held_live":true,
-                        }))
-                        .map_err(io::Error::other)?;
                         if let Some(observation) = &projection_observation {
-                            let token = peer.original_token_envelope(deadline)?;
+                            let token = root_owner.original_token_envelope(deadline)?;
                             observation
                                 .lock()
                                 .map_err(|_| {
                                     io::Error::other("experiment held observation poisoned")
                                 })?
-                                .peer = Some((peer.identity.pid, peer.identity.birth, token));
+                                .root =
+                                Some((root_owner.identity.pid, root_owner.identity.birth, token));
                         }
-                        let path = directory.join(ProviderExperimentRecord::NativeTcpPeer.leaf());
+                        let bytes = serde_json::to_vec(&serde_json::json!({
+                        "format": "memcordon.windows-native-listener", "revision": 1,
+                        "root_pid": root_pid, "root_creation_time_100ns": root_owner.identity.birth,
+                        "address": "127.0.0.1", "port": port, "held_owner_live": true,
+                        "native_table_owner_observed_before_and_after": true, "conflicting_bind_win32_code": refusal.raw_os_error(),
+                    })).map_err(io::Error::other)?;
+                        let path = directory.join(ProviderExperimentRecord::NativeListener.leaf());
                         let mut file = OpenOptions::new()
                             .write(true)
                             .create_new(true)
@@ -5363,134 +5260,321 @@ pub(crate) mod native {
                         file.write_all(&bytes)?;
                         file.sync_all()?;
                         if read(&path, 16 * 1024).map_err(io::Error::other)? != bytes {
-                            return Err(io::Error::other("native TCP peer named readback differs"));
+                            return Err(io::Error::other("native listener named readback differs"));
                         }
-                        if callback_private_custody.is_none() {
-                            held_family
-                                .lock()
-                                .map_err(|_| io::Error::other("fixture ownership poisoned"))?
-                                .push(peer);
-                        }
-                    }
-                }
-                if needs_toolchain_observer {
-                    match start_transport {
-                        descriptor::StartTransport::NamedEvent => {
-                            signal(toolchain_event.as_ref().ok_or_else(|| {
-                                io::Error::other("original toolchain observer event absent")
-                            })?)?
-                        }
-                        descriptor::StartTransport::ControllerStdin { .. } => control_session
-                            .as_mut()
-                            .ok_or_else(|| {
-                                io::Error::other("original Joint control session absent")
-                            })?
-                            .release(
-                                descriptor::controller_start::Phase::ToolchainObserverRelease,
-                            )?,
-                    }
-                    observe_toolchain_descendants(
-                        &directory,
-                        &toolchain_output_root,
-                        &toolchain_challenge,
-                        &transcript,
-                        root_pid,
-                        &held_family,
-                        ToolchainObservationImages {
-                            images: &toolchain_images,
-                            clock: toolchain_clock.ok_or_else(|| {
-                                io::Error::other("toolchain diagnostic original clock absent")
-                            })?,
-                        },
-                        work_deadline,
-                    )?;
-                }
-                if let (Some(cohort), Some(generation)) = (cohort_event, generation_event) {
-                    let deadline = work_deadline.min(Instant::now() + Duration::from_secs(600));
-                    let mut released_cohort = 0;
-                    let mut released_generation = 0;
-                    loop {
-                        let published = super::live_events(
-                            &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
-                        )
-                        .map_err(io::Error::other)?;
-                        for event in &published {
-                            let controller = match (event.stage.as_str(), event.ordinal) {
-                                ("cohort-live", Some(ordinal)) if ordinal > released_cohort => {
-                                    released_cohort = ordinal;
-                                    Some(&cohort)
-                                }
-                                ("generation-live", Some(ordinal))
-                                    if ordinal > released_generation =>
-                                {
-                                    released_generation = ordinal;
-                                    Some(&generation)
-                                }
-                                _ => None,
-                            };
-                            if let Some(controller) = controller {
-                                let parents = process_parents()?;
-                                let active = memcordon_testkit::windows_processes_for_image_until(
-                                    &fixture, deadline,
-                                )?;
-                                let mut family = held_family
-                                    .lock()
-                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                                let root = family
-                                    .iter()
-                                    .find(|held| held.identity.pid == root_pid)
+                        if let Some(endpoint_event) = endpoint_event {
+                            signal(&endpoint_event)?;
+                        } else {
+                            if let Some(custody) = &callback_private_custody {
+                                let start_binding = control_session
+                                    .as_ref()
                                     .ok_or_else(|| {
-                                        io::Error::other("original churn root owner absent")
+                                        io::Error::other(
+                                            "private peer admission START session absent",
+                                        )
+                                    })?
+                                    .binding
+                                    .clone();
+                                let root = held_family
+                                    .lock()
+                                    .map_err(|_| {
+                                        io::Error::other("private root ownership poisoned")
+                                    })?
+                                    .first()
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        io::Error::other("private original root absent")
                                     })?;
-                                if root.has_exited()? {
-                                    return Err(io::Error::other(
-                                        "original churn root retired before barrier",
-                                    ));
-                                }
-                                let root_identity = (root.identity.pid, root.identity.birth);
-                                let mut generation_depths = std::collections::BTreeSet::new();
-                                let mut live_children = 0usize;
-                                for process in active {
-                                    let Some(depth) = rooted_process_depth(
-                                        (process.identity.pid, process.identity.birth),
-                                        root_identity,
-                                        &parents,
-                                    ) else {
-                                        continue;
-                                    };
-                                    if process.has_exited()? {
-                                        continue;
+                                let pending = loop {
+                                    let events = super::live_events(
+                                        &read(&transcript, 16 * 1024 * 1024)
+                                            .map_err(io::Error::other)?,
+                                    )
+                                    .map_err(io::Error::other)?;
+                                    let intent = events
+                                        .iter()
+                                        .filter(|event| event.stage == "tcp-peer-spawn-intent")
+                                        .collect::<Vec<_>>();
+                                    let pending = events
+                                        .iter()
+                                        .filter(|event| event.stage == "tcp-peer-pending-admission")
+                                        .collect::<Vec<_>>();
+                                    if intent.len() > 1 || pending.len() > 1 {
+                                        custody.mark_unknown_spawn();
+                                        return Err(io::Error::other(
+                                            "private peer admission marker replay",
+                                        ));
                                     }
-                                    if depth != 0 {
-                                        live_children += 1;
-                                    }
-                                    if event.stage == "generation-live" {
-                                        generation_depths.insert(depth);
-                                    }
-                                    if !family.iter().any(|held| held.identity == process.identity)
-                                    {
-                                        if process.has_exited()? {
+                                    if let Some(intent) = intent.first() {
+                                        custody
+                                            .note_spawn_uncertainty()
+                                            .map_err(io::Error::other)?;
+                                        if intent.pid != root_pid || intent.value.len() > 1024 {
                                             return Err(io::Error::other(
-                                                "churn controller observed an already retired process",
+                                                "private peer spawn-intent binding extent differs",
                                             ));
                                         }
-                                        family.push(process);
+                                        let observed:descriptor::controller_start::PeerAdmissionBinding = serde_json::from_slice(&intent.value).map_err(io::Error::other)?;
+                                        if observed != descriptor::controller_start::PeerAdmissionBinding::from_start(&start_binding) {
+                                        return Err(io::Error::other("private peer spawn-intent binding differs"));
                                     }
-                                }
-                                if event.stage == "generation-live"
-                                    && ![1, 2, 3]
+                                    }
+                                    if let Some(pending) = pending.first() {
+                                        custody
+                                            .note_spawn_uncertainty()
+                                            .map_err(io::Error::other)?;
+                                        if intent.len() != 1
+                                            || pending.sequence <= intent[0].sequence
+                                            || pending.pid != root_pid
+                                            || pending.value.len() > 1024
+                                        {
+                                            return Err(io::Error::other(
+                                                "private pending peer lacks bound prior spawn intent",
+                                            ));
+                                        }
+                                        let pending:descriptor::controller_start::PeerPendingAdmission = serde_json::from_slice(&pending.value).map_err(io::Error::other)?;
+                                        pending.validate(&start_binding)?;
+                                        break pending;
+                                    }
+                                    if root.has_exited()? {
+                                        return Err(io::Error::other(
+                                            "private root retired before peer admission",
+                                        ));
+                                    }
+                                    if Instant::now() >= deadline {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "original peer admission deadline exhausted",
+                                        ));
+                                    }
+                                    std::thread::sleep(Duration::from_millis(10));
+                                };
+                                let expected = memcordon_platform::test_support::ProcessIdentity {
+                                    pid: pending.recipient.pid,
+                                    birth: u128::from(pending.recipient.birth),
+                                };
+                                let _held_peer = custody
+                                    .admit_peer(
+                                        &root,
+                                        pending.recipient.handle,
+                                        expected,
+                                        &fixture,
+                                        deadline,
+                                    )
+                                    .map_err(io::Error::other)?;
+                                // Native owner insertion is complete, and no family
+                                // mutex remains held across this authenticated ACK.
+                                control_session
+                                    .as_mut()
+                                    .expect("checked original private session")
+                                    .peer_held(&pending.recipient)?;
+                            }
+                            let peer_identity = loop {
+                                let published = super::live_events(
+                                    &read(&transcript, 16 * 1024 * 1024)
+                                        .map_err(io::Error::other)?,
+                                )
+                                .map_err(io::Error::other)?;
+                                if callback_private_custody.is_some()
+                                    && published
                                         .iter()
-                                        .all(|depth| generation_depths.contains(depth))
+                                        .filter(|event| event.stage == "tcp-peer-created")
+                                        .count()
+                                        > 1
                                 {
                                     return Err(io::Error::other(
-                                        "native held snapshot omitted a generation in the three-generation branch",
+                                        "private TCP peer publication count differs",
                                     ));
                                 }
+                                if let Some(peer) = published
+                                    .iter()
+                                    .find(|event| event.stage == "tcp-peer-created")
                                 {
-                                    for process in family
-                                        .iter()
-                                        .filter(|process| !process.has_exited().unwrap_or(true))
+                                    if peer.pid != root_pid {
+                                        return Err(io::Error::other(
+                                            "TCP peer publisher differs from held root",
+                                        ));
+                                    }
+                                    break serde_json::from_slice::<
+                                        memcordon_core::WindowsProcessIdentityV1,
+                                    >(&peer.value)
+                                    .map_err(io::Error::other)?;
+                                }
+                                if Instant::now() >= deadline {
+                                    return Err(io::Error::other(
+                                        "native TCP peer publication deadline expired",
+                                    ));
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            };
+                            let peer = if let Some(custody) = &callback_private_custody {
+                                custody
+                                    .admitted_peer(
+                                        memcordon_platform::test_support::ProcessIdentity {
+                                            pid: peer_identity.process_id,
+                                            birth: u128::from(peer_identity.creation_time_100ns),
+                                        },
+                                    )
+                                    .map_err(io::Error::other)?
+                            } else {
+                                memcordon_testkit::windows_processes_for_image_until(
+                                    &fixture, deadline,
+                                )?
+                                .into_iter()
+                                .find(|process| process.identity.pid == peer_identity.process_id)
+                                .ok_or_else(|| {
+                                    io::Error::other("native TCP peer handle unavailable")
+                                })?
+                            };
+                            let (family_count, root) = {
+                                let held = held_family
+                                    .lock()
+                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                (
+                                    held.len(),
+                                    held.first().cloned().ok_or_else(|| {
+                                        io::Error::other("original root owner absent")
+                                    })?,
+                                )
+                            };
+                            let parent_matches = if callback_private_custody.is_some() {
+                                peer.native_parent_process_id()? == root_pid
+                            } else {
+                                process_parents()?.get(&peer.identity.pid) == Some(&root_pid)
+                            };
+                            if family_count
+                                != (if callback_private_custody.is_some() {
+                                    2
+                                } else {
+                                    1
+                                })
+                                || root.has_exited()?
+                                || peer.has_exited()?
+                                || peer.identity.birth
+                                    != u128::from(peer_identity.creation_time_100ns)
+                                || root.identity.birth > peer.identity.birth
+                                || !parent_matches
+                            {
+                                return Err(io::Error::other(
+                                    "native held TCP peer identity or live ancestry differs",
+                                ));
+                            }
+                            let bytes = serde_json::to_vec(&serde_json::json!({
+                            "format":"memcordon.windows-native-tcp-peer", "revision":1,
+                            "pid":peer.identity.pid, "birth":peer.identity.birth,
+                            "parent_pid":root_pid, "parent_birth":root.identity.birth,
+                            "native_parent_edge_observed":true, "parent_and_child_held_live":true,
+                        }))
+                        .map_err(io::Error::other)?;
+                            if let Some(observation) = &projection_observation {
+                                let token = peer.original_token_envelope(deadline)?;
+                                observation
+                                    .lock()
+                                    .map_err(|_| {
+                                        io::Error::other("experiment held observation poisoned")
+                                    })?
+                                    .peer = Some((peer.identity.pid, peer.identity.birth, token));
+                            }
+                            let path =
+                                directory.join(ProviderExperimentRecord::NativeTcpPeer.leaf());
+                            let mut file = OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&path)?;
+                            file.write_all(&bytes)?;
+                            file.sync_all()?;
+                            if read(&path, 16 * 1024).map_err(io::Error::other)? != bytes {
+                                return Err(io::Error::other(
+                                    "native TCP peer named readback differs",
+                                ));
+                            }
+                            if callback_private_custody.is_none() {
+                                held_family
+                                    .lock()
+                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?
+                                    .push(peer);
+                            }
+                        }
+                    }
+                    if needs_toolchain_observer {
+                        match start_transport {
+                            descriptor::StartTransport::NamedEvent => {
+                                signal(toolchain_event.as_ref().ok_or_else(|| {
+                                    io::Error::other("original toolchain observer event absent")
+                                })?)?
+                            }
+                            descriptor::StartTransport::ControllerStdin { .. } => control_session
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    io::Error::other("original Joint control session absent")
+                                })?
+                                .release(
+                                    descriptor::controller_start::Phase::ToolchainObserverRelease,
+                                )?,
+                        }
+                        observe_toolchain_descendants(
+                            &directory,
+                            &toolchain_output_root,
+                            &toolchain_challenge,
+                            &transcript,
+                            root_pid,
+                            &held_family,
+                            ToolchainObservationImages {
+                                images: &toolchain_images,
+                                clock: toolchain_clock.ok_or_else(|| {
+                                    io::Error::other("toolchain diagnostic original clock absent")
+                                })?,
+                            },
+                            work_deadline,
+                        )?;
+                    }
+                    if let (Some(cohort), Some(generation)) = (cohort_event, generation_event) {
+                        let deadline = work_deadline.min(Instant::now() + Duration::from_secs(600));
+                        let mut released_cohort = 0;
+                        let mut released_generation = 0;
+                        loop {
+                            let published = super::live_events(
+                                &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
+                            )
+                            .map_err(io::Error::other)?;
+                            for event in &published {
+                                let controller = match (event.stage.as_str(), event.ordinal) {
+                                    ("cohort-live", Some(ordinal)) if ordinal > released_cohort => {
+                                        released_cohort = ordinal;
+                                        Some(&cohort)
+                                    }
+                                    ("generation-live", Some(ordinal))
+                                        if ordinal > released_generation =>
                                     {
+                                        released_generation = ordinal;
+                                        Some(&generation)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(controller) = controller {
+                                    let parents = process_parents()?;
+                                    let active =
+                                        memcordon_testkit::windows_processes_for_image_until(
+                                            &fixture, deadline,
+                                        )?;
+                                    let mut family = held_family.lock().map_err(|_| {
+                                        io::Error::other("fixture ownership poisoned")
+                                    })?;
+                                    let root = family
+                                        .iter()
+                                        .find(|held| held.identity.pid == root_pid)
+                                        .ok_or_else(|| {
+                                            io::Error::other("original churn root owner absent")
+                                        })?;
+                                    if root.has_exited()? {
+                                        return Err(io::Error::other(
+                                            "original churn root retired before barrier",
+                                        ));
+                                    }
+                                    let root_identity = (root.identity.pid, root.identity.birth);
+                                    let mut generation_depths = std::collections::BTreeSet::new();
+                                    let mut live_children = 0usize;
+                                    for process in active {
                                         let Some(depth) = rooted_process_depth(
                                             (process.identity.pid, process.identity.birth),
                                             root_identity,
@@ -5498,14 +5582,57 @@ pub(crate) mod native {
                                         ) else {
                                             continue;
                                         };
-                                        if depth == 0 {
+                                        if process.has_exited()? {
                                             continue;
                                         }
-                                        let parent_pid =
-                                            *parents.get(&process.identity.pid).ok_or_else(
-                                                || io::Error::other("held ancestor edge missing"),
-                                            )?;
-                                        let parent = family.iter().find(|parent| parent.identity.pid == parent_pid && !parent.has_exited().unwrap_or(true))
+                                        if depth != 0 {
+                                            live_children += 1;
+                                        }
+                                        if event.stage == "generation-live" {
+                                            generation_depths.insert(depth);
+                                        }
+                                        if !family
+                                            .iter()
+                                            .any(|held| held.identity == process.identity)
+                                        {
+                                            if process.has_exited()? {
+                                                return Err(io::Error::other(
+                                                    "churn controller observed an already retired process",
+                                                ));
+                                            }
+                                            family.push(process);
+                                        }
+                                    }
+                                    if event.stage == "generation-live"
+                                        && ![1, 2, 3]
+                                            .iter()
+                                            .all(|depth| generation_depths.contains(depth))
+                                    {
+                                        return Err(io::Error::other(
+                                            "native held snapshot omitted a generation in the three-generation branch",
+                                        ));
+                                    }
+                                    {
+                                        for process in family
+                                            .iter()
+                                            .filter(|process| !process.has_exited().unwrap_or(true))
+                                        {
+                                            let Some(depth) = rooted_process_depth(
+                                                (process.identity.pid, process.identity.birth),
+                                                root_identity,
+                                                &parents,
+                                            ) else {
+                                                continue;
+                                            };
+                                            if depth == 0 {
+                                                continue;
+                                            }
+                                            let parent_pid = *parents
+                                                .get(&process.identity.pid)
+                                                .ok_or_else(|| {
+                                                    io::Error::other("held ancestor edge missing")
+                                                })?;
+                                            let parent = family.iter().find(|parent| parent.identity.pid == parent_pid && !parent.has_exited().unwrap_or(true))
                                             .ok_or_else(|| {
                                                 let candidates = family.iter().filter(|held| held.identity.pid == parent_pid);
                                                 let candidate_count = candidates.clone().count();
@@ -5521,194 +5648,206 @@ pub(crate) mod native {
                                                     event.stage, event.ordinal, process.identity.pid, process.identity.birth, candidate_count > 8,
                                                 ))
                                             })?;
-                                        if parent.identity.birth > process.identity.birth {
-                                            return Err(io::Error::other(
-                                                "ToolHelp parent PID was reused after child creation",
-                                            ));
+                                            if parent.identity.birth > process.identity.birth {
+                                                return Err(io::Error::other(
+                                                    "ToolHelp parent PID was reused after child creation",
+                                                ));
+                                            }
                                         }
                                     }
-                                }
-                                if event.stage == "cohort-live" {
-                                    let end = event.ordinal.expect("matched ordinal");
-                                    let count = u32::from_le_bytes(
-                                        event.value.as_slice().try_into().map_err(|_| {
-                                            io::Error::other("invalid cohort count")
-                                        })?,
-                                    );
-                                    if count == 0 || count > descriptor::CHURN_LIVE || count > end {
-                                        return Err(io::Error::other(
-                                            "cohort count differs from frozen controller bound",
-                                        ));
+                                    if event.stage == "cohort-live" {
+                                        let end = event.ordinal.expect("matched ordinal");
+                                        let count = u32::from_le_bytes(
+                                            event.value.as_slice().try_into().map_err(|_| {
+                                                io::Error::other("invalid cohort count")
+                                            })?,
+                                        );
+                                        if count == 0
+                                            || count > descriptor::CHURN_LIVE
+                                            || count > end
+                                        {
+                                            return Err(io::Error::other(
+                                                "cohort count differs from frozen controller bound",
+                                            ));
+                                        }
+                                        if live_children != count as usize + 1 || live_children > 64
+                                        {
+                                            return Err(io::Error::other(
+                                                "native live population differs from cohort leaves plus retained TCP peer",
+                                            ));
+                                        }
+                                        let children: Vec<_> = published
+                                            .iter()
+                                            .filter(|e| {
+                                                e.stage == "child-created"
+                                                    && e.ordinal.is_some_and(|n| {
+                                                        n >= end - count && n < end
+                                                    })
+                                            })
+                                            .collect();
+                                        let ordinals: BTreeSet<_> = children
+                                            .iter()
+                                            .filter_map(|child| child.ordinal)
+                                            .collect();
+                                        if children.len() != count as usize
+                                            || ordinals != (end - count..end).collect()
+                                        {
+                                            return Err(io::Error::other(
+                                                "cohort publication omitted or duplicated a required ordinal",
+                                            ));
+                                        }
+                                        let mut unique = BTreeSet::new();
+                                        for child in children {
+                                            let identity: memcordon_core::WindowsProcessIdentityV1 =
+                                                serde_json::from_slice(&child.value)
+                                                    .map_err(io::Error::other)?;
+                                            if !unique.insert((
+                                                identity.process_id,
+                                                identity.creation_time_100ns,
+                                            )) {
+                                                return Err(io::Error::other(
+                                                    "cohort publication duplicated a native process identity",
+                                                ));
+                                            }
+                                            if !family.iter().any(|p| {
+                                                p.identity.pid == identity.process_id
+                                                    && p.identity.birth
+                                                        == u128::from(identity.creation_time_100ns)
+                                                    && !p.has_exited().unwrap_or(true)
+                                            }) {
+                                                return Err(io::Error::other(
+                                                    "churn cohort identity was not held live before release",
+                                                ));
+                                            }
+                                        }
                                     }
-                                    if live_children != count as usize + 1 || live_children > 64 {
-                                        return Err(io::Error::other(
-                                            "native live population differs from cohort leaves plus retained TCP peer",
-                                        ));
-                                    }
-                                    let children: Vec<_> = published
+                                    let mut live_members = Vec::new();
+                                    for member in family
                                         .iter()
-                                        .filter(|e| {
-                                            e.stage == "child-created"
-                                                && e.ordinal
-                                                    .is_some_and(|n| n >= end - count && n < end)
-                                        })
-                                        .collect();
-                                    let ordinals: BTreeSet<_> =
-                                        children.iter().filter_map(|child| child.ordinal).collect();
-                                    if children.len() != count as usize
-                                        || ordinals != (end - count..end).collect()
+                                        .filter(|process| !process.has_exited().unwrap_or(true))
                                     {
-                                        return Err(io::Error::other(
-                                            "cohort publication omitted or duplicated a required ordinal",
-                                        ));
-                                    }
-                                    let mut unique = BTreeSet::new();
-                                    for child in children {
-                                        let identity: memcordon_core::WindowsProcessIdentityV1 =
-                                            serde_json::from_slice(&child.value)
-                                                .map_err(io::Error::other)?;
-                                        if !unique.insert((
-                                            identity.process_id,
-                                            identity.creation_time_100ns,
-                                        )) {
-                                            return Err(io::Error::other(
-                                                "cohort publication duplicated a native process identity",
-                                            ));
+                                        if rooted_process_depth(
+                                            (member.identity.pid, member.identity.birth),
+                                            root_identity,
+                                            &parents,
+                                        )
+                                        .is_none()
+                                        {
+                                            continue;
                                         }
-                                        if !family.iter().any(|p| {
-                                            p.identity.pid == identity.process_id
-                                                && p.identity.birth
-                                                    == u128::from(identity.creation_time_100ns)
-                                                && !p.has_exited().unwrap_or(true)
-                                        }) {
-                                            return Err(io::Error::other(
-                                                "churn cohort identity was not held live before release",
-                                            ));
-                                        }
-                                    }
-                                }
-                                let mut live_members = Vec::new();
-                                for member in family
-                                    .iter()
-                                    .filter(|process| !process.has_exited().unwrap_or(true))
-                                {
-                                    if rooted_process_depth(
-                                        (member.identity.pid, member.identity.birth),
-                                        root_identity,
-                                        &parents,
-                                    )
-                                    .is_none()
-                                    {
-                                        continue;
-                                    }
-                                    let parent = if member.identity.pid == root_pid {
-                                        None
-                                    } else {
-                                        let parent_pid = *parents
-                                            .get(&member.identity.pid)
-                                            .ok_or_else(|| {
-                                                io::Error::other("churn live ancestry edge missing")
-                                            })?;
-                                        Some(
-                                            family
-                                                .iter()
-                                                .find(|parent| {
-                                                    parent.identity.pid == parent_pid
-                                                        && !parent.has_exited().unwrap_or(true)
-                                                })
+                                        let parent = if member.identity.pid == root_pid {
+                                            None
+                                        } else {
+                                            let parent_pid = *parents
+                                                .get(&member.identity.pid)
                                                 .ok_or_else(|| {
                                                     io::Error::other(
-                                                        "churn live ancestry owner missing",
+                                                        "churn live ancestry edge missing",
                                                     )
-                                                })?,
-                                        )
-                                    };
-                                    live_members.push(serde_json::json!({
+                                                })?;
+                                            Some(
+                                                family
+                                                    .iter()
+                                                    .find(|parent| {
+                                                        parent.identity.pid == parent_pid
+                                                            && !parent.has_exited().unwrap_or(true)
+                                                    })
+                                                    .ok_or_else(|| {
+                                                        io::Error::other(
+                                                            "churn live ancestry owner missing",
+                                                        )
+                                                    })?,
+                                            )
+                                        };
+                                        live_members.push(serde_json::json!({
                                         "pid":member.identity.pid,"birth":member.identity.birth,
                                         "parent_pid":parent.map(|parent| parent.identity.pid),
                                         "parent_birth":parent.map(|parent| parent.identity.birth),
                                         "held_live_before_release":true,
                                     }));
-                                }
-                                let bytes = serde_json::to_vec(&serde_json::json!({
+                                    }
+                                    let bytes = serde_json::to_vec(&serde_json::json!({
                                     "format":"memcordon.windows-native-churn-barrier","revision":1,
                                     "stage":event.stage,"ordinal":event.ordinal,"root_pid":root_pid,
                                     "live_children":live_children,"members":live_members,
                                 }))
                                 .map_err(io::Error::other)?;
-                                let path = directory.join(format!(
-                                    "native-{}-{}.json",
-                                    event.stage,
-                                    event.ordinal.expect("controller ordinal")
-                                ));
-                                let mut file = OpenOptions::new()
-                                    .write(true)
-                                    .create_new(true)
-                                    .open(&path)?;
-                                file.write_all(&bytes)?;
-                                file.sync_all()?;
-                                if read(&path, 128 * 1024).map_err(io::Error::other)? != bytes {
-                                    return Err(io::Error::other(
-                                        "native churn ancestry named readback differs",
+                                    let path = directory.join(format!(
+                                        "native-{}-{}.json",
+                                        event.stage,
+                                        event.ordinal.expect("controller ordinal")
                                     ));
-                                }
-                                let root = family
-                                    .iter()
-                                    .find(|held| {
-                                        (held.identity.pid, held.identity.birth) == root_identity
-                                    })
-                                    .ok_or_else(|| {
-                                        io::Error::other("original diagnostic root owner absent")
-                                    })?;
-                                let console_image =
-                                    held_console_image.as_ref().ok_or_else(|| {
-                                        io::Error::other("held native console image absent")
-                                    })?;
-                                let candidates = root.direct_children_for_image_until(
-                                    &console_image.path,
-                                    deadline,
-                                )?;
-                                let mut console = held_console_owners.lock().map_err(|_| {
-                                    io::Error::other("native console ownership poisoned")
-                                })?;
-                                for candidate in candidates {
-                                    if candidate.has_exited()? {
-                                        continue;
-                                    }
-                                    if family
-                                        .iter()
-                                        .any(|held| held.identity == candidate.identity)
-                                    {
+                                    let mut file = OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(&path)?;
+                                    file.write_all(&bytes)?;
+                                    file.sync_all()?;
+                                    if read(&path, 128 * 1024).map_err(io::Error::other)? != bytes {
                                         return Err(io::Error::other(
-                                            "console identity overlaps fixture ownership",
+                                            "native churn ancestry named readback differs",
                                         ));
                                     }
-                                    if console.iter().any(|held| {
-                                        held.identity.pid == candidate.identity.pid
-                                            && held.identity.birth != candidate.identity.birth
-                                    }) {
-                                        return Err(io::Error::other(
-                                            "console PID differs from original held birth",
-                                        ));
-                                    }
-                                    if !console
+                                    let root = family
                                         .iter()
-                                        .any(|held| held.identity == candidate.identity)
-                                    {
-                                        if console.len() >= 8 {
+                                        .find(|held| {
+                                            (held.identity.pid, held.identity.birth)
+                                                == root_identity
+                                        })
+                                        .ok_or_else(|| {
+                                            io::Error::other(
+                                                "original diagnostic root owner absent",
+                                            )
+                                        })?;
+                                    let console_image =
+                                        held_console_image.as_ref().ok_or_else(|| {
+                                            io::Error::other("held native console image absent")
+                                        })?;
+                                    let candidates = root.direct_children_for_image_until(
+                                        &console_image.path,
+                                        deadline,
+                                    )?;
+                                    let mut console = held_console_owners.lock().map_err(|_| {
+                                        io::Error::other("native console ownership poisoned")
+                                    })?;
+                                    for candidate in candidates {
+                                        if candidate.has_exited()? {
+                                            continue;
+                                        }
+                                        if family
+                                            .iter()
+                                            .any(|held| held.identity == candidate.identity)
+                                        {
                                             return Err(io::Error::other(
-                                                "native console owners exceed finite bound",
+                                                "console identity overlaps fixture ownership",
                                             ));
                                         }
-                                        console.push(candidate);
+                                        if console.iter().any(|held| {
+                                            held.identity.pid == candidate.identity.pid
+                                                && held.identity.birth != candidate.identity.birth
+                                        }) {
+                                            return Err(io::Error::other(
+                                                "console PID differs from original held birth",
+                                            ));
+                                        }
+                                        if !console
+                                            .iter()
+                                            .any(|held| held.identity == candidate.identity)
+                                        {
+                                            if console.len() >= 8 {
+                                                return Err(io::Error::other(
+                                                    "native console owners exceed finite bound",
+                                                ));
+                                            }
+                                            console.push(candidate);
+                                        }
                                     }
-                                }
-                                if root.has_exited()? {
-                                    return Err(io::Error::other(
-                                        "original console parent retired before publication",
-                                    ));
-                                }
-                                let owners = console
+                                    if root.has_exited()? {
+                                        return Err(io::Error::other(
+                                            "original console parent retired before publication",
+                                        ));
+                                    }
+                                    let owners = console
                                     .iter()
                                     .map(|owner| {
                                         Ok(serde_json::json!({
@@ -5718,7 +5857,7 @@ pub(crate) mod native {
                                         }))
                                     })
                                     .collect::<io::Result<Vec<_>>>()?;
-                                let console_bytes = serde_json::to_vec(&serde_json::json!({
+                                    let console_bytes = serde_json::to_vec(&serde_json::json!({
                                     "format":"memcordon.windows-native-console-owners","revision":1,
                                     "root_pid":root_identity.0,"root_birth":root_identity.1,
                                     "root_held_live":true,"job_membership_established":false,
@@ -5726,243 +5865,256 @@ pub(crate) mod native {
                                     "image_sha256":console_image.sha256,"image_file_identity":console_image.identity,
                                     "owners":owners,
                                 })).map_err(io::Error::other)?;
-                                if console_bytes.len() > 256 * 1024 {
-                                    return Err(io::Error::other(
-                                        "native console ownership exceeds finite bound",
+                                    if console_bytes.len() > 256 * 1024 {
+                                        return Err(io::Error::other(
+                                            "native console ownership exceeds finite bound",
+                                        ));
+                                    }
+                                    let console_path = directory.join(format!(
+                                        "native-console-owners-{}-{}.json",
+                                        event.stage,
+                                        event.ordinal.expect("controller ordinal"),
                                     ));
-                                }
-                                let console_path = directory.join(format!(
-                                    "native-console-owners-{}-{}.json",
-                                    event.stage,
-                                    event.ordinal.expect("controller ordinal"),
-                                ));
-                                let mut console_file = OpenOptions::new()
-                                    .write(true)
-                                    .create_new(true)
-                                    .open(&console_path)?;
-                                console_file.write_all(&console_bytes)?;
-                                console_file.sync_all()?;
-                                if read(&console_path, 256 * 1024).map_err(io::Error::other)?
-                                    != console_bytes
-                                {
-                                    return Err(io::Error::other(
-                                        "native console ownership named readback differs",
-                                    ));
-                                }
-                                drop(console);
-                                let known: Vec<_> =
-                                    family.iter().map(|held| held.identity).collect();
-                                let diagnostic = match root
-                                    .diagnose_unheld_direct_children(&known, deadline)
-                                {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        let detail = error.to_string();
-                                        serde_json::json!({"format":"memcordon.windows-unheld-direct-child-diagnostic","revision":1,
+                                    let mut console_file = OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(&console_path)?;
+                                    console_file.write_all(&console_bytes)?;
+                                    console_file.sync_all()?;
+                                    if read(&console_path, 256 * 1024).map_err(io::Error::other)?
+                                        != console_bytes
+                                    {
+                                        return Err(io::Error::other(
+                                            "native console ownership named readback differs",
+                                        ));
+                                    }
+                                    drop(console);
+                                    let known: Vec<_> =
+                                        family.iter().map(|held| held.identity).collect();
+                                    let diagnostic = match root
+                                        .diagnose_unheld_direct_children(&known, deadline)
+                                    {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            let detail = error.to_string();
+                                            serde_json::json!({"format":"memcordon.windows-unheld-direct-child-diagnostic","revision":1,
                                             "root_pid":root_identity.0,"root_birth":root_identity.1,
                                             "job_membership_established":false,"accepted_family_modified":false,
                                             "unavailable_kind":format!("{:?}",error.kind()),"raw_os_error":error.raw_os_error(),
                                             "detail":detail.chars().take(512).collect::<String>(),"detail_truncated":detail.chars().count()>512})
-                                    }
-                                };
-                                let bytes =
-                                    serde_json::to_vec(&diagnostic).map_err(io::Error::other)?;
-                                if bytes.len() > 256 * 1024 {
-                                    return Err(io::Error::other(
-                                        "native child diagnostic exceeds finite bound",
-                                    ));
-                                }
-                                let path = directory.join(format!(
-                                    "native-unheld-children-{}-{}.json",
-                                    event.stage,
-                                    event.ordinal.expect("controller ordinal"),
-                                ));
-                                let mut file = OpenOptions::new()
-                                    .write(true)
-                                    .create_new(true)
-                                    .open(&path)?;
-                                file.write_all(&bytes)?;
-                                file.sync_all()?;
-                                if read(&path, 256 * 1024).map_err(io::Error::other)? != bytes {
-                                    return Err(io::Error::other(
-                                        "native child diagnostic named readback differs",
-                                    ));
-                                }
-                                if Instant::now() >= deadline {
-                                    return Err(io::Error::other(
-                                        "original churn cutoff exhausted before release",
-                                    ));
-                                }
-                                if root.has_exited()? {
-                                    return Err(io::Error::other(
-                                        "original console parent retired before barrier release",
-                                    ));
-                                }
-                                drop(family);
-                                signal(controller)?;
-                            }
-                        }
-                        if published.iter().any(|e| e.stage == "churn-complete") {
-                            break;
-                        }
-                        if Instant::now() >= deadline {
-                            return Err(io::Error::other(
-                                "churn native controller deadline expired",
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-                if let Some(name) = descendant_gate {
-                    let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
-                    let mut intermediate_held = false;
-                    loop {
-                        let events = super::live_events(
-                            &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
-                        )
-                        .map_err(io::Error::other)?;
-                        if intermediate_first && !intermediate_held {
-                            if let Some(event) = events
-                                .iter()
-                                .find(|event| event.stage == "intermediate-live-with-descendant")
-                            {
-                                #[derive(Deserialize)]
-                                #[serde(deny_unknown_fields)]
-                                struct Intermediate {
-                                    parent: memcordon_core::WindowsProcessIdentityV1,
-                                    child: memcordon_core::WindowsProcessIdentityV1,
-                                }
-                                let identities: Intermediate = serde_json::from_slice(&event.value)
-                                    .map_err(io::Error::other)?;
-                                let mut active =
-                                    memcordon_testkit::windows_processes_for_image_until(
-                                        &fixture, deadline,
-                                    )?;
-                                let parents = process_parents()?;
-                                let mut family = held_family
-                                    .lock()
-                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                                let root = family
-                                    .first()
-                                    .ok_or_else(|| io::Error::other("held root missing"))?;
-                                if root.has_exited()?
-                                    || parents.get(&identities.parent.process_id) != Some(&root_pid)
-                                    || parents.get(&identities.child.process_id)
-                                        != Some(&identities.parent.process_id)
-                                    || root.identity.birth
-                                        > u128::from(identities.parent.creation_time_100ns)
-                                    || identities.parent.creation_time_100ns
-                                        > identities.child.creation_time_100ns
-                                {
-                                    return Err(io::Error::other(
-                                        "intermediate native ancestry/ordering differs",
-                                    ));
-                                }
-                                for expected in
-                                    [identities.parent.clone(), identities.child.clone()]
-                                {
-                                    let index = active
-                                        .iter()
-                                        .position(|held| {
-                                            held.identity.pid == expected.process_id
-                                                && held.identity.birth
-                                                    == u128::from(expected.creation_time_100ns)
-                                        })
-                                        .ok_or_else(|| {
-                                            io::Error::other(
-                                                "intermediate native held identity missing",
-                                            )
-                                        })?;
-                                    let held = active.swap_remove(index);
-                                    if held.has_exited()? {
+                                        }
+                                    };
+                                    let bytes = serde_json::to_vec(&diagnostic)
+                                        .map_err(io::Error::other)?;
+                                    if bytes.len() > 256 * 1024 {
                                         return Err(io::Error::other(
-                                            "intermediate family already retired before controller",
+                                            "native child diagnostic exceeds finite bound",
                                         ));
                                     }
-                                    family.push(held);
+                                    let path = directory.join(format!(
+                                        "native-unheld-children-{}-{}.json",
+                                        event.stage,
+                                        event.ordinal.expect("controller ordinal"),
+                                    ));
+                                    let mut file = OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(&path)?;
+                                    file.write_all(&bytes)?;
+                                    file.sync_all()?;
+                                    if read(&path, 256 * 1024).map_err(io::Error::other)? != bytes {
+                                        return Err(io::Error::other(
+                                            "native child diagnostic named readback differs",
+                                        ));
+                                    }
+                                    if Instant::now() >= deadline {
+                                        return Err(io::Error::other(
+                                            "original churn cutoff exhausted before release",
+                                        ));
+                                    }
+                                    if root.has_exited()? {
+                                        return Err(io::Error::other(
+                                            "original console parent retired before barrier release",
+                                        ));
+                                    }
+                                    drop(family);
+                                    signal(controller)?;
                                 }
-                                let bytes = serde_json::to_vec(&serde_json::json!({
+                            }
+                            if published.iter().any(|e| e.stage == "churn-complete") {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::other(
+                                    "churn native controller deadline expired",
+                                ));
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    if let Some(name) = descendant_gate {
+                        let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
+                        let mut intermediate_held = false;
+                        loop {
+                            let events = super::live_events(
+                                &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
+                            )
+                            .map_err(io::Error::other)?;
+                            if intermediate_first && !intermediate_held {
+                                if let Some(event) = events.iter().find(|event| {
+                                    event.stage == "intermediate-live-with-descendant"
+                                }) {
+                                    #[derive(Deserialize)]
+                                    #[serde(deny_unknown_fields)]
+                                    struct Intermediate {
+                                        parent: memcordon_core::WindowsProcessIdentityV1,
+                                        child: memcordon_core::WindowsProcessIdentityV1,
+                                    }
+                                    let identities: Intermediate =
+                                        serde_json::from_slice(&event.value)
+                                            .map_err(io::Error::other)?;
+                                    let mut active =
+                                        memcordon_testkit::windows_processes_for_image_until(
+                                            &fixture, deadline,
+                                        )?;
+                                    let parents = process_parents()?;
+                                    let mut family = held_family.lock().map_err(|_| {
+                                        io::Error::other("fixture ownership poisoned")
+                                    })?;
+                                    let root = family
+                                        .first()
+                                        .ok_or_else(|| io::Error::other("held root missing"))?;
+                                    if root.has_exited()?
+                                        || parents.get(&identities.parent.process_id)
+                                            != Some(&root_pid)
+                                        || parents.get(&identities.child.process_id)
+                                            != Some(&identities.parent.process_id)
+                                        || root.identity.birth
+                                            > u128::from(identities.parent.creation_time_100ns)
+                                        || identities.parent.creation_time_100ns
+                                            > identities.child.creation_time_100ns
+                                    {
+                                        return Err(io::Error::other(
+                                            "intermediate native ancestry/ordering differs",
+                                        ));
+                                    }
+                                    for expected in
+                                        [identities.parent.clone(), identities.child.clone()]
+                                    {
+                                        let index = active
+                                            .iter()
+                                            .position(|held| {
+                                                held.identity.pid == expected.process_id
+                                                    && held.identity.birth
+                                                        == u128::from(expected.creation_time_100ns)
+                                            })
+                                            .ok_or_else(|| {
+                                                io::Error::other(
+                                                    "intermediate native held identity missing",
+                                                )
+                                            })?;
+                                        let held = active.swap_remove(index);
+                                        if held.has_exited()? {
+                                            return Err(io::Error::other(
+                                                "intermediate family already retired before controller",
+                                            ));
+                                        }
+                                        family.push(held);
+                                    }
+                                    let bytes = serde_json::to_vec(&serde_json::json!({
                                     "format":"memcordon.windows-intermediate-live-family","revision":1,
                                     "root_pid":root_pid,"root_birth":family[0].identity.birth,
                                     "parent":identities.parent,"child":identities.child,
                                     "native_parent_edges_observed":true,"all_three_held_live":true
                                 })).map_err(io::Error::other)?;
-                                let mut file = OpenOptions::new()
-                                    .write(true)
-                                    .create_new(true)
-                                    .open(directory.join("held-intermediate-family.json"))?;
-                                file.write_all(&bytes)?;
-                                file.sync_all()?;
-                                drop(family);
-                                descendant_release(&format!("{name}-intermediate-live"))?;
-                                intermediate_held = true;
+                                    let mut file = OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(directory.join("held-intermediate-family.json"))?;
+                                    file.write_all(&bytes)?;
+                                    file.sync_all()?;
+                                    drop(family);
+                                    descendant_release(&format!("{name}-intermediate-live"))?;
+                                    intermediate_held = true;
+                                }
                             }
-                        }
-                        if let Some(event) = events.iter().find(|event| {
-                            event.stage
-                                == if intermediate_first {
-                                    "intermediate-exits-with-live-descendant"
+                            if let Some(event) = events.iter().find(|event| {
+                                event.stage
+                                    == if intermediate_first {
+                                        "intermediate-exits-with-live-descendant"
+                                    } else {
+                                        "root-exits-with-live-descendant"
+                                    }
+                            }) {
+                                let child: memcordon_core::WindowsProcessIdentityV1 =
+                                    serde_json::from_slice(&event.value)
+                                        .map_err(io::Error::other)?;
+                                let active = memcordon_testkit::windows_processes_for_image_until(
+                                    &fixture, deadline,
+                                )?;
+                                let held_child = active
+                                    .into_iter()
+                                    .find(|p| {
+                                        p.identity.pid == child.process_id
+                                            && p.identity.birth
+                                                == u128::from(child.creation_time_100ns)
+                                    })
+                                    .ok_or_else(|| {
+                                        io::Error::other(
+                                            "descendant native barrier identity differs",
+                                        )
+                                    })?;
+                                let mut family = held_family
+                                    .lock()
+                                    .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                let root_live = family
+                                    .first()
+                                    .is_some_and(|p| !p.has_exited().unwrap_or(false));
+                                if root_live != intermediate_first {
+                                    drop(family);
                                 } else {
-                                    "root-exits-with-live-descendant"
+                                    if held_child.has_exited()? {
+                                        return Err(io::Error::other(
+                                            "descendant exited before root native observation",
+                                        ));
+                                    }
+                                    if intermediate_first
+                                        && (!intermediate_held
+                                            || family.len() != 3
+                                            || !family[1].has_exited()?)
+                                    {
+                                        return Err(io::Error::other(
+                                            "intermediate did not retire before its held live descendant",
+                                        ));
+                                    }
+                                    if !family
+                                        .iter()
+                                        .any(|held| held.identity == held_child.identity)
+                                    {
+                                        family.push(held_child);
+                                    }
+                                    drop(family);
+                                    descendant_release(&name)?;
+                                    break;
                                 }
-                        }) {
-                            let child: memcordon_core::WindowsProcessIdentityV1 =
-                                serde_json::from_slice(&event.value).map_err(io::Error::other)?;
-                            let active = memcordon_testkit::windows_processes_for_image_until(
-                                &fixture, deadline,
-                            )?;
-                            let held_child = active
-                                .into_iter()
-                                .find(|p| {
-                                    p.identity.pid == child.process_id
-                                        && p.identity.birth == u128::from(child.creation_time_100ns)
-                                })
-                                .ok_or_else(|| {
-                                    io::Error::other("descendant native barrier identity differs")
-                                })?;
-                            let mut family = held_family
-                                .lock()
-                                .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
-                            let root_live = family
-                                .first()
-                                .is_some_and(|p| !p.has_exited().unwrap_or(false));
-                            if root_live != intermediate_first {
-                                drop(family);
-                            } else {
-                                if held_child.has_exited()? {
-                                    return Err(io::Error::other(
-                                        "descendant exited before root native observation",
-                                    ));
-                                }
-                                if intermediate_first
-                                    && (!intermediate_held
-                                        || family.len() != 3
-                                        || !family[1].has_exited()?)
-                                {
-                                    return Err(io::Error::other(
-                                        "intermediate did not retire before its held live descendant",
-                                    ));
-                                }
-                                if !family
-                                    .iter()
-                                    .any(|held| held.identity == held_child.identity)
-                                {
-                                    family.push(held_child);
-                                }
-                                drop(family);
-                                descendant_release(&name)?;
-                                break;
                             }
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::other(
+                                    "root-first native ordering barrier not observed",
+                                ));
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
                         }
-                        if Instant::now() >= deadline {
-                            return Err(io::Error::other(
-                                "root-first native ordering barrier not observed",
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
                     }
+                    Ok(())
+                })();
+                match callback {
+                    Ok(()) => memcordon_testkit::OwnedCallbackOutcome::Completed,
+                    Err(error) if application_ended => {
+                        memcordon_testkit::OwnedCallbackOutcome::ApplicationEnded(error)
+                    }
+                    Err(error) => memcordon_testkit::OwnedCallbackOutcome::Abort(error),
                 }
-                Ok(())
             },
         );
         // Mandatory child/callback outcome is frozen before optional consumer
@@ -6151,6 +6303,13 @@ pub(crate) mod native {
             }
             Ok(())
         })();
+        let (output, application_end_error) = match output {
+            Err(memcordon_testkit::ProcessTestError::ApplicationEnded {
+                error,
+                settlement: Ok(output),
+            }) => (Ok(*output), Some(error)),
+            output => (output, None),
+        };
         let failure_case = serde_json::to_value(input.descriptor.case).ok();
         let failure_challenge =
             crate::windows_causal_acceptance::sha256(&input.descriptor.challenge);
@@ -6241,6 +6400,76 @@ pub(crate) mod native {
             )
         };
         let collection = (|| -> Result<()> {
+            let retain_calls = || {
+                let trace_carrier = |name: &str, format: &str| -> Result<serde_json::Value> {
+                    let source = input.descriptor.output_root.join(name);
+                    if !source.try_exists()? {
+                        return Ok(serde_json::json!({"state":"absent","authority":false}));
+                    }
+                    let bytes = read(&source, 64 * 1024)?;
+                    let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Ok(
+                                serde_json::json!({"state":"invalid","error":error.to_string(),"authority":false,"identity_admission":false}),
+                            );
+                        }
+                    };
+                    if parsed["format"] != format || parsed["revision"] != 1 {
+                        return Ok(
+                            serde_json::json!({"state":"invalid","error":"original-call diagnostic carrier format differs","authority":false,"identity_admission":false}),
+                        );
+                    }
+                    let path = report.with_extension(name);
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                    drop(file);
+                    if read(&path, 64 * 1024)? != bytes {
+                        return Err(CiError::Message(
+                            "original-call diagnostic retained bytes differ".into(),
+                        ));
+                    }
+                    Ok(
+                        serde_json::json!({"state":"retained","path":path,"sha256":crate::windows_causal_acceptance::sha256(&bytes),"authority":false,"identity_admission":false}),
+                    )
+                };
+                let mut retained = serde_json::Map::new();
+                for (field, name, format) in [
+                    (
+                        "winsock_trace",
+                        "winsock-startup-trace.json",
+                        "memcordon.original-winsock-startup-trace",
+                    ),
+                    (
+                        "listener_trace",
+                        "listener-call-trace.json",
+                        "memcordon.original-rust-listener-trace",
+                    ),
+                    (
+                        "native_file_requests",
+                        "listener-native-file-requests.json",
+                        "memcordon.original-native-file-requests",
+                    ),
+                    (
+                        "peer_spawn_trace",
+                        "peer-spawn-call-trace.json",
+                        "memcordon.original-peer-spawn-trace",
+                    ),
+                    (
+                        "peer_stdout",
+                        "tcp-peer-stdout.json",
+                        "memcordon.owned-peer-stdout",
+                    ),
+                ] {
+                    let value = trace_carrier(name, format).unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
+                    retained.insert(field.into(), value);
+                }
+                serde_json::Value::Object(retained)
+            };
             if let Err(memcordon_testkit::ProcessTestError::Callback {
                 stdout,
                 stderr,
@@ -6252,69 +6481,7 @@ pub(crate) mod native {
             }) = &output
             {
                 let retention = (|| -> Result<()> {
-                    // Copy this bounded diagnostic into the existing small failure
-                    // carrier. It never supplies launch or object-identity authority.
-                    let trace_carrier = |name: &str, format: &str| -> Result<serde_json::Value> {
-                        let source = input.descriptor.output_root.join(name);
-                        if !source.try_exists()? {
-                            return Ok(serde_json::json!({"state":"absent","authority":false}));
-                        }
-                        let bytes = read(&source, 64 * 1024)?;
-                        let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                return Ok(
-                                    serde_json::json!({"state":"invalid","error":error.to_string(),"authority":false,"identity_admission":false}),
-                                );
-                            }
-                        };
-                        if parsed["format"] != format || parsed["revision"] != 1 {
-                            return Ok(
-                                serde_json::json!({"state":"invalid","error":"original-call diagnostic carrier format differs","authority":false,"identity_admission":false}),
-                            );
-                        }
-                        let path = report.with_extension(name);
-                        let mut file = OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&path)?;
-                        file.write_all(&bytes)?;
-                        file.sync_all()?;
-                        drop(file);
-                        if read(&path, 64 * 1024)? != bytes {
-                            return Err(CiError::Message(
-                                "original-call diagnostic retained bytes differ".into(),
-                            ));
-                        }
-                        Ok(
-                            serde_json::json!({"state":"retained","path":path,"sha256":crate::windows_causal_acceptance::sha256(&bytes),"authority":false,"identity_admission":false}),
-                        )
-                    };
-                    let winsock_trace = trace_carrier(
-                        "winsock-startup-trace.json",
-                        "memcordon.original-winsock-startup-trace",
-                    )
-                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
-                    let listener_trace = trace_carrier(
-                        "listener-call-trace.json",
-                        "memcordon.original-rust-listener-trace",
-                    )
-                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
-                    let native_file_requests = trace_carrier(
-                        "listener-native-file-requests.json",
-                        "memcordon.original-native-file-requests",
-                    )
-                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
-                    let peer_spawn_trace = trace_carrier(
-                        "peer-spawn-call-trace.json",
-                        "memcordon.original-peer-spawn-trace",
-                    )
-                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
-                    let peer_stdout = trace_carrier(
-                        "tcp-peer-stdout.json",
-                        "memcordon.owned-peer-stdout",
-                    )
-                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
+                    let calls = retain_calls();
                     let product_context = if *capture_complete && cleanup.is_ok() {
                         retain_callback_product_context(&public_report, &report, &config.provider)
                             .map_err(|error| error.to_string())
@@ -6327,11 +6494,11 @@ pub(crate) mod native {
                         "observed_status":observed_status.map(|status| status.code()),
                         "termination":termination.map(|status| status.code()), "cleanup":cleanup,
                         "product_context":product_context,
-                        "peer_stdout":peer_stdout,
-                        "winsock_trace":winsock_trace,
-                        "listener_trace":listener_trace,
-                        "native_file_requests":native_file_requests,
-                        "peer_spawn_trace":peer_spawn_trace,
+                        "peer_stdout":calls["peer_stdout"],
+                        "winsock_trace":calls["winsock_trace"],
+                        "listener_trace":calls["listener_trace"],
+                        "native_file_requests":calls["native_file_requests"],
+                        "peer_spawn_trace":calls["peer_spawn_trace"],
                     }))?;
                     for (extension, bytes) in [
                         ("stdout.bin", stdout.as_slice()),
@@ -6457,10 +6624,39 @@ pub(crate) mod native {
                 }
             }
             let output = output.map_err(callback_error)?;
+            if let Some(error) = application_end_error.as_ref() {
+                let calls = retain_calls();
+                let product_context =
+                    retain_callback_product_context(&public_report, &report, &config.provider)
+                        .map_err(|error| error.to_string());
+                let diagnostic = serde_json::to_vec(&serde_json::json!({
+                    "format":"memcordon.windows-positive-callback-failure","revision":1,
+                    "callback_outcome":"application-ended","frontend_exit":"natural",
+                    "error":error.to_string(),"capture_complete":true,"observed_status":output.status.code(),
+                    "termination":null,"cleanup":Ok::<(), String>(()),"product_context":product_context,
+                    "peer_stdout":calls["peer_stdout"],"winsock_trace":calls["winsock_trace"],
+                    "listener_trace":calls["listener_trace"],"native_file_requests":calls["native_file_requests"],
+                    "peer_spawn_trace":calls["peer_spawn_trace"],
+                }))?;
+                let path = report.with_extension("callback-failure.json");
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                file.write_all(&diagnostic)?;
+                file.sync_all()?;
+                drop(file);
+                if read(&path, 64 * 1024)? != diagnostic {
+                    return Err(CiError::Message(
+                        "natural application-end diagnostic retained bytes differ".into(),
+                    ));
+                }
+            }
             let exit_bytes = serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.windows-positive-exit","revision":1,
                 "target":config.target,"executable_sha256":execution_sha256,"public_executable_sha256":config.cli.sha256,
                 "native_status":output.status.code(),"capture_complete":true,
+                "frontend_exit":"natural","application_end_observed":application_end_error.is_some(),
             }))?;
             let exit_path = report
                 .parent()
@@ -6537,7 +6733,32 @@ pub(crate) mod native {
             let held = held.as_ref().ok_or_else(|| {
                 CiError::Message("native request/attempt association not held".into())
             })?;
-            assess(
+            if let Some(error) = application_end_error.as_ref() {
+                let ended = match error.get_ref().and_then(|source| {
+                    source.downcast_ref::<crate::windows_listener_wait::Failure>()
+                }) {
+                    Some(crate::windows_listener_wait::Failure::Retired { identity, status }) => {
+                        crate::windows_listener_wait::ApplicationEnd {
+                            identity: *identity,
+                            status: *status,
+                        }
+                    }
+                    _ => {
+                        return Err(CiError::Message(
+                            "application-ended callback omitted its typed held-root exit".into(),
+                        ));
+                    }
+                };
+                validate_ended_application_settlement(
+                    &result_bytes,
+                    output.status.code().ok_or_else(|| {
+                        CiError::Message("missing natural frontend status".into())
+                    })?,
+                    ended,
+                    held,
+                )?;
+            }
+            let assessment = assess(
                 input,
                 &result_bytes,
                 &output.stdout,
@@ -6565,7 +6786,13 @@ pub(crate) mod native {
                     },
                 },
                 held,
-            )?;
+            );
+            let deferred_assessment = if application_end_error.is_some() {
+                Some(assessment)
+            } else {
+                assessment?;
+                None
+            };
             if terminal.format != "memcordon.windows-terminal-observation"
                 || terminal.revision != 2
                 || terminal.provider != held.provider
@@ -6597,6 +6824,9 @@ pub(crate) mod native {
                 || request.environment != fixture_environment::entries()?
             {
                 return Err(CiError::Message("exact observed launch request differs from held binding, declared contract or native system prerequisite environment".into()));
+            }
+            if let Some(assessment) = deferred_assessment {
+                assessment?;
             }
             if input.descriptor.case == descriptor::Case::Churn {
                 let observation = &terminal.terminal.process_observation;
@@ -6660,6 +6890,14 @@ pub(crate) mod native {
             record.behavior = Ok(());
             Ok(())
         })();
+        let collection = match (application_end_error, collection) {
+            (Some(primary), Ok(())) => Err(CiError::Io(primary)),
+            (Some(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(CiError::Io(primary)),
+                secondary: Box::new(secondary),
+            }),
+            (None, collection) => collection,
+        };
         if let Err(error) = &collection {
             record.behavior = Err(error.to_string());
         }

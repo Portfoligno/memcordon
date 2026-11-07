@@ -246,3 +246,162 @@ fn original_retirement_cause_survives_real_error_composition_with_secondary_clea
     );
     assert!(matches!(secondary.as_ref(),CiError::Io(error) if error.raw_os_error()==Some(13)));
 }
+
+#[test]
+fn only_exact_released_retired_prefix_without_recipient_or_release_debt_can_settle_naturally() {
+    let stages = [
+        "started",
+        "native-argv-observed",
+        "sentinel-handles-excluded",
+        "token-envelope",
+        "controller-released",
+    ];
+    let retired = Failure::Retired {
+        identity: ORIGINAL,
+        status: 2,
+    };
+    let observed = || Owner {
+        identity: ORIGINAL,
+        exit_status: Some(2),
+    };
+    assert_eq!(
+        wait::application_end(
+            ORIGINAL,
+            observed(),
+            &retired,
+            true,
+            &stages,
+            Some(0),
+            Some(false)
+        ),
+        Some(wait::ApplicationEnd {
+            identity: ORIGINAL,
+            status: 2
+        })
+    );
+    for (recipients, release) in [
+        (None, Some(false)),
+        (Some(1), Some(false)),
+        (Some(0), None),
+        (Some(0), Some(true)),
+    ] {
+        assert!(
+            wait::application_end(
+                ORIGINAL,
+                observed(),
+                &retired,
+                true,
+                &stages,
+                recipients,
+                release
+            )
+            .is_none()
+        );
+    }
+    assert!(
+        wait::application_end(
+            ORIGINAL,
+            observed(),
+            &retired,
+            false,
+            &stages,
+            Some(0),
+            Some(false)
+        )
+        .is_none()
+    );
+    for status in [None, Some(0), Some(3)] {
+        assert!(
+            wait::application_end(
+                ORIGINAL,
+                Owner {
+                    identity: ORIGINAL,
+                    exit_status: status
+                },
+                &retired,
+                true,
+                &stages,
+                Some(0),
+                Some(false)
+            )
+            .is_none()
+        );
+    }
+    for identity in [
+        Identity {
+            pid: ORIGINAL.pid + 1,
+            ..ORIGINAL
+        },
+        Identity {
+            birth: ORIGINAL.birth + 1,
+            ..ORIGINAL
+        },
+    ] {
+        assert!(
+            wait::application_end(
+                ORIGINAL,
+                Owner {
+                    identity,
+                    exit_status: Some(2)
+                },
+                &retired,
+                true,
+                &stages,
+                Some(0),
+                Some(false)
+            )
+            .is_none()
+        );
+    }
+    for failure in [
+        Failure::IdentityMismatch,
+        Failure::PublicationMismatch,
+        Failure::Deadline,
+        Failure::Retired {
+            identity: Identity {
+                birth: ORIGINAL.birth + 1,
+                ..ORIGINAL
+            },
+            status: 2,
+        },
+    ] {
+        assert!(
+            wait::application_end(
+                ORIGINAL,
+                observed(),
+                &failure,
+                true,
+                &stages,
+                Some(0),
+                Some(false)
+            )
+            .is_none()
+        );
+    }
+    let mut later = stages.to_vec();
+    later.push("tcp-listener-owned");
+    assert!(
+        wait::application_end(
+            ORIGINAL,
+            observed(),
+            &retired,
+            true,
+            &later,
+            Some(0),
+            Some(false)
+        )
+        .is_none()
+    );
+    assert!(
+        wait::application_end(
+            ORIGINAL,
+            observed(),
+            &retired,
+            true,
+            &stages[..stages.len() - 1],
+            Some(0),
+            Some(false)
+        )
+        .is_none()
+    );
+}

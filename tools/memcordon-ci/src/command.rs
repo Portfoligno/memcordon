@@ -1447,6 +1447,10 @@ impl CommandSpec {
         if let (Err(error), Some(group)) = (&result, &group) {
             use memcordon_testkit::ProcessTestError;
             let unsettled = match error {
+                ProcessTestError::ApplicationEnded { .. } => {
+                    crate::work_outcome::native_error_settlement(error)
+                        == crate::work_outcome::WriterSettlement::Unknown
+                }
                 ProcessTestError::Wait(_) | ProcessTestError::Output(_) => true,
                 ProcessTestError::Callback {
                     cleanup,

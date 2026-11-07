@@ -9,6 +9,97 @@ use memcordon_ci::windows_consumer_readiness::{
 mod current_fixture;
 
 #[test]
+fn natural_frontend_settlement_preserves_the_exact_failed_application_and_retirement_checks() {
+    use memcordon_ci::windows_consumer_readiness::{
+        current_association, current_native, validate_ended_application_settlement,
+    };
+    use memcordon_ci::windows_listener_wait::{ApplicationEnd, Identity};
+    let result = current_fixture::completed_loader_failure();
+    let target = current_native(&result)
+        .unwrap()
+        .target_identity
+        .as_ref()
+        .unwrap();
+    let ended = ApplicationEnd {
+        identity: Identity {
+            pid: target.process_id,
+            birth: target.creation_time_100ns.into(),
+        },
+        status: 0xC0000142,
+    };
+    let association = current_association(&result).unwrap().clone();
+    let bytes = serde_json::to_vec(&result).unwrap();
+    validate_ended_application_settlement(&bytes, 125, ended, &association).unwrap();
+    assert!(check_positive_barrier_result(&bytes, &association.provider).is_err());
+    assert!(validate_ended_application_settlement(&bytes, 2, ended, &association).is_err());
+    assert!(
+        validate_ended_application_settlement(
+            &bytes,
+            125,
+            ApplicationEnd { status: 2, ..ended },
+            &association
+        )
+        .is_err()
+    );
+    assert!(
+        validate_ended_application_settlement(
+            &bytes,
+            125,
+            ApplicationEnd {
+                identity: Identity {
+                    birth: ended.identity.birth + 1,
+                    ..ended.identity
+                },
+                ..ended
+            },
+            &association
+        )
+        .is_err()
+    );
+    let mut other = association.clone();
+    other.request_sha256 = memcordon_core::hash_bytes(b"different request");
+    assert!(validate_ended_application_settlement(&bytes, 125, ended, &other).is_err());
+    assert!(
+        validate_ended_application_settlement(
+            &serde_json::to_vec(&current_fixture::launch_failure()).unwrap(),
+            125,
+            ended,
+            &association
+        )
+        .is_err()
+    );
+    for field in ["retirement", "ack"] {
+        let mut incomplete = result.clone();
+        let memcordon_core::result_v3::RuntimeExecutionV3::WindowsSealed { native, .. } =
+            &mut incomplete.runtime
+        else {
+            panic!("native fixture")
+        };
+        match field {
+            "retirement" => native.guardian_reaped = false,
+            "ack" => {
+                native
+                    .frontend_delivery
+                    .as_mut()
+                    .unwrap()
+                    .acknowledgement_observed = false
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_ended_application_settlement(
+                &serde_json::to_vec(&incomplete).unwrap(),
+                125,
+                ended,
+                &association
+            )
+            .is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
 fn fileio_capture_keeps_restricted_joint_and_only_adds_ordinary_provider_joint() {
     use memcordon_ci::windows_consumer_readiness::{
         CaseKey, loader_fileio_requested, loader_fileio_retention,

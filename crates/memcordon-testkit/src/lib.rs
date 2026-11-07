@@ -135,6 +135,10 @@ pub struct CancellationObservation {
 pub enum ProcessTestError {
     Spawn(io::Error),
     Wait(io::Error),
+    ApplicationEnded {
+        error: io::Error,
+        settlement: Result<Box<ObservedOutput>, Box<ProcessTestError>>,
+    },
     Callback {
         error: io::Error,
         stdout: Vec<u8>,
@@ -172,6 +176,35 @@ impl fmt::Display for ProcessTestError {
         match self {
             Self::Spawn(error) => write!(formatter, "test command failed to spawn: {error}"),
             Self::Wait(error) => write!(formatter, "test command wait failed: {error}"),
+            Self::ApplicationEnded { error, settlement } => {
+                write!(
+                    formatter,
+                    "test application ended: {error}; frontend settlement="
+                )?;
+                match settlement {
+                    Ok(output) => write!(
+                        formatter,
+                        "natural status={:?}; elapsed={:?}; stdout-bytes={}; stderr-bytes={}",
+                        output.status,
+                        output.elapsed,
+                        output.stdout.len(),
+                        output.stderr.len()
+                    ),
+                    Err(secondary) => {
+                        let kind = match secondary.as_ref() {
+                            Self::Spawn(_) => "spawn",
+                            Self::Wait(_) => "wait",
+                            Self::ApplicationEnded { .. } => "application-ended",
+                            Self::Callback { .. } => "callback",
+                            Self::Output(_) => "capture",
+                            Self::OutputLimit { .. } => "output-limit",
+                            Self::Timeout { .. } => "timeout",
+                            Self::Cancelled { .. } => "cancelled",
+                        };
+                        write!(formatter, "failed ({kind}); exact secondary retained")
+                    }
+                }
+            }
             Self::Callback {
                 error,
                 observed_status,
@@ -219,7 +252,23 @@ impl fmt::Display for ProcessTestError {
     }
 }
 
-impl std::error::Error for ProcessTestError {}
+impl std::error::Error for ProcessTestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ApplicationEnded { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Only callers with an authenticated application-exit observation may defer
+/// frontend termination. An application failure remains an error regardless of
+/// whether that frontend subsequently settles naturally.
+pub enum OwnedCallbackOutcome {
+    Completed,
+    Abort(io::Error),
+    ApplicationEnded(io::Error),
+}
 
 struct OutputReader {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -588,6 +637,56 @@ pub fn run_with_deadline_owned_spawn_with_io_output_limit(
         Some(limit),
         ProcessControl::default(),
     )
+}
+
+/// Opt in to preserving a failed application's frontend for its existing
+/// terminal exchange. The original owner loop, bounded readers and execution
+/// budget are shared with the strict entrypoint; aborts retain its immediate
+/// cleanup behavior. No application-ended outcome can return success.
+pub fn run_until_owned_spawn_with_io_output_limit_outcome(
+    command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(
+        u32,
+        Option<std::process::ChildStdin>,
+        OutputSnapshot,
+    ) -> OwnedCallbackOutcome
+    + Send
+    + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    let application_error = Arc::new(Mutex::new(None));
+    let callback_error = Arc::clone(&application_error);
+    let settlement = run_until_owned_spawn_with_io_output_limit(
+        command,
+        cutoff,
+        limit,
+        spawn,
+        move |pid, input, snapshot| match after_spawn(pid, input, snapshot) {
+            OwnedCallbackOutcome::Completed => Ok(()),
+            OwnedCallbackOutcome::Abort(error) => Err(error),
+            OwnedCallbackOutcome::ApplicationEnded(error) => {
+                // This only completes controller work in the shared loop. The
+                // public result below always retains this application failure.
+                *callback_error
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(error);
+                Ok(())
+            }
+        },
+    );
+    let primary = application_error
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    match primary {
+        Some(error) => Err(ProcessTestError::ApplicationEnded {
+            error,
+            settlement: settlement.map(Box::new).map_err(Box::new),
+        }),
+        None => settlement,
+    }
 }
 
 fn observe_deadline_child(

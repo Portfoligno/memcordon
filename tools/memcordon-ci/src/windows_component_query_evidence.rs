@@ -27,12 +27,25 @@ pub fn retain_not_started(directory: &Path) -> io::Result<()> {
         b"{\"format\":\"memcordon.windows-live-association-query-result\",\"revision\":1,\"streams_available\":false,\"observation\":{\"kind\":\"not-started\",\"reason\":\"original-work-cutoff-expired\"}}\n")
 }
 
-pub fn retain_result(
-    directory: &Path,
-    result: &Result<ObservedOutput, ProcessTestError>,
-) -> io::Result<()> {
+type CapturedStreams<'a> = Option<(&'a [u8], &'a [u8])>;
+fn result_evidence<'a>(
+    result: Result<&'a ObservedOutput, &'a ProcessTestError>,
+) -> (CapturedStreams<'a>, serde_json::Value) {
     use serde_json::json;
-    let (streams, evidence) = match result {
+    match result {
+        Err(ProcessTestError::ApplicationEnded { error, settlement }) => {
+            let (streams, evidence) = match settlement {
+                Ok(output) => (
+                    Some((output.stdout.as_slice(), output.stderr.as_slice())),
+                    json!({"kind":"natural-exit","status":format!("{:?}",output.status),"elapsed_ms":output.elapsed.as_millis(),"capture_complete":true}),
+                ),
+                Err(secondary) => result_evidence(Err(secondary)),
+            };
+            (
+                streams,
+                json!({"kind":"application-ended","error":error.to_string(),"raw_os_error":error.raw_os_error(),"settlement":evidence}),
+            )
+        }
         Ok(output) => (
             Some((&output.stdout, &output.stderr)),
             json!({
@@ -113,7 +126,13 @@ pub fn retain_result(
         Err(ProcessTestError::Output(error)) => {
             (None, json!({"kind":"output", "error":error.to_string()}))
         }
-    };
+    }
+}
+pub fn retain_result(
+    directory: &Path,
+    result: &Result<ObservedOutput, ProcessTestError>,
+) -> io::Result<()> {
+    let (streams, evidence) = result_evidence(result.as_ref());
     if let Some((stdout, stderr)) = streams {
         let limit = memcordon_core::WindowsGuardianAttemptObservation::MAX_FRAME_BYTES;
         if stdout.len() > limit || stderr.len() > limit {
@@ -124,7 +143,7 @@ pub fn retain_result(
         retain(&directory.join("live-association-query.stdout.bin"), stdout)?;
         retain(&directory.join("live-association-query.stderr.bin"), stderr)?;
     }
-    let bytes = serde_json::to_vec(&json!({
+    let bytes = serde_json::to_vec(&serde_json::json!({
         "format":"memcordon.windows-live-association-query-result", "revision":1,
         "streams_available":streams.is_some(), "observation":evidence,
     }))?;

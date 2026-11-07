@@ -15,6 +15,48 @@ pub struct Publication {
     pub value: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationEnd {
+    pub identity: Identity,
+    pub status: u32,
+}
+
+/// The original Joint prefix creates no recipient before publishing a listener.
+/// Only this complete, released prefix can leave no controller recipient waiting.
+pub fn application_end(
+    expected: Identity,
+    owner: Owner,
+    failure: &Failure,
+    start_handoff_returned: bool,
+    stages: &[&str],
+    other_recipients: Option<usize>,
+    pending_controller_release: Option<bool>,
+) -> Option<ApplicationEnd> {
+    let Failure::Retired { identity, status } = failure else {
+        return None;
+    };
+    let prefix = [
+        "started",
+        "native-argv-observed",
+        "sentinel-handles-excluded",
+        "token-envelope",
+        "controller-released",
+    ];
+    (expected.pid != 0
+        && expected.birth != 0
+        && *identity == expected
+        && owner.identity == expected
+        && owner.exit_status == Some(*status)
+        && start_handoff_returned
+        && stages == prefix
+        && other_recipients == Some(0)
+        && pending_controller_release == Some(false))
+    .then_some(ApplicationEnd {
+        identity: *identity,
+        status: *status,
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Failure {
     Retired { identity: Identity, status: u32 },
