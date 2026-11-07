@@ -54,6 +54,7 @@ fn provider_input_experiment_job(mut job: Value, dot_local_file: bool) -> Value 
         "result.stderr.bin",
         "result.guardian-query.stdout.bin",
         "result.guardian-query.stderr.bin",
+        "tcp-peer-stdout.bin",
     ] {
         paths.push('\n');
         paths.push_str(&format!(

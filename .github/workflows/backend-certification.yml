@@ -2892,6 +2892,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-native-file-requests.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.peer-spawn-call-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.tcp-peer-stdout.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-frontend.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json
@@ -2900,6 +2901,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-native-file-requests.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.peer-spawn-call-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.tcp-peer-stdout.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.json
@@ -3326,6 +3328,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-native-file-requests.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.peer-spawn-call-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.tcp-peer-stdout.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-frontend.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json
@@ -3334,6 +3337,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-native-file-requests.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.peer-spawn-call-trace.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.tcp-peer-stdout.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.loader-fileio.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/fixture-manifest-inventory.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/native-argv/result.guardian-query.json
@@ -6943,6 +6947,7 @@ jobs:
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/tcp-peer-stdout.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stdout.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stderr.bin
             target/ci/provider-input-experiment/cases/package-uninstall.capture.json
@@ -7351,6 +7356,7 @@ jobs:
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
             target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
+            target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/tcp-peer-stdout.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stdout.bin
             target/ci/provider-input-experiment/cases/package-uninstall.stderr.bin
             target/ci/provider-input-experiment/cases/package-uninstall.capture.json
@@ -7759,6 +7765,7 @@ jobs:
             target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
             target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
             target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/tcp-peer-stdout.bin
             target/ci/provider-file-input-experiment/cases/package-uninstall.stdout.bin
             target/ci/provider-file-input-experiment/cases/package-uninstall.stderr.bin
             target/ci/provider-file-input-experiment/cases/package-uninstall.capture.json
@@ -8167,6 +8174,7 @@ jobs:
             target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
             target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
             target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/tcp-peer-stdout.bin
             target/ci/provider-file-input-experiment/cases/package-uninstall.stdout.bin
             target/ci/provider-file-input-experiment/cases/package-uninstall.stderr.bin
             target/ci/provider-file-input-experiment/cases/package-uninstall.capture.json

@@ -30,6 +30,7 @@ mod native_gate_precondition;
 mod operation_context;
 mod own_thread_deadline_self_check;
 mod peer_retirement;
+mod peer_stdout;
 mod provider_input_probes;
 mod provider_input_target_record;
 mod provider_loader_context;
@@ -348,6 +349,7 @@ fn peer_failures(primary: io::Error, secondary: io::Error) -> io::Error {
 struct FailedPeerOwner {
     child: std::process::Child,
     _forwarding: Vec<File>,
+    stdout: Option<peer_stdout::Owned>,
 }
 struct UnsettledPeer {
     error: io::Error,
@@ -382,12 +384,24 @@ fn settle_peer_failure(
     primary: io::Error,
     cutoff: std::time::Instant,
 ) -> io::Error {
+    settle_peer_failure_with_stdout(peer, forwarding, None, primary, cutoff)
+}
+
+fn settle_peer_failure_with_stdout(
+    peer: std::process::Child,
+    forwarding: Vec<File>,
+    stdout: Option<peer_stdout::Owned>,
+    primary: io::Error,
+    cutoff: std::time::Instant,
+) -> io::Error {
     use memcordon_platform::windows_registry_error::at;
     let mut owner = FailedPeerOwner {
         child: peer,
         _forwarding: forwarding,
+        stdout,
     };
     owner.child.stdin.take();
+    let mut stdout_result = Ok(());
     match peer_retirement::settle(
         owner,
         primary,
@@ -409,17 +423,32 @@ fn settle_peer_failure(
                 "Win32",
                 None,
             )
-            .map(|status| status.is_some())
+            .map(|status| {
+                if status.is_some() {
+                    if let Some(stdout) = owner.stdout.take() {
+                        stdout_result = stdout.finish();
+                    }
+                    true
+                } else {
+                    false
+                }
+            })
         },
     ) {
-        peer_retirement::Outcome::Retired(error) => error,
-        peer_retirement::Outcome::Unsettled { owner, error } => io::Error::new(
-            error.kind(),
-            UnsettledPeer {
-                error,
-                _owner: Box::leak(Box::new(owner)),
-            },
-        ),
+        peer_retirement::Outcome::Retired(error) => peer_stdout::preserve(error, stdout_result),
+        peer_retirement::Outcome::Unsettled { owner, error } => {
+            let error = match &owner.stdout {
+                Some(stdout) => peer_stdout::preserve(error, stdout.unresolved()),
+                None => error,
+            };
+            io::Error::new(
+                error.kind(),
+                UnsettledPeer {
+                    error,
+                    _owner: Box::leak(Box::new(owner)),
+                },
+            )
+        }
     }
 }
 
@@ -782,13 +811,23 @@ fn joint_mapped(
         Operation::ChallengeWrite,
         fs::write(&challenge_path, &descriptor.challenge),
     )?;
+    let cutoff = control
+        .as_deref()
+        .map(|session| session.original_deadline());
+    let mut peer_stdout = Some(context(
+        Operation::PeerStdoutCreate,
+        peer_stdout::Owned::create(&descriptor.output_root, cutoff),
+    )?);
     let mut peer_command = child_command()?;
     peer_command
         .arg("tcp-peer")
         .arg(address.port().to_string())
         .arg(challenge_path)
         .arg(&descriptor.output_root)
-        .stdout(Stdio::null())
+        .stdout(context(
+            Operation::PeerStdoutDuplicate,
+            peer_stdout.as_ref().expect("owned stdout").stdio(),
+        )?)
         .stderr(Stdio::inherit());
     if registry.is_some() {
         let session = control
@@ -824,10 +863,23 @@ fn joint_mapped(
             ),
         )?;
     }
-    let mut peer = context(
+    let mut peer = match context(
         Operation::PeerCommandSpawn,
         spawn_trace::spawn(&mut peer_command, trace.as_ref()),
-    )?;
+    ) {
+        Ok(peer) => peer,
+        Err(primary) => {
+            let stdout = peer_stdout.take().expect("owned stdout");
+            let error = peer_stdout::preserve(primary, stdout.unresolved());
+            // No returned Child cannot prove that a partially created recipient
+            // retired. Controller spawn uncertainty keeps namespace custody too.
+            std::mem::forget(stdout);
+            return Err(error);
+        }
+    };
+    // Command retains its configured stdio; close that local duplicate while
+    // keeping the original held file and the child's actual inherited handle.
+    drop(peer_command);
     // Every error after spawn retains/settles this original Child. In a private
     // experiment the controller independently owns the peer before transfer,
     // or keeps the unresolved spawn interval quarantined.
@@ -941,7 +993,12 @@ fn joint_mapped(
             return Err(io::Error::other("TCP peer did not half-close"));
         }
         stream.shutdown(Shutdown::Write)?;
-        if !peer.wait()?.success() {
+        let status = peer.wait()?;
+        context(
+            Operation::PeerStdoutValidate,
+            peer_stdout.take().expect("owned stdout").finish(),
+        )?;
+        if !status.success() {
             return Err(io::Error::other("TCP child failed"));
         }
         transcript.event("tcp-peer-complete", None, &descriptor.challenge)
@@ -952,9 +1009,34 @@ fn joint_mapped(
             Some(session) => {
                 let cutoff = session.original_deadline();
                 let forwarding = session.take_private_directory_files();
-                Err(settle_peer_failure(peer, forwarding, primary, cutoff))
+                Err(settle_peer_failure_with_stdout(
+                    peer,
+                    forwarding,
+                    peer_stdout.take(),
+                    primary,
+                    cutoff,
+                ))
             }
-            None => Err(primary),
+            None => {
+                // Without an original deadline/settlement session, no new
+                // timeout or claimed retirement can justify releasing this file.
+                let owner = FailedPeerOwner {
+                    child: peer,
+                    _forwarding: Vec::new(),
+                    stdout: peer_stdout.take(),
+                };
+                let error = match &owner.stdout {
+                    Some(stdout) => peer_stdout::preserve(primary, stdout.unresolved()),
+                    None => primary,
+                };
+                Err(io::Error::new(
+                    error.kind(),
+                    UnsettledPeer {
+                        error,
+                        _owner: Box::leak(Box::new(owner)),
+                    },
+                ))
+            }
         },
     }
 }

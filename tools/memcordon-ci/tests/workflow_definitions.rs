@@ -116,6 +116,7 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
             "result.listener-call-trace.json",
             "result.listener-native-file-requests.json",
             "result.peer-spawn-call-trace.json",
+            "result.tcp-peer-stdout.json",
         ] {
             paths.push(format!("{prefix}/windows-installed/{case}/{name}"));
         }

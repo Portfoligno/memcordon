@@ -127,6 +127,8 @@ pub enum ProviderExperimentRecord {
     NativeFileRequests,
     PeerNativeFileRequests,
     PeerSpawnTrace,
+    PeerStdoutRecord,
+    PeerStdout,
     StartupTrace,
     PeerStartupTrace,
     InputProbes,
@@ -145,12 +147,14 @@ pub enum ProviderExperimentRecord {
 }
 
 impl ProviderExperimentRecord {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::ListenerTrace,
         Self::PeerListenerTrace,
         Self::NativeFileRequests,
         Self::PeerNativeFileRequests,
         Self::PeerSpawnTrace,
+        Self::PeerStdoutRecord,
+        Self::PeerStdout,
         Self::StartupTrace,
         Self::PeerStartupTrace,
         Self::InputProbes,
@@ -175,6 +179,8 @@ impl ProviderExperimentRecord {
             Self::NativeFileRequests => "listener-native-file-requests.json",
             Self::PeerNativeFileRequests => "peer-listener-native-file-requests.json",
             Self::PeerSpawnTrace => "peer-spawn-call-trace.json",
+            Self::PeerStdoutRecord => "tcp-peer-stdout.json",
+            Self::PeerStdout => "tcp-peer-stdout.bin",
             Self::StartupTrace => "winsock-startup-trace.json",
             Self::PeerStartupTrace => "peer-winsock-startup-trace.json",
             Self::InputProbes => "provider-input-probes.json",
@@ -202,7 +208,8 @@ impl ProviderExperimentRecord {
             | Self::CallbackStderr
             | Self::GuardianQuery
             | Self::GuardianStdout
-            | Self::GuardianStderr => Some(64 * 1024),
+            | Self::GuardianStderr
+            | Self::PeerStdout => Some(64 * 1024),
             _ => None,
         }
     }
@@ -233,7 +240,7 @@ impl ProviderExperimentRecord {
         serde_json::json!({"leaf":self.leaf(),"copy_ceiling_bytes":ceiling,"source_metadata_bytes":source_bytes,
             "retained_bytes":copied.map(<[u8]>::len),"retained_sha256":copied.map(crate::windows_causal_acceptance::sha256),
             "file_copy_complete":complete,"state":state,"producer_capture_complete":null,
-            "producer_capture_completeness":"not inferred; consult original callback-failure or guardian-query record",
+            "producer_capture_completeness":"not inferred; consult original callback-failure, guardian-query or owned-peer-stdout record",
             "acceptance_authority":false})
     }
 
@@ -6303,6 +6310,11 @@ pub(crate) mod native {
                         "memcordon.original-peer-spawn-trace",
                     )
                     .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
+                    let peer_stdout = trace_carrier(
+                        "tcp-peer-stdout.json",
+                        "memcordon.owned-peer-stdout",
+                    )
+                    .unwrap_or_else(|error|serde_json::json!({"state":"retention-error","error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"authority":false,"identity_admission":false}));
                     let product_context = if *capture_complete && cleanup.is_ok() {
                         retain_callback_product_context(&public_report, &report, &config.provider)
                             .map_err(|error| error.to_string())
@@ -6315,6 +6327,7 @@ pub(crate) mod native {
                         "observed_status":observed_status.map(|status| status.code()),
                         "termination":termination.map(|status| status.code()), "cleanup":cleanup,
                         "product_context":product_context,
+                        "peer_stdout":peer_stdout,
                         "winsock_trace":winsock_trace,
                         "listener_trace":listener_trace,
                         "native_file_requests":native_file_requests,

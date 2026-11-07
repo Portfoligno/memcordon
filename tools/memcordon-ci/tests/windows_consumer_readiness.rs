@@ -94,6 +94,8 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     assert!(leaves.contains("listener-native-file-requests.json"));
     assert!(leaves.contains("peer-listener-native-file-requests.json"));
     assert!(leaves.contains("peer-spawn-call-trace.json"));
+    assert!(leaves.contains("tcp-peer-stdout.json"));
+    assert!(leaves.contains("tcp-peer-stdout.bin"));
     assert!(leaves.contains("result.loader-fileio.json"));
     assert!(leaves.contains("result.callback-failure.json"));
     assert!(leaves.contains("result.guardian-query.stderr.bin"));
@@ -107,6 +109,7 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     )
     .unwrap();
     fs::remove_file(native.join("result.guardian-query.stdout.bin")).unwrap();
+    fs::write(fixture.join("tcp-peer-stdout.bin"), vec![1; 64 * 1024 + 1]).unwrap();
     let facts = temporary.path().join("facts");
     let mut copied = Vec::new();
     retain_provider_experiment_facts(
@@ -142,12 +145,15 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     assert!(index_bytes.len() <= 8 * 1024);
     let index: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
     let captures = index["captures"].as_array().unwrap();
-    assert_eq!(captures.len(), 6);
+    assert_eq!(captures.len(), 7);
+    assert!(!facts.join("tcp-peer-stdout.bin").exists());
+    assert!(!copied.contains(&fixture.join("tcp-peer-stdout.bin")));
     for (leaf, state) in [
         ("result.stderr.bin", "copied"),
         ("result.stdout.bin", "copied"),
         ("result.guardian-query.stderr.bin", "oversize-not-copied"),
         ("result.guardian-query.stdout.bin", "not-present"),
+        ("tcp-peer-stdout.bin", "oversize-not-copied"),
     ] {
         assert_eq!(
             captures.iter().find(|row| row["leaf"] == leaf).unwrap()["state"],
@@ -166,6 +172,7 @@ fn controller_capture_metadata_distinguishes_complete_files_oversize_and_produce
         Record::GuardianQuery,
         Record::GuardianStdout,
         Record::GuardianStderr,
+        Record::PeerStdout,
     ];
     let original_stderr = vec![b'x'; 4984];
     let mut index = Vec::new();

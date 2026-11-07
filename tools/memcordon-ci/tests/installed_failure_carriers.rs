@@ -25,6 +25,7 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
             "result.listener-call-trace.json",
             "result.listener-native-file-requests.json",
             "result.peer-spawn-call-trace.json",
+            "result.tcp-peer-stdout.json",
         ] {
             let path = root.path().join("windows-installed").join(case).join(file);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
