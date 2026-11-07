@@ -1260,6 +1260,14 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             }
             return spawn_trace::standalone_self_check();
         }
+        Some("listener-peer-spawn-composition-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "listener-peer-spawn composition self-check takes no operands",
+                ));
+            }
+            return spawn_trace::composition_self_check();
+        }
         Some("own-thread-deadline-self-check") => {
             if args.next().is_some() {
                 return Err(io::Error::other(

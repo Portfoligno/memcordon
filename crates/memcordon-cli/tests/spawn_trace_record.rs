@@ -10,7 +10,7 @@ use record::{Packet, Row, bounded, diagnostic, validate};
 
 fn packet() -> Packet {
     let mut packet = Packet {
-        version: 1,
+        version: 2,
         packet_bytes: record::PACKET_BYTES as u32,
         owner_count: 1,
         route_count: 5,
@@ -123,7 +123,8 @@ fn exact_abi_and_each_api_keep_domains_arguments_and_unproved_child_outputs_dist
     );
     assert_eq!(value["denied_object_identity_proved"], false);
     assert_eq!(value["environment_or_command_line_captured"], false);
-    assert_eq!(std::mem::size_of::<Packet>(), 9824);
+    assert_eq!(std::mem::size_of::<Packet>(), 9888);
+    assert_eq!(std::mem::offset_of!(Packet, refusal), 9824);
     assert_eq!(std::mem::offset_of!(Row, name), 224);
 }
 
@@ -232,7 +233,7 @@ fn malformed_layout_counts_route_proofs_and_pinned_failures_are_rejected_explici
         packet.total_calls = 1;
         packet.rows[0] = row(1, 1);
         match case {
-            0 => packet.version = 2,
+            0 => packet.version = 1,
             1 => packet.packet_bytes -= 1,
             2 => packet.record_count = 17,
             3 => packet.route_count = 6,
@@ -269,6 +270,20 @@ fn maximum_rows_first_failure_and_binding_fit_the_fixed_carrier_without_hidden_o
     for route in &mut packet.routes {
         route.target = packet.owners[0].identity;
     }
+    packet.refusal = record::Refusal {
+        descriptor_module: u64::MAX,
+        slot: u64::MAX,
+        resolved: u64::MAX,
+        current: u64::MAX,
+        present: 1,
+        reason: 11,
+        descriptor_index: u32::MAX,
+        thunk_index: u32::MAX,
+        kind: 2,
+        ordinal: u32::MAX,
+        candidate: 5,
+        availability: 511,
+    };
     for index in 0..16 {
         packet.rows[index] = row(index as u32 % 5 + 1, index as u64 + 5);
         packet.rows[index].name.fill(u16::MAX);
@@ -287,4 +302,89 @@ fn maximum_rows_first_failure_and_binding_fit_the_fixed_carrier_without_hidden_o
     assert_eq!(value["trace"]["rows"].as_array().unwrap().len(), 16);
     assert_eq!(value["trace"]["first_failure"]["sequence"], 1);
     assert!(bounded(serde_json::json!({"too_large":"x".repeat(record::RECORD_BYTES)})).is_err());
+}
+
+#[test]
+fn first_setup_refusal_distinguishes_unknown_from_measured_zero_and_rejects_old_layout() {
+    let mut packet = packet();
+    packet.refusal = record::Refusal {
+        present: 1,
+        reason: 11,
+        descriptor_index: 8,
+        thunk_index: 219,
+        kind: 2,
+        ordinal: 17,
+        candidate: 1,
+        descriptor_module: u64::MAX,
+        slot: u64::MAX - 8,
+        resolved: 0x1234,
+        current: 0,
+        availability: 511,
+    };
+    validate(&packet).unwrap();
+    let value = diagnostic(&packet);
+    let refusal = &value["first_setup_refusal"];
+    assert_eq!(refusal["reason"], "selected-export-mismatch");
+    assert_eq!(refusal["candidate_api"], "NtOpenFile");
+    assert_eq!(refusal["callback_ordinal"], 17);
+    assert!(refusal.get("declared_ordinal").is_none());
+    assert_eq!(refusal["current_slot_scalar"], 0);
+    assert_eq!(refusal["selected_exact_equality"], false);
+    assert_eq!(refusal["descriptor_index"], 8);
+    assert!(bounded(value).unwrap().len() <= record::RECORD_BYTES);
+    packet.refusal = record::Refusal {
+        present: 1,
+        reason: 19,
+        ..Default::default()
+    };
+    let value = diagnostic(&packet);
+    for field in [
+        "descriptor_index",
+        "thunk_index",
+        "kind",
+        "callback_ordinal",
+        "candidate_classification",
+        "descriptor_module_scalar",
+        "slot_scalar",
+        "resolved_export_scalar",
+        "current_slot_scalar",
+        "selected_exact_equality",
+    ] {
+        assert!(value["first_setup_refusal"][field].is_null(), "{field}");
+    }
+    assert_eq!(
+        value["first_setup_refusal"]["reason"],
+        "terminal-callback-missing"
+    );
+    for change in 0..5 {
+        let mut malformed = self::packet();
+        match change {
+            0 => {
+                malformed.version = 1;
+                malformed.packet_bytes = 9824;
+            }
+            1 => {
+                malformed.refusal.present = 1;
+                malformed.refusal.reason = 25;
+            }
+            2 => {
+                malformed.refusal.present = 1;
+                malformed.refusal.reason = 1;
+                malformed.refusal.availability = 512;
+            }
+            3 => {
+                malformed.refusal.present = 1;
+                malformed.refusal.reason = 1;
+                malformed.refusal.current = 1;
+            }
+            _ => {
+                malformed.refusal.present = 1;
+                malformed.refusal.reason = 1;
+                malformed.refusal.candidate = 7;
+                malformed.refusal.availability = 16;
+            }
+        }
+        assert!(validate(&malformed).is_err());
+        assert_eq!(diagnostic(&malformed)["packet_valid"], false);
+    }
 }

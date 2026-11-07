@@ -1,7 +1,7 @@
 #pragma once
 #include "native_file_request_trace.h"
 
-constexpr uint32_t SpawnVersion=1,SpawnOwners=1,SpawnRoutes=5,SpawnRows=16,SpawnNameUnits=128;
+constexpr uint32_t SpawnVersion=2,SpawnOwners=1,SpawnRoutes=5,SpawnRows=16,SpawnNameUnits=128;
 using SpawnOwner=NativeFileOwner;
 using SpawnRoute=NativeFileRoute;
 struct SpawnRow {
@@ -19,6 +19,10 @@ struct SpawnRow {
     uint32_t output_flags,flags,output_pid,output_tid;
     uint16_t name[SpawnNameUnits];
 };
+struct SpawnRefusal {
+    uint64_t descriptor_module,slot,resolved,current;
+    uint32_t present,reason,descriptor_index,thunk_index,kind,ordinal,candidate,availability;
+};
 struct SpawnPacket {
     uint32_t version,packet_bytes,owner_count,route_count,record_count,total_calls,total_failures,dropped,overflow,incomplete,first_failure_present;
     uint32_t scope_attempted,scope_returned,scope_reentry,late,clock_failures,input_failures,unmatched_scope,scope_unavailable,route_failures,original_thread,reserved;
@@ -26,9 +30,12 @@ struct SpawnPacket {
     SpawnOwner owners[SpawnOwners];
     SpawnRoute routes[SpawnRoutes];
     SpawnRow first_failure,rows[SpawnRows];
+    SpawnRefusal refusal;
 };
 static_assert(sizeof(SpawnOwner)==224 && sizeof(SpawnRoute)==264,"spawn route ABI v1");
 static_assert(sizeof(SpawnRow)==480 && offsetof(SpawnRow,name)==224,"spawn row ABI v1");
-static_assert(sizeof(SpawnPacket)==9824 && offsetof(SpawnPacket,owners)==120 && offsetof(SpawnPacket,routes)==344 && offsetof(SpawnPacket,first_failure)==1664 && offsetof(SpawnPacket,rows)==2144,"spawn packet ABI v1");
+static_assert(sizeof(SpawnRefusal)==64 && offsetof(SpawnPacket,refusal)==9824,"spawn refusal ABI v2");
+static_assert(sizeof(SpawnPacket)==9888 && offsetof(SpawnPacket,owners)==120 && offsetof(SpawnPacket,routes)==344 && offsetof(SpawnPacket,first_failure)==1664 && offsetof(SpawnPacket,rows)==2144,"spawn packet ABI v2");
 extern "C" void memcordon_spawn_trace_call(SpawnPacket*,const ListenerRequest*,ListenerInvoke,void*);
 extern "C" uint32_t memcordon_spawn_trace_mock(uint64_t,uint64_t);
+extern "C" uint32_t memcordon_spawn_trace_composition_check(uint64_t,uint64_t,SpawnPacket*);

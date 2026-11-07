@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 
-pub const PACKET_BYTES: usize = 9824;
+pub const PACKET_BYTES: usize = 9888;
 pub const RECORD_BYTES: usize = 64 * 1024;
 pub const ROUTES: usize = 5;
 pub const ROWS: usize = 16;
@@ -72,6 +72,22 @@ impl Default for Row {
 }
 #[repr(C)]
 #[derive(Default)]
+pub struct Refusal {
+    pub descriptor_module: u64,
+    pub slot: u64,
+    pub resolved: u64,
+    pub current: u64,
+    pub present: u32,
+    pub reason: u32,
+    pub descriptor_index: u32,
+    pub thunk_index: u32,
+    pub kind: u32,
+    pub ordinal: u32,
+    pub candidate: u32,
+    pub availability: u32,
+}
+#[repr(C)]
+#[derive(Default)]
 pub struct Packet {
     pub version: u32,
     pub packet_bytes: u32,
@@ -103,6 +119,7 @@ pub struct Packet {
     pub routes: [Route; ROUTES],
     pub first_failure: Row,
     pub rows: [Row; ROWS],
+    pub refusal: Refusal,
 }
 const _: () = {
     assert!(std::mem::size_of::<Row>() == 480);
@@ -112,6 +129,8 @@ const _: () = {
     assert!(std::mem::offset_of!(Packet, routes) == 344);
     assert!(std::mem::offset_of!(Packet, first_failure) == 1664);
     assert!(std::mem::offset_of!(Packet, rows) == 2144);
+    assert!(std::mem::size_of::<Refusal>() == 64);
+    assert!(std::mem::offset_of!(Packet, refusal) == 9824);
 };
 
 fn api(operation: u32) -> Option<&'static str> {
@@ -162,7 +181,7 @@ fn row_valid(row: &Row, packet: &Packet) -> bool {
             || (row.returned == 1 && !failure(row) && row.flags & 64 == 0))
 }
 pub fn validate(packet: &Packet) -> Result<(), &'static str> {
-    if packet.version != 1 || packet.packet_bytes as usize != PACKET_BYTES {
+    if packet.version != 2 || packet.packet_bytes as usize != PACKET_BYTES {
         return Err("unsupported spawn packet version or extent");
     }
     if packet.reserved != 0
@@ -178,6 +197,29 @@ pub fn validate(packet: &Packet) -> Result<(), &'static str> {
         || (packet.first_failure_present != 0 && packet.total_failures == 0)
     {
         return Err("invalid spawn packet bounds or counters");
+    }
+    let refusal = &packet.refusal;
+    if refusal.present > 1
+        || (refusal.present == 0 && (refusal.reason != 0 || refusal.availability != 0))
+        || (refusal.present == 1 && !(1..=24).contains(&refusal.reason))
+        || refusal.availability & !511 != 0
+        || refusal.kind > 4
+        || refusal.candidate > 6
+        || [
+            (1, refusal.descriptor_module),
+            (2, refusal.slot),
+            (4, refusal.current),
+            (8, refusal.resolved),
+            (16, u64::from(refusal.candidate)),
+            (32, u64::from(refusal.ordinal)),
+            (64, u64::from(refusal.descriptor_index)),
+            (128, u64::from(refusal.thunk_index)),
+            (256, u64::from(refusal.kind)),
+        ]
+        .iter()
+        .any(|(bit, value)| refusal.availability & bit == 0 && *value != 0)
+    {
+        return Err("invalid spawn first-refusal fields or availability");
     }
     for owner in &packet.owners[..packet.owner_count as usize] {
         if owner.role != 1
@@ -297,6 +339,48 @@ fn row(value: &Row, packet: &Packet) -> Value {
     }
     observed
 }
+fn setup_refusal(value: &Refusal) -> Value {
+    let labels = [
+        "unknown",
+        "descriptor-callback",
+        "thunk-limit",
+        "thunk-unreadable",
+        "end-marker",
+        "function-limit",
+        "original-clock-or-cutoff",
+        "slot-shape",
+        "ordinal-shape",
+        "ordinal-export-unavailable",
+        "ordinal-alias-ambiguous",
+        "selected-export-mismatch",
+        "named-import-shape",
+        "duplicate-candidate",
+        "candidate-capacity",
+        "target-identity",
+        "pointer-copy-fault",
+        "bounded-import-preflight",
+        "enumeration-result",
+        "terminal-callback-missing",
+        "owner-clock-or-cutoff",
+        "owner-identity",
+        "cache-unavailable",
+        "cache-validation",
+        "publication-or-revalidation",
+    ];
+    let known = |bit| value.availability & bit != 0;
+    json!({"reason_code":value.reason,"reason":labels[value.reason as usize],"availability":value.availability,
+        "descriptor_index":known(64).then_some(value.descriptor_index),"thunk_index":known(128).then_some(value.thunk_index),
+        "kind":known(256).then_some(value.kind),"callback_ordinal":known(32).then_some(value.ordinal),
+        "ordinal_source":"enumeration-callback; structural disagreement remains possible",
+        "candidate_classification":known(16).then_some(value.candidate),
+        "candidate_api":if known(16){api(value.candidate)}else{None},
+        "validated_candidate_name_identity":if known(16)&&value.kind==1{api(value.candidate)}else{None},
+        "arbitrary_name_content_available":false,
+        "descriptor_module_scalar":known(1).then_some(value.descriptor_module),"slot_scalar":known(2).then_some(value.slot),
+        "resolved_export_scalar":known(8).then_some(value.resolved),"current_slot_scalar":known(4).then_some(value.current),
+        "selected_exact_equality":(known(4)&&known(8)).then_some(value.current==value.resolved),
+        "derived_from_existing_discovery_values":true,"denied_object_identity_proved":false,"acceptance_authority":false})
+}
 pub fn diagnostic(packet: &Packet) -> Value {
     let checked = validate(packet);
     let valid = checked.is_ok();
@@ -328,6 +412,8 @@ pub fn diagnostic(packet: &Packet) -> Value {
         "started_qpc":packet.started_qpc,"finished_qpc":packet.finished_qpc,"cutoff_qpc":packet.cutoff_qpc,"frequency":packet.frequency,
         "owners":owners,"routes":routes,"rows":rows,"invalid_rows_omitted":if valid{0}else{packet.record_count},
         "first_failure_present":packet.first_failure_present,"first_failure":if valid&&packet.first_failure_present==1 {row(&packet.first_failure,packet)}else{Value::Null},
+        "first_setup_refusal":if valid&&packet.refusal.present==1{setup_refusal(&packet.refusal)}else{Value::Null},
+        "setup_refusal_scope":"first setup failure retained in process; cached failure can predate this callback",
         "scope":"same-thread original Rust Command::spawn only; separate from original loader scope",
         "interpretation":"INCONCLUSIVE: missing imports, zero hits, dynamic/internal/foreign-thread routes and partial observations prove no absence or denied object",
         "environment_or_command_line_captured":false,"global_route_coverage":false,"acceptance_authority":false,"first_observed_failure_is_decisive_cause":false,

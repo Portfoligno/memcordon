@@ -510,6 +510,41 @@ pub fn connect(context: &Context<'_>, address: SocketAddrV4) -> io::Result<TcpSt
     result
 }
 
+/// Production listener setup only: no competing fixture native-file mock.
+pub(super) fn composition_listener(
+    clock: &super::descriptor::ControlClock,
+) -> io::Result<TcpListener> {
+    live(clock)?;
+    let mut observed = capture(clock);
+    let listener = observed.take_result().map_err(|original| {
+        io::Error::new(
+            original.kind(),
+            Failure {
+                original,
+                summary: summary(&observed.packet),
+                retention: None,
+            },
+        )
+    })?;
+    live(clock)?;
+    if observed.packet.setup_stage != 1
+        || observed.packet.setup_error != 0
+        || observed.packet.called != 1
+        || observed.packet.armed != 1
+        || observed.packet.callback_outcome != 1
+        || observed.packet.protections_restored != 1
+        || observed.packet.rollback_error != 0
+        || observed.packet.owner_pinned != 1
+        || observed.packet.returned_mask & 0x1A != 0x1A
+        || record::diagnostic(&observed.packet)["invalid_packet"] != false
+    {
+        return Err(io::Error::other(
+            "listener-before-spawn actual listener route incomplete",
+        ));
+    }
+    Ok(listener)
+}
+
 pub fn self_check() -> io::Result<i32> {
     use windows_sys::Win32::System::Performance::{
         QueryPerformanceCounter, QueryPerformanceFrequency,

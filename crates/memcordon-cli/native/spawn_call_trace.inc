@@ -117,45 +117,88 @@ static_assert(std::is_same_v<decltype(&spawn_open),SpawnOpen> && std::is_same_v<
 static_assert(std::is_same_v<decltype(&spawn_file),SpawnFile> && std::is_same_v<decltype(&spawn_duplicate),SpawnDuplicate> && std::is_same_v<decltype(&spawn_process),SpawnProcess>,"Win32 spawn wrapper ABI");
 static const Hook spawn_hooks[SpawnRoutes]={{"NtOpenFile",reinterpret_cast<void*>(spawn_open)},{"NtCreateNamedPipeFile",reinterpret_cast<void*>(spawn_pipe)},{"CreateFileW",reinterpret_cast<void*>(spawn_file)},{"DuplicateHandle",reinterpret_cast<void*>(spawn_duplicate)},{"CreateProcessW",reinterpret_cast<void*>(spawn_process)}};
 
-struct SpawnCache {volatile LONG state;Image mapped;SpawnOwner owner;WsaPacket proof;WsaNode targets[SpawnRoutes];SpawnRoute routes[SpawnRoutes];uint32_t route_count;};
+enum SpawnRefusalReason : uint32_t {SpawnDescriptor=1,SpawnThunkLimit,SpawnThunkRead,SpawnEndMarker,SpawnFunctionLimit,SpawnClock,SpawnSlotShape,SpawnOrdinalShape,SpawnOrdinalMissing,SpawnOrdinalAmbiguous,SpawnSelectedMismatch,SpawnNamedShape,SpawnDuplicateCandidate,SpawnCapacity,SpawnTargetIdentity,SpawnPointerFault,SpawnBoundedImports,SpawnEnumeration,SpawnCallbackEnd,SpawnOwnerClock,SpawnOwnerIdentity,SpawnCacheUnavailable,SpawnCacheValidation,SpawnPublication};
+// Availability bits name values already read; zero without a bit is unknown.
+enum SpawnAvailability : uint32_t {SpawnDescriptorKnown=1,SpawnSlotKnown=2,SpawnCurrentKnown=4,SpawnResolvedKnown=8,SpawnCandidateKnown=16,SpawnOrdinalKnown=32,SpawnDescriptorIndexKnown=64,SpawnThunkIndexKnown=128,SpawnKindKnown=256};
+static void spawn_first_refusal(SpawnRefusal* destination,uint32_t reason,const SpawnRefusal& observed){if(destination&&!destination->present){*destination=observed;destination->reason=reason;destination->present=1;}}
+static bool spawn_ordinal_selected(void* resolved,void* current,void* const* exports,size_t* typed,uint32_t* reason){
+    *typed=0;*reason=0;
+    if(!resolved){*reason=SpawnOrdinalMissing;return false;}
+    // Declared identity is classified independently of the live IAT. The
+    // shared helper intentionally conflates mismatch with unselected otherwise.
+    *typed=typed_ordinal_operation(resolved,resolved,exports,SpawnRoutes);
+    if(*typed>SpawnRoutes){*reason=SpawnOrdinalAmbiguous;return false;}
+    if(*typed&&resolved!=current){*reason=SpawnSelectedMismatch;return false;}
+    return true;
+}
+static bool spawn_ordinal_shape(uint64_t thunk,DWORD ordinal,LPCSTR name,HMODULE descriptor){return IMAGE_SNAP_BY_ORDINAL64(thunk)&&!name&&ordinal&&ordinal<=UINT16_MAX&&IMAGE_ORDINAL64(thunk)==ordinal&&!(thunk&~(IMAGE_ORDINAL_FLAG64|UINT64_C(0xffff)))&&descriptor;}
+static bool spawn_slot_shape(uint64_t thunk,uintptr_t slot,uintptr_t first,size_t index,const Image& mapped){return thunk&&index<4096&&first<=UINTPTR_MAX-index*sizeof(void*)&&slot==first+index*sizeof(void*)&&range(slot,sizeof(void*),mapped.iat,mapped.iat_end);}
+struct SpawnCache {volatile LONG state;Image mapped;SpawnOwner owner;WsaPacket proof;WsaNode targets[SpawnRoutes];SpawnRoute routes[SpawnRoutes];uint32_t route_count;SpawnRefusal refusal;};
 static SpawnCache spawn_cache={};
-struct SpawnDiscovery {ReturnedDiscovery base;uint32_t kinds[SpawnRoutes];};
+struct SpawnDiscovery {ReturnedDiscovery base;uint32_t kinds[SpawnRoutes];SpawnRefusal* refusal;};
 static std::atomic<NativeFileWritable> spawn_private_writable{nullptr};
-static BOOL CALLBACK spawn_import_file(void* context,HMODULE module,LPCSTR name){return returned_import_file(&static_cast<SpawnDiscovery*>(context)->base,module,name);}
+static BOOL CALLBACK spawn_import_file(void* context,HMODULE module,LPCSTR name){
+    auto* discovery=static_cast<SpawnDiscovery*>(context);auto* state=&discovery->base;
+    const auto result=returned_import_file(state,module,name);
+    if(state->error){SpawnRefusal observed={};observed.kind=name?4:3;observed.availability=SpawnKindKnown;
+        if(state->packet->descriptor_count){observed.descriptor_index=state->packet->descriptor_count-1;observed.availability|=SpawnDescriptorIndexKnown;}
+        spawn_first_refusal(discovery->refusal,name?SpawnDescriptor:SpawnCallbackEnd,observed);}
+    return result;
+}
+static BOOL spawn_discovery_failure(SpawnDiscovery* discovery,SpawnRefusal* observed,uint32_t reason,DWORD error){
+    discovery->base.error=error;spawn_first_refusal(discovery->refusal,reason,*observed);return FALSE;
+}
 static BOOL CALLBACK spawn_import_function(void* context,DWORD ordinal,LPCSTR name,void** slot){
     auto* discovery=static_cast<SpawnDiscovery*>(context);auto* state=&discovery->base;auto* proof=state->packet;
+    SpawnRefusal observed={};observed.descriptor_module=reinterpret_cast<uintptr_t>(state->descriptor);observed.slot=reinterpret_cast<uintptr_t>(slot);observed.ordinal=ordinal;
+    observed.thunk_index=static_cast<uint32_t>(state->thunk_index);observed.availability=SpawnDescriptorKnown|SpawnSlotKnown|SpawnOrdinalKnown|SpawnThunkIndexKnown;
+    if(proof->descriptor_count){observed.descriptor_index=proof->descriptor_count-1;observed.availability|=SpawnDescriptorIndexKnown;}
     __try {
         if(state->error)return FALSE;
-        if(state->thunk_index>=4096){state->error=ERROR_BUFFER_OVERFLOW;return FALSE;}
+        if(state->thunk_index>=4096)return spawn_discovery_failure(discovery,&observed,SpawnThunkLimit,ERROR_BUFFER_OVERFLOW);
         const auto address=state->original_thunk+state->thunk_index*sizeof(IMAGE_THUNK_DATA64);
-        if(!readable(address,sizeof(IMAGE_THUNK_DATA64),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        if(!readable(address,sizeof(IMAGE_THUNK_DATA64),state->image))return spawn_discovery_failure(discovery,&observed,SpawnThunkRead,ERROR_INVALID_DATA);
         const auto thunk=reinterpret_cast<const IMAGE_THUNK_DATA64*>(address)->u1.Ordinal;
-        if(!slot){if(thunk||ordinal||name)state->error=ERROR_INVALID_DATA;return state->error==ERROR_SUCCESS;}
-        if(++proof->function_count>16384||!live(proof)){state->error=proof->setup_error?proof->setup_error:ERROR_BUFFER_OVERFLOW;return FALSE;}
+        if(!slot){observed.kind=3;observed.availability|=SpawnKindKnown;if(thunk||ordinal||name)return spawn_discovery_failure(discovery,&observed,SpawnEndMarker,ERROR_INVALID_DATA);return TRUE;}
+        if(++proof->function_count>16384)return spawn_discovery_failure(discovery,&observed,SpawnFunctionLimit,proof->setup_error?proof->setup_error:ERROR_BUFFER_OVERFLOW);
+        if(!live(proof))return spawn_discovery_failure(discovery,&observed,SpawnClock,proof->setup_error?proof->setup_error:ERROR_BUFFER_OVERFLOW);
         const auto slot_address=reinterpret_cast<uintptr_t>(slot);
-        if(!thunk||slot_address!=state->first_thunk+state->thunk_index*sizeof(void*)||!range(slot_address,sizeof(void*),state->image.iat,state->image.iat_end)||!readable(slot_address,sizeof(void*),state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+        if(!spawn_slot_shape(thunk,slot_address,state->first_thunk,state->thunk_index,state->image)||!readable(slot_address,sizeof(void*),state->image))return spawn_discovery_failure(discovery,&observed,SpawnSlotShape,ERROR_INVALID_DATA);
         ++state->thunk_index;size_t typed=0;uint32_t kind=1;
         if(IMAGE_SNAP_BY_ORDINAL64(thunk)){
-            kind=2;
-            if(name||!ordinal||ordinal>UINT16_MAX||IMAGE_ORDINAL64(thunk)!=ordinal||(thunk&~(IMAGE_ORDINAL_FLAG64|UINT64_C(0xffff)))||!state->descriptor){state->error=ERROR_INVALID_DATA;return FALSE;}
+            kind=2;observed.kind=2;observed.availability|=SpawnKindKnown;
+            if(!spawn_ordinal_shape(thunk,ordinal,name,state->descriptor))return spawn_discovery_failure(discovery,&observed,SpawnOrdinalShape,ERROR_INVALID_DATA);
             void* exports[SpawnRoutes]={};for(size_t op=0;op<SpawnRoutes;++op)exports[op]=reinterpret_cast<void*>(GetProcAddress(state->descriptor,spawn_hooks[op].name));
             void* resolved=reinterpret_cast<void*>(GetProcAddress(state->descriptor,MAKEINTRESOURCEA(static_cast<WORD>(ordinal))));
-            typed=typed_ordinal_operation(resolved,*slot,exports,SpawnRoutes);
-            if(!resolved||resolved!=*slot||typed>SpawnRoutes){state->error=ERROR_INVALID_DATA;return FALSE;}if(!typed)return TRUE;
-        }else if(ordinal||!name||thunk>UINT32_MAX||reinterpret_cast<uintptr_t>(name)!=state->image.base+static_cast<uint32_t>(thunk)+sizeof(WORD)||!bounded_name(name,state->image)){state->error=ERROR_INVALID_DATA;return FALSE;}
+            observed.resolved=reinterpret_cast<uintptr_t>(resolved);observed.availability|=SpawnResolvedKnown;
+            uint32_t reason=0;
+            // First classify without consulting the slot, then compare only a
+            // selected candidate. Never skip a candidate because it was changed.
+            if(!spawn_ordinal_selected(resolved,resolved,exports,&typed,&reason)){observed.candidate=static_cast<uint32_t>(typed);if(resolved)observed.availability|=SpawnCandidateKnown;return spawn_discovery_failure(discovery,&observed,reason,ERROR_INVALID_DATA);}
+            observed.candidate=static_cast<uint32_t>(typed);observed.availability|=SpawnCandidateKnown;
+            if(!typed)return TRUE;
+            void* current=*slot;observed.current=reinterpret_cast<uintptr_t>(current);observed.availability|=SpawnCurrentKnown;
+            if(!spawn_ordinal_selected(resolved,current,exports,&typed,&reason))return spawn_discovery_failure(discovery,&observed,reason,ERROR_INVALID_DATA);
+        }else {
+            observed.kind=1;observed.availability|=SpawnKindKnown;
+            if(ordinal||!name||thunk>UINT32_MAX||reinterpret_cast<uintptr_t>(name)!=state->image.base+static_cast<uint32_t>(thunk)+sizeof(WORD)||!bounded_name(name,state->image))return spawn_discovery_failure(discovery,&observed,SpawnNamedShape,ERROR_INVALID_DATA);
+        }
         for(size_t op=0;op<SpawnRoutes;++op){
             if(typed?typed!=op+1:!equals(name,spawn_hooks[op].name,state->image))continue;
-            for(size_t previous=0;previous<proof->slot_count;++previous)if(proof->slots[previous].operation==op+1||proof->slots[previous].slot==slot_address){state->error=ERROR_DUP_NAME;return FALSE;}
-            if(proof->slot_count>=SpawnRoutes){state->error=ERROR_BUFFER_OVERFLOW;return FALSE;}
-            auto& selected=proof->slots[proof->slot_count++];selected.slot=slot_address;selected.operation=static_cast<uint32_t>(op+1);selected.descriptor_module=reinterpret_cast<uintptr_t>(state->descriptor);selected.original=reinterpret_cast<uintptr_t>(*slot);selected.hook=reinterpret_cast<uintptr_t>(spawn_hooks[op].target);discovery->kinds[op]=kind;
+            observed.candidate=static_cast<uint32_t>(op+1);observed.availability|=SpawnCandidateKnown;
+            for(size_t previous=0;previous<proof->slot_count;++previous)if(proof->slots[previous].operation==op+1||proof->slots[previous].slot==slot_address)return spawn_discovery_failure(discovery,&observed,SpawnDuplicateCandidate,ERROR_DUP_NAME);
+            if(proof->slot_count>=SpawnRoutes)return spawn_discovery_failure(discovery,&observed,SpawnCapacity,ERROR_BUFFER_OVERFLOW);
+            if(!(observed.availability&SpawnCurrentKnown)){observed.current=reinterpret_cast<uintptr_t>(*slot);observed.availability|=SpawnCurrentKnown;}
+            void* current=reinterpret_cast<void*>(static_cast<uintptr_t>(observed.current));
+            auto& selected=proof->slots[proof->slot_count++];selected.slot=slot_address;selected.operation=static_cast<uint32_t>(op+1);selected.descriptor_module=reinterpret_cast<uintptr_t>(state->descriptor);selected.original=observed.current;selected.hook=reinterpret_cast<uintptr_t>(spawn_hooks[op].target);discovery->kinds[op]=kind;
             Page page={};HMODULE target_owner=nullptr;Image target={};
-            if(!data_page(slot,state->image,&page)||!state->descriptor||GetProcAddress(state->descriptor,spawn_hooks[op].name)!=reinterpret_cast<FARPROC>(*slot)||
-               !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(*slot),&target_owner)||!capture_node_data(target_owner,*slot,&state->targets[op],&target,&proof->incomplete,false)){
-                state->error=ERROR_NOT_SUPPORTED;return FALSE;
-            }
+            if(!data_page(slot,state->image,&page)||!state->descriptor)return spawn_discovery_failure(discovery,&observed,SpawnTargetIdentity,ERROR_NOT_SUPPORTED);
+            void* resolved=reinterpret_cast<void*>(GetProcAddress(state->descriptor,spawn_hooks[op].name));observed.resolved=reinterpret_cast<uintptr_t>(resolved);observed.availability|=SpawnResolvedKnown;
+            if(resolved!=current)return spawn_discovery_failure(discovery,&observed,SpawnSelectedMismatch,ERROR_NOT_SUPPORTED);
+            if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(current),&target_owner)||!capture_node_data(target_owner,current,&state->targets[op],&target,&proof->incomplete,false))return spawn_discovery_failure(discovery,&observed,SpawnTargetIdentity,ERROR_NOT_SUPPORTED);
         }
         return TRUE;
-    }__except(EXCEPTION_EXECUTE_HANDLER){state->error=ERROR_INVALID_ADDRESS;proof->incomplete=1;return FALSE;}
+    }__except(EXCEPTION_EXECUTE_HANDLER){proof->incomplete=1;return spawn_discovery_failure(discovery,&observed,SpawnPointerFault,ERROR_INVALID_ADDRESS);}
 }
 static bool spawn_routes_live(const SpawnCache* cache){
     __try {
@@ -189,29 +232,30 @@ static void spawn_prepare(SpawnPacket* output,ListenerInvoke callback){
     ObserverSetup setup;auto& record=output->owners[0];record.role=1;record.shared_owner=UINT32_MAX;output->owner_count=1;
     auto* cache=&spawn_cache;const LONG state=InterlockedCompareExchange(&cache->state,1,0);
     if(state==2){record=cache->owner;HMODULE current=nullptr;
-        if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(callback),&current)||reinterpret_cast<uintptr_t>(current)!=cache->mapped.base||!executable(reinterpret_cast<void*>(callback),current)||!spawn_routes_live(cache)){record.stage=6;record.error=ERROR_RETRY;record.complete=0;output->route_failures=1;return;}
+        if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(callback),&current)||reinterpret_cast<uintptr_t>(current)!=cache->mapped.base||!executable(reinterpret_cast<void*>(callback),current)||!spawn_routes_live(cache)){record.stage=6;record.error=ERROR_RETRY;record.complete=0;output->route_failures=1;spawn_first_refusal(&output->refusal,SpawnCacheValidation,SpawnRefusal{});return;}
         for(uint32_t index=0;index<cache->route_count;++index)output->routes[output->route_count++]=cache->routes[index];return;}
-    if(state!=0){record.stage=9;record.error=state==1?ERROR_BUSY:ERROR_NOT_SUPPORTED;output->route_failures=1;return;}
+    if(state!=0){record.stage=9;record.error=state==1?ERROR_BUSY:ERROR_NOT_SUPPORTED;output->route_failures=1;if(state==3)output->refusal=cache->refusal;spawn_first_refusal(&output->refusal,SpawnCacheUnavailable,SpawnRefusal{});return;}
     auto* proof=&cache->proof;proof->version=1;proof->cutoff_qpc=output->cutoff_qpc;proof->frequency=output->frequency;
     HMODULE owner=nullptr;Image mapped={};bool success=false;
     do {
-        if(!live(proof)){record.stage=2;record.error=proof->setup_error;break;}
+        if(!live(proof)){record.stage=2;record.error=proof->setup_error;spawn_first_refusal(&cache->refusal,SpawnOwnerClock,SpawnRefusal{});break;}
         const BOOL resolved=GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(callback),&owner);const auto error=resolved?ERROR_SUCCESS:GetLastError();
-        if(!resolved||owner!=GetModuleHandleW(nullptr)||!capture_node_data(owner,reinterpret_cast<void*>(callback),&record.identity,&mapped,&proof->incomplete,false)){record.stage=3;record.error=resolved?ERROR_INVALID_ADDRESS:error;break;}
+        if(!resolved||owner!=GetModuleHandleW(nullptr)||!capture_node_data(owner,reinterpret_cast<void*>(callback),&record.identity,&mapped,&proof->incomplete,false)){record.stage=3;record.error=resolved?ERROR_INVALID_ADDRESS:error;spawn_first_refusal(&cache->refusal,SpawnOwnerIdentity,SpawnRefusal{});break;}
         cache->mapped=mapped;cache->owner=record;
         if(!mapped.imports&&!mapped.iat){record.flags|=2;record.complete=1;record.stage=1;success=true;break;}
-        SpawnDiscovery discovery={};discovery.base.image=mapped;discovery.base.packet=proof;
+        SpawnDiscovery discovery={};discovery.base.image=mapped;discovery.base.packet=proof;discovery.refusal=&cache->refusal;
         bool complete=returned_bounded_imports(&discovery.base);
-        if(complete){SetLastError(ERROR_SUCCESS);complete=DetourEnumerateImportsEx(owner,&discovery,spawn_import_file,spawn_import_function)!=FALSE;const auto enumeration_error=GetLastError();if(!complete&&!discovery.base.error)discovery.base.error=enumeration_error?enumeration_error:ERROR_INVALID_DATA;}
+        if(!complete)spawn_first_refusal(&cache->refusal,SpawnBoundedImports,SpawnRefusal{});
+        if(complete){SetLastError(ERROR_SUCCESS);complete=DetourEnumerateImportsEx(owner,&discovery,spawn_import_file,spawn_import_function)!=FALSE;const auto enumeration_error=GetLastError();if(!complete&&!discovery.base.error){discovery.base.error=enumeration_error?enumeration_error:ERROR_INVALID_DATA;spawn_first_refusal(&cache->refusal,SpawnEnumeration,SpawnRefusal{});}}
         record.descriptor_count=proof->descriptor_count;record.function_count=proof->function_count;cache->route_count=proof->slot_count;
         for(uint32_t index=0;index<proof->slot_count&&index<SpawnRoutes;++index){auto& route=cache->routes[index];route.slot=proof->slots[index];route.owner_index=0;route.thunk_kind=discovery.kinds[route.slot.operation-1];route.target=discovery.base.targets[route.slot.operation-1];cache->targets[route.slot.operation-1]=route.target;}
-        if(!complete||!proof->callbacks_complete||discovery.base.error){record.stage=4;record.error=proof->setup_error?proof->setup_error:discovery.base.error?discovery.base.error:ERROR_INVALID_DATA;break;}
-        if(!spawn_publish(cache)){record.stage=proof->setup_stage?proof->setup_stage:5;record.error=proof->setup_error?proof->setup_error:ERROR_RETRY;break;}
+        if(!complete||!proof->callbacks_complete||discovery.base.error){record.stage=4;record.error=proof->setup_error?proof->setup_error:discovery.base.error?discovery.base.error:ERROR_INVALID_DATA;spawn_first_refusal(&cache->refusal,proof->callbacks_complete?SpawnEnumeration:SpawnCallbackEnd,SpawnRefusal{});break;}
+        if(!spawn_publish(cache)){record.stage=proof->setup_stage?proof->setup_stage:5;record.error=proof->setup_error?proof->setup_error:ERROR_RETRY;spawn_first_refusal(&cache->refusal,SpawnPublication,SpawnRefusal{});break;}
         record.complete=1;record.stage=1;success=true;
     }while(false);
     if(proof->incomplete)record.flags|=4;if(!success)output->route_failures=increment(output->route_failures);
     for(uint32_t index=0;index<cache->route_count&&index<SpawnRoutes;++index){auto& route=cache->routes[index];route.slot=proof->slots[index];route.stage=success?1:record.stage;route.error=success?0:record.error;route.postvalidated=success?1:0;output->routes[output->route_count++]=route;}
-    cache->owner=record;InterlockedExchange(&cache->state,success?2:3);
+    cache->owner=record;output->refusal=cache->refusal;InterlockedExchange(&cache->state,success?2:3);
 }
 
 // POD-only SEH boundary; no exception translation or synthetic callback result.
@@ -302,8 +346,33 @@ struct SpawnMockRestore {
     ~SpawnMockRestore(){spawn_collector=collector;spawn_private_targets.store(targets,std::memory_order_release);spawn_private_clock.store(clock,std::memory_order_release);spawn_private_prepare.store(prepare,std::memory_order_release);spawn_mock.store(mock,std::memory_order_release);spawn_private_writable.store(writable,std::memory_order_release);errors_restore(errors);}
 };
 static bool spawn_mock_protection_failure(Page*,size_t,WsaPacket* packet){failure(packet,5,ERROR_ACCESS_DENIED);return false;}
+static uint32_t spawn_preflight_selfcheck(uint64_t cutoff,uint64_t frequency){
+    void* exports[SpawnRoutes]={};for(size_t index=0;index<SpawnRoutes;++index)exports[index]=reinterpret_cast<void*>(0x1000+index*8);
+    void* unrelated=reinterpret_cast<void*>(0x2000);void* changed=reinterpret_cast<void*>(0x3000);size_t typed=0;uint32_t reason=0;
+    void* unselected_slots[]={unrelated,changed,exports[0],nullptr};for(void* current:unselected_slots)if(!spawn_ordinal_selected(unrelated,current,exports,&typed,&reason)||typed||reason)return 1;
+    for(size_t index=0;index<SpawnRoutes;++index){
+        if(!spawn_ordinal_selected(exports[index],exports[index],exports,&typed,&reason)||typed!=index+1||reason)return 2;
+        if(spawn_ordinal_selected(exports[index],changed,exports,&typed,&reason)||typed!=index+1||reason!=SpawnSelectedMismatch)return 3;
+        if(spawn_ordinal_selected(exports[index],spawn_hooks[index].target,exports,&typed,&reason)||typed!=index+1||reason!=SpawnSelectedMismatch)return 4;
+    }
+    if(spawn_ordinal_selected(nullptr,changed,exports,&typed,&reason)||typed||reason!=SpawnOrdinalMissing)return 5;
+    void* aliases[SpawnRoutes]={exports[0],exports[0],nullptr,nullptr,nullptr};
+    if(spawn_ordinal_selected(exports[0],exports[0],aliases,&typed,&reason)||typed!=SpawnRoutes+1||reason!=SpawnOrdinalAmbiguous)return 6;
+    const uint64_t ordinal=IMAGE_ORDINAL_FLAG64|17;const auto descriptor=reinterpret_cast<HMODULE>(1);
+    if(!spawn_ordinal_shape(ordinal,17,nullptr,descriptor)||spawn_ordinal_shape(17,17,nullptr,descriptor)||spawn_ordinal_shape(ordinal|UINT64_C(0x10000),17,nullptr,descriptor)||spawn_ordinal_shape(ordinal,18,nullptr,descriptor)||spawn_ordinal_shape(ordinal,17,reinterpret_cast<LPCSTR>(1),descriptor)||spawn_ordinal_shape(ordinal,17,nullptr,nullptr)||spawn_ordinal_shape(IMAGE_ORDINAL_FLAG64|65535,65536,nullptr,descriptor))return 7;
+    Image mapped={};mapped.iat=0x1000;mapped.iat_end=0x1028;
+    if(!spawn_slot_shape(ordinal,0x1020,0x1000,4,mapped)||spawn_slot_shape(ordinal,0x1021,0x1000,4,mapped)||spawn_slot_shape(ordinal,0x1028,0x1000,5,mapped)||spawn_slot_shape(ordinal,0x1000,0x1000,4096,mapped)||spawn_slot_shape(0,0x1000,0x1000,0,mapped))return 8;
+    WsaPacket proof={};proof.cutoff_qpc=cutoff;proof.frequency=frequency;SpawnRefusal refusal={};SpawnDiscovery bad={};bad.base.packet=&proof;bad.refusal=&refusal;bad.base.thunk_index=4096;
+    if(spawn_import_function(&bad,0,nullptr,nullptr)||refusal.reason!=SpawnThunkLimit||refusal.thunk_index!=4096||refusal.availability&SpawnCurrentKnown)return 9;
+    bad.base.error=0;bad.base.thunk_index=0;refusal={};
+    if(spawn_import_function(&bad,0,nullptr,nullptr)||refusal.reason!=SpawnThunkRead||refusal.availability&(SpawnCurrentKnown|SpawnResolvedKnown))return 10;
+    SpawnRefusal measured={};measured.current=0;measured.availability=SpawnCurrentKnown;SpawnRefusal first={};spawn_first_refusal(&first,SpawnSelectedMismatch,measured);measured.current=0x9876;spawn_first_refusal(&first,SpawnTargetIdentity,measured);
+    if(first.reason!=SpawnSelectedMismatch||first.current||first.availability!=SpawnCurrentKnown)return 11;
+    return 0;
+}
 extern "C" uint32_t memcordon_spawn_trace_mock(uint64_t cutoff,uint64_t frequency){
     const auto saved=errors();SpawnMockRestore restore={spawn_collector,spawn_private_targets.load(),spawn_private_clock.load(),spawn_private_prepare.load(),spawn_mock.load(),spawn_private_writable.load(),saved};
+    const auto preflight=spawn_preflight_selfcheck(cutoff,frequency);if(preflight)return 32+preflight;
     SpawnMock state={};state.same=true;state.incoming={131,131};state.outgoing={5,5};state.status=static_cast<NTSTATUS>(0xC0000022u);state.file=INVALID_HANDLE_VALUE;state.cutoff=cutoff;state.write_output=true;
     HANDLE output=nullptr;PROCESS_INFORMATION process={};LARGE_INTEGER timeout={};timeout.QuadPart=-500000;
     WCHAR text[]={L'p',L'i',L'p',L'e',0};UNICODE_STRING name={8,10,text};OBJECT_ATTRIBUTES attributes={sizeof(OBJECT_ATTRIBUTES),reinterpret_cast<HANDLE>(0x7788),&name,0x40,nullptr,nullptr};
@@ -356,4 +425,31 @@ extern "C" uint32_t memcordon_spawn_trace_mock(uint64_t cutoff,uint64_t frequenc
         if(published||changed.proof.setup_error!=ERROR_ACCESS_DENIED||*reinterpret_cast<void**>(changed.proof.slots[0].slot)!=before)return 29;
     }
     errors_restore(saved);return 0;
+}
+
+static void spawn_composition_callback(void* opaque,ListenerOutcome* outcome){++*static_cast<uint32_t*>(opaque);outcome->kind=1;}
+static uint32_t spawn_composition_inner(uint64_t cutoff,uint64_t frequency,SpawnPacket* output){
+    if(!output)return 8;
+    *output={};output->version=SpawnVersion;output->packet_bytes=sizeof(*output);output->cutoff_qpc=cutoff;output->frequency=frequency;output->incomplete=1;output->scope_unavailable=1;
+    WsaPacket budget={};budget.cutoff_qpc=cutoff;budget.frequency=frequency;
+    if(!live(&budget)||InterlockedCompareExchange(&listener_installed,0,0)!=2||InterlockedCompareExchange(&spawn_cache.state,0,0)!=0)return 1;
+    ListenerPacket before={};before.cutoff_qpc=cutoff;before.frequency=frequency;listener_copy_route(&before);
+    if(!before.slot_count||before.slot_count>16||(before.published_mask&0x1A)!=0x1A||!listener_route_live(&before,listener_route.targets)||!live(&budget))return 2;
+    const auto incoming=errors();ListenerRequest request={cutoff,frequency,incoming.win32,incoming.wsa,0,0};auto& packet=*output;uint32_t calls=0;
+    memcordon_spawn_trace_call(&packet,&request,spawn_composition_callback,&calls);
+    if(calls!=1||packet.scope_attempted!=1||packet.scope_returned!=1||packet.owner_count!=1||packet.owners[0].complete!=1||packet.route_count!=SpawnRoutes||packet.refusal.present||!spawn_routes_live(&spawn_cache)||!live(&budget))return 3;
+    uint32_t operations=0;for(uint32_t index=0;index<packet.route_count;++index){const auto& route=packet.routes[index];
+        if(!route.slot.operation||route.slot.operation>SpawnRoutes||!route.slot.published||route.slot.restored||!route.postvalidated||!route.original_protection)return 4;
+        operations|=1u<<(route.slot.operation-1);
+    }
+    if(operations!=(1u<<SpawnRoutes)-1)return 5;
+    ListenerPacket after={};after.cutoff_qpc=cutoff;after.frequency=frequency;listener_copy_route(&after);
+    if(after.slot_count!=before.slot_count||after.published_mask!=before.published_mask||!listener_route_live(&after,listener_route.targets)||!live(&budget))return 6;
+    for(uint32_t index=0;index<before.slot_count;++index){const auto& original=before.slots[index];const auto& observed=after.slots[index];
+        if(original.slot!=observed.slot||original.original!=observed.original||original.hook!=observed.hook||original.published!=observed.published||original.restored!=observed.restored)return 7;
+    }
+    return 0;
+}
+extern "C" uint32_t memcordon_spawn_trace_composition_check(uint64_t cutoff,uint64_t frequency,SpawnPacket* output){
+    const auto saved=errors();const auto result=spawn_composition_inner(cutoff,frequency,output);errors_restore(saved);return result;
 }

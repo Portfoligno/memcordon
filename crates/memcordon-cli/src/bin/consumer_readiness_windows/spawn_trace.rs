@@ -22,6 +22,11 @@ unsafe extern "C" {
         opaque: *mut c_void,
     );
     fn memcordon_spawn_trace_mock(cutoff: u64, frequency: u64) -> u32;
+    fn memcordon_spawn_trace_composition_check(
+        cutoff: u64,
+        frequency: u64,
+        packet: *mut record::Packet,
+    ) -> u32;
 }
 struct Invocation<'a> {
     command: &'a mut Command,
@@ -173,6 +178,11 @@ pub fn self_check(clock: &super::descriptor::ControlClock) -> io::Result<()> {
 
 /// Run only this observer's permanent-IAT checks in a fresh fixture process.
 pub fn standalone_self_check() -> io::Result<i32> {
+    self_check(&self_check_clock()?)?;
+    Ok(0)
+}
+
+fn self_check_clock() -> io::Result<super::descriptor::ControlClock> {
     use windows_sys::Win32::System::Performance::{
         QueryPerformanceCounter, QueryPerformanceFrequency,
     };
@@ -193,10 +203,38 @@ pub fn standalone_self_check() -> io::Result<i32> {
                 .ok_or_else(|| io::Error::other("peer spawn selfcheck clock overflow"))?,
         )
         .ok_or_else(|| io::Error::other("peer spawn selfcheck cutoff overflow"))?;
-    self_check(&super::descriptor::ControlClock {
+    Ok(super::descriptor::ControlClock {
         revision: 1,
         work_cutoff_qpc: cutoff,
         qpc_frequency: frequency,
-    })?;
+    })
+}
+
+/// A fresh process exercises the real listener-then-spawn publication order.
+pub fn composition_self_check() -> io::Result<i32> {
+    let clock = self_check_clock()?;
+    super::listener_trace::live(&clock)?;
+    let _startup = super::native::winsock_startup(None)?;
+    let listener = super::listener_trace::composition_listener(&clock)?;
+    super::listener_trace::live(&clock)?;
+    // SAFETY: native checks only import publication and unchanged listener
+    // routes; its one empty callback creates no additional application process.
+    let mut packet = record::Packet::default();
+    let failed = unsafe {
+        memcordon_spawn_trace_composition_check(
+            clock.work_cutoff_qpc,
+            clock.qpc_frequency,
+            &mut packet,
+        )
+    };
+    if failed != 0 {
+        let observed = record::diagnostic(&packet);
+        return Err(io::Error::other(format!(
+            "listener-before-spawn selfcheck {failed}; owner-stage={}; owner-error={}; first-refusal={}",
+            packet.owners[0].stage, packet.owners[0].error, observed["first_setup_refusal"]
+        )));
+    }
+    drop(listener);
+    super::listener_trace::live(&clock)?;
     Ok(0)
 }
