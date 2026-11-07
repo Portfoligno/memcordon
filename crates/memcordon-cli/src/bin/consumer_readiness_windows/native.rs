@@ -894,6 +894,64 @@ pub fn sentinel_frontend(
     launch_frontend(arguments, false, Some(Path::new(&descriptor)), false, None)
 }
 
+/// The same private preparation is used once for both members of a matched
+/// pair. The ordinary launcher retains its original two token owners too.
+pub(super) fn select_frontend_caller(restrict: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
+        TOKEN_ALL_ACCESS, WinRestrictedCodeSid,
+    };
+    let mut primary = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary) } == 0 {
+        return Err(frontend_os_error("OpenProcessToken"));
+    }
+    let primary_owned = unsafe { OwnedHandle::from_raw_handle(primary.cast()) };
+    let mut restricting_sid = [0u32; 17];
+    let mut restricting_length = std::mem::size_of_val(&restricting_sid) as u32;
+    if unsafe {
+        CreateWellKnownSid(
+            WinRestrictedCodeSid,
+            std::ptr::null_mut(),
+            restricting_sid.as_mut_ptr().cast(),
+            &mut restricting_length,
+        )
+    } == 0
+    {
+        return Err(frontend_os_error("CreateWellKnownSid"));
+    }
+    let restricting = SID_AND_ATTRIBUTES {
+        Sid: restricting_sid.as_mut_ptr().cast(),
+        Attributes: 0,
+    };
+    let mut restricted = std::ptr::null_mut();
+    if unsafe {
+        CreateRestrictedToken(
+            primary,
+            DISABLE_MAX_PRIVILEGE,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            1,
+            &restricting,
+            &mut restricted,
+        )
+    } == 0
+    {
+        return Err(frontend_os_error("CreateRestrictedToken"));
+    }
+    let restricted_owned = unsafe { OwnedHandle::from_raw_handle(restricted.cast()) };
+    if restrict && unsafe { IsTokenRestricted(restricted) } == 0 {
+        return Err(io::Error::other(
+            "native restricted token was not restricted",
+        ));
+    }
+    if restrict {
+        super::native_fixture_default_dacl::prepare(primary, restricted)?;
+    }
+    Ok((primary_owned, restricted_owned))
+}
+
 fn launch_frontend(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
     restrict: bool,
@@ -905,9 +963,6 @@ fn launch_frontend(
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
         GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
-    };
-    use windows_sys::Win32::Security::{
-        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -935,66 +990,7 @@ fn launch_frontend(
             "restricted frontend argv exceeds its native bound",
         ));
     }
-    let mut primary = std::ptr::null_mut();
-    // SAFETY: current process pseudo-handle and writable output are valid.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary) } == 0 {
-        return Err(frontend_os_error("OpenProcessToken"));
-    }
-    // SAFETY: successful OpenProcessToken transfers one token reference.
-    let primary_owned = unsafe { OwnedHandle::from_raw_handle(primary.cast()) };
-    use windows_sys::Win32::Security::{CreateWellKnownSid, WinRestrictedCodeSid};
-    let mut restricting_sid = [0u32; 17];
-    let mut restricting_length = std::mem::size_of_val(&restricting_sid) as u32;
-    // SAFETY: aligned maximum native SID buffer; this distinct principal has
-    // explicit read grants on inputs and write grants only on candidate outputs.
-    if unsafe {
-        CreateWellKnownSid(
-            WinRestrictedCodeSid,
-            std::ptr::null_mut(),
-            restricting_sid.as_mut_ptr().cast(),
-            &mut restricting_length,
-        )
-    } == 0
-    {
-        return Err(frontend_os_error("CreateWellKnownSid"));
-    }
-    let restricting = SID_AND_ATTRIBUTES {
-        Sid: restricting_sid.as_mut_ptr().cast(),
-        Attributes: 0,
-    };
-    let mut restricted = std::ptr::null_mut();
-    // SAFETY: live source token/SID; output acquires a new restricted primary
-    // token. Privileges are removed, and access must also satisfy RestrictedCode
-    // independently of the ordinary driver's owning user SID.
-    if unsafe {
-        CreateRestrictedToken(
-            primary,
-            DISABLE_MAX_PRIVILEGE,
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            1,
-            &restricting,
-            &mut restricted,
-        )
-    } == 0
-    {
-        return Err(frontend_os_error("CreateRestrictedToken"));
-    }
-    // SAFETY: newly returned restricted token reference transfers once.
-    let restricted_owned = unsafe { OwnedHandle::from_raw_handle(restricted.cast()) };
-    // SAFETY: query only against held restricted token.
-    if restrict && unsafe { IsTokenRestricted(restricted) } == 0 {
-        return Err(io::Error::other(
-            "native restricted token was not restricted",
-        ));
-    }
-    if restrict {
-        // This launcher owns the newly derived fixture token. Its default
-        // objects must satisfy both ordinary and RestrictedCode access checks.
-        super::native_fixture_default_dacl::prepare(primary, restricted)?;
-    }
+    let (primary_owned, restricted_owned) = select_frontend_caller(restrict)?;
     // SAFETY: read only this launcher's three standard handles.
     let standard_handles = unsafe {
         [

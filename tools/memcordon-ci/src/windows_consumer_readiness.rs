@@ -26,6 +26,10 @@ mod gate_security;
 #[cfg(windows)]
 #[path = "windows_guardian_query.rs"]
 mod guardian_query;
+#[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/matched_control_input_record.rs"]
+pub mod matched_control_input_record;
+#[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/matched_control_report.rs"]
+pub mod matched_control_report;
 #[cfg(windows)]
 #[path = "windows_start_gate_policy.rs"]
 mod start_gate_policy;
@@ -535,6 +539,15 @@ pub fn positive_keys() -> BTreeSet<CaseKey> {
 }
 
 pub fn validate_suite(input: &SuiteInput) -> Result<()> {
+    if input
+        .cases
+        .iter()
+        .any(|case| case.descriptor.matched_control.is_some())
+    {
+        return Err(CiError::Message(
+            "matched observations are separate from required full-positive suite inputs".into(),
+        ));
+    }
     if input.format != "memcordon.windows-readiness-input" || input.revision != 2 {
         return Err(CiError::Message(
             "unsupported Windows readiness input format/revision".into(),
@@ -727,7 +740,17 @@ pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -
             } if version == descriptor::controller_start::REGISTRY_VERSION
                 || (descriptor.provider_input_experiment && version == if descriptor.provider_input_binding.as_ref().is_some_and(|binding| binding.file_layout()) { descriptor::controller_start::PRIVATE_FILE_VERSION } else { descriptor::controller_start::PRIVATE_VERSION })
         );
-    if !explicit_registry && descriptor.start_transport != expected_start_transport(key) {
+    let explicit_matched = descriptor.matched_control.is_some()
+        && matches!(
+            descriptor.start_transport,
+            descriptor::StartTransport::ControllerStdin {
+                version: descriptor::controller_start::VERSION
+            }
+        );
+    if !explicit_registry
+        && !explicit_matched
+        && descriptor.start_transport != expected_start_transport(key)
+    {
         return Err(CiError::Message(
             "fixture START transport differs from its declared case".into(),
         ));
@@ -1389,7 +1412,7 @@ pub fn assess(
             "native target token differs from protected caller expectation".into(),
         ));
     }
-    if case.key.scenario == "sentinel-handles"
+    if (case.key.scenario == "sentinel-handles" || case.descriptor.matched_control.is_some())
         && !event.iter().any(|event| {
             event.stage == "sentinel-handles-excluded" && event.value == 1u32.to_le_bytes()
         })
@@ -1666,6 +1689,14 @@ pub fn run_provider_input_experiment_until(
     dot_local_file: bool,
 ) -> Result<serde_json::Value> {
     native::provider_input_experiment(root, config, deadlines, dot_local_file)
+}
+
+#[cfg(windows)]
+pub fn run_matched_owned_until(
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+) -> Result<serde_json::Value> {
+    native::matched_owned(config, deadlines)
 }
 
 #[cfg(windows)]
@@ -2663,6 +2694,7 @@ pub(crate) mod native {
                 ordinary.clone()
             };
             let descriptor = descriptor::Descriptor {
+                matched_control: None,
                 format: "memcordon.fixture-workload".into(),
                 revision: descriptor::DESCRIPTOR_REVISION,
                 case,
@@ -4136,6 +4168,7 @@ pub(crate) mod native {
             None,
             ExecutionClocks {
                 work: work_deadline,
+                matched: None,
                 cleanup,
                 registry: None,
                 projection_observation: None,
@@ -4186,6 +4219,7 @@ pub(crate) mod native {
             excluded_fixture,
             ExecutionClocks {
                 work: work_deadline,
+                matched: None,
                 cleanup: None,
                 registry: None,
                 projection_observation: None,
@@ -4195,11 +4229,30 @@ pub(crate) mod native {
     }
 
     struct ExecutionClocks {
+        matched: Option<MatchedExecution>,
         work: Instant,
         cleanup: Option<Instant>,
         registry: Option<Arc<Mutex<memcordon_testkit::WindowsWinsockRegistryProjection>>>,
         projection_observation: Option<Arc<Mutex<ProjectionObservation>>>,
         private_custody: Option<Arc<crate::windows_private_custody::PrivateFixtureCustody>>,
+    }
+
+    struct MatchedExecution {
+        plan_path: PathBuf,
+        plan: descriptor::matched_plan::Plan,
+        guards: Vec<std::fs::File>,
+        admitted: bool,
+        settled: bool,
+    }
+
+    impl Drop for MatchedExecution {
+        fn drop(&mut self) {
+            if self.admitted && !self.settled && !self.guards.is_empty() {
+                // An incomplete pair cannot release its original source namespace.
+                // This quarantine owns actual guards for this controller lifetime.
+                let _retained = Box::leak(Box::new(std::mem::take(&mut self.guards)));
+            }
+        }
     }
 
     #[derive(Default)]
@@ -4218,6 +4271,11 @@ pub(crate) mod native {
         mut clocks: ExecutionClocks,
     ) -> Result<()> {
         let mut declared = input.clone();
+        if declared.descriptor.matched_control.is_some() != clocks.matched.is_some() {
+            return Err(CiError::Message(
+                "matched descriptor requires its separate owned pair execution".into(),
+            ));
+        }
         if needs_registry_input(&input.key, input.descriptor.case) {
             if clocks.registry.is_some() && !input.descriptor.provider_input_experiment {
                 return Err(CiError::Message("provided registry owner is restricted to the separately declared input experiment".into()));
@@ -4309,7 +4367,7 @@ pub(crate) mod native {
         baseline: GuardianBaseline,
         excluded: Vec<GuardianAssociationIdentity>,
         excluded_fixture: Option<HeldFixtureExclusion>,
-        clocks: ExecutionClocks,
+        mut clocks: ExecutionClocks,
     ) -> Result<()> {
         let work_deadline = clocks.work;
         let work_budget = work_deadline
@@ -4456,7 +4514,8 @@ pub(crate) mod native {
         let held_association = Arc::clone(&association);
         let frontend = Arc::new(Mutex::new(None::<WindowsImageProcess>));
         let held_frontend = Arc::clone(&frontend);
-        let capture_frontend_identity = expected_status(&input.key) != 0
+        let capture_frontend_identity = input.descriptor.matched_control.is_some()
+            || expected_status(&input.key) != 0
             || matches!(
                 input.descriptor.case,
                 descriptor::Case::DeadlineDemand | descriptor::Case::MemoryDemand
@@ -4521,6 +4580,57 @@ pub(crate) mod native {
             .open(&input.descriptor_path)?;
         descriptor_owner.write_all(&descriptor_bytes)?;
         descriptor_owner.sync_all()?;
+        let matched_plan = if let Some(pair) = &clocks.matched {
+            let direct = pair
+                .plan
+                .direct_descriptor_for(&input.descriptor)
+                .map_err(CiError::Message)?;
+            fs::create_dir_all(&direct.output_root)?;
+            let direct_path = pair.plan_path.with_extension("direct-input.json");
+            drop(crate::windows_native_files::publish_owned_file(
+                &direct_path,
+                &serde_json::to_vec(&direct)?,
+            )?);
+            let plan = &pair.plan;
+            if plan.direct_descriptor != direct_path
+                || plan.installed_descriptor != input.descriptor_path
+            {
+                return Err(CiError::Message(
+                    "matched final descriptor allocations differ".into(),
+                ));
+            }
+            plan.validate(&direct, &input.descriptor)
+                .map_err(CiError::Message)?;
+            drop(crate::windows_native_files::publish_owned_file(
+                &pair.plan_path,
+                &serde_json::to_vec(plan)?,
+            )?);
+            Some(pair.plan_path.clone())
+        } else {
+            None
+        };
+        let mut descriptor_owner = if matched_plan.is_some() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let reader = OpenOptions::new()
+                .read(true)
+                .share_mode(3)
+                .custom_flags(0x0020_0000)
+                .open(&input.descriptor_path)?;
+            let before = memcordon_testkit::windows_held_file_metadata(&descriptor_owner)?;
+            let after = memcordon_testkit::windows_held_file_metadata(&reader)?;
+            if (before.volume_serial, before.file_index) != (after.volume_serial, after.file_index)
+                || after.attributes & (0x400 | 0x10 | 0x40) != 0
+                || after.links != 1
+            {
+                return Err(CiError::Message(
+                    "matched original descriptor read owner identity differs".into(),
+                ));
+            }
+            drop(descriptor_owner);
+            reader
+        } else {
+            descriptor_owner
+        };
         let challenge_path = report
             .parent()
             .expect("case report has parent")
@@ -4546,6 +4656,30 @@ pub(crate) mod native {
             input,
         )?
         .materialize()?;
+        if let Some(plan) = matched_plan {
+            let original: Vec<OsString> = command.get_args().map(OsString::from).collect();
+            if original
+                .first()
+                .is_none_or(|arg| arg != "consumer-readiness-windows")
+                || original.get(1).is_none_or(|arg| {
+                    arg != "system-frontend" && arg != "system-restricted-frontend"
+                })
+            {
+                return Err(CiError::Message(
+                    "matched execution requires the original explicit system frontend command"
+                        .into(),
+                ));
+            }
+            let mut broker = std::process::Command::new(command.get_program());
+            broker.current_dir(&config.output_directory);
+            broker.args([
+                OsString::from("consumer-readiness-windows"),
+                OsString::from("matched-control-frontend"),
+                plan.into_os_string(),
+            ]);
+            broker.args(original.into_iter().skip(2));
+            command = broker;
+        }
         // Workload inputs are absolute owned paths; ambient controller secrets
         // must never enter the authenticated launch request or its observation.
         command.env_clear();
@@ -4680,14 +4814,79 @@ pub(crate) mod native {
                 "original Windows work deadline exhausted during observer preparation".into(),
             ));
         }
+        if let Some(pair) = clocks.matched.as_mut() {
+            pair.admitted = true;
+        }
+        let matched_spawn = input.descriptor.matched_control.is_some();
+        let broker_observation = Arc::new(Mutex::new(None::<io::Result<(u32, u64)>>));
+        let spawn_observation = Arc::clone(&broker_observation);
+        let callback_broker = Arc::clone(&broker_observation);
         let output = memcordon_testkit::run_until_owned_spawn_with_io_output_limit_outcome(
             command,
             work_deadline,
             4 * 1024 * 1024,
-            |mut command| command.spawn(),
+            move |mut command| {
+                let child = command.spawn()?;
+                if matched_spawn {
+                    let observed = (|| -> io::Result<(u32, u64)> {
+                        use std::os::windows::io::AsRawHandle;
+                        use windows_sys::Win32::{
+                            Foundation::FILETIME, System::Threading::GetProcessTimes,
+                        };
+                        provision_budget(work_deadline).map_err(io::Error::other)?;
+                        let mut birth = FILETIME::default();
+                        let mut exit = FILETIME::default();
+                        let mut kernel = FILETIME::default();
+                        let mut user = FILETIME::default();
+                        if unsafe {
+                            GetProcessTimes(
+                                child.as_raw_handle(),
+                                &mut birth,
+                                &mut exit,
+                                &mut kernel,
+                                &mut user,
+                            )
+                        } == 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let birth = (u64::from(birth.dwHighDateTime) << 32)
+                            | u64::from(birth.dwLowDateTime);
+                        provision_budget(work_deadline).map_err(io::Error::other)?;
+                        if child.id() == 0 || birth == 0 {
+                            return Err(io::Error::other(
+                                "matched original broker identity is unavailable",
+                            ));
+                        }
+                        Ok((child.id(), birth))
+                    })();
+                    *spawn_observation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(observed);
+                }
+                // Even a failed identity query returns this actual Child to its
+                // existing owner loop; callback Abort performs owned cleanup.
+                Ok(child)
+            },
             move |wrapper_pid, mut stdin, _| {
                 let mut application_ended = false;
                 let callback = (|| -> io::Result<()> {
+                    if matched_spawn {
+                        let mut observed = callback_broker
+                            .lock()
+                            .map_err(|_| io::Error::other("matched broker observation poisoned"))?;
+                        match observed.take() {
+                            Some(Ok(identity)) => {
+                                *observed = Some(Ok(identity));
+                            }
+                            Some(Err(error)) => return Err(error),
+                            None => {
+                                return Err(io::Error::other(
+                                    "matched broker native observation missing",
+                                ));
+                            }
+                        }
+                    }
                     let mut control_session = None;
                     let _fileio_guard = crate::windows_loader_fileio::callback_guard(Arc::clone(
                         &callback_fileio_owner,
@@ -6399,6 +6598,7 @@ pub(crate) mod native {
                 expected_gate_failure.as_ref(),
             )
         };
+        let mut terminal_settled = false;
         let collection = (|| -> Result<()> {
             let retain_calls = || {
                 let trace_carrier = |name: &str, format: &str| -> Result<serde_json::Value> {
@@ -6703,7 +6903,9 @@ pub(crate) mod native {
             let mut final_descriptor: descriptor::Descriptor =
                 serde_json::from_slice(&final_descriptor_bytes)?;
             final_descriptor.validate().map_err(CiError::Message)?;
-            if input.key.family == "W-ENVELOPE" && input.key.scenario == "sentinel-handles" {
+            if (input.key.family == "W-ENVELOPE" && input.key.scenario == "sentinel-handles")
+                || input.descriptor.matched_control.is_some()
+            {
                 if final_descriptor.sentinel_handles.len() != 1 {
                     return Err(CiError::Message(
                         "native sentinel frontend did not augment exactly one held identity".into(),
@@ -6727,12 +6929,59 @@ pub(crate) mod native {
             record.terminal_observation_sha256 =
                 Some(crate::windows_causal_acceptance::sha256(&terminal_bytes));
             record.collection = Ok(());
+            let matched_exit = if input.descriptor.matched_control.is_some() {
+                let target = {
+                    let held = family
+                        .lock()
+                        .map_err(|_| CiError::Message("matched native family poisoned".into()))?;
+                    if held.len() != 1 {
+                        return Err(CiError::Message(
+                            "matched application family differs from its original root".into(),
+                        ));
+                    }
+                    held[0].clone()
+                };
+                let front = frontend
+                    .lock()
+                    .map_err(|_| CiError::Message("matched frontend ownership poisoned".into()))?
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        CiError::Message("matched original frontend owner absent".into())
+                    })?;
+                provision_budget(work_deadline)?;
+                let target_status = target.native_exit_status()?.ok_or_else(|| {
+                    CiError::Message("matched original target remains live".into())
+                })?;
+                let frontend_status = front.native_exit_status()?.ok_or_else(|| {
+                    CiError::Message("matched original frontend remains live".into())
+                })?;
+                provision_budget(work_deadline)?;
+                Some((
+                    front.identity.pid,
+                    i32::try_from(frontend_status).map_err(|_| {
+                        CiError::Message("matched frontend status exceeds signed width".into())
+                    })?,
+                    crate::windows_listener_wait::ApplicationEnd {
+                        identity: crate::windows_listener_wait::Identity {
+                            pid: target.identity.pid,
+                            birth: target.identity.birth,
+                        },
+                        status: target_status,
+                    },
+                ))
+            } else {
+                None
+            };
             let held = association
                 .lock()
                 .map_err(|_| CiError::Message("association ownership poisoned".into()))?;
             let held = held.as_ref().ok_or_else(|| {
                 CiError::Message("native request/attempt association not held".into())
             })?;
+            if let Some((_, status, ended)) = matched_exit {
+                validate_ended_application_settlement(&result_bytes, status, ended, held)?;
+            }
             if let Some(error) = application_end_error.as_ref() {
                 let ended = match error.get_ref().and_then(|source| {
                     source.downcast_ref::<crate::windows_listener_wait::Failure>()
@@ -6765,11 +7014,15 @@ pub(crate) mod native {
                 &output.stderr,
                 &transcript,
                 FrontendExit {
-                    status: output
-                        .status
-                        .code()
-                        .ok_or_else(|| CiError::Message("missing native frontend status".into()))?,
-                    original_pid: {
+                    status: match matched_exit {
+                        Some((_, status, _)) => status,
+                        None => output.status.code().ok_or_else(|| {
+                            CiError::Message("missing native frontend status".into())
+                        })?,
+                    },
+                    original_pid: if let Some((pid, _, _)) = matched_exit {
+                        Some(pid)
+                    } else {
                         let frontend = frontend
                             .lock()
                             .map_err(|_| CiError::Message("frontend ownership poisoned".into()))?;
@@ -6787,12 +7040,13 @@ pub(crate) mod native {
                 },
                 held,
             );
-            let deferred_assessment = if application_end_error.is_some() {
-                Some(assessment)
-            } else {
-                assessment?;
-                None
-            };
+            let deferred_assessment =
+                if application_end_error.is_some() || input.descriptor.matched_control.is_some() {
+                    Some(assessment)
+                } else {
+                    assessment?;
+                    None
+                };
             if terminal.format != "memcordon.windows-terminal-observation"
                 || terminal.revision != 2
                 || terminal.provider != held.provider
@@ -6825,6 +7079,7 @@ pub(crate) mod native {
             {
                 return Err(CiError::Message("exact observed launch request differs from held binding, declared contract or native system prerequisite environment".into()));
             }
+            terminal_settled = true;
             if let Some(assessment) = deferred_assessment {
                 assessment?;
             }
@@ -7064,6 +7319,165 @@ pub(crate) mod native {
         if let Err(error) = gate_retention {
             eprintln!("optional native gate diagnostics unavailable: {error}");
         }
+        let matched_observation = (|| -> Result<Option<descriptor::matched::Comparison>> {
+            let Some(pair) = clocks.matched.as_ref() else {
+                return Ok(None);
+            };
+            provision_budget(work_deadline)?;
+            let observed = matched_control_report::decode(&read(
+                &pair.plan.record,
+                matched_control_report::MAX_BYTES,
+            )?)
+            .map_err(CiError::Message)?;
+            let installed_bytes = read(&input.descriptor_path, descriptor::MAX_DESCRIPTOR_BYTES)?;
+            let installed =
+                descriptor::Descriptor::parse(&installed_bytes).map_err(CiError::Message)?;
+            let mut expected = input.descriptor.clone();
+            expected.sentinel_handles = installed.sentinel_handles.clone();
+            if installed.sentinel_handles.len() != 1
+                || serde_json::to_vec(&installed)? != serde_json::to_vec(&expected)?
+            {
+                return Err(CiError::Message(
+                    "matched final installed descriptor differs beyond the original sentinel"
+                        .into(),
+                ));
+            }
+            let direct = pair
+                .plan
+                .direct_descriptor_for(&installed)
+                .map_err(CiError::Message)?;
+            let direct_bytes = read(
+                &pair.plan.direct_descriptor,
+                descriptor::MAX_DESCRIPTOR_BYTES,
+            )?;
+            if direct_bytes != serde_json::to_vec(&direct)? {
+                return Err(CiError::Message(
+                    "matched final direct descriptor differs from the same plan".into(),
+                ));
+            }
+            pair.plan
+                .validate(&direct, &installed)
+                .map_err(CiError::Message)?;
+            let target = {
+                let held = family
+                    .lock()
+                    .map_err(|_| CiError::Message("matched installed family poisoned".into()))?;
+                if held.len() != 1 {
+                    return Err(CiError::Message(
+                        "matched installed family differs from one original root".into(),
+                    ));
+                }
+                held[0].clone()
+            };
+            let frontend = frontend
+                .lock()
+                .map_err(|_| CiError::Message("matched frontend ownership poisoned".into()))?
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    CiError::Message("matched original frontend owner missing".into())
+                })?;
+            provision_budget(work_deadline)?;
+            let target_status = target
+                .native_exit_status()?
+                .ok_or_else(|| CiError::Message("matched installed target remains live".into()))?;
+            let frontend_status = frontend
+                .native_exit_status()?
+                .ok_or_else(|| CiError::Message("matched original frontend remains live".into()))?;
+            provision_budget(work_deadline)?;
+            if target_status != observed.installed_frontend.native_status
+                || frontend_status != observed.installed_frontend.native_status
+            {
+                return Err(CiError::Message(
+                    "matched native installed target/frontend status differs from retained report"
+                        .into(),
+                ));
+            }
+            let stdout = read(
+                &pair.plan.record.with_extension("direct-stdout.bin"),
+                64 * 1024,
+            )?;
+            let stderr = read(
+                &pair.plan.record.with_extension("direct-stderr.bin"),
+                64 * 1024,
+            )?;
+            let broker = broker_observation
+                .lock()
+                .map_err(|_| {
+                    CiError::Message("matched original broker observation poisoned".into())
+                })?
+                .as_ref()
+                .and_then(|entry| entry.as_ref().ok())
+                .copied()
+                .ok_or_else(|| {
+                    CiError::Message("matched original broker identity unproved".into())
+                })?;
+            let compared = matched_control_report::validate(
+                &observed,
+                &pair.plan,
+                &matched_control_report::Expected {
+                    broker,
+                    direct_descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                        &direct_bytes,
+                    ),
+                    installed_descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                        &installed_bytes,
+                    ),
+                    installed_target: (
+                        target.identity.pid,
+                        u64::try_from(target.identity.birth).map_err(|_| {
+                            CiError::Message("matched target birth width differs".into())
+                        })?,
+                    ),
+                    frontend: (
+                        frontend.identity.pid,
+                        u64::try_from(frontend.identity.birth).map_err(|_| {
+                            CiError::Message("matched frontend birth width differs".into())
+                        })?,
+                    ),
+                    direct_stdout: matched_control_report::StreamEvidence {
+                        bytes: stdout.len() as u64,
+                        sha256: descriptor::controller_start::descriptor_digest(&stdout),
+                    },
+                    direct_stderr: matched_control_report::StreamEvidence {
+                        bytes: stderr.len() as u64,
+                        sha256: descriptor::controller_start::descriptor_digest(&stderr),
+                    },
+                },
+            )
+            .map_err(CiError::Message)?;
+            provision_budget(work_deadline)?;
+            Ok(Some(compared))
+        })();
+        if let Some(pair) = clocks.matched.as_mut() {
+            pair.settled = terminal_settled && retirement.is_ok() && matched_observation.is_ok();
+        }
+        let matched_positive = matched_observation.and_then(|observed| {
+            if observed.is_some_and(|comparison| {
+                !matches!(
+                    comparison.outcome,
+                    descriptor::matched::ComparisonOutcome::ScopeSuccess
+                )
+            }) {
+                Err(CiError::Message(
+                    "matched owned positive/protected-negative scope did not complete exactly"
+                        .into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let collection = match (collection, matched_positive) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
+        if let Err(error) = &collection {
+            record.behavior = Err(error.to_string());
+        }
         match (collection, retirement) {
             (Err(primary), Err(cleanup)) => Err(CiError::LaneFailures {
                 primary: Box::new(primary),
@@ -7249,6 +7663,7 @@ pub(crate) mod native {
                             None,
                             ExecutionClocks {
                                 work: deadlines.work,
+                                matched: None,
                                 cleanup: Some(deadlines.cleanup),
                                 registry: Some(Arc::clone(&projection)),
                                 projection_observation: Some(Arc::clone(&held_observation)),
@@ -7533,6 +7948,384 @@ pub(crate) mod native {
             Ok(())
         } else {
             Err(CiError::Message("Windows positive suite incomplete".into()))
+        }
+    }
+
+    pub(crate) fn matched_owned(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+    ) -> Result<serde_json::Value> {
+        use descriptor::matched::{Binding, Lane, Scope};
+        let snapshot = |restricted: bool| -> Result<TokenObservation> {
+            let mut argv = vec![OsString::from("consumer-readiness-windows")];
+            if restricted {
+                argv.extend([
+                    OsString::from("restricted-frontend"),
+                    config.fixture.path.clone().into_os_string(),
+                    OsString::from("consumer-readiness-windows"),
+                ]);
+            }
+            argv.push(OsString::from("token-snapshot"));
+            let budget = provision_budget(deadlines.work)?;
+            let mut command =
+                CommandSpec::new(&config.fixture.path, &config.output_directory, budget)
+                    .args(argv)
+                    .materialize()?;
+            command.env_clear();
+            let output =
+                memcordon_testkit::run_with_deadline_output_limit(&mut command, budget, 16 * 1024)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+            if !output.status.success() || !output.stderr.is_empty() {
+                return Err(CiError::Message(
+                    "matched caller preparation snapshot failed".into(),
+                ));
+            }
+            let observed: TokenObservation = serde_json::from_slice(&output.stdout)?;
+            if observed.restricted != restricted {
+                return Err(CiError::Message(
+                    "matched caller preparation restriction differs".into(),
+                ));
+            }
+            Ok(observed)
+        };
+        fs::create_dir_all(&config.output_directory)?;
+        let ordinary = snapshot(false)?;
+        let restricted = snapshot(true)?;
+        let sid = sid_text(&ordinary.user_sid)?;
+        set_directory_acl(
+            &config.output_directory,
+            &format!("D:P(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)"),
+        )?;
+        for image in [&config.cli.path, &config.fixture.path] {
+            set_directory_acl(
+                image,
+                &format!("D:P(A;;GA;;;{sid})(A;;GRGX;;;RC)(A;;GA;;;SY)"),
+            )?;
+        }
+        let candidate = config.output_directory.join("candidate-outputs");
+        fs::create_dir(&candidate)?;
+        set_directory_acl(
+            &candidate,
+            &format!("D:P(A;OICI;GA;;;{sid})(A;OICI;GA;;;RC)(A;OICI;GA;;;SY)"),
+        )?;
+        let driver_probe = config.output_directory.join("protected-driver-probe");
+        let provider_probe = config
+            .installed_agent
+            .path
+            .parent()
+            .ok_or_else(|| CiError::Message("matched installed provider parent absent".into()))?
+            .join("protected-readiness-probe");
+        let protected_acl =
+            format!("D:P(D;OICI;GW;;;RC)(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)");
+        let mut probe_owners = Vec::<(PathBuf, Option<(u32, u64)>)>::new();
+        let operation = (|| -> Result<serde_json::Value> {
+            for probe in [&driver_probe, &provider_probe] {
+                fs::create_dir(probe)?;
+                probe_owners.push((probe.clone(), None));
+                let held = descriptor::matched_plan::hold_chain(probe, deadlines.work)?;
+                let info = memcordon_testkit::windows_held_file_metadata(held.last().ok_or_else(
+                    || CiError::Message("matched protected probe identity absent".into()),
+                )?)?;
+                probe_owners.last_mut().expect("new probe owner").1 =
+                    Some((info.volume_serial, info.file_index));
+                drop(held);
+                set_directory_acl(probe, &protected_acl)?;
+            }
+            let request=memcordon_core::workload_request::WorkloadRequestV1::parse(br#"{"format":"memcordon.workload-request","revision":1,"runtime":{"kind":"windows-sealed","profile":"windows-sealed-current-token-v1"},"requirements":[]}"#).map_err(CiError::Message)?;
+            let request = request
+                .canonical_bytes()
+                .map_err(|error| CiError::Message(error.to_string()))?;
+            let mut pairs = Vec::new();
+            let mut first_error = None;
+            for (scope, name) in [
+                (Scope::BinaryFiles, "binary-files"),
+                (Scope::Envelope, "envelope"),
+            ] {
+                for (is_restricted, profile, expected) in [
+                    (false, "ordinary", &ordinary),
+                    (true, "restricted", &restricted),
+                ] {
+                    let pair_started = Instant::now();
+                    let work = deadlines.work.min(pair_started + Duration::from_secs(120));
+                    let cleanup = deadlines
+                        .cleanup
+                        .min(pair_started + Duration::from_secs(180));
+                    provision_budget(work)?;
+                    let directory = config
+                        .output_directory
+                        .join("matched-owned-controls")
+                        .join(name)
+                        .join(profile);
+                    fs::create_dir_all(&directory)?;
+                    let mut selected = config.clone();
+                    selected.output_directory = directory.clone();
+                    let token_path = directory.join(if is_restricted {
+                        "windows-restricted-token.json"
+                    } else {
+                        "windows-ordinary-token.json"
+                    });
+                    drop(crate::windows_native_files::publish_owned_file(
+                        &token_path,
+                        &serde_json::to_vec(expected)?,
+                    )?);
+                    let pair_sha256 = random_challenge()?;
+                    let challenge = random_challenge()?.to_vec();
+                    let denied = if is_restricted && scope == Scope::Envelope {
+                        vec![
+                            driver_probe.join("denied-write.bin"),
+                            provider_probe.join("denied-write.bin"),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    let output = candidate.join(name).join(profile).join("installed");
+                    let direct_output = candidate.join(name).join(profile).join("direct");
+                    let (work_cutoff_qpc, qpc_frequency) =
+                        memcordon_testkit::windows_native_work_cutoff(work)?;
+                    let mut descriptor = descriptor::Descriptor {
+                        matched_control: Some(Binding {
+                            pair_sha256,
+                            lane: Lane::Installed,
+                            scope,
+                            input_sha256: [0; 32],
+                        }),
+                        provider_input_experiment: false,
+                        provider_input_paths: Vec::new(),
+                        provider_input_binding: None,
+                        format: "memcordon.fixture-workload".into(),
+                        revision: descriptor::DESCRIPTOR_REVISION,
+                        case: if scope == Scope::BinaryFiles {
+                            descriptor::Case::BinaryFiles
+                        } else {
+                            descriptor::Case::Envelope
+                        },
+                        output_root: output.clone(),
+                        transcript: output.join("fixture-events.bin"),
+                        challenge,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        arguments: Vec::new(),
+                        application_status: 0,
+                        churn_creations: descriptor::CHURN_CREATIONS,
+                        churn_live: descriptor::CHURN_LIVE,
+                        denied_write_paths: denied,
+                        sentinel_handles: Vec::new(),
+                        descendant_gate: None,
+                        start_gate: Some("matched-owned-scope".into()),
+                        start_transport: descriptor::StartTransport::ControllerStdin {
+                            version: descriptor::controller_start::VERSION,
+                        },
+                        control_clock: Some(descriptor::ControlClock {
+                            revision: 1,
+                            work_cutoff_qpc,
+                            qpc_frequency,
+                        }),
+                        winsock_registry: None,
+                        gate_access_diagnostic: None,
+                        gate_precondition: None,
+                        completion_gate: None,
+                        cohort_gate: None,
+                        generation_gate: None,
+                        toolchain: None,
+                    };
+                    fs::create_dir_all(&output)?;
+                    fs::create_dir_all(&direct_output)?;
+                    let plan_path = directory.join("plan.json");
+                    let broker_record = directory.join("broker.json");
+                    let (cleanup_cutoff_qpc, cleanup_frequency) =
+                        memcordon_testkit::windows_native_work_cutoff(cleanup)?;
+                    if cleanup_frequency != qpc_frequency {
+                        return Err(CiError::Message(
+                            "matched pair clock frequencies differ".into(),
+                        ));
+                    }
+                    let mut roles = vec![
+                        (
+                            descriptor::matched_plan::DirectoryRole::Cwd,
+                            directory.clone(),
+                        ),
+                        (
+                            descriptor::matched_plan::DirectoryRole::DirectOutput,
+                            direct_output,
+                        ),
+                        (
+                            descriptor::matched_plan::DirectoryRole::InstalledOutput,
+                            output,
+                        ),
+                    ];
+                    if is_restricted && scope == Scope::Envelope {
+                        roles.extend([
+                            (
+                                descriptor::matched_plan::DirectoryRole::DriverParent,
+                                driver_probe.clone(),
+                            ),
+                            (
+                                descriptor::matched_plan::DirectoryRole::ProviderParent,
+                                provider_probe.clone(),
+                            ),
+                        ]);
+                    }
+                    let mut directories = Vec::new();
+                    let mut guards = Vec::new();
+                    for (role, path) in roles {
+                        let held = descriptor::matched_plan::hold_chain(&path, work)?;
+                        directories.push(descriptor::matched_plan::observe_directory(
+                            role,
+                            &path,
+                            held.last().ok_or_else(|| {
+                                CiError::Message("matched producer directory custody absent".into())
+                            })?,
+                            work,
+                        )?);
+                        guards.extend(held);
+                    }
+                    let mut plan = descriptor::matched_plan::Plan {
+                        revision: 1,
+                        pair_sha256,
+                        input_sha256: [0; 32],
+                        scope,
+                        restricted: is_restricted,
+                        fixture_sha256: config.fixture.sha256.clone(),
+                        cli_sha256: config.cli.sha256.clone(),
+                        direct_descriptor: plan_path.with_extension("direct-input.json"),
+                        installed_descriptor: directory.join("installed-input.json"),
+                        cwd: directory.clone(),
+                        environment: fixture_environment::entries()?,
+                        directories,
+                        work_clock: descriptor
+                            .control_clock
+                            .clone()
+                            .expect("matched work clock"),
+                        cleanup_cutoff_qpc,
+                        record: broker_record.clone(),
+                    };
+                    let direct = plan
+                        .direct_descriptor_for(&descriptor)
+                        .map_err(CiError::Message)?;
+                    plan.input_sha256 = plan.input_digest(&direct).map_err(CiError::Message)?;
+                    descriptor
+                        .matched_control
+                        .as_mut()
+                        .expect("matched installed binding")
+                        .input_sha256 = plan.input_sha256;
+                    let key = CaseKey {
+                        family: "W-MATCHED-OWNED".into(),
+                        scenario: profile.into(),
+                    };
+                    let input = CaseInput {
+                        key: key.clone(),
+                        descriptor,
+                        descriptor_path: directory.join("installed-input.json"),
+                        workload_request: write_workload_request(&directory, &key, &request)?,
+                        expected_token: expected.clone(),
+                    };
+                    let mut assessment = CaseAssessment {
+                        key,
+                        behavior: Err("not run".into()),
+                        collection: Err("not collected".into()),
+                        retirement: Err("not observed".into()),
+                        descriptor_sha256: String::new(),
+                        result_sha256: None,
+                        stdout_sha256: None,
+                        stderr_sha256: None,
+                        transcript_sha256: None,
+                        request_sha256: Some(crate::windows_causal_acceptance::sha256(&request)),
+                        terminal_observation_sha256: None,
+                    };
+                    let baseline = GuardianBaseline::quiescent(
+                        &config.installed_agent.path,
+                        &config.installed_manifest.path,
+                        &config.installed_agent.sha256,
+                        &config.installed_manifest.sha256,
+                    )?;
+                    let result = execute_with_baseline_clocks(
+                        &selected,
+                        &input,
+                        &mut assessment,
+                        baseline,
+                        Vec::new(),
+                        None,
+                        ExecutionClocks {
+                            work,
+                            cleanup: Some(cleanup),
+                            matched: Some(MatchedExecution {
+                                plan_path,
+                                plan,
+                                guards,
+                                admitted: false,
+                                settled: false,
+                            }),
+                            registry: None,
+                            projection_observation: None,
+                            private_custody: None,
+                        },
+                    );
+                    let captured = (|| -> Result<serde_json::Value> {
+                        let bytes = read(&broker_record, matched_control_report::MAX_BYTES)?;
+                        let observed =
+                            matched_control_report::decode(&bytes).map_err(CiError::Message)?;
+                        Ok(
+                            serde_json::json!({"path":broker_record,"sha256":crate::windows_causal_acceptance::sha256(&bytes),"scope":observed.scope,"comparison":observed.comparison,"direct_native_status":observed.direct.native_status,"frontend_native_status":observed.installed_frontend.native_status}),
+                        )
+                    })();
+                    let capture_error = captured.as_ref().err().map(ToString::to_string);
+                    let (broker, capture) = match captured {
+                        Ok(value) => (Some(value), Ok(())),
+                        Err(error) => (None, Err(error)),
+                    };
+                    let result = match (result, capture) {
+                        (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                            primary: Box::new(primary),
+                            secondary: Box::new(secondary),
+                        }),
+                        (Err(primary), _) => Err(primary),
+                        (Ok(()), capture) => capture,
+                    };
+                    pairs.push(serde_json::json!({"scope":scope,"caller":profile,"installed":assessment,"broker":broker,"broker_capture_error":capture_error,"execution_error":result.as_ref().err().map(ToString::to_string)}));
+                    if let Err(error) = result {
+                        first_error = Some(error);
+                        break;
+                    }
+                }
+                if first_error.is_some() {
+                    break;
+                }
+            }
+            let report = serde_json::json!({"format":"memcordon.matched-owned-scopes","revision":1,"pairs":pairs});
+            drop(crate::windows_native_files::publish_owned_file(
+                &config.output_directory.join("matched-owned-controls.json"),
+                &serde_json::to_vec(&report)?,
+            )?);
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(report),
+            }
+        })();
+        let cleanup = (|| -> Result<()> {
+            for (path, expected) in &probe_owners {
+                provision_budget(deadlines.cleanup)?;
+                let expected = expected.ok_or_else(|| {
+                    CiError::Message(
+                        "matched probe creation identity unavailable; namespace retained".into(),
+                    )
+                })?;
+                descriptor::matched_plan::remove_empty_directory(
+                    path,
+                    expected,
+                    deadlines.cleanup,
+                )?;
+                provision_budget(deadlines.cleanup)?;
+            }
+            Ok(())
+        })();
+        match (operation, cleanup) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(report), Ok(())) => Ok(report),
         }
     }
 }

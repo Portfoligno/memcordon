@@ -80,6 +80,106 @@ fn provider_input_experiment_job(mut job: Value, dot_local_file: bool) -> Value 
     job
 }
 
+fn matched_owned_job(mut job: Value) -> Value {
+    job["strategy"]["matrix"]["include"]
+        .as_sequence_mut()
+        .expect("installed matrix")
+        .retain(|entry| entry["channel"].as_str() == Some("native"));
+    let steps = job["steps"].as_sequence_mut().expect("installed steps");
+    steps.retain(|step| {
+        !step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("working-windows-consumer --channel cargo"))
+            && !step["with"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("windows-installed"))
+    });
+    let command = steps
+        .iter_mut()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("working-windows-consumer --channel native"))
+        })
+        .expect("native consumer step");
+    command["id"] = text("matched-owned");
+    command["run"] = text(
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-matched-owned --destination target/ci/matched-owned",
+    );
+    let base = "target/ci/matched-owned/cases";
+    let mut paths = vec![
+        format!("{base}/matched-owned-execution.json"),
+        format!("{base}/matched-owned-controls.json"),
+    ];
+    for leaf in [
+        "broker.json",
+        "broker.direct-stdout.bin",
+        "broker.direct-stderr.bin",
+        "plan.json",
+        "plan.direct-input.json",
+        "installed-input.json",
+        "windows-ordinary-token.json",
+        "windows-restricted-token.json",
+    ] {
+        paths.push(format!("{base}/matched-owned-controls/*/*/{leaf}"));
+    }
+    for leaf in [
+        "result.json",
+        "result.stdout.bin",
+        "result.stderr.bin",
+        "result.terminal-observation.json",
+        "result.callback-failure.json",
+        "result.failed-frontend.json",
+        "result.failed-terminal-observation.json",
+        "result.guardian-query.json",
+        "result.guardian-query.stdout.bin",
+        "result.guardian-query.stderr.bin",
+        "native-exit.json",
+        "native-retirement.json",
+    ] {
+        paths.push(format!(
+            "{base}/matched-owned-controls/*/*/W-MATCHED-OWNED/*/{leaf}"
+        ));
+    }
+    for lane in ["direct", "installed"] {
+        for leaf in [
+            "application-terminal.json",
+            "matched-input-readback.json",
+            "fixture-events.bin",
+            "native-argv.json",
+            "nested/empty.bin",
+            "nested/all-bytes.bin",
+            "nested/challenge.bin",
+        ] {
+            paths.push(format!("{base}/candidate-outputs/*/*/{lane}/{leaf}"));
+        }
+    }
+    for leaf in [
+        "frontend-result.json",
+        "frontend-result.terminal-observation.json",
+    ] {
+        paths.push(format!("{base}/candidate-outputs/*/*/installed/{leaf}"));
+    }
+    paths.push(crate::installed_failure_carriers::package_cleanup_paths(
+        base,
+    ));
+    let mut with = serde_yaml::Mapping::new();
+    with.insert(text("name"), text("matched-owned-${{ matrix.id }}"));
+    with.insert(text("path"), text(&paths.join("\n")));
+    with.insert(text("if-no-files-found"), text("warn"));
+    let mut artifact = serde_yaml::Mapping::new();
+    artifact.insert(
+        text("name"),
+        text("Retain finite matched owned measurements"),
+    );
+    artifact.insert(text("if"), text("!cancelled()"));
+    artifact.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    artifact.insert(text("timeout-minutes"), Value::Number(2.into()));
+    artifact.insert(text("with"), Value::Mapping(with));
+    steps.push(Value::Mapping(artifact));
+    job
+}
+
 fn installed_failure_carriers() -> Value {
     let mut inputs = serde_yaml::Mapping::new();
     inputs.insert(
@@ -125,6 +225,14 @@ fn node_4() -> Value {
     values.insert(text("windows-payload-arm64"), node_488());
     values.insert(text("windows-installed-x64"), node_602());
     values.insert(text("windows-installed-arm64"), node_701());
+    values.insert(
+        text("windows-matched-owned-x64"),
+        matched_owned_job(node_602()),
+    );
+    values.insert(
+        text("windows-matched-owned-arm64"),
+        matched_owned_job(node_701()),
+    );
     values.insert(text("private-linux"), node_800());
     values.insert(text("standard-linux"), node_845());
     values.insert(text("standard-windows"), node_941());

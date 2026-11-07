@@ -146,6 +146,12 @@ pub enum ReleaseCommand {
         #[arg(long, value_enum)]
         channel: ConsumerChannel,
     },
+    WorkingWindowsMatchedOwned {
+        #[arg(long, default_value = "target/ci/windows-prepared")]
+        prepared: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     WorkingWindowsProviderExperiment {
         #[arg(long, default_value = "target/ci/windows-prepared")]
         prepared: PathBuf,
@@ -414,6 +420,10 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 }
             },
         ),
+        ReleaseCommand::WorkingWindowsMatchedOwned {
+            prepared,
+            destination,
+        } => windows_installed_consumer::run_matched_owned(root, &prepared, &destination),
         ReleaseCommand::WorkingWindowsProviderExperiment {
             prepared,
             destination,

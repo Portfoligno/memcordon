@@ -1096,6 +1096,91 @@ mod native {
         }
     }
 
+    pub(super) fn matched_owned(
+        config: &InstalledWindowsPayload,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> Result<()> {
+        verify_selected(config)?;
+        require_removed(config)?;
+        fs::create_dir_all(&config.output_directory)?;
+        let mut started = false;
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<serde_json::Value> {
+                started = true;
+                package(config, "install", deadlines.work).map_err(CiError::Message)?;
+                package(config, "verify", deadlines.work).map_err(CiError::Message)?;
+                drop(quiescent(config)?);
+                crate::windows_consumer_readiness::run_matched_owned_until(config, deadlines)
+            },
+        ));
+        let _cleanup_scope = crate::cancellation::retirement_scope(deadlines.cleanup);
+        let cleanup = (|| -> Result<()> {
+            if started {
+                let recovered = recover_retained_state(config, deadlines).map_err(CiError::Message);
+                let removed =
+                    package(config, "uninstall", deadlines.cleanup).map_err(CiError::Message);
+                match (recovered, removed) {
+                    (Err(primary), Err(secondary)) => {
+                        return Err(CiError::LaneFailures {
+                            primary: Box::new(primary),
+                            secondary: Box::new(secondary),
+                        });
+                    }
+                    (Err(primary), _) => return Err(primary),
+                    (Ok(()), result) => result?,
+                }
+                require_removed(config)?;
+            }
+            Ok(())
+        })();
+        let operation = match operation {
+            Ok(result) => result,
+            Err(payload) => {
+                if let Err(error) = cleanup {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "matched scope panic cleanup: {error}"
+                    );
+                }
+                std::panic::resume_unwind(payload)
+            }
+        };
+        let report = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.matched-owned-execution","revision":1,"target":config.target,
+            "source_commit":config.source_commit,"fixture_sha256":config.fixture.sha256,
+            "measurements":operation.as_ref().ok(),"measurement_error":operation.as_ref().err().map(ToString::to_string),
+            "installation_cleanup":cleanup.as_ref().map(|_|()).map_err(ToString::to_string),
+        }))?;
+        let retained = if report.len() > 64 * 1024 {
+            Err(CiError::Message(
+                "matched execution summary exceeds64KiB".into(),
+            ))
+        } else {
+            crate::windows_native_files::publish_owned_file(
+                &config.output_directory.join("matched-owned-execution.json"),
+                &report,
+            )
+            .map(drop)
+            .map_err(CiError::from)
+        };
+        let result = match (operation.map(|_| ()), cleanup) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
+        match (result, retained) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        }
+    }
+
     pub(super) fn run_components_from_source_until(
         root: &Path,
         config: &InstalledWindowsPayload,
@@ -2088,6 +2173,14 @@ pub fn run_from_source_with_observer_until(
         ));
     }
     native::run(config, observer, deadlines, Some(root))
+}
+
+#[cfg(windows)]
+pub fn run_matched_owned_until(
+    config: &InstalledWindowsPayload,
+    deadlines: WindowsLeaseDeadlines,
+) -> Result<()> {
+    native::matched_owned(config, deadlines)
 }
 
 #[cfg(windows)]

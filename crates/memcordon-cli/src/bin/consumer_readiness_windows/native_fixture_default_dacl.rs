@@ -224,6 +224,25 @@ impl Snapshot {
     pub(super) fn stable_eq(&self, other: &Self) -> bool {
         self.stable == other.stable && self.default_acl == other.default_acl
     }
+
+    /// A newly created primary token can have a distinct token object id.
+    /// Its effective envelope and default ACL must still match the held input.
+    pub(super) fn same_input(&self, other: &Self) -> bool {
+        self.stable.envelope == other.stable.envelope
+            && self.stable.expiration == other.stable.expiration
+            && self.stable.group_count == other.stable.group_count
+            && self.stable.privilege_count == other.stable.privilege_count
+            && self.default_acl == other.default_acl
+    }
+    pub(super) fn default_acl(&self) -> Option<&[u8]> {
+        self.default_acl.as_deref()
+    }
+    pub(super) fn measurement(&self) -> serde_json::Value {
+        serde_json::json!({"envelope":self.stable.envelope,"token_id":self.stable.token_id,
+            "expiration":self.stable.expiration,"group_count":self.stable.group_count,"privilege_count":self.stable.privilege_count,
+            "modified_id":self.modified_id,"default_acl_bytes":self.default_acl.as_ref().map(Vec::len),
+            "default_acl_sha256":self.default_acl.as_deref().map(super::descriptor::controller_start::descriptor_digest)})
+    }
 }
 
 pub(super) fn snapshot(token: HANDLE) -> io::Result<Snapshot> {

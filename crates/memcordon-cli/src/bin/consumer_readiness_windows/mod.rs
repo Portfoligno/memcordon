@@ -21,6 +21,13 @@ mod listener_trace;
 mod listener_trace_record;
 mod loader_security;
 mod loader_security_record;
+mod matched_control_application;
+mod matched_control_broker;
+mod matched_control_input_record;
+mod matched_control_io;
+mod matched_control_process;
+mod matched_control_readback;
+mod matched_control_report;
 mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;
@@ -253,19 +260,7 @@ fn tcp_peer(
 }
 
 fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
-    let directory = descriptor.output_root.join("nested");
-    fs::create_dir(&directory)?;
-    fs::write(directory.join("empty.bin"), [])?;
-    let bytes: Vec<u8> = (0..=255).collect();
-    let temporary = directory.join("unrenamed.bin");
-    fs::write(&temporary, &bytes)?;
-    let renamed = directory.join("all-bytes.bin");
-    fs::rename(temporary, &renamed)?;
-    if fs::read(renamed)? != bytes {
-        return Err(io::Error::other("binary file readback differs"));
-    }
-    fs::write(directory.join("challenge.bin"), &descriptor.challenge)?;
-    transcript.event("binary-files", None, &descriptor.challenge)
+    matched_control_application::binary_files(descriptor, transcript, None)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1336,6 +1331,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             }
             return listener_trace::self_check();
         }
+        Some("matched-control-frontend") => return matched_control_broker::run(args),
         Some("peer-spawn-call-trace-self-check") => {
             if args.next().is_some() {
                 return Err(io::Error::other(
@@ -1755,6 +1751,17 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         ),
         descriptor::StartTransport::NamedEvent => None,
     };
+    if descriptor.matched_control.is_some() {
+        matched_control_readback::capture(
+            &descriptor,
+            descriptor_digest,
+            &envelope,
+            control
+                .as_ref()
+                .ok_or_else(|| io::Error::other("matched START session absent"))?
+                .original_deadline(),
+        )?;
+    }
     let released = match descriptor.start_transport {
         descriptor::StartTransport::ControllerStdin { .. } => {
             control
@@ -1787,202 +1794,216 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 )
             })?;
     }
-    match descriptor.case {
-        Case::Joint | Case::EndpointMismatch => joint(
-            &descriptor,
-            &mut transcript,
-            false,
-            control.as_mut(),
-            &envelope,
-            Path::new(&first),
-        )?,
-        Case::Churn => joint(
-            &descriptor,
-            &mut transcript,
-            true,
-            control.as_mut(),
-            &envelope,
-            Path::new(&first),
-        )?,
-        Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
-        Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
-        Case::EmptyInput => {
-            let mut actual = Vec::new();
-            io::stdin().take(1).read_to_end(&mut actual)?;
-            if !actual.is_empty() {
-                return Err(io::Error::other(
-                    "empty-input fixture received unexpected stdin bytes",
-                ));
-            }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(descriptor.output_root.join("stdin.bin"))?;
-            file.write_all(&actual)?;
-            file.sync_all()?;
-            transcript.event("stdin-read-to-eof", None, &actual)?;
-        }
-        Case::BinaryStreams => {
-            let stdout = descriptor.stdout.clone();
-            let stderr = descriptor.stderr.clone();
-            let out = thread::spawn(move || -> io::Result<()> {
-                for _ in 0..128 {
-                    io::stdout().write_all(&stdout)?;
+    if descriptor.matched_control.is_some() {
+        matched_control_application::execute(&descriptor, descriptor_digest, &mut transcript)?;
+    } else {
+        match descriptor.case {
+            Case::Joint | Case::EndpointMismatch => joint(
+                &descriptor,
+                &mut transcript,
+                false,
+                control.as_mut(),
+                &envelope,
+                Path::new(&first),
+            )?,
+            Case::Churn => joint(
+                &descriptor,
+                &mut transcript,
+                true,
+                control.as_mut(),
+                &envelope,
+                Path::new(&first),
+            )?,
+            Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
+            Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
+            Case::EmptyInput => {
+                let mut actual = Vec::new();
+                io::stdin().take(1).read_to_end(&mut actual)?;
+                if !actual.is_empty() {
+                    return Err(io::Error::other(
+                        "empty-input fixture received unexpected stdin bytes",
+                    ));
                 }
-                io::stdout().flush()
-            });
-            for _ in 0..128 {
-                io::stderr().write_all(&stderr)?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(descriptor.output_root.join("stdin.bin"))?;
+                file.write_all(&actual)?;
+                file.sync_all()?;
+                transcript.event("stdin-read-to-eof", None, &actual)?;
             }
-            io::stderr().flush()?;
-            out.join()
-                .map_err(|_| io::Error::other("stdout writer panicked"))??;
-        }
-        Case::Envelope => {
-            if !descriptor.denied_write_paths.is_empty() {
-                binary_files(&descriptor, &mut transcript)?;
-                protected_write_probes(&descriptor, &mut transcript)?;
-            }
-        }
-        Case::EmptyStreams | Case::NativeArgv | Case::ApplicationExit => {}
-        Case::DeadlineDemand | Case::HeldDemand => {
-            let mut child = child_command()?
-                .arg("cohort-leaf")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            let mut ready = [0u8];
-            child
-                .stdout
-                .as_mut()
-                .ok_or_else(|| io::Error::other("demand child readiness pipe absent"))?
-                .read_exact(&mut ready)?;
-            if ready != [0xA5] {
-                return Err(io::Error::other(
-                    "demand child did not enter native held barrier",
-                ));
-            }
-            transcript.event(
-                "child-created",
-                Some(0),
-                &serde_json::to_vec(&native::child_identity(&child)?).map_err(io::Error::other)?,
-            )?;
-            transcript.event("policy-demand-started", None, &descriptor.challenge)?;
-            loop {
-                std::hint::black_box(&child);
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        Case::MemoryDemand => {
-            transcript.event("policy-demand-started", None, &descriptor.challenge)?;
-            let mut committed = Vec::<Vec<u8>>::new();
-            loop {
-                let mut allocation = Vec::new();
-                if allocation.try_reserve_exact(8 * 1024 * 1024).is_err() {
-                    loop {
-                        thread::sleep(Duration::from_millis(5));
+            Case::BinaryStreams => {
+                let stdout = descriptor.stdout.clone();
+                let stderr = descriptor.stderr.clone();
+                let out = thread::spawn(move || -> io::Result<()> {
+                    for _ in 0..128 {
+                        io::stdout().write_all(&stdout)?;
                     }
+                    io::stdout().flush()
+                });
+                for _ in 0..128 {
+                    io::stderr().write_all(&stderr)?;
                 }
-                allocation.resize(8 * 1024 * 1024, 0xA5);
-                std::hint::black_box(&allocation);
-                committed.push(allocation);
-                std::hint::black_box(&committed);
+                io::stderr().flush()?;
+                out.join()
+                    .map_err(|_| io::Error::other("stdout writer panicked"))??;
             }
-        }
-        Case::NestedJob => native::nested_job()?,
-        Case::BreakawayDenied => native::breakaway_denied()?,
-        Case::AllowedTokenChange => {
-            let executable = std::env::current_exe()?;
-            let output = child_command()?
-                .arg("restricted-frontend")
-                .arg(&executable)
-                .arg("consumer-readiness-windows")
-                .arg("token-change-child")
-                .arg(descriptor.output_root.join("token-change-output.bin"))
-                .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()?;
-            if !output.status.success() || !output.stderr.is_empty() {
-                return Err(io::Error::other("allowed token-change descendant failed"));
+            Case::Envelope => {
+                if !descriptor.denied_write_paths.is_empty() {
+                    binary_files(&descriptor, &mut transcript)?;
+                    protected_write_probes(&descriptor, &mut transcript)?;
+                }
             }
-            transcript.event("allowed-token-change-retained-job", None, &output.stdout)?;
-        }
-        Case::RootFirst | Case::IntermediateFirst => {
-            let gate = descriptor
-                .descendant_gate
-                .as_ref()
-                .expect("validated descendant gate");
-            let owned_gate = native::create_controller_gate(gate)?;
-            if descriptor.case == Case::IntermediateFirst {
-                let intermediate_gate = format!("{gate}-intermediate-live");
-                let intermediate_owner = native::create_controller_gate(&intermediate_gate)?;
-                let mut intermediate = child_command()?
-                    .arg("intermediate-exit")
-                    .arg(gate)
-                    .arg(descriptor.output_root.join("descendant-output.bin"))
-                    .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
+            Case::EmptyStreams | Case::NativeArgv | Case::ApplicationExit => {}
+            Case::DeadlineDemand | Case::HeldDemand => {
+                let mut child = child_command()?
+                    .arg("cohort-leaf")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
+                    .stderr(Stdio::piped())
                     .spawn()?;
-                let identity: memcordon_core::WindowsProcessIdentityV1 = serde_json::from_slice(
-                    &frame_read(intermediate.stdout.as_mut().expect("piped intermediate"))?,
-                )
-                .map_err(io::Error::other)?;
-                let parent = native::child_identity(&intermediate)?;
-                transcript.event(
-                    "intermediate-live-with-descendant",
-                    None,
-                    &serde_json::to_vec(&serde_json::json!({"parent":parent,"child":identity}))
-                        .map_err(io::Error::other)?,
-                )?;
-                native::wait_controller_gate(std::ffi::OsStr::new(&intermediate_gate), || Ok(()))?;
-                intermediate
-                    .stdin
-                    .take()
-                    .expect("piped intermediate release")
-                    .write_all(&[0xA5])?;
-                if !intermediate.wait()?.success() {
-                    return Err(io::Error::other("intermediate did not exit naturally"));
-                }
-                drop(intermediate_owner);
-                transcript.event(
-                    "intermediate-exits-with-live-descendant",
-                    None,
-                    &serde_json::to_vec(&identity).map_err(io::Error::other)?,
-                )?;
-                native::wait_controller_gate(std::ffi::OsStr::new(gate), || Ok(()))?;
-                drop(owned_gate);
-            } else {
-                let mut child = child_command()?
-                    .arg("descendant-hold")
-                    .arg(gate)
-                    .arg(descriptor.output_root.join("descendant-output.bin"))
-                    .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .spawn()?;
-                let mut ready = [0];
+                let mut ready = [0u8];
                 child
                     .stdout
                     .as_mut()
-                    .expect("piped stdout")
+                    .ok_or_else(|| io::Error::other("demand child readiness pipe absent"))?
                     .read_exact(&mut ready)?;
-                if ready != [0xA5] || child.try_wait()?.is_some() {
-                    return Err(io::Error::other("descendant was not held live"));
+                if ready != [0xA5] {
+                    return Err(io::Error::other(
+                        "demand child did not enter native held barrier",
+                    ));
                 }
-                let identity = native::child_identity(&child)?;
                 transcript.event(
-                    "root-exits-with-live-descendant",
-                    None,
-                    &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+                    "child-created",
+                    Some(0),
+                    &serde_json::to_vec(&native::child_identity(&child)?)
+                        .map_err(io::Error::other)?,
                 )?;
-                drop(owned_gate);
+                transcript.event("policy-demand-started", None, &descriptor.challenge)?;
+                loop {
+                    std::hint::black_box(&child);
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
-            // Intentionally relinquish only the root's wait; Job ownership must
-            // continue after this process exits. Collection drains descendant I/O.
+            Case::MemoryDemand => {
+                transcript.event("policy-demand-started", None, &descriptor.challenge)?;
+                let mut committed = Vec::<Vec<u8>>::new();
+                loop {
+                    let mut allocation = Vec::new();
+                    if allocation.try_reserve_exact(8 * 1024 * 1024).is_err() {
+                        loop {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    allocation.resize(8 * 1024 * 1024, 0xA5);
+                    std::hint::black_box(&allocation);
+                    committed.push(allocation);
+                    std::hint::black_box(&committed);
+                }
+            }
+            Case::NestedJob => native::nested_job()?,
+            Case::BreakawayDenied => native::breakaway_denied()?,
+            Case::AllowedTokenChange => {
+                let executable = std::env::current_exe()?;
+                let output = child_command()?
+                    .arg("restricted-frontend")
+                    .arg(&executable)
+                    .arg("consumer-readiness-windows")
+                    .arg("token-change-child")
+                    .arg(descriptor.output_root.join("token-change-output.bin"))
+                    .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()?;
+                if !output.status.success() || !output.stderr.is_empty() {
+                    return Err(io::Error::other("allowed token-change descendant failed"));
+                }
+                transcript.event("allowed-token-change-retained-job", None, &output.stdout)?;
+            }
+            Case::RootFirst | Case::IntermediateFirst => {
+                let gate = descriptor
+                    .descendant_gate
+                    .as_ref()
+                    .expect("validated descendant gate");
+                let owned_gate = native::create_controller_gate(gate)?;
+                if descriptor.case == Case::IntermediateFirst {
+                    let intermediate_gate = format!("{gate}-intermediate-live");
+                    let intermediate_owner = native::create_controller_gate(&intermediate_gate)?;
+                    let mut intermediate = child_command()?
+                        .arg("intermediate-exit")
+                        .arg(gate)
+                        .arg(descriptor.output_root.join("descendant-output.bin"))
+                        .arg(
+                            serde_json::to_string(&descriptor.challenge)
+                                .map_err(io::Error::other)?,
+                        )
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let identity: memcordon_core::WindowsProcessIdentityV1 =
+                        serde_json::from_slice(&frame_read(
+                            intermediate.stdout.as_mut().expect("piped intermediate"),
+                        )?)
+                        .map_err(io::Error::other)?;
+                    let parent = native::child_identity(&intermediate)?;
+                    transcript.event(
+                        "intermediate-live-with-descendant",
+                        None,
+                        &serde_json::to_vec(&serde_json::json!({"parent":parent,"child":identity}))
+                            .map_err(io::Error::other)?,
+                    )?;
+                    native::wait_controller_gate(std::ffi::OsStr::new(&intermediate_gate), || {
+                        Ok(())
+                    })?;
+                    intermediate
+                        .stdin
+                        .take()
+                        .expect("piped intermediate release")
+                        .write_all(&[0xA5])?;
+                    if !intermediate.wait()?.success() {
+                        return Err(io::Error::other("intermediate did not exit naturally"));
+                    }
+                    drop(intermediate_owner);
+                    transcript.event(
+                        "intermediate-exits-with-live-descendant",
+                        None,
+                        &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+                    )?;
+                    native::wait_controller_gate(std::ffi::OsStr::new(gate), || Ok(()))?;
+                    drop(owned_gate);
+                } else {
+                    let mut child = child_command()?
+                        .arg("descendant-hold")
+                        .arg(gate)
+                        .arg(descriptor.output_root.join("descendant-output.bin"))
+                        .arg(
+                            serde_json::to_string(&descriptor.challenge)
+                                .map_err(io::Error::other)?,
+                        )
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let mut ready = [0];
+                    child
+                        .stdout
+                        .as_mut()
+                        .expect("piped stdout")
+                        .read_exact(&mut ready)?;
+                    if ready != [0xA5] || child.try_wait()?.is_some() {
+                        return Err(io::Error::other("descendant was not held live"));
+                    }
+                    let identity = native::child_identity(&child)?;
+                    transcript.event(
+                        "root-exits-with-live-descendant",
+                        None,
+                        &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+                    )?;
+                    drop(owned_gate);
+                }
+                // Intentionally relinquish only the root's wait; Job ownership must
+                // continue after this process exits. Collection drains descendant I/O.
+            }
         }
     }
     transcript.event("finished", None, &descriptor.challenge)?;

@@ -11,6 +11,10 @@ pub mod controller_start;
 pub mod gate_access;
 #[path = "gate_precondition_input.rs"]
 pub mod gate_precondition;
+#[path = "matched_control_record.rs"]
+pub mod matched;
+#[path = "matched_control_plan.rs"]
+pub mod matched_plan;
 #[path = "stream_bytes.rs"]
 mod stream_bytes;
 #[path = "toolchain_command.rs"]
@@ -189,6 +193,8 @@ impl ControlClock {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Descriptor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_control: Option<matched::Binding>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub provider_input_experiment: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -302,6 +308,29 @@ impl Descriptor {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(binding) = &self.matched_control {
+            let expected = match self.case {
+                Case::BinaryFiles => matched::Scope::BinaryFiles,
+                Case::Envelope => matched::Scope::Envelope,
+                _ => return Err("matched measurement supports only BinaryFiles/Envelope".into()),
+            };
+            if binding.scope != expected
+                || self.provider_input_experiment
+                || self.winsock_registry.is_some()
+                || self.toolchain.is_some()
+                || !matches!(
+                    self.start_transport,
+                    StartTransport::ControllerStdin {
+                        version: controller_start::VERSION
+                    }
+                )
+                || self.control_clock.is_none()
+                || !(self.denied_write_paths.is_empty()
+                    || (expected == matched::Scope::Envelope && self.denied_write_paths.len() == 2))
+            {
+                return Err("matched measurement descriptor scope/input/START differs".into());
+            }
+        }
         memcordon_platform::windows_private_fixture_binding::validate_declaration(
             self.provider_input_experiment,
             &self.provider_input_paths,
@@ -366,6 +395,10 @@ impl Descriptor {
                     )
                 } else {
                     matches!(self.case, Case::Envelope | Case::Joint)
+                        || (self.case == Case::BinaryFiles
+                            && self.matched_control.as_ref().is_some_and(|binding| {
+                                binding.scope == matched::Scope::BinaryFiles
+                            }))
                 })
                 || self.start_gate.is_none()
             {

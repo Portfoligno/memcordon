@@ -398,6 +398,7 @@ fn descriptor() -> Descriptor {
         .join("bin")
         .join("rust-lld.exe");
     Descriptor {
+        matched_control: None,
         format: "memcordon.fixture-workload".into(),
         revision: descriptor::DESCRIPTOR_REVISION,
         case: Case::Churn,

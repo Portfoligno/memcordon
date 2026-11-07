@@ -320,6 +320,7 @@ fn run() -> Result<()> {
             memcordon_ci::release::ReleaseCommand::WorkingWindowsPrepare { .. }
                 | memcordon_ci::release::ReleaseCommand::WorkingWindowsConsumer { .. }
                 | memcordon_ci::release::ReleaseCommand::WorkingWindowsProviderExperiment { .. }
+                | memcordon_ci::release::ReleaseCommand::WorkingWindowsMatchedOwned { .. }
         ),
         _ => false,
     };

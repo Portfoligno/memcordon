@@ -27,6 +27,7 @@ fn workload_request_selection_is_absolute_exclusive_and_shared_by_both_frontends
     assert_eq!(std::fs::read(&selected).unwrap(), bytes);
     let root = owned.path().to_path_buf();
     let descriptor = descriptor::Descriptor {
+        matched_control: None,
         format: "memcordon.fixture-workload".into(),
         revision: descriptor::DESCRIPTOR_REVISION,
         case: descriptor::Case::Envelope,
