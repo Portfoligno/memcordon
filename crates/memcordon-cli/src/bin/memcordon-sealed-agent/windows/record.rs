@@ -34,6 +34,9 @@ use super::pipe::OwnedHandle;
 use super::writer_lifecycle::DriverPhase;
 use super::writer_observation::driver;
 
+#[path = "live_guardian_diagnostics.rs"]
+mod live_guardian_diagnostics;
+
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
@@ -5429,14 +5432,16 @@ pub fn observe_live_guardian_details(
         if record.guardian_identity.as_ref() != Some(expected) {
             continue;
         }
-        if selected.is_some()
-            || record.boot_identity != boot
-            || record.provider_generation != provider.generation.as_str()
-            || !record.target_released
-            || !record.resume_attempted
-            || record.authorization_unix_millis.is_none()
-        {
-            return Err("live guardian association is ambiguous or not released".into());
+        let predicates = live_guardian_diagnostics::AssociationRefusalPredicates {
+            duplicate_match: selected.is_some(),
+            boot_mismatch: record.boot_identity != boot,
+            provider_mismatch: record.provider_generation != provider.generation.as_str(),
+            target_not_released: !record.target_released,
+            resume_not_attempted: !record.resume_attempted,
+            authorization_missing: record.authorization_unix_millis.is_none(),
+        };
+        if let Some(refusal) = predicates.refusal(expected, record.record_revision) {
+            return Err(refusal.to_string());
         }
         selected = Some((
             memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
