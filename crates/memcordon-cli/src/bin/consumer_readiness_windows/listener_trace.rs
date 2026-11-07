@@ -1,5 +1,5 @@
 //! Observe the original Rust constructor without transferring socket ownership.
-use super::{listener_trace_record as record, winsock_trace::Context};
+use super::{listener_trace_record as record, native_file_trace_record, winsock_trace::Context};
 use std::{
     any::Any,
     ffi::c_void,
@@ -15,28 +15,30 @@ use windows_sys::Win32::{
 };
 
 unsafe extern "C" {
-    fn memcordon_listener_trace_call(
+    fn memcordon_listener_native_file_trace_call(
         packet: *mut record::Packet,
         request: *const record::Request,
         invoke: unsafe extern "C" fn(*mut c_void, *mut record::Outcome),
         opaque: *mut c_void,
+        native_files: *mut native_file_trace_record::Packet,
     );
     fn memcordon_listener_trace_mock(cutoff: u64, frequency: u64) -> u32;
+    fn memcordon_native_file_trace_mock(cutoff: u64, frequency: u64) -> u32;
 }
 
 #[derive(Clone, Copy)]
-struct ErrorPair {
+pub(super) struct ErrorPair {
     win32: u32,
     wsa: i32,
 }
 impl ErrorPair {
-    fn capture() -> Self {
+    pub(super) fn capture() -> Self {
         // SAFETY: thread-local reads; explicit startup already succeeded here.
         let win32 = unsafe { GetLastError() };
         let wsa = unsafe { WSAGetLastError() };
         Self { win32, wsa }
     }
-    fn restore(self) {
+    pub(super) fn restore(self) {
         // SAFETY: restore reachable saved values, with no API after SetLastError.
         unsafe {
             WSASetLastError(self.wsa);
@@ -190,6 +192,8 @@ fn token(clock: &super::descriptor::ControlClock, effective: bool) -> serde_json
 
 struct Captured {
     packet: record::Packet,
+    native_files: native_file_trace_record::Packet,
+    loader_policies: Option<serde_json::Value>,
     invocation: Invocation,
     process_token: serde_json::Value,
     effective_token: serde_json::Value,
@@ -237,25 +241,30 @@ fn capture_call(
         reserved: 0,
     };
     let mut packet = record::Packet::default();
+    let mut native_files = native_file_trace_record::Packet::default();
     let mut invocation = Invocation {
         connect,
         ..Invocation::default()
     };
     let process_token = token(clock, false);
     let effective_token = token(clock, true);
+    let loader_policies = experiment.then(|| super::provider_loader_policy_native::capture(clock));
     // SAFETY: fixed asserted ABI, private non-unwinding callback and stack slots
     // live throughout this synchronous call. C++ never receives socket ownership.
     unsafe {
-        memcordon_listener_trace_call(
+        memcordon_listener_native_file_trace_call(
             &mut packet,
             &request,
             invoke_listener,
             (&mut invocation as *mut Invocation).cast(),
+            &mut native_files,
         );
     }
     let outgoing = ErrorPair::capture();
     Captured {
         packet,
+        native_files,
+        loader_policies,
         invocation,
         process_token,
         effective_token,
@@ -277,6 +286,56 @@ impl Write for Bounded {
     }
 }
 fn retain(
+    context: &Context<'_>,
+    capture: &Captured,
+    security: Option<serde_json::Value>,
+) -> io::Result<()> {
+    // Each finite carrier gets its own publication attempt. A companion failure
+    // must not hide the existing listener record, or replace the original call.
+    let listener = retain_listener(context, capture, security);
+    let native_files = retain_native_files(context, capture);
+    match (listener, native_files) {
+        (Err(listener), Err(native_files)) => Err(io::Error::new(
+            listener.kind(),
+            format!(
+                "listener trace retention: {listener}; native file request retention: {native_files}"
+            ),
+        )),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn retain_native_files(context: &Context<'_>, capture: &Captured) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    live(context.clock)?;
+    let binding = context.binding;
+    let bytes = native_file_trace_record::bounded(serde_json::json!({
+        "format":"memcordon.original-native-file-requests","revision":1,
+        "original_binding":{"pid":binding.pid,"creation_time_100ns":binding.birth,
+            "descriptor_sha256":binding.descriptor_sha256,
+            "challenge_sha256":super::descriptor::controller_start::descriptor_digest(&binding.challenge),
+            "cutoff_qpc":context.clock.work_cutoff_qpc,"qpc_frequency":context.clock.qpc_frequency,
+            "peer":context.peer,"authority":false},
+        "trace":native_file_trace_record::diagnostic(&capture.native_files),
+        "provider_loader_policies":capture.loader_policies.clone().map(|snapshot|super::provider_loader_policy::bind(snapshot,binding.pid,binding.birth)),
+        "acceptance_authority":false
+    }))?;
+    live(context.clock)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(context.output_root.join(if context.peer {
+            "peer-listener-native-file-requests.json"
+        } else {
+            "listener-native-file-requests.json"
+        }))?;
+    file.write_all(&bytes)?;
+    file.sync_all()
+}
+
+fn retain_listener(
     context: &Context<'_>,
     capture: &Captured,
     security: Option<serde_json::Value>,
@@ -480,11 +539,37 @@ pub fn self_check() -> io::Result<i32> {
     live(&clock)?;
     let _startup = super::native::winsock_startup(None)?;
     live(&clock)?;
+    let saved_errors = ErrorPair::capture();
+    // SAFETY: sentinel values affect only this explicit native selfcheck thread.
+    unsafe {
+        WSASetLastError(29991);
+        SetLastError(29992);
+    }
+    let expected_errors = ErrorPair::capture();
+    let _policy_snapshot = super::provider_loader_policy_native::capture(&clock);
+    let restored_errors = ErrorPair::capture();
+    saved_errors.restore();
+    if restored_errors.win32 != expected_errors.win32 || restored_errors.wsa != expected_errors.wsa
+    {
+        return Err(io::Error::other(
+            "provider policy snapshot changed caller error state",
+        ));
+    }
+    live(&clock)?;
     // SAFETY: private mock originals are tested before any real listener IAT publication.
     let failed = unsafe { memcordon_listener_trace_mock(cutoff, frequency) };
     if failed != 0 {
         return Err(io::Error::other(format!(
             "listener native forwarding selfcheck {failed}"
+        )));
+    }
+    live(&clock)?;
+    // SAFETY: private finite native mocks, including admitted owned-image IAT
+    // routes, run only in this explicit selfcheck, never the real workload.
+    let failed = unsafe { memcordon_native_file_trace_mock(cutoff, frequency) };
+    if failed != 0 {
+        return Err(io::Error::other(format!(
+            "native file request forwarding selfcheck {failed}"
         )));
     }
     let before = checked_token(&clock, false)?;

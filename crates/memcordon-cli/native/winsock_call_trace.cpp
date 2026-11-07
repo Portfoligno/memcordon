@@ -9,6 +9,7 @@
 #include <type_traits>
 #include "detours.h"
 #include "winsock_call_trace.h"
+#include "native_file_request_trace.h"
 
 static_assert(sizeof(void*)==8 && sizeof(WCHAR)==2 && sizeof(NTSTATUS)==4,"WSA trace native ABI");
 static_assert(sizeof(OBJECT_ATTRIBUTES)==48 && offsetof(OBJECT_ATTRIBUTES,ObjectName)==16,"WSA native object attributes ABI");
@@ -318,6 +319,14 @@ using LoaderWindowClock=BOOL(*)(LARGE_INTEGER*);
 static std::atomic<LoaderWindowClock> loader_private_clock{nullptr};
 static BOOL loader_window_clock(LARGE_INTEGER* value){const auto mock=loader_private_clock.load(std::memory_order_acquire);return mock?mock(value):QueryPerformanceCounter(value);}
 struct LoaderWindowCapture {ListenerPacket* packet;ListenerLoaderWindow window;bool start_valid;};
+struct NativeFileCollector {NativeFilePacket* packet;uint64_t ldr,parent,started;uint32_t thread;bool inside,disarmed;};
+struct NativeFileScope {NativeFileCollector previous;NativeFilePacket* packet;bool managed,armed;};
+static __declspec(thread) NativeFilePacket* native_file_output=nullptr;
+static __declspec(thread) NativeFileCollector native_file_collector={};
+static NativeFileScope native_file_scope_begin(const LoaderWindowCapture*,bool);
+static void native_file_scope_end(const NativeFileScope&);
+static void native_file_prepare(ListenerPacket*,void*,void*);
+static NTSTATUS native_file_ldr_forward(Load,PWSTR,PULONG,PUNICODE_STRING,PHANDLE,const LoaderWindowCapture*,bool);
 static LoaderWindowCapture loader_window_begin(const WsaEntry* entry,bool active){
     LoaderWindowCapture capture={};if(!active||!loader_collector.timeline)return capture;
     capture.packet=loader_collector.timeline;
@@ -354,7 +363,10 @@ template<unsigned Returned=0> static NTSTATUS NTAPI load_dll(PWSTR search,PULONG
     if(active){unicode(&entry,value);entry.flags=dword_input<Returned>(flags,&entry,4);}
     LoaderWindowCapture window={};if constexpr(Returned==2)window=loader_window_begin(&entry,active);
     saved.forward(active);
-    const auto result=original<Load,Returned>(4)(search,flags,value,out);const DWORD error=saved.returned();
+    NTSTATUS result=0;
+    if constexpr(Returned==2)result=native_file_ldr_forward(original<Load,Returned>(4),search,flags,value,out,&window,active);
+    else result=original<Load,Returned>(4)(search,flags,value,out);
+    const DWORD error=saved.returned();
     if constexpr(Returned==2)loader_window_end(&window,result<0);
     if(active&&result>=0)output<Returned>(&entry,reinterpret_cast<void**>(out));finish<Returned>(&entry,active,result,error,result<0);SetLastError(error);return result;
 }
@@ -1341,6 +1353,7 @@ static bool returned_publish(WsaPacket* packet,const Image& mapped,const WsaNode
     if(!success)returned_rollback(packet);
     restore(pages,count,packet);return success;
 }
+#include "native_file_request_trace.inc"
 static void returned_failure(ListenerReturnedModule* section,uint32_t stage,DWORD error,uint32_t reason){
     section->setup_stage=stage;section->setup_error=error?error:ERROR_INVALID_DATA;section->setup_reason=reason;
     section->scope_flags|=2;section->incomplete=1;
@@ -1472,7 +1485,10 @@ static LoaderCallScope loader_owner_begin(const WsaEntry* entry,bool active,void
         // targets. Its prepare callback never installs or changes a real IAT.
         const auto prepare=loader_private_prepare.load(std::memory_order_acquire);
         if(prepare)prepared=prepare(listener,target);else loader_failure(scope,9,ERROR_BUSY,5);
-    }else prepared=loader_prepare(listener,target);
+    }else {
+        prepared=loader_prepare(listener,target);
+        native_file_prepare(listener,target,loader_originals[3].load(std::memory_order_acquire));
+    }
     scope->scope_flags|=scope->dependencies.scope_flags;scope->incomplete|=scope->dependencies.incomplete;
     if(!prepared){scope->skipped_count=increment(scope->skipped_count);return result;}
     scope->armed=1;scope->dependencies.armed=1;scope->dependencies.incoming_error=entry->incoming_error;
@@ -1618,6 +1634,22 @@ extern "C" void memcordon_listener_trace_call(ListenerPacket* packet,const Liste
     packet->loader_owner.dependencies.frequency=packet->frequency;packet->loader_owner.dependencies.original_thread=packet->original_thread;
     bool ready=false;{ObserverSetup setup;ready=listener_install(packet,reinterpret_cast<void*>(callback));}
     listener_invoke(packet,request,callback,opaque,ready);
+}
+extern "C" void memcordon_listener_native_file_trace_call(ListenerPacket* packet,const ListenerRequest* request,ListenerInvoke callback,void* opaque,NativeFilePacket* native){
+    if(!native||!request){memcordon_listener_trace_call(packet,request,callback,opaque);return;}
+    const auto previous=native_file_output;const auto previous_scope=native_file_collector;
+    *native={};native->version=NativeFileVersion;native->packet_bytes=sizeof(*native);
+    native->cutoff_qpc=request->cutoff_qpc;native->frequency=request->frequency;native->original_thread=GetCurrentThreadId();
+    for(auto& owner:native->owners)owner.shared_owner=UINT32_MAX;
+    if(previous||previous_scope.packet){native->incomplete=1;native->unmatched_scope=1;if(previous)previous->incomplete=1;}
+    native_file_output=native;native_file_collector={};
+    __try {memcordon_listener_trace_call(packet,request,callback,opaque);}
+    __finally {
+        const auto outgoing=errors();
+        if(AbnormalTermination())native->incomplete=1;
+        if(native_file_collector.packet){native->incomplete=1;native->unmatched_scope=increment(native->unmatched_scope);}
+        native_file_output=previous;native_file_collector=previous_scope;errors_restore(outgoing);
+    }
 }
 
 struct Mock {std::atomic<uint32_t> calls,heaps;DWORD expected_error;PHANDLE output;POBJECT_ATTRIBUTES attributes;std::atomic<bool> same;};

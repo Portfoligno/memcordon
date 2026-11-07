@@ -2,6 +2,7 @@ mod attempt_store;
 pub(crate) mod bootstrap_image_capability;
 pub mod control_service;
 mod diagnostics;
+mod frame_write;
 pub mod guardian;
 pub mod guardian_service;
 pub mod job;

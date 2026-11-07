@@ -150,6 +150,8 @@ fn build_gate_call_trace() {
     println!("cargo:rerun-if-changed=native/gate_call_trace.h");
     println!("cargo:rerun-if-changed=native/winsock_call_trace.cpp");
     println!("cargo:rerun-if-changed=native/winsock_call_trace.h");
+    println!("cargo:rerun-if-changed=native/native_file_request_trace.h");
+    println!("cargo:rerun-if-changed=native/native_file_request_trace.inc");
     cc::Build::new()
         .cpp(true)
         .static_crt(true)
@@ -163,4 +165,5 @@ fn build_gate_call_trace() {
     println!("cargo:rustc-link-arg-bin=memcordon-test-fixture=/guard:cf");
     println!("cargo:rustc-link-arg-bin=memcordon-test-fixture=/DYNAMICBASE");
     println!("cargo:rustc-link-lib=kernel32");
+    println!("cargo:rustc-link-lib=ntdll");
 }

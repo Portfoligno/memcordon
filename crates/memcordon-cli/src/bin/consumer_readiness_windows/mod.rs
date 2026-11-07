@@ -24,12 +24,16 @@ mod loader_security_record;
 mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;
+mod native_file_trace_record;
 mod native_fixture_default_dacl;
 mod native_gate_precondition;
+mod operation_context;
 mod own_thread_deadline_self_check;
 mod peer_retirement;
 mod provider_input_probes;
 mod provider_input_target_record;
+mod provider_loader_policy;
+mod provider_loader_policy_native;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
@@ -131,7 +135,10 @@ fn read_descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn child_command() -> io::Result<Command> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(operation_context::context(
+        operation_context::Operation::CurrentExecutable,
+        std::env::current_exe(),
+    )?);
     command.arg("consumer-readiness-windows");
     Ok(command)
 }
@@ -706,26 +713,36 @@ fn joint_mapped(
     }
     let _winsock = native::winsock_startup(trace)?;
     let listener = listener_trace::bind(trace.as_ref())?;
-    let address = listener.local_addr()?;
+    use operation_context::{Operation, context};
+    let address = context(Operation::ListenerLocalAddress, listener.local_addr())?;
     // The original socket stays held until every IPC/churn/descendant stage completes.
     let conflicting_bind = match TcpListener::bind(address) {
-        Ok(_) => return Err(io::Error::other("competing bind acquired live endpoint")),
+        Ok(_) => {
+            return context(
+                Operation::CompetingBind,
+                Err(io::Error::other("competing bind acquired live endpoint")),
+            );
+        }
         Err(error) => error,
     };
     let conflicting_code = conflicting_bind.raw_os_error();
     if conflicting_code != Some(10048) {
-        return Err(io::Error::other(format!(
-            "competing bind did not report WSAEADDRINUSE: {conflicting_bind}"
-        )));
+        return context(Operation::CompetingBind, Err(conflicting_bind));
     }
-    transcript.event(
-        "tcp-conflicting-bind",
-        None,
-        &conflicting_code
-            .expect("validated native bind code")
-            .to_le_bytes(),
+    context(
+        Operation::TranscriptConflictingBind,
+        transcript.event(
+            "tcp-conflicting-bind",
+            None,
+            &conflicting_code
+                .expect("validated native bind code")
+                .to_le_bytes(),
+        ),
     )?;
-    transcript.event("tcp-listener-owned", None, &address.port().to_le_bytes())?;
+    context(
+        Operation::TranscriptListenerOwned,
+        transcript.event("tcp-listener-owned", None, &address.port().to_le_bytes()),
+    )?;
     if descriptor.case == Case::EndpointMismatch {
         let policy_endpoint = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         let allowed = policy_endpoint.local_addr()?.port();
@@ -748,7 +765,10 @@ fn joint_mapped(
         return Ok(());
     }
     let challenge_path = descriptor.output_root.join("tcp-challenge.bin");
-    fs::write(&challenge_path, &descriptor.challenge)?;
+    context(
+        Operation::ChallengeWrite,
+        fs::write(&challenge_path, &descriptor.challenge),
+    )?;
     let mut peer_command = child_command()?;
     peer_command
         .arg("tcp-peer")
@@ -782,46 +802,65 @@ fn joint_mapped(
             .as_deref()
             .expect("checked private session")
             .peer_admission_binding();
-        transcript.event(
-            "tcp-peer-spawn-intent",
-            None,
-            &serde_json::to_vec(&binding).map_err(io::Error::other)?,
+        context(
+            Operation::TranscriptSpawnIntent,
+            transcript.event(
+                "tcp-peer-spawn-intent",
+                None,
+                &serde_json::to_vec(&binding).map_err(io::Error::other)?,
+            ),
         )?;
     }
-    let mut peer = peer_command.spawn()?;
+    let mut peer = context(Operation::PeerCommandSpawn, peer_command.spawn())?;
     // Every error after spawn retains/settles this original Child. In a private
     // experiment the controller independently owns the peer before transfer,
     // or keeps the unresolved spawn interval quarantined.
     let worked = (|| -> io::Result<()> {
         let permit = if descriptor.provider_input_experiment {
             let session = control.as_deref_mut().expect("checked private session");
-            let pending = session.pending_peer(&peer)?;
-            transcript.event(
-                "tcp-peer-pending-admission",
-                None,
-                &serde_json::to_vec(&pending).map_err(io::Error::other)?,
+            let pending = context(Operation::PendingPeerIdentity, session.pending_peer(&peer))?;
+            context(
+                Operation::TranscriptPendingAdmission,
+                transcript.event(
+                    "tcp-peer-pending-admission",
+                    None,
+                    &serde_json::to_vec(&pending).map_err(io::Error::other)?,
+                ),
             )?;
-            Some(session.receive_peer_recipient(&pending)?)
+            Some(context(
+                Operation::PeerRecipientAdmission,
+                session.receive_peer_recipient(&pending),
+            )?)
         } else {
             None
         };
         if let Some(registry) = registry {
-            send_peer_registry(
-                &mut peer,
-                registry,
-                descriptor,
-                control.as_deref().expect("checked registry control"),
-                permit,
+            context(
+                Operation::RegistryMetadataHandoff,
+                send_peer_registry(
+                    &mut peer,
+                    registry,
+                    descriptor,
+                    control.as_deref().expect("checked registry control"),
+                    permit,
+                ),
             )?;
             control
                 .as_deref_mut()
                 .expect("checked registry control")
                 .close_private_directories();
         }
-        transcript.event(
-            "tcp-peer-created",
-            None,
-            &serde_json::to_vec(&native::child_identity(&peer)?).map_err(io::Error::other)?,
+        context(
+            Operation::TranscriptPeerCreated,
+            transcript.event(
+                "tcp-peer-created",
+                None,
+                &serde_json::to_vec(&context(
+                    Operation::PeerIdentity,
+                    native::child_identity(&peer),
+                )?)
+                .map_err(io::Error::other)?,
+            ),
         )?;
         let (mut stream, _) = listener.accept()?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;

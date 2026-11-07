@@ -112,6 +112,7 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
             "result.stderr.bin",
             "result.winsock-startup-trace.json",
             "result.listener-call-trace.json",
+            "result.listener-native-file-requests.json",
         ] {
             paths.push(format!("{prefix}/windows-installed/{case}/{name}"));
         }

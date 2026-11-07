@@ -582,6 +582,18 @@ pub(super) fn lifecycle_snapshot(cutoff: std::time::Instant) -> super::writer_li
                                 _ => None,
                             }
                         }),
+                        publisher_failure: lane
+                            .publisher_error
+                            .get()
+                            .zip(lane.observation.as_ref())
+                            .map(|(error, cell)| {
+                                super::writer_lifecycle::PublisherFailureSnapshot::retained(
+                                    cell.publisher_binding(),
+                                    &error.event,
+                                    &error.detail,
+                                    error.truncated,
+                                )
+                            }),
                     })
                     .collect(),
             },

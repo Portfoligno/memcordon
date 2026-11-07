@@ -1,3 +1,5 @@
+#[path = "../src/bin/memcordon-sealed-agent/windows/frame_write.rs"]
+pub mod frame_write;
 #[path = "../src/bin/memcordon-sealed-agent/windows/settlement_observation.rs"]
 mod observation;
 #[path = "../src/bin/memcordon-sealed-agent/windows/settlement.rs"]

@@ -1,3 +1,5 @@
+#[path = "../src/bin/memcordon-sealed-agent/windows/frame_write.rs"]
+pub mod frame_write;
 #[path = "../src/bin/memcordon-sealed-agent/windows/writer_lifecycle.rs"]
 mod lifecycle;
 use lifecycle::*;
@@ -23,6 +25,7 @@ fn row(history: History) -> WriterSnapshot {
         pending: Some(3),
         quarantined: Some(false),
         publisher_native_code: None,
+        publisher_failure: None,
         thread: ThreadObservation::Running { tid: 7, birth: 789 },
         changed: false,
     }
@@ -49,6 +52,7 @@ fn snapshot(records: Vec<WriterSnapshot>) -> Snapshot {
         dropped: 0,
         changed: false,
         completed_before_cutoff: true,
+        sampled_at: Some(std::time::Instant::now()),
     }
 }
 fn registered() -> History {
@@ -58,6 +62,300 @@ fn registered() -> History {
     value.transition(Stage::WorkerCreated, None);
     value.transition(Stage::Registered, None);
     value
+}
+
+fn publisher_event(redacted: bool) -> memcordon_core::CausalEventV1 {
+    memcordon_core::CausalEventV1 {
+        sequence: 1,
+        origin: memcordon_core::DiagnosticOriginV1::RecordWriter,
+        category: memcordon_core::FailureCategoryV1::Persistence,
+        operation: memcordon_core::FailureOperationV1::StoreRecord,
+        code: memcordon_core::FailureCodeV1::UnexpectedProviderFailure,
+        native_code: Some(memcordon_core::NativeFailureCodeV1::Win32(5)),
+        observed_phase: memcordon_core::AttemptObservationPhaseV1::Terminalizing,
+        safe_detail: memcordon_core::SafeDiagnosticDetailV1::ProviderMessage {
+            id: memcordon_core::SafeMessageIdV1::CommitNotConfirmed,
+        },
+        detail_redacted: redacted,
+        detail_truncated: false,
+        terminalization_reference: None,
+    }
+}
+
+#[test]
+fn publisher_error_is_exact_tuple_bound_redacted_and_never_changes_writer_state() {
+    let mut history = registered();
+    history.transition(Stage::PublicationFailed, Some(5));
+    let mut failed = row(history);
+    failed.quarantined = Some(true);
+    failed.pending = Some(0);
+    failed.publisher_failure = Some(PublisherFailureSnapshot::retained(
+        failed.history.binding.clone(),
+        &publisher_event(true),
+        "private-user-path-must-not-be-published",
+        false,
+    ));
+    let observed = snapshot(vec![failed]);
+    let before = &observed.records[0];
+    let value = publisher_diagnostic(&observed, before);
+    assert_eq!(value["event"], serde_json::json!(publisher_event(true)));
+    assert!(value["detail"].is_null());
+    assert!(
+        !serde_json::to_string(&value)
+            .unwrap()
+            .contains("private-user-path")
+    );
+    assert_eq!(value["state"], "first-retained-publisher-error-observed");
+    assert_eq!(value["current_file_binding"], false);
+    assert_eq!(value["retirement_proof"], false);
+    assert_eq!(value["later_persistence_errors_substituted"], false);
+    for field in ["attempt", "request", "generation", "owner"] {
+        let mut changed = observed.clone();
+        let source = &mut changed.records[0]
+            .publisher_failure
+            .as_mut()
+            .unwrap()
+            .binding;
+        match field {
+            "attempt" => {
+                source.attempt_id = String::from(memcordon_core::hash_bytes(b"other-attempt"))
+            }
+            "request" => {
+                source.request_sha256 = String::from(memcordon_core::hash_bytes(b"other-request"))
+            }
+            "generation" => source.generation += 1,
+            "owner" => source.owner.as_mut().unwrap().birth += 1,
+            _ => unreachable!(),
+        }
+        let value = publisher_diagnostic(&changed, &changed.records[0]);
+        assert_eq!(value["state"], "unavailable-tuple-mismatch", "{field}");
+        assert!(value["event"].is_null());
+        assert!(value["detail"].is_null());
+    }
+    for state in [
+        Availability::Busy,
+        Availability::Poisoned,
+        Availability::Cutoff,
+    ] {
+        let mut unavailable = observed.clone();
+        unavailable.registry = state;
+        assert_eq!(
+            publisher_diagnostic(&unavailable, &unavailable.records[0])["state"],
+            "unavailable-registry"
+        );
+    }
+    let mut late = observed.clone();
+    late.completed_before_cutoff = false;
+    assert_eq!(
+        publisher_diagnostic(&late, &late.records[0])["state"],
+        "unavailable-original-cutoff"
+    );
+    let mut removed = observed.clone();
+    removed.records[0].registry_present = Some(false);
+    assert_eq!(
+        publisher_diagnostic(&removed, &removed.records[0])["state"],
+        "unavailable-local-lane-not-retained"
+    );
+    let mut absent = observed.clone();
+    absent.records[0].publisher_failure = None;
+    assert_eq!(
+        publisher_diagnostic(&absent, &absent.records[0])["state"],
+        "not-observed-for-local-lane"
+    );
+    assert_eq!(observed.records[0].quarantined, Some(true));
+    assert_eq!(observed.records[0].pending, Some(0));
+    assert_eq!(observed.records[0].history.stage, Stage::PublicationFailed);
+    assert_eq!(observed.records[0].history.last_native_error, Some(5));
+}
+
+#[test]
+fn publisher_detail_truncation_and_outer_omissions_preserve_fixed_report_bound() {
+    let mut failed = row(registered());
+    failed.publisher_failure = Some(PublisherFailureSnapshot::retained(
+        failed.history.binding.clone(),
+        &publisher_event(false),
+        &"界".repeat(2000),
+        false,
+    ));
+    let failure = failed.publisher_failure.as_ref().unwrap();
+    assert!(failure.detail.len() <= PUBLISHER_DETAIL_BYTES);
+    assert!(failure.truncated);
+    assert!(failure.detail.is_char_boundary(failure.detail.len()));
+    let observed = snapshot(vec![failed.clone()]);
+    let value = publisher_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(value["detail"], failure.detail);
+    assert_eq!(value["detail_truncated"], true);
+    assert!(value["original_detail_total_bytes"].is_null());
+    let value = diagnostic(&snapshot(vec![failed; OUTPUT_ROWS]), &[]);
+    assert!(serde_json::to_vec(&value).unwrap().len() <= RECORD_BYTES);
+    assert!(value["records_omitted"].as_u64().unwrap() > 0);
+    let mut source_truncated = row(registered());
+    source_truncated.publisher_failure = Some(PublisherFailureSnapshot::retained(
+        source_truncated.history.binding.clone(),
+        &publisher_event(false),
+        "already shortened",
+        true,
+    ));
+    let value = publisher_diagnostic(&snapshot(vec![source_truncated.clone()]), &source_truncated);
+    assert_eq!(value["detail_truncated"], true);
+}
+
+#[test]
+fn transport_substage_is_last_observed_for_exact_tuple_and_keeps_outer_driver_and_cutoffs() {
+    use frame_write::{ProgressOutcome, ProgressPhase, WriteProgress};
+    use std::time::{Duration, Instant};
+    let sampled = Instant::now();
+    let outer = sampled + Duration::from_secs(10);
+    let inner = sampled + Duration::from_secs(20);
+    let mut history = registered();
+    history.transition(Stage::PublicationCompleted, None);
+    history.driver_transition(DriverPhase::TerminalDelivery, DriverOutcome::Attempted);
+    let source = history.snapshot().binding;
+    let before = history.snapshot();
+    let attempted = WriteProgress {
+        phase: ProgressPhase::PayloadWrite,
+        outcome: ProgressOutcome::Attempted,
+        expected_bytes: Some(20),
+        transferred_bytes: 5,
+        native_code: None,
+        observed_write_count: None,
+        native_call_succeeded: None,
+    };
+    assert!(history.transport_transition(
+        &source,
+        TransportUpdate {
+            progress: attempted,
+            outer_cutoff: outer,
+            inner_cutoff: inner
+        }
+    ));
+    let after = history.snapshot();
+    assert_eq!(after.stage, before.stage);
+    assert_eq!(
+        after.last_driver_event.as_ref().unwrap().outcome,
+        DriverOutcome::Attempted
+    );
+    assert!(!after.admission_retired);
+    assert!(!after.removed);
+    let mut observed = snapshot(vec![row(history)]);
+    observed.sampled_at = Some(sampled);
+    let value = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(value["last_observed"]["progress"]["outcome"], "attempted");
+    assert_eq!(value["last_observed"]["progress"]["transferred_bytes"], 5);
+    assert!(value["last_observed"]["progress"]["observed_write_count"].is_null());
+    assert_eq!(
+        value["last_observed"]["selected_outer_cutoff_remaining_millis_at_sample"],
+        10000
+    );
+    assert_eq!(
+        value["last_observed"]["selected_inner_cutoff_remaining_millis_at_sample"],
+        20000
+    );
+    assert!(value["last_observed"]["stage_qpc"].is_null());
+    assert_eq!(value["current_blocking_api_proved"], false);
+    assert_eq!(value["retained_worker_thread_is_context_only"], true);
+    assert!(value["executing_io_thread_identity"].is_null());
+    observed.sampled_at = Some(inner + Duration::from_secs(1));
+    observed.completed_before_cutoff = false;
+    let value = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(
+        value["last_observed"]["outer_cutoff_expired_at_sample"],
+        true
+    );
+    assert_eq!(
+        value["last_observed"]["inner_cutoff_expired_at_sample"],
+        true
+    );
+    assert_eq!(value["sample_completed_before_original_cutoff"], false);
+    observed.sampled_at = None;
+    assert!(transport_diagnostic(&observed,&observed.records[0])["last_observed"]["inner_cutoff_expired_at_sample"].is_null());
+}
+
+#[test]
+fn transport_partial_failure_and_foreign_or_dropped_updates_never_mint_completion() {
+    use frame_write::{ProgressOutcome, ProgressPhase, WriteProgress};
+    use std::time::{Duration, Instant};
+    let cutoff = Instant::now() + Duration::from_secs(2);
+    let mut history = registered();
+    let source = history.snapshot().binding;
+    let failure = WriteProgress {
+        phase: ProgressPhase::HeaderWrite,
+        outcome: ProgressOutcome::ReturnedError,
+        expected_bytes: Some(4),
+        transferred_bytes: 2,
+        native_code: Some(232),
+        observed_write_count: Some(1),
+        native_call_succeeded: Some(false),
+    };
+    let update = TransportUpdate {
+        progress: failure,
+        outer_cutoff: cutoff,
+        inner_cutoff: cutoff,
+    };
+    assert!(history.transport_transition(&source, update));
+    for field in ["request", "attempt", "generation", "owner"] {
+        let mut foreign = source.clone();
+        match field {
+            "request" => {
+                foreign.request_sha256 =
+                    String::from(memcordon_core::hash_bytes(b"foreign request"))
+            }
+            "attempt" => {
+                foreign.attempt_id = String::from(memcordon_core::hash_bytes(b"foreign attempt"))
+            }
+            "generation" => foreign.generation += 1,
+            "owner" => foreign.owner.as_mut().unwrap().birth += 1,
+            _ => unreachable!(),
+        }
+        assert!(!history.transport_transition(&foreign, update));
+    }
+    let finish = WriteProgress {
+        phase: ProgressPhase::WatcherFinish,
+        outcome: ProgressOutcome::ReturnedOk,
+        expected_bytes: None,
+        transferred_bytes: 0,
+        native_code: None,
+        observed_write_count: None,
+        native_call_succeeded: None,
+    };
+    assert!(history.transport_transition(
+        &source,
+        TransportUpdate {
+            progress: finish,
+            ..update
+        }
+    ));
+    let mut observed = snapshot(vec![row(history)]);
+    observed.dropped = 3;
+    observed.changed = true;
+    let value = transport_diagnostic(&observed, &observed.records[0]);
+    assert_eq!(value["first_failure"]["progress"]["native_code"], 232);
+    assert_eq!(value["first_failure"]["progress"]["transferred_bytes"], 2);
+    assert_eq!(
+        value["last_observed"]["progress"]["phase"],
+        "watcher-finish"
+    );
+    assert_eq!(value["updates_rejected"], 4);
+    assert_eq!(value["global_diagnostic_updates_dropped"], 3);
+    assert_eq!(value["updates_complete"], false);
+    assert_eq!(value["retirement_proof"], false);
+    assert!(!observed.records[0].history.admission_retired);
+    assert!(observed.records[0].history.last_driver_event.is_none());
+    let mut rebound = registered();
+    let source = rebound.snapshot().binding;
+    assert!(rebound.transport_transition(&source, update));
+    rebound.bind_owner(Owner {
+        birth: owner().birth + 1,
+        ..owner()
+    });
+    let rebound = snapshot(vec![row(rebound)]);
+    assert!(rebound.records[0].history.binding_changed);
+    assert_eq!(
+        transport_diagnostic(&rebound, &rebound.records[0])["state"],
+        "unavailable-producer-tuple"
+    );
+    let rendered = diagnostic(&observed, &[]);
+    assert!(serde_json::to_vec(&rendered).unwrap().len() <= RECORD_BYTES);
 }
 
 #[test]

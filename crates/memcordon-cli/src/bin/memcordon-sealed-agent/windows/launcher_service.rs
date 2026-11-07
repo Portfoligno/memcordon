@@ -1900,8 +1900,10 @@ fn handle_control(
                             let terminal_transport = pipe::SynchronousIoDeadline::start(
                                 Instant::now() + Duration::from_secs(30),
                             )?;
-                            driver(&attempt_id, &request_sha256, DriverPhase::TerminalDelivery)
-                                .run(|| pipe::write_frame(connection, &response)).map_err(|secondary| {
+                            let delivery =
+                                driver(&attempt_id, &request_sha256, DriverPhase::TerminalDelivery);
+                            let progress = delivery.transport();
+                            delivery.run(||pipe::write_frame_observed(connection,&response,terminal_transport.cutoff(),|update|progress.record(update))).map_err(|secondary| {
                                 format!(
                                     "{primary_detail}; secondary bound rejection delivery failure: {secondary}"
                                 )
@@ -4111,12 +4113,20 @@ fn launch_attempt(
             pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))
                 .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
         (|| -> Result<(), String> {
-            driver(
+            let delivery = driver(
                 &request.attempt_id,
                 &request.request_sha256,
                 DriverPhase::TerminalDelivery,
-            )
-            .run(|| pipe::write_frame(connection, &response))?;
+            );
+            let progress = delivery.transport();
+            delivery.run(|| {
+                pipe::write_frame_observed(
+                    connection,
+                    &response,
+                    terminal_transport.cutoff(),
+                    |update| progress.record(update),
+                )
+            })?;
             Ok(())
         })()
         .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;

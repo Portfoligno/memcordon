@@ -124,6 +124,11 @@ fn closed_native_pipe_retains_actual_write_error() {
 
 #[cfg(feature = "test-support")]
 fn pumped_frame_pipe_pair() -> (OwnedHandle, OwnedHandle) {
+    frame_pipe_pair(true)
+}
+
+#[cfg(feature = "test-support")]
+fn frame_pipe_pair(overlapped: bool) -> (OwnedHandle, OwnedHandle) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = wide_null(&format!(
         r"\\.\pipe\memcordon-pumped-frame-test-{}-{}",
@@ -135,7 +140,7 @@ fn pumped_frame_pipe_pair() -> (OwnedHandle, OwnedHandle) {
     let server = OwnedHandle::new(unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_ACCESS_DUPLEX | if overlapped { FILE_FLAG_OVERLAPPED } else { 0 },
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             256,
@@ -161,13 +166,221 @@ fn pumped_frame_pipe_pair() -> (OwnedHandle, OwnedHandle) {
     })
     .unwrap();
     // SAFETY: the current-process pseudo-handle is only borrowed by accept.
-    let server = accept_target_desktop_bootstrap_pipe(
-        server,
-        unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() },
-        std::time::Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap();
+    let server = if overlapped {
+        accept_target_desktop_bootstrap_pipe(
+            server,
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() },
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap()
+    } else {
+        let connected = unsafe { ConnectNamedPipe(server.raw(), ptr::null_mut()) };
+        let error = if connected == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        assert!(
+            connected != 0
+                || error.as_ref().and_then(io::Error::raw_os_error)
+                    == Some(ERROR_PIPE_CONNECTED as i32)
+        );
+        server
+    };
     (server, client)
+}
+
+#[cfg(feature = "test-support")]
+struct ProgressThread<T> {
+    handle: Option<std::thread::JoinHandle<T>>,
+    cutoff: std::time::Instant,
+}
+#[cfg(feature = "test-support")]
+impl<T> ProgressThread<T> {
+    fn new(handle: std::thread::JoinHandle<T>, cutoff: std::time::Instant) -> Self {
+        Self {
+            handle: Some(handle),
+            cutoff,
+        }
+    }
+    fn take_retired(&mut self) -> Option<std::thread::Result<T>> {
+        use std::os::windows::io::AsRawHandle;
+        loop {
+            if std::time::Instant::now() >= self.cutoff {
+                return None;
+            }
+            // Query only the retained actual thread object inside the original
+            // test settlement cutoff, before consuming the owner in join.
+            let status = unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(
+                    self.handle.as_ref().unwrap().as_raw_handle(),
+                    0,
+                )
+            };
+            if std::time::Instant::now() >= self.cutoff {
+                return None;
+            }
+            if status == WAIT_OBJECT_0 {
+                return Some(self.handle.take().unwrap().join());
+            }
+            if status != WAIT_TIMEOUT {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn join(mut self) -> T {
+        match self.take_retired() {
+            Some(Ok(value)) => value,
+            Some(Err(_)) => panic!("native progress thread panicked"),
+            None => {
+                std::mem::forget(self.handle.take().unwrap());
+                panic!(
+                    "native progress thread retirement unproved; original owner retained for test process lifetime"
+                );
+            }
+        }
+    }
+}
+#[cfg(feature = "test-support")]
+impl<T> Drop for ProgressThread<T> {
+    fn drop(&mut self) {
+        if self.handle.is_some() && self.take_retired().is_none() {
+            std::mem::forget(self.handle.take().unwrap());
+            if !std::thread::panicking() {
+                panic!("unsettled native progress test owner retained");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn terminal_progress_with_nonreading_client_keeps_drain_and_watcher_results_honest() {
+    use super::super::frame_write::{ProgressOutcome, ProgressPhase};
+    let started = std::time::Instant::now();
+    let io_cutoff = started + Duration::from_secs(2);
+    let test_cutoff = started + Duration::from_secs(5);
+    let (server, client) = frame_pipe_pair(false);
+    let (sent, received) = std::sync::mpsc::sync_channel(32);
+    let writer = ProgressThread::new(
+        std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let result = write_frame_detailed_observed_until(
+                server.raw(),
+                &"bounded terminal response",
+                io_cutoff,
+                &mut |progress| {
+                    let _ = sent.try_send(progress);
+                    events.push(progress);
+                },
+            );
+            (result, events)
+        }),
+        test_cutoff,
+    );
+    let mut drain_observed = false;
+    while let Ok(event) =
+        received.recv_timeout(io_cutoff.saturating_duration_since(std::time::Instant::now()))
+    {
+        if event.phase == ProgressPhase::Drain && event.outcome == ProgressOutcome::Attempted {
+            drain_observed = true;
+            break;
+        }
+    }
+    // Keep the actual client open without reading through the selected write
+    // cutoff. Closing it is test teardown, never a production transport repair.
+    std::thread::sleep(io_cutoff.saturating_duration_since(std::time::Instant::now()));
+    drop(client);
+    let (result, events) = writer.join();
+    assert!(drain_observed);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.phase == ProgressPhase::WatcherFinish
+                && event.outcome == ProgressOutcome::Attempted)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.phase == ProgressPhase::WatcherFinish
+                && event.outcome != ProgressOutcome::Attempted)
+    );
+    if let Err(error) = result {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.outcome == ProgressOutcome::ReturnedError)
+        );
+        if let Some(code) = error.native_code {
+            assert!(events.iter().any(|event| event.native_code == Some(code)));
+        }
+    } else {
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.outcome == ProgressOutcome::ReturnedError)
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn terminal_progress_cutoff_racing_client_read_preserves_actual_result_and_owner_settlement() {
+    use super::super::frame_write::{ProgressOutcome, ProgressPhase};
+    let started = std::time::Instant::now();
+    let io_cutoff = started + Duration::from_secs(2);
+    let test_cutoff = started + Duration::from_secs(5);
+    let (server, client) = frame_pipe_pair(false);
+    let reader = ProgressThread::new(
+        std::thread::spawn(move || {
+            std::thread::sleep(io_cutoff.saturating_duration_since(std::time::Instant::now()));
+            read_frame_until::<String>(client.raw(), test_cutoff)
+        }),
+        test_cutoff,
+    );
+    let writer = ProgressThread::new(
+        std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let result = write_frame_detailed_observed_until(
+                server.raw(),
+                &"unchanged race payload",
+                io_cutoff,
+                &mut |progress| events.push(progress),
+            );
+            (result, events)
+        }),
+        test_cutoff,
+    );
+    let (result, events) = writer.join();
+    let read = reader.join();
+    if let Ok(payload) = read {
+        assert_eq!(payload, "unchanged race payload");
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.phase == ProgressPhase::Serialize
+                && event.outcome == ProgressOutcome::Attempted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.phase == ProgressPhase::WatcherFinish
+                && event.outcome == ProgressOutcome::Attempted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        result.is_ok(),
+        !events
+            .iter()
+            .any(|event| event.outcome == ProgressOutcome::ReturnedError)
+    );
+    // The race outcome is actual I/O evidence, not proof that an individual
+    // returned stage completed before its deadline or that an ACK was received.
 }
 
 #[cfg(feature = "test-support")]

@@ -1,13 +1,16 @@
 //! Bounded historical producer observations. No value grants settlement authority.
+use super::frame_write::{ProgressOutcome, WriteProgress};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 pub const HISTORY_EVENTS: usize = 16;
 pub const JOURNAL_RECORDS: usize = 16;
 pub const OUTPUT_ROWS: usize = 8;
 pub const NAME_TOKENS: usize = 8;
 pub const RECORD_BYTES: usize = 8192;
+pub const PUBLISHER_DETAIL_BYTES: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Owner {
@@ -79,6 +82,17 @@ pub struct DriverEvent {
     pub phase: DriverPhase,
     pub outcome: DriverOutcome,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct TransportUpdate {
+    pub progress: WriteProgress,
+    pub outer_cutoff: Instant,
+    pub inner_cutoff: Instant,
+}
+#[derive(Clone, Debug)]
+pub struct TransportEvent {
+    pub sequence: u64,
+    pub update: TransportUpdate,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub sequence: u64,
@@ -103,6 +117,12 @@ pub struct HistoryRecord {
     pub admission_retired: bool,
     pub last_driver_event: Option<DriverEvent>,
     pub first_driver_failure: Option<DriverEvent>,
+    #[serde(skip)]
+    pub last_transport_event: Option<TransportEvent>,
+    #[serde(skip)]
+    pub first_transport_failure: Option<TransportEvent>,
+    pub transport_updates: u64,
+    pub transport_updates_rejected: u64,
 }
 pub struct History {
     record: HistoryRecord,
@@ -129,6 +149,10 @@ impl History {
                 admission_retired: false,
                 last_driver_event: None,
                 first_driver_failure: None,
+                last_transport_event: None,
+                first_transport_failure: None,
+                transport_updates: 0,
+                transport_updates_rejected: 0,
             },
             events: VecDeque::new(),
         };
@@ -194,6 +218,26 @@ impl History {
         record.events = self.events.iter().cloned().collect();
         record
     }
+    pub fn transport_transition(&mut self, source: &Binding, update: TransportUpdate) -> bool {
+        if source != &self.record.binding || source.owner.is_none() || self.record.binding_changed {
+            self.record.transport_updates_rejected =
+                self.record.transport_updates_rejected.saturating_add(1);
+            return false;
+        }
+        self.bump();
+        let event = TransportEvent {
+            sequence: self.record.sequence,
+            update,
+        };
+        self.record.transport_updates = self.record.transport_updates.saturating_add(1);
+        if update.progress.outcome == ProgressOutcome::ReturnedError
+            && self.record.first_transport_failure.is_none()
+        {
+            self.record.first_transport_failure = Some(event.clone());
+        }
+        self.record.last_transport_event = Some(event);
+        true
+    }
 
     pub fn driver_transition(&mut self, phase: DriverPhase, outcome: DriverOutcome) {
         self.bump();
@@ -239,12 +283,39 @@ pub enum ThreadObservation {
     Cutoff,
 }
 #[derive(Clone, Debug)]
+pub struct PublisherFailureSnapshot {
+    pub binding: Binding,
+    pub event: memcordon_core::CausalEventV1,
+    pub detail: String,
+    pub truncated: bool,
+}
+impl PublisherFailureSnapshot {
+    pub fn retained(
+        binding: Binding,
+        event: &memcordon_core::CausalEventV1,
+        detail: &str,
+        truncated: bool,
+    ) -> Self {
+        let mut end = detail.len().min(PUBLISHER_DETAIL_BYTES);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            binding,
+            event: event.clone(),
+            detail: detail[..end].into(),
+            truncated: truncated || end != detail.len(),
+        }
+    }
+}
+#[derive(Clone, Debug)]
 pub struct WriterSnapshot {
     pub history: HistoryRecord,
     pub registry_present: Option<bool>,
     pub pending: Option<usize>,
     pub quarantined: Option<bool>,
     pub publisher_native_code: Option<u32>,
+    pub publisher_failure: Option<PublisherFailureSnapshot>,
     pub thread: ThreadObservation,
     pub changed: bool,
 }
@@ -261,6 +332,7 @@ pub struct Snapshot {
     pub dropped: u64,
     pub changed: bool,
     pub completed_before_cutoff: bool,
+    pub sampled_at: Option<Instant>,
 }
 fn digest(value: &str) -> bool {
     value.len() == String::from(memcordon_core::hash_bytes(&[])).len()
@@ -349,6 +421,93 @@ pub fn filename_correlations(snapshot: &Snapshot, tokens: &[String]) -> Value {
 }
 
 /// Inputs are primitive copies from a bounded nonblocking observation, never lanes or handles.
+pub fn publisher_diagnostic(snapshot: &Snapshot, row: &WriterSnapshot) -> Value {
+    let unavailable = |reason| json!({"state":reason,"detail_omitted":true,"current_file_binding":false,"retirement_proof":false});
+    if !snapshot.completed_before_cutoff {
+        return unavailable("unavailable-original-cutoff");
+    }
+    if snapshot.registry != Availability::Available {
+        return unavailable("unavailable-registry");
+    }
+    if snapshot.history != Availability::Available {
+        return unavailable("unavailable-history");
+    }
+    if row.registry_present != Some(true) {
+        return unavailable("unavailable-local-lane-not-retained");
+    }
+    let Some(failure) = &row.publisher_failure else {
+        return unavailable("not-observed-for-local-lane");
+    };
+    if !valid(&row.history)
+        || row.history.binding_changed
+        || failure.binding != row.history.binding
+        || failure.binding.owner.is_none()
+        || failure.binding.owner != snapshot.current_owner
+    {
+        return unavailable("unavailable-tuple-mismatch");
+    }
+    let mut end = failure.detail.len().min(PUBLISHER_DETAIL_BYTES);
+    while !failure.detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({"state":"first-retained-publisher-error-observed","binding":failure.binding,
+        "event":failure.event,"detail":(!failure.event.detail_redacted).then(||&failure.detail[..end]),
+        "detail_redacted":failure.event.detail_redacted,"retained_detail_bytes":failure.detail.len(),
+        "detail_truncated":failure.truncated||end!=failure.detail.len(),"detail_limit_bytes":PUBLISHER_DETAIL_BYTES,
+        "original_detail_total_bytes":null,"later_persistence_errors_substituted":false,
+        "sample_changed":snapshot.changed||row.changed,"independent_samples_not_atomic":true,
+        "current_file_binding":false,"retirement_proof":false})
+}
+
+pub fn transport_diagnostic(snapshot: &Snapshot, row: &WriterSnapshot) -> Value {
+    fn event(value: Option<&TransportEvent>, sampled: Option<Instant>) -> Value {
+        let Some(value) = value else {
+            return json!({"state":"not-observed"});
+        };
+        let remaining = |cutoff: Instant| {
+            sampled
+                .and_then(|at| u64::try_from(cutoff.saturating_duration_since(at).as_millis()).ok())
+        };
+        json!({"sequence":value.sequence,"progress":value.update.progress,
+            "selected_outer_cutoff_remaining_millis_at_sample":remaining(value.update.outer_cutoff),
+            "selected_inner_cutoff_remaining_millis_at_sample":remaining(value.update.inner_cutoff),
+            "outer_cutoff_expired_at_sample":sampled.map(|at|at>=value.update.outer_cutoff),
+            "inner_cutoff_expired_at_sample":sampled.map(|at|at>=value.update.inner_cutoff),
+            "outer_cutoff_not_after_inner":value.update.outer_cutoff<=value.update.inner_cutoff,
+            "stage_qpc":null,"stage_timestamp_unavailable":true})
+    }
+    let history = &row.history;
+    if !valid(history)
+        || history.binding_changed
+        || history.binding.owner.is_none()
+        || history.binding.owner != snapshot.current_owner
+    {
+        return json!({"state":"unavailable-producer-tuple","retirement_proof":false});
+    }
+    let retained = u64::from(history.last_transport_event.is_some())
+        + u64::from(
+            history
+                .first_transport_failure
+                .as_ref()
+                .is_some_and(|failure| {
+                    history
+                        .last_transport_event
+                        .as_ref()
+                        .is_none_or(|last| last.sequence != failure.sequence)
+                }),
+        );
+    json!({"state":"historical-last-observed-substage-only","binding":history.binding,
+        "last_observed":event(history.last_transport_event.as_ref(),snapshot.sampled_at),
+        "first_failure":event(history.first_transport_failure.as_ref(),snapshot.sampled_at),
+        "updates_observed":history.transport_updates,"updates_omitted":history.transport_updates.saturating_sub(retained),
+        "updates_rejected":history.transport_updates_rejected,"global_diagnostic_updates_dropped":snapshot.dropped,"updates_complete":false,
+        "executing_io_thread_identity":null,"driver_thread_identity_unavailable":true,
+        "retained_worker_thread_is_context_only":true,"current_blocking_api_proved":false,
+        "sample_changed":snapshot.changed||row.changed,"sample_completed_before_original_cutoff":snapshot.completed_before_cutoff,
+        "registry_state":snapshot.registry,"history_state":snapshot.history,
+        "current_file_binding":false,"retirement_proof":false,"acceptance_authority":false})
+}
+
 pub fn diagnostic(snapshot: &Snapshot, writer_tokens: &[String]) -> Value {
     let mut rows = Vec::new();
     let mut selected = Vec::new();
@@ -382,7 +541,9 @@ pub fn diagnostic(snapshot: &Snapshot, writer_tokens: &[String]) -> Value {
                 "registry_removed":history.removed,"admission_retirement_returned_ok":history.admission_retired,
                 "events_omitted":history.omitted_events.saturating_add(history.events.len() as u64),
                 "binding_changed":history.binding_changed,"registry_present":row.registry_present,
-                "pending":row.pending,"quarantined":row.quarantined,"publisher_native_code":row.publisher_native_code,"thread":row.thread,"changed":row.changed,
+                "pending":row.pending,"quarantined":row.quarantined,"publisher_native_code":row.publisher_native_code,
+                "publisher_error":publisher_diagnostic(snapshot,row),"thread":row.thread,"changed":row.changed,
+                "terminal_transport":transport_diagnostic(snapshot,row),
                 "current_file_binding":false,"retirement_proof":false})
         } else {json!({"invalid_record":true,"binding_omitted":true,"retirement_proof":false})});
     }

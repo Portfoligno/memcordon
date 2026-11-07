@@ -6,7 +6,7 @@ use super::writer_lifecycle::{
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, LazyLock, Mutex, Weak,
+        Arc, LazyLock, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     thread::JoinHandle,
@@ -29,11 +29,21 @@ struct Journal {
 pub(super) struct Cell {
     pub generation: u64,
     attempt_id: String,
+    source_binding: Binding,
+    source_owner: OnceLock<Owner>,
     state: Mutex<State>,
 }
 struct State {
     history: History,
     thread: Option<JoinHandle<()>>,
+}
+impl Cell {
+    pub(super) fn publisher_binding(&self) -> Binding {
+        Binding {
+            owner: self.source_owner.get().copied(),
+            ..self.source_binding.clone()
+        }
+    }
 }
 
 fn dropped() {
@@ -68,15 +78,18 @@ pub(super) fn begin(attempt_id: &str, request_sha256: &str) {
         journal.cells.pop_front();
         journal.evicted = journal.evicted.saturating_add(1);
     }
-    let history = History::new(Binding {
+    let binding = Binding {
         attempt_id: attempt_id.into(),
         request_sha256: request_sha256.into(),
         owner: None,
         generation,
-    });
+    };
+    let history = History::new(binding.clone());
     journal.cells.push_back(Arc::new(Cell {
         generation,
         attempt_id: attempt_id.into(),
+        source_binding: binding,
+        source_owner: OnceLock::new(),
         state: Mutex::new(State {
             history,
             thread: None,
@@ -109,6 +122,7 @@ pub(super) fn bind_owner(attempt_id: &str, owner: Owner) {
     };
     if let Ok(mut state) = cell.state.try_lock() {
         state.history.bind_owner(owner);
+        let _ = cell.source_owner.set(owner);
         changed();
     } else {
         dropped();
@@ -166,6 +180,15 @@ pub(super) fn driver(
 }
 
 impl DriverObservation {
+    pub(super) fn transport(&self) -> TransportObservation {
+        TransportObservation {
+            cell: if self.phase == DriverPhase::TerminalDelivery {
+                self.cell.clone()
+            } else {
+                None
+            },
+        }
+    }
     fn record(&self, outcome: DriverOutcome) {
         if let Some(cell) = self.cell.as_ref().and_then(Weak::upgrade) {
             if let Ok(mut state) = cell.state.try_lock() {
@@ -188,6 +211,28 @@ impl DriverObservation {
         result
     }
 }
+pub(super) struct TransportObservation {
+    cell: Option<Weak<Cell>>,
+}
+impl TransportObservation {
+    pub(super) fn record(&self, update: model::TransportUpdate) {
+        let Some(cell) = self.cell.as_ref().and_then(Weak::upgrade) else {
+            dropped();
+            return;
+        };
+        if let Ok(mut state) = cell.state.try_lock() {
+            if !state
+                .history
+                .transport_transition(&cell.publisher_binding(), update)
+            {
+                dropped();
+            }
+            changed();
+        } else {
+            dropped();
+        }
+    }
+}
 
 pub(super) fn retain_thread(cell: &Option<Arc<Cell>>, handle: JoinHandle<()>) {
     if let Some(cell) = cell {
@@ -208,6 +253,7 @@ pub(super) struct Local {
     pub pending: usize,
     pub quarantined: bool,
     pub publisher_native_code: Option<u32>,
+    pub publisher_failure: Option<model::PublisherFailureSnapshot>,
 }
 pub(super) struct LocalRegistry {
     pub availability: Availability,
@@ -291,6 +337,7 @@ pub(super) fn snapshot(cutoff: Instant, local: impl FnOnce() -> LocalRegistry) -
             pending: found.map(|row| row.pending),
             quarantined: found.map(|row| row.quarantined),
             publisher_native_code: found.and_then(|row| row.publisher_native_code),
+            publisher_failure: found.and_then(|row| row.publisher_failure.clone()),
             thread: match &state.thread {
                 Some(handle) => thread_observation(handle, cutoff),
                 None => ThreadObservation::NoHandle,
@@ -301,7 +348,9 @@ pub(super) fn snapshot(cutoff: Instant, local: impl FnOnce() -> LocalRegistry) -
     output.changed |= before != SEQUENCE.load(Ordering::Acquire)
         || output.dropped != DROPPED.load(Ordering::Acquire);
     output.dropped = DROPPED.load(Ordering::Acquire);
-    output.completed_before_cutoff = Instant::now() < cutoff;
+    let sampled_at = Instant::now();
+    output.sampled_at = Some(sampled_at);
+    output.completed_before_cutoff = sampled_at < cutoff;
     output
 }
 
