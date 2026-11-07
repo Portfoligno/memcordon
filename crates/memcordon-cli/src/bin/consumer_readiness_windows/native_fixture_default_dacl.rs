@@ -238,10 +238,15 @@ impl Snapshot {
         self.default_acl.as_deref()
     }
     pub(super) fn measurement(&self) -> serde_json::Value {
+        use sha2::Digest;
+        let default_acl_sha256 = self
+            .default_acl
+            .as_deref()
+            .map(|bytes| -> [u8; 32] { sha2::Sha256::digest(bytes).into() });
         serde_json::json!({"envelope":self.stable.envelope,"token_id":self.stable.token_id,
             "expiration":self.stable.expiration,"group_count":self.stable.group_count,"privilege_count":self.stable.privilege_count,
             "modified_id":self.modified_id,"default_acl_bytes":self.default_acl.as_ref().map(Vec::len),
-            "default_acl_sha256":self.default_acl.as_deref().map(super::descriptor::controller_start::descriptor_digest)})
+            "default_acl_sha256":default_acl_sha256})
     }
 }
 
