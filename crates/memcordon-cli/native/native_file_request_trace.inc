@@ -332,8 +332,6 @@ static bool native_file_system_inventory(void* anchor,uint64_t cutoff,uint64_t f
 }
 // These normal imports exist solely for the selected native selfcheck. Their
 // two read-only invalid-name calls never run in the original workload path.
-extern "C" NTSYSAPI NTSTATUS NTAPI NtCreateFile(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,PIO_STATUS_BLOCK,PLARGE_INTEGER,ULONG,ULONG,ULONG,ULONG,PVOID,ULONG);
-extern "C" NTSYSAPI NTSTATUS NTAPI NtOpenFile(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,PIO_STATUS_BLOCK,ULONG,ULONG);
 static_assert(std::is_same_v<decltype(&NtCreateFile),NativeCreateFile>,"NtCreateFile exact forwarding ABI");
 static_assert(std::is_same_v<decltype(&NtOpenFile),NativeOpenFile>,"NtOpenFile exact forwarding ABI");
 static __declspec(noinline) NTSTATUS native_file_direct_open(PHANDLE output,POBJECT_ATTRIBUTES attributes,PIO_STATUS_BLOCK io){return NtOpenFile(output,FILE_READ_ATTRIBUTES,attributes,io,7,0);}
