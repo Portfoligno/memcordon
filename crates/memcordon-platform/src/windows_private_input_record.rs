@@ -10,6 +10,7 @@ pub enum ObjectRole {
     Fixture,
     Provider,
     LocalDirectory,
+    LocalMarkerFile,
     InputDirectory,
     OwnedBase,
 }

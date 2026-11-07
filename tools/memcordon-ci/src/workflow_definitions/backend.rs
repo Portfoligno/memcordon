@@ -8,7 +8,12 @@ pub(super) fn definition() -> Value {
 
 /// A sibling experiment keeps original mandatory consumers independent and
 /// reuses the same owned driver/payload preparation without new cache cases.
-fn provider_input_experiment_job(mut job: Value) -> Value {
+fn provider_input_experiment_job(mut job: Value, dot_local_file: bool) -> Value {
+    let directory = if dot_local_file {
+        "provider-file-input-experiment"
+    } else {
+        "provider-input-experiment"
+    };
     job["strategy"]["matrix"]["include"]
         .as_sequence_mut()
         .expect("installed matrix")
@@ -31,16 +36,18 @@ fn provider_input_experiment_job(mut job: Value) -> Value {
         })
         .expect("native consumer step");
     selected["id"] = text("provider-input-experiment");
-    selected["run"] = text(
-        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-input-experiment",
-    );
+    selected["run"] = text(if dot_local_file {
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-file-input-experiment --dot-local-file"
+    } else {
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-input-experiment"
+    });
     let mut with = serde_yaml::Mapping::new();
     with.insert(
         text("name"),
-        text("provider-input-experiment-${{ matrix.id }}"),
+        text(&format!("{directory}-${{{{ matrix.id }}}}")),
     );
-    let mut paths = String::from(
-        "target/ci/provider-input-experiment/cases/provider-input-experiment.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/declaration.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/result.json\ntarget/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/*.json",
+    let mut paths = format!(
+        "target/ci/{directory}/cases/provider-input-experiment.json\ntarget/ci/{directory}/cases/provider-input-experiment/*/declaration.json\ntarget/ci/{directory}/cases/provider-input-experiment/*/result.json\ntarget/ci/{directory}/cases/provider-input-experiment/*/facts/*.json",
     );
     for leaf in [
         "result.stdout.bin",
@@ -50,12 +57,12 @@ fn provider_input_experiment_job(mut job: Value) -> Value {
     ] {
         paths.push('\n');
         paths.push_str(&format!(
-            "target/ci/provider-input-experiment/cases/provider-input-experiment/*/facts/{leaf}"
+            "target/ci/{directory}/cases/provider-input-experiment/*/facts/{leaf}"
         ));
     }
     paths.push('\n');
     paths.push_str(&crate::installed_failure_carriers::package_cleanup_paths(
-        "target/ci/provider-input-experiment/cases",
+        &format!("target/ci/{directory}/cases"),
     ));
     with.insert(text("path"), text(&paths));
     with.insert(text("if-no-files-found"), text("warn"));
@@ -132,11 +139,19 @@ fn node_4() -> Value {
     values.insert(text("macos-administrative-contracts"), node_1543());
     values.insert(
         text("windows-provider-input-experiment-x64"),
-        provider_input_experiment_job(node_602()),
+        provider_input_experiment_job(node_602(), false),
     );
     values.insert(
         text("windows-provider-input-experiment-arm64"),
-        provider_input_experiment_job(node_701()),
+        provider_input_experiment_job(node_701(), false),
+    );
+    values.insert(
+        text("windows-provider-file-input-experiment-x64"),
+        provider_input_experiment_job(node_602(), true),
+    );
+    values.insert(
+        text("windows-provider-file-input-experiment-arm64"),
+        provider_input_experiment_job(node_701(), true),
     );
     Value::Mapping(values)
 }

@@ -1,6 +1,6 @@
 //! Private owned workload inputs. These are never provider authorization.
 pub use memcordon_platform::windows_private_fixture_binding::{
-    PrivateFixtureAncestor, PrivateFixtureBinding,
+    DotLocalInput, PrivateFixtureAncestor, PrivateFixtureBinding, PrivateFixtureFile,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -236,7 +236,15 @@ fn is_false(value: &bool) -> bool {
 impl Descriptor {
     fn registry_start_version(&self) -> u32 {
         if self.provider_input_experiment {
-            controller_start::PRIVATE_VERSION
+            if self
+                .provider_input_binding
+                .as_ref()
+                .is_some_and(PrivateFixtureBinding::file_layout)
+            {
+                controller_start::PRIVATE_FILE_VERSION
+            } else {
+                controller_start::PRIVATE_VERSION
+            }
         } else {
             controller_start::REGISTRY_VERSION
         }
@@ -307,8 +315,8 @@ impl Descriptor {
                 || !matches!(
                     self.start_transport,
                     StartTransport::ControllerStdin {
-                        version: controller_start::PRIVATE_VERSION
-                    }
+                        version
+                    } if version==self.registry_start_version()
                 ))
         {
             return Err(
@@ -320,12 +328,23 @@ impl Descriptor {
             return Err("provider input paths require explicit experiment".into());
         }
         if self.provider_input_experiment
-            && (self.case != Case::Joint || !(2..=9).contains(&self.provider_input_paths.len()))
+            && (self.case != Case::Joint
+                || !(if self
+                    .provider_input_binding
+                    .as_ref()
+                    .is_some_and(PrivateFixtureBinding::file_layout)
+                {
+                    3..=10
+                } else {
+                    2..=9
+                })
+                .contains(&self.provider_input_paths.len()))
         {
-            return Err(
+            return Err(if self.provider_input_binding.as_ref().is_some_and(PrivateFixtureBinding::file_layout) {
+                "provider input file experiment requires Joint and three to ten declared private inputs"
+            } else {
                 "provider input experiment requires Joint and two to nine declared private inputs"
-                    .into(),
-            );
+            }.into());
         }
         if self.format != "memcordon.fixture-workload" || self.revision != DESCRIPTOR_REVISION {
             return Err("unsupported fixture workload format/revision".into());
@@ -334,7 +353,7 @@ impl Descriptor {
             let declared = self.winsock_registry.is_some();
             if version
                 != if self.provider_input_experiment {
-                    controller_start::PRIVATE_VERSION
+                    self.registry_start_version()
                 } else if declared {
                     controller_start::REGISTRY_VERSION
                 } else {

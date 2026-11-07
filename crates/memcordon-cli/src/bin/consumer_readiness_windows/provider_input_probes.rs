@@ -119,13 +119,13 @@ fn reject_target<T>(
         "declared_fixture_named_file":declared,
         "native_binding_failure":evidence.native_failure.as_ref().map(binding_native::failure_record),
         "same_loaded_image_or_custody_proved":false,"primary_error":rejection.primary,
-        "targets":context.paths.iter().take(9).enumerate().map(|(index,path)|serde_json::json!({
+        "targets":context.paths.iter().take(if context.file_layout {10} else {9}).enumerate().map(|(index,path)|serde_json::json!({
             "index":index,"path":target_record::path_record(path.as_os_str().encode_wide(),false),
             "absolute":path.is_absolute(),"no_dot_components":target_record::no_dot_components(path),
             "equals_observed_current_executable":evidence.current_executable.is_some_and(|current|path==current),
             "equals_declared_fixture":path==context.fixture,
             "immediate_declared_local_leaf":path.parent()==Some(context.directory)})).collect::<Vec<_>>(),
-        "targets_omitted":context.paths.len().saturating_sub(9),
+        "targets_omitted":context.paths.len().saturating_sub(if context.file_layout {10} else {9}),
         "completed_before_original_cutoff":Instant::now()<work
     });
     // Every field above has a finite shape. Keep the primary refusal even if
@@ -330,8 +330,13 @@ pub fn prepare(
                 fixture: &binding.fixture,
                 output_root,
                 parent,
-                directory: &binding.local_directory.path,
+                directory: if binding.file_layout() {
+                    parent
+                } else {
+                    binding.local_input.path()
+                },
                 peer,
+                file_layout: binding.file_layout(),
             };
             return reject_target(
                 &context,
@@ -350,7 +355,7 @@ pub fn prepare(
         }
     };
     let executable = verified.fixture();
-    let directory = verified.local_directory();
+    let directory = verified.provider_directory();
     let context = Context {
         paths,
         fixture: executable,
@@ -358,6 +363,7 @@ pub fn prepare(
         parent,
         directory,
         peer,
+        file_layout: binding.file_layout(),
     };
     if let Some(rejection) = target_record::reject(&context) {
         return reject_target(
@@ -395,7 +401,7 @@ pub fn run(descriptor: &Descriptor, peer: bool, prepared: Prepared) -> io::Resul
         .fixture()
         .parent()
         .ok_or_else(|| io::Error::other("verified private fixture parent absent"))?;
-    let directory = verified.local_directory();
+    let directory = verified.provider_directory();
     let mut binding_observation = verified.observation().clone();
     binding_observation["metadata_receiver_role"] =
         serde_json::json!(if peer { "peer" } else { "root" });
@@ -506,7 +512,11 @@ pub fn run(descriptor: &Descriptor, peer: bool, prepared: Prepared) -> io::Resul
                 .collect::<String>();
             rows.push(serde_json::json!({"path_sha256":path_sha256,"write_dac_error":write_dac_error,"write_owner_error":write_owner_error,"write_error":write_error,"delete_error":delete_error,"rename_error":rename_error,"substitution_error":substitution_error,"all_mutations_refused":true}));
         }
-        for path in [parent, directory] {
+        for path in if parent == directory {
+            vec![parent]
+        } else {
+            vec![parent, directory]
+        } {
             let write_dac_error = denied_authority(path, WRITE_DAC, work)?;
             let write_owner_error = denied_authority(path, WRITE_OWNER, work)?;
             directory_authority.push(serde_json::json!({"write_dac_error":write_dac_error,"write_owner_error":write_owner_error}));

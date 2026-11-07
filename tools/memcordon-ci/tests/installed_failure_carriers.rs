@@ -18,6 +18,8 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
     for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
         for file in [
             "result.callback-failure.json",
+            "result.failed-frontend.json",
+            "result.failed-terminal-observation.json",
             "result.stderr.bin",
             "result.winsock-startup-trace.json",
             "result.listener-call-trace.json",

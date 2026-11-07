@@ -10,6 +10,15 @@ use std::io::{self, Read, Write};
 pub const VERSION: u32 = 2;
 pub const REGISTRY_VERSION: u32 = 3;
 pub const PRIVATE_VERSION: u32 = 4;
+pub const PRIVATE_FILE_VERSION: u32 = 5;
+
+pub fn private_start_version(expected: &DirectoryExpectation) -> u32 {
+    if expected.local_role == DirectoryRole::LocalMarkerFile {
+        PRIVATE_FILE_VERSION
+    } else {
+        PRIVATE_VERSION
+    }
+}
 const MAGIC: &[u8; 8] = b"MCSTART\0";
 const HEADER: usize = 8 + 4 + 4 + 32 + 4 + 8 + 4;
 pub const MAX_CHALLENGE: usize = 4096;
@@ -313,8 +322,8 @@ fn send_bound(
     let mut bytes = Vec::with_capacity(HEADER + binding.challenge.len());
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(
-        &if directories.is_some() {
-            PRIVATE_VERSION
+        &if let Some((expected, _)) = directories {
+            private_start_version(expected)
         } else if registry.is_some() {
             REGISTRY_VERSION
         } else {
@@ -558,8 +567,8 @@ impl Receiver {
         let mut expected = Vec::with_capacity(HEADER);
         expected.extend_from_slice(MAGIC);
         expected.extend_from_slice(
-            &if self.expected_directories.is_some() {
-                PRIVATE_VERSION
+            &if let Some(expected) = &self.expected_directories {
+                private_start_version(expected)
             } else if self.expected_registry.is_some() {
                 REGISTRY_VERSION
             } else {
@@ -638,6 +647,7 @@ impl Receiver {
                             1 => DirectoryRole::InputAncestor,
                             2 => DirectoryRole::LocalDirectory,
                             3 => DirectoryRole::OutputAncestor,
+                            4 => DirectoryRole::LocalMarkerFile,
                             _ => return Err(io::Error::other("unknown directory reference role")),
                         };
                     references.push(DirectoryReference {

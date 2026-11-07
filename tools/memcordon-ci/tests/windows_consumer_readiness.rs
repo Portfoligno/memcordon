@@ -416,7 +416,9 @@ fn experiment_descriptor() -> Descriptor {
             .encode_utf16()
             .collect(),
         ancestors,
-        local_directory: directory(local, 100),
+        local_input: memcordon_platform::windows_private_fixture_binding::DotLocalInput::Directory(
+            directory(local, 100),
+        ),
         output_ancestors,
     });
     value
@@ -447,6 +449,56 @@ fn fixture_binding_is_experiment_only_and_part_of_the_original_bounded_descripto
     let mut oversized = valid;
     oversized.arguments = vec!["x".repeat(4096); 64];
     assert!(Descriptor::parse(&serde_json::to_vec(&oversized).unwrap()).is_err());
+
+    use memcordon_platform::windows_private_fixture_binding::{DotLocalInput, PrivateFixtureFile};
+    use sha2::Digest;
+    let mut file = experiment_descriptor();
+    let binding = file.provider_input_binding.as_mut().unwrap();
+    let DotLocalInput::Directory(local) = &binding.local_input else {
+        unreachable!()
+    };
+    let marker = PrivateFixtureFile {
+        path: local.path.clone(),
+        volume_serial: local.volume_serial,
+        file_index: local.file_index,
+        attributes: 0x20,
+        links: 1,
+        bytes: 0,
+        sha256: hex::encode(sha2::Sha256::digest([])),
+        native_path_utf16: r"\Device\Volume\private-fixture-inputs\fixture.exe.local"
+            .encode_utf16()
+            .collect(),
+    };
+    file.provider_input_paths = vec![
+        binding.fixture.clone(),
+        marker.path.clone(),
+        binding.fixture.parent().unwrap().join("provider.dll"),
+    ];
+    binding.revision = 3;
+    binding.local_input = DotLocalInput::File(marker);
+    file.start_transport = descriptor::StartTransport::ControllerStdin {
+        version: descriptor::controller_start::PRIVATE_FILE_VERSION,
+    };
+    let bytes = serde_json::to_vec(&file).unwrap();
+    let parsed = Descriptor::parse(&bytes).unwrap();
+    assert_eq!(parsed.provider_input_binding, file.provider_input_binding);
+    let digest = descriptor::controller_start::descriptor_digest(&bytes);
+    Descriptor::parse_authenticated_peer(
+        &bytes,
+        digest,
+        &file.challenge,
+        &file.output_root,
+        file.control_clock.as_ref().unwrap(),
+    )
+    .unwrap();
+    let mut downgraded = file.clone();
+    downgraded.start_transport = descriptor::StartTransport::ControllerStdin {
+        version: descriptor::controller_start::PRIVATE_VERSION,
+    };
+    assert!(Descriptor::parse(&serde_json::to_vec(&downgraded).unwrap()).is_err());
+    let mut mixed = file;
+    mixed.provider_input_binding.as_mut().unwrap().revision = 2;
+    assert!(Descriptor::parse(&serde_json::to_vec(&mixed).unwrap()).is_err());
 }
 
 #[test]

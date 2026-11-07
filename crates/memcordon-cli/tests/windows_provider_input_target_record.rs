@@ -27,6 +27,7 @@ fn exact_fixture_and_immediate_leaves_preserve_all_guard_refusals() {
             parent: &parent,
             directory: &directory,
             peer: true,
+            file_layout: false,
         })
     };
     assert!(evaluate(&valid, &output).is_none());
@@ -99,9 +100,38 @@ fn exact_fixture_and_immediate_leaves_preserve_all_guard_refusals() {
         parent: &parent,
         directory: &directory,
         peer: true,
+        file_layout: false,
     };
     assert!(context.peer);
     assert!(record::output_separate(&context));
+    let mut siblings = vec![executable.clone(), directory.clone()];
+    siblings.extend((0..8).map(|index| parent.join(format!("provider-{index}.dll"))));
+    let file_context = Context {
+        paths: &siblings,
+        directory: &parent,
+        file_layout: true,
+        ..context
+    };
+    assert!(reject(&file_context).is_none());
+    assert!(record::output_separate(&file_context));
+    assert_eq!(
+        reject(&Context {
+            paths: &siblings[..2],
+            ..file_context
+        })
+        .unwrap()
+        .predicate,
+        "target-count-below-three"
+    );
+    assert_eq!(
+        reject(&Context {
+            file_layout: false,
+            ..file_context
+        })
+        .unwrap()
+        .predicate,
+        "target-count-above-nine"
+    );
 }
 
 #[test]

@@ -6,7 +6,9 @@
 //! attest image pages against copy-on-write modification.
 use crate::{
     test_support::{WindowsHeldFileMetadata, windows_held_file_metadata},
-    windows_private_fixture_binding::{PrivateFixtureAncestor, PrivateFixtureBinding},
+    windows_private_fixture_binding::{
+        DotLocalInput, PrivateFixtureAncestor, PrivateFixtureBinding, PrivateFixtureFile,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -44,7 +46,7 @@ pub struct BorrowedPrivateDirectories<'a> {
 /// Only the native verifier below can construct it.
 pub struct VerifiedPrivateFixture {
     fixture: PathBuf,
-    local_directory: PathBuf,
+    provider_directory: PathBuf,
     observation: serde_json::Value,
     output: VerifiedOutput,
 }
@@ -52,8 +54,8 @@ impl VerifiedPrivateFixture {
     pub fn fixture(&self) -> &Path {
         &self.fixture
     }
-    pub fn local_directory(&self) -> &Path {
-        &self.local_directory
+    pub fn provider_directory(&self) -> &Path {
+        &self.provider_directory
     }
     pub fn observation(&self) -> &serde_json::Value {
         &self.observation
@@ -264,6 +266,27 @@ fn directory_matches(
     cutoff: Instant,
     progress: &mut Progress,
 ) -> io::Result<WindowsHeldFileMetadata> {
+    let metadata = metadata_reference(file, cutoff, progress)?;
+    progress.substage = "identity-compare";
+    if metadata.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.volume_serial != expected.volume_serial
+        || metadata.file_index != expected.file_index
+        || metadata.attributes != expected.attributes
+    {
+        return Err(io::Error::other(
+            "private fixture directory identity or attributes differ",
+        ));
+    }
+    progress.after(cutoff)?;
+    Ok(metadata)
+}
+
+fn metadata_reference(
+    file: &File,
+    cutoff: Instant,
+    progress: &mut Progress,
+) -> io::Result<WindowsHeldFileMetadata> {
     use windows_sys::{
         Wdk::Foundation::{NtQueryObject, ObjectBasicInformation},
         Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION,
@@ -306,20 +329,80 @@ fn directory_matches(
     }
     progress.step("identity-metadata-query");
     progress.before(cutoff)?;
-    let metadata = windows_held_file_metadata(file)?;
-    progress.substage = "identity-compare";
-    if metadata.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    windows_held_file_metadata(file)
+}
+
+fn marker_matches(
+    file: &File,
+    expected: &PrivateFixtureFile,
+    cutoff: Instant,
+    progress: &mut Progress,
+) -> io::Result<()> {
+    let facts = |metadata: &WindowsHeldFileMetadata| {
+        (
+            metadata.volume_serial,
+            metadata.file_index,
+            metadata.attributes,
+            metadata.links,
+            metadata.length,
+        )
+    };
+    let metadata = metadata_reference(file, cutoff, progress)?;
+    progress.substage = "marker-identity-compare";
+    if metadata.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | 0x40) != 0
         || metadata.volume_serial != expected.volume_serial
         || metadata.file_index != expected.file_index
         || metadata.attributes != expected.attributes
+        || metadata.links != 1
+        || metadata.links != expected.links
+        || metadata.length != 0
+        || metadata.length != expected.bytes
     {
         return Err(io::Error::other(
-            "private fixture directory identity or attributes differ",
+            "private .local marker identity, kind, links or empty extent differs",
         ));
     }
     progress.after(cutoff)?;
-    Ok(metadata)
+    progress.step("marker-held-native-name-join");
+    if query_native_name_inner(file, cutoff)? != expected.native_path_utf16 {
+        return Err(io::Error::other(
+            "private .local marker native name differs",
+        ));
+    }
+    // Query-only transferred references grant no data read. Join a transient
+    // share-all named read handle back to that same held marker before hashing.
+    let mut named = open(&expected.path, false, cutoff, progress)?;
+    progress.step("marker-named-metadata-query");
+    progress.before(cutoff)?;
+    let observed = windows_held_file_metadata(&named)?;
+    progress.after(cutoff)?;
+    if facts(&observed) != facts(&metadata)
+        || query_native_name_inner(&named, cutoff)? != expected.native_path_utf16
+    {
+        return Err(io::Error::other(
+            "named .local marker does not join original held object",
+        ));
+    }
+    let mut byte = [0u8; 1];
+    progress.step("marker-empty-byte-hash");
+    progress.before(cutoff)?;
+    let count = named.read(&mut byte)?;
+    progress.after(cutoff)?;
+    let empty_hash = Sha256::digest([])
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    progress.step("marker-final-metadata-query");
+    progress.before(cutoff)?;
+    let final_metadata = windows_held_file_metadata(&named)?;
+    progress.after(cutoff)?;
+    if count != 0 || expected.sha256 != empty_hash || facts(&final_metadata) != facts(&metadata) {
+        return Err(io::Error::other(
+            "private .local marker empty bytes or stable metadata differ",
+        ));
+    }
+    drop(named);
+    live(cutoff)
 }
 fn file_matches(
     metadata: &WindowsHeldFileMetadata,
@@ -489,14 +572,16 @@ fn verify_output_inner(
         }
         let metadata = directory_matches(&directories.output[index], expected, cutoff, progress)?;
         progress.substage = "output-alias-compare";
-        for input in [parent, &binding.local_directory] {
-            if metadata.volume_serial == input.volume_serial
-                && metadata.file_index == input.file_index
-            {
-                return Err(io::Error::other(
-                    "private output ancestry aliases the input namespace",
-                ));
-            }
+        let local_identity = match &binding.local_input {
+            DotLocalInput::Directory(local) => (local.volume_serial, local.file_index),
+            DotLocalInput::File(marker) => (marker.volume_serial, marker.file_index),
+        };
+        if [(parent.volume_serial, parent.file_index), local_identity]
+            .contains(&(metadata.volume_serial, metadata.file_index))
+        {
+            return Err(io::Error::other(
+                "private output ancestry aliases the input namespace",
+            ));
         }
     }
     let ancestors = count;
@@ -539,13 +624,16 @@ pub fn verify(
             progress.object("input-ancestor", index, binding.ancestors.len());
             directory_matches(&directories.input[index], ancestor, cutoff, &mut progress)?;
         }
-        progress.object("local-directory", 0, 1);
-        directory_matches(
-            directories.local,
-            &binding.local_directory,
-            cutoff,
-            &mut progress,
-        )?;
+        match &binding.local_input {
+            DotLocalInput::Directory(directory) => {
+                progress.object("local-directory", 0, 1);
+                directory_matches(directories.local, directory, cutoff, &mut progress)?;
+            }
+            DotLocalInput::File(marker) => {
+                progress.object("local-marker-file", 0, 1);
+                marker_matches(directories.local, marker, cutoff, &mut progress)?;
+            }
+        }
         phase = "held-fixture-identity";
         progress.object("fixture", 0, 1);
         let mut file = open(&binding.fixture, false, cutoff, &mut progress)?;
@@ -599,7 +687,11 @@ pub fn verify(
         live(cutoff)?;
         Ok(VerifiedPrivateFixture {
             fixture: binding.fixture.clone(),
-            local_directory: binding.local_directory.path.clone(),
+            provider_directory: if binding.file_layout() {
+                binding.fixture.parent().unwrap().to_owned()
+            } else {
+                binding.local_input.path().to_owned()
+            },
             output,
             observation: serde_json::json!({"main_allocation_base":base,"main_mapping_mem_image":true,
                 "native_backing_name_join":true,"volume_serial":binding.volume_serial,"file_index":binding.file_index,
@@ -611,6 +703,8 @@ pub fn verify(
                 "synchronous_io_deadline_settled_before_capability":true,
                 "scope":"authenticated-descriptor-and-live-trusted-controller-private-sealed-custody",
                 "hostile_host_ancestor_mutation_excluded":false,"in_memory_image_byte_integrity_proved":false,
+                "dot_local_layout":if binding.file_layout() {"file-marker-siblings"} else {"directory"},
+                "local_marker_file_verified":binding.file_layout(),
                 "completed_before_original_cutoff":true}),
         })
     });

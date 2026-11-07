@@ -30,6 +30,7 @@ fn directories(
     output_count: u32,
 ) -> (start::DirectoryExpectation, start::DirectoryTransfer) {
     let expected = start::DirectoryExpectation {
+        local_role: start::DirectoryRole::LocalDirectory,
         manifest_sha256: [17; 32],
         input_count,
         output_count,
@@ -131,6 +132,92 @@ fn private_start_binds_all129_metadata_references_and_requires_peer_owner_ack_be
             )
             .is_err()
     );
+}
+
+#[test]
+fn marker_start5_authenticates_role4_without_directory_downgrade_or_new_frame_capacity() {
+    let mut binding = binding();
+    binding.challenge = vec![0xff; start::MAX_CHALLENGE];
+    let (mut expected, mut metadata) = directories(64, 64);
+    let directory_expected = expected.clone();
+    expected.local_role = start::DirectoryRole::LocalMarkerFile;
+    metadata.version = expected.transfer_version();
+    metadata.references[64].role = start::DirectoryRole::LocalMarkerFile;
+    let registry = registry();
+    assert!(
+        start::Sender::with_registry(registry, true)
+            .with_directories(metadata.clone(), directory_expected.clone())
+            .is_err()
+    );
+    let mut sender = start::Sender::with_registry(registry, true)
+        .with_directories(metadata.clone(), expected.clone())
+        .unwrap();
+    let mut bytes = Vec::new();
+    sender
+        .send(&mut bytes, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    assert_eq!(bytes.len(), start::MAX_FRAME_BYTES);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
+    assert_eq!(u32::from_le_bytes(bytes[108..112].try_into().unwrap()), 2);
+    let mut receiver =
+        Receiver::with_directories(registry.manifest_sha256, expected.clone(), true).unwrap();
+    receiver
+        .receive(&mut Cursor::new(&bytes), &binding, || Ok(()))
+        .unwrap();
+    assert_eq!(receiver.directory_transfer(), Some(&metadata));
+    let peer = start::PeerRecipient {
+        handle: 0x400,
+        pid: 9002,
+        birth: binding.birth + 1,
+    };
+    let mut ack = Vec::new();
+    sender
+        .send_peer_held(&mut ack, &binding, &peer, || Ok(()))
+        .unwrap();
+    assert_eq!(ack.len(), 64 + 44 + 20 + binding.challenge.len());
+    assert_eq!(u32::from_le_bytes(ack[8..12].try_into().unwrap()), 5);
+    receiver
+        .receive_peer_held(&mut Cursor::new(ack), &binding, &peer, || Ok(()))
+        .unwrap();
+    let marker = 108 + 40 + 64 * 20;
+    for case in 0..6 {
+        let mut changed = bytes.clone();
+        match case {
+            0 => changed[8..12].copy_from_slice(&4u32.to_le_bytes()),
+            1 => changed[108..112].copy_from_slice(&1u32.to_le_bytes()),
+            2 => changed[marker..marker + 4].copy_from_slice(&2u32.to_le_bytes()),
+            3 => changed[116] ^= 1,
+            4 => changed[marker + 16..marker + 20].copy_from_slice(&0x100080u32.to_le_bytes()),
+            _ => changed[16] ^= 1,
+        }
+        let mut receiver =
+            Receiver::with_directories(registry.manifest_sha256, expected.clone(), true).unwrap();
+        assert!(
+            receiver
+                .receive(&mut Cursor::new(changed), &binding, || Ok(()))
+                .is_err(),
+            "{case}"
+        );
+        assert!(receiver.directory_transfer().is_none());
+        assert!(receiver.registry_capability().is_none());
+    }
+    let mut directory_receiver =
+        Receiver::with_directories(registry.manifest_sha256, directory_expected, true).unwrap();
+    assert!(
+        directory_receiver
+            .receive(&mut Cursor::new(&bytes), &binding, || Ok(()))
+            .is_err()
+    );
+    for length in [64, 108, marker + 12, bytes.len() - 1] {
+        let mut receiver =
+            Receiver::with_directories(registry.manifest_sha256, expected.clone(), true).unwrap();
+        assert!(
+            receiver
+                .receive(&mut Cursor::new(&bytes[..length]), &binding, || Ok(()))
+                .is_err()
+        );
+        assert!(receiver.directory_transfer().is_none());
+    }
 }
 
 #[test]

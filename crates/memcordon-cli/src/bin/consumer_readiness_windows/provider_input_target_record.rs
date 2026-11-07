@@ -16,6 +16,7 @@ pub struct Context<'a> {
     pub parent: &'a Path,
     pub directory: &'a Path,
     pub peer: bool,
+    pub file_layout: bool,
 }
 
 pub struct Rejection {
@@ -39,10 +40,24 @@ pub fn output_separate(context: &Context<'_>) -> bool {
 /// Preserve namespace predicates and exact declared-path comparisons. The
 /// actual current image is authorized by the separate native capability.
 pub fn reject(context: &Context<'_>) -> Option<Rejection> {
-    let reason = if context.paths.len() < 2 {
-        Some(("target-count-below-two", None))
-    } else if context.paths.len() > 9 {
-        Some(("target-count-above-nine", None))
+    let reason = if context.paths.len() < if context.file_layout { 3 } else { 2 } {
+        Some((
+            if context.file_layout {
+                "target-count-below-three"
+            } else {
+                "target-count-below-two"
+            },
+            None,
+        ))
+    } else if context.paths.len() > if context.file_layout { 10 } else { 9 } {
+        Some((
+            if context.file_layout {
+                "target-count-above-ten"
+            } else {
+                "target-count-above-nine"
+            },
+            None,
+        ))
     } else if !context.paths.iter().any(|path| path == context.fixture) {
         Some(("verified-fixture-not-in-declared-targets", None))
     } else if !context.output_root.is_absolute() {

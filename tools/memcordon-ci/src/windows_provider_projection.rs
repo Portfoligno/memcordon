@@ -88,6 +88,7 @@ pub mod native {
         pub input_root: PathBuf,
         pub output_root: PathBuf,
         pub local: PathBuf,
+        marker: Option<Arc<HeldWindowsArtifact>>,
         files: Vec<(PathBuf, Arc<HeldWindowsArtifact>)>,
         witnesses: Vec<PrivateInput>,
         directories: Vec<Arc<fs::File>>,
@@ -106,6 +107,7 @@ pub mod native {
             target: &str,
             parent: &Path,
             work: Instant,
+            dot_local_file: bool,
         ) -> Result<Self> {
             live(work)?;
             let _parents = windows_native_files::hold_ancestors(parent)?;
@@ -153,10 +155,24 @@ pub mod native {
                 ));
             }
             live(work)?;
-            fs::create_dir(&local)?;
-            live(work)?;
             let mut directories = directories;
-            directories.extend(windows_native_files::hold_ancestors(&local)?);
+            let marker = if dot_local_file {
+                drop(windows_native_files::publish_owned_file(&local, &[])?);
+                live(work)?;
+                Some(Arc::new(windows_native_files::hold_artifact(
+                    &local, None, 0,
+                )?))
+            } else {
+                fs::create_dir(&local)?;
+                live(work)?;
+                directories.extend(windows_native_files::hold_ancestors(&local)?);
+                None
+            };
+            let local = if dot_local_file {
+                fs::canonicalize(local)?
+            } else {
+                local
+            };
             let fixture = SelectedArtifact {
                 path: path.clone(),
                 sha256: held.sha256.clone(),
@@ -168,13 +184,14 @@ pub mod native {
                 input_root,
                 output_root,
                 local,
+                marker,
                 files: vec![(path, Arc::new(held))],
                 witnesses: Vec::new(),
                 directories: directories.into_iter().map(Arc::new).collect(),
                 output_directories: Vec::new(),
                 declared_output: None,
                 custody: None,
-                inventory: serde_json::json!({"format":"memcordon.declared-provider-inputs","revision":1,"diagnostic_only":true,"acceptance_authority":false,"original_file_identities_preserved":false,"fixture_manifest":manifest,"sources":[],"sealed":false}),
+                inventory: serde_json::json!({"format":"memcordon.declared-provider-inputs","revision":1,"layout":if dot_local_file {"file-marker-siblings"} else {"directory"},"diagnostic_only":true,"acceptance_authority":false,"original_file_identities_preserved":false,"fixture_manifest":manifest,"sources":[],"sealed":false}),
                 launched: false,
                 retired: false,
                 quarantined: false,
@@ -210,7 +227,19 @@ pub mod native {
                 live(work)?;
                 let source_identity = (held.metadata.volume_serial, held.metadata.file_index);
                 live(work)?;
-                let destination = self.local.join(&candidate.basename);
+                let destination = if self.marker.is_some() {
+                    &self.input_root
+                } else {
+                    &self.local
+                }
+                .join(&candidate.basename);
+                if self.files.iter().any(|(path, _)| path == &destination)
+                    || destination == self.local
+                {
+                    return Err(CiError::Message(
+                        "private provider collides with fixture or marker".into(),
+                    ));
+                }
                 let copied = held.publish(&destination, work)?;
                 live(work)?;
                 held.verify(work)?;
@@ -238,6 +267,24 @@ pub mod native {
             }
             self.inventory["catalog"] = serde_json::to_value(catalog)?;
             self.inventory["sources"] = serde_json::json!(records);
+            if self.marker.is_some() {
+                let observed = fs::read_dir(&self.input_root)?
+                    .map(|entry| fs::canonicalize(entry?.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                let expected = self
+                    .paths()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                if observed
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    != expected
+                {
+                    return Err(CiError::Message(
+                        "file-marker input namespace has unexpected siblings".into(),
+                    ));
+                }
+            }
             live(work)
         }
         pub fn seal(&mut self, sid: &str, work: Instant) -> Result<()> {
@@ -260,14 +307,26 @@ pub mod native {
                 )?);
                 windows_native_files::verify_named_artifact(held, path)?;
             }
-            security.push(seal(
-                &self.local,
-                true,
-                sid,
-                work,
-                ObjectRole::LocalDirectory,
-                None,
-            )?);
+            if let Some(marker) = &self.marker {
+                security.push(seal(
+                    &self.local,
+                    false,
+                    sid,
+                    work,
+                    ObjectRole::LocalMarkerFile,
+                    None,
+                )?);
+                windows_native_files::verify_named_artifact(marker, &self.local)?;
+            } else {
+                security.push(seal(
+                    &self.local,
+                    true,
+                    sid,
+                    work,
+                    ObjectRole::LocalDirectory,
+                    None,
+                )?);
+            }
             security.push(seal(
                 &self.input_root,
                 true,
@@ -289,7 +348,15 @@ pub mod native {
             Ok(())
         }
         pub fn paths(&self) -> Vec<PathBuf> {
-            self.files.iter().map(|(path, _)| path.clone()).collect()
+            let mut paths = self
+                .files
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            if self.marker.is_some() {
+                paths.insert(1, self.local.clone());
+            }
+            paths
         }
         pub fn witnesses(&self) -> &[PrivateInput] {
             &self.witnesses
@@ -304,6 +371,10 @@ pub mod native {
                 live(work)?;
                 windows_native_files::verify_named_artifact(held, path)?;
             }
+            if let Some(marker) = &self.marker {
+                live(work)?;
+                windows_native_files::verify_named_artifact(marker, &self.local)?;
+            }
             live(work)
         }
         pub fn fixture_binding(
@@ -313,7 +384,9 @@ pub mod native {
         {
             use memcordon_platform::{
                 test_support::windows_held_file_metadata,
-                windows_private_fixture_binding::PrivateFixtureAncestor,
+                windows_private_fixture_binding::{
+                    DotLocalInput, PrivateFixtureAncestor, PrivateFixtureFile,
+                },
             };
             self.verify(work)?;
             let output = self.declared_output.as_ref().ok_or_else(|| {
@@ -357,10 +430,14 @@ pub mod native {
                     "held private fixture selection differs".into(),
                 ));
             }
-            let local = self
-                .directories
-                .last()
-                .ok_or_else(|| CiError::Message("held private local directory absent".into()))?;
+            let local = match &self.marker {
+                Some(marker) => marker.private_file(),
+                None => self
+                    .directories
+                    .last()
+                    .ok_or_else(|| CiError::Message("held private local directory absent".into()))?
+                    .as_ref(),
+            };
             // Use the declared fixture's immediate namespace spelling, joined
             // back to the original held directory by native identity below.
             let declared_local =
@@ -370,8 +447,9 @@ pub mod native {
                         CiError::Message("held private local leaf absent".into())
                     })?);
             live(work)?;
+            let directory = self.marker.is_none();
             let identity =
-                windows_native_files::native_file_identity(local, true, &declared_local)?;
+                windows_native_files::native_file_identity(local, directory, &declared_local)?;
             let metadata = windows_held_file_metadata(local)?;
             let named = fs::OpenOptions::new()
                 .access_mode(FILE_READ_ATTRIBUTES)
@@ -379,24 +457,39 @@ pub mod native {
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
                 .open(&declared_local)?;
             live(work)?;
-            if windows_native_files::native_file_identity(&named, true, &declared_local)?
+            if windows_native_files::native_file_identity(&named, directory, &declared_local)?
                 != identity
             {
                 return Err(CiError::Message(
                     "held private local directory changed".into(),
                 ));
             }
-            let binding = held.private_fixture_binding(
-                path,
-                PrivateFixtureAncestor {
+            let local_input = if let Some(marker) = &self.marker {
+                if !marker.bytes.is_empty() || metadata.length != 0 || metadata.links != 1 {
+                    return Err(CiError::Message(
+                        "held .local marker is not an empty single-link file".into(),
+                    ));
+                }
+                DotLocalInput::File(PrivateFixtureFile {
                     path: declared_local,
                     volume_serial: identity.0,
                     file_index: identity.1,
                     attributes: metadata.attributes,
-                },
-                output_ancestors,
-                work,
-            )?;
+                    links: metadata.links,
+                    bytes: metadata.length,
+                    sha256: marker.sha256.clone(),
+                    native_path_utf16: marker.native_path()?,
+                })
+            } else {
+                DotLocalInput::Directory(PrivateFixtureAncestor {
+                    path: declared_local,
+                    volume_serial: identity.0,
+                    file_index: identity.1,
+                    attributes: metadata.attributes,
+                })
+            };
+            let binding =
+                held.private_fixture_binding(path, local_input, output_ancestors, work)?;
             binding.validate(&self.paths()).map_err(CiError::Message)?;
             binding.validate_output(output).map_err(CiError::Message)?;
             live(work)?;
@@ -467,10 +560,15 @@ pub mod native {
                     })?
                     .1,
             );
-            let local =
-                Arc::clone(self.directories.last().ok_or_else(|| {
-                    CiError::Message("original private local owner absent".into())
-                })?);
+            let local = if let Some(marker) = &self.marker {
+                crate::windows_private_custody::LocalInputCustody::File(Arc::clone(marker))
+            } else {
+                crate::windows_private_custody::LocalInputCustody::Directory(Arc::clone(
+                    self.directories.last().ok_or_else(|| {
+                        CiError::Message("original private local owner absent".into())
+                    })?,
+                ))
+            };
             let custody = Arc::new(crate::windows_private_custody::PrivateFixtureCustody::new(
                 fixture,
                 local,
@@ -553,6 +651,7 @@ pub mod native {
                 ));
             }
             self.files.clear();
+            self.marker.take();
             self.directories.clear();
             self.custody.take();
             self.output_directories.clear();

@@ -83,6 +83,7 @@ pub fn run_provider_input_experiment(
     root: &Path,
     prepared: &Path,
     destination: &Path,
+    dot_local_file: bool,
 ) -> Result<()> {
     use std::{
         path::PathBuf,
@@ -120,7 +121,10 @@ pub fn run_provider_input_experiment(
     )?;
     let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;
     let result = crate::windows_installed_cases::run_provider_input_experiment_from_source_until(
-        root, &config, deadlines,
+        root,
+        &config,
+        deadlines,
+        dot_local_file,
     );
     if result.is_err() {
         let _retained = payload.retain();
@@ -129,7 +133,7 @@ pub fn run_provider_input_experiment(
 }
 
 #[cfg(not(windows))]
-pub fn run_provider_input_experiment(_: &Path, _: &Path, _: &Path) -> Result<()> {
+pub fn run_provider_input_experiment(_: &Path, _: &Path, _: &Path, _: bool) -> Result<()> {
     Err(CiError::Message(
         "declared provider input experiment requires native Windows".into(),
     ))

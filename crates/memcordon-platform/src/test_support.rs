@@ -18,6 +18,7 @@ pub mod windows_private_process;
 #[cfg(windows)]
 pub use windows_private_process::{
     WindowsPendingChildProcess, duplicate_directory_metadata_into_child,
+    duplicate_marker_metadata_into_child,
 };
 #[cfg(windows)]
 #[path = "windows_private_input.rs"]

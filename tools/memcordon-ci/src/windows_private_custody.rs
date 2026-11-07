@@ -4,7 +4,8 @@ use crate::{CiError, Result, windows_native_files::HeldWindowsArtifact};
 use memcordon_platform::{
     test_support::{ProcessIdentity, WindowsImageProcess, WindowsPendingChildProcess},
     windows_private_fixture_binding::{
-        DIRECTORY_QUERY_ACCESS, DirectoryReference, DirectoryTransfer, PrivateFixtureBinding,
+        DIRECTORY_QUERY_ACCESS, DirectoryReference, DirectoryRole, DirectoryTransfer,
+        PrivateFixtureBinding,
     },
 };
 use std::{
@@ -14,9 +15,21 @@ use std::{
     time::Instant,
 };
 
+pub(crate) enum LocalInputCustody {
+    Directory(Arc<File>),
+    File(Arc<HeldWindowsArtifact>),
+}
+impl LocalInputCustody {
+    fn file(&self) -> &File {
+        match self {
+            Self::Directory(file) => file,
+            Self::File(artifact) => artifact.private_file(),
+        }
+    }
+}
 pub(crate) struct PrivateFixtureCustody {
     fixture: Arc<HeldWindowsArtifact>,
-    local: Arc<File>,
+    local: LocalInputCustody,
     output: Vec<Arc<File>>,
     pub family: Arc<Mutex<Vec<WindowsImageProcess>>>,
     cleanup: Mutex<Vec<Arc<WindowsPendingChildProcess>>>,
@@ -27,7 +40,7 @@ pub(crate) struct PrivateFixtureCustody {
 impl PrivateFixtureCustody {
     pub fn new(
         fixture: Arc<HeldWindowsArtifact>,
-        local: Arc<File>,
+        local: LocalInputCustody,
         output: Vec<Arc<File>>,
         binding: PrivateFixtureBinding,
     ) -> Self {
@@ -75,7 +88,7 @@ impl PrivateFixtureCustody {
             .fixture
             .private_ancestor_files()
             .iter()
-            .chain(std::iter::once(self.local.as_ref()))
+            .chain(std::iter::once(self.local.file()))
             .chain(self.output.iter().map(Arc::as_ref))
             .collect::<Vec<_>>();
         if roles.len() != sources.len() {
@@ -110,8 +123,11 @@ impl PrivateFixtureCustody {
         let primary = (|| -> Result<DirectoryTransfer> {
             let mut references = Vec::new();
             for ((role, index), source) in roles.into_iter().zip(sources) {
-                let handle =
-                    recipient.duplicate_directory_metadata(source, work, &mut duplicated)?;
+                let handle = if role == DirectoryRole::LocalMarkerFile {
+                    recipient.duplicate_marker_metadata(source, work, &mut duplicated)?
+                } else {
+                    recipient.duplicate_directory_metadata(source, work, &mut duplicated)?
+                };
                 references.push(DirectoryReference {
                     role,
                     index,
@@ -120,7 +136,7 @@ impl PrivateFixtureCustody {
                 });
             }
             let transfer = DirectoryTransfer {
-                version: 1,
+                version: expected.transfer_version(),
                 manifest_sha256: expected.manifest_sha256,
                 references,
             };

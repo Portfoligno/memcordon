@@ -41,6 +41,15 @@ fn directory_reference(
     deadline: Instant,
     duplicated: &mut u32,
 ) -> io::Result<u64> {
+    metadata_reference(source, recipient, deadline, duplicated, false)
+}
+fn metadata_reference(
+    source: &File,
+    recipient: windows_sys::Win32::Foundation::HANDLE,
+    deadline: Instant,
+    duplicated: &mut u32,
+    marker: bool,
+) -> io::Result<u64> {
     live(deadline)?;
     if *duplicated as usize >= MAX_DIRECTORY_REFERENCES {
         return Err(io::Error::other(
@@ -49,12 +58,20 @@ fn directory_reference(
     }
     let metadata = windows_held_file_metadata(source)?;
     live(deadline)?;
-    if metadata.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
-        return Err(io::Error::other(
-            "private metadata source is not a no-reparse directory",
-        ));
+    let valid = if marker {
+        metadata.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | 0x40) == 0
+            && metadata.links == 1
+            && metadata.length == 0
+    } else {
+        metadata.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            && metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    };
+    if !valid {
+        return Err(io::Error::other(if marker {
+            "private metadata source kind or marker empty extent differs"
+        } else {
+            "private metadata source is not a no-reparse directory"
+        }));
     }
     let mut transferred = std::ptr::null_mut();
     // SAFETY: caller owns both objects; explicit read-attributes only, no
@@ -89,6 +106,15 @@ pub fn duplicate_directory_metadata_into_child(
     directory_reference(source, child.as_raw_handle(), deadline, duplicated)
 }
 
+pub fn duplicate_marker_metadata_into_child(
+    child: &Child,
+    source: &File,
+    deadline: Instant,
+    duplicated: &mut u32,
+) -> io::Result<u64> {
+    metadata_reference(source, child.as_raw_handle(), deadline, duplicated, true)
+}
+
 /// A successful remote duplicate is immediately owned, even if later admission
 /// fails. The controller must retain this owner before calling `admit`.
 pub struct WindowsPendingChildProcess {
@@ -112,6 +138,24 @@ impl WindowsImageProcess {
             return Err(io::Error::other("private metadata recipient has retired"));
         }
         directory_reference(source, self._handle.as_raw_handle(), deadline, duplicated)
+    }
+    pub fn duplicate_marker_metadata(
+        &self,
+        source: &File,
+        deadline: Instant,
+        duplicated: &mut u32,
+    ) -> io::Result<u64> {
+        live(deadline)?;
+        if self.has_exited()? {
+            return Err(io::Error::other("private metadata recipient has retired"));
+        }
+        metadata_reference(
+            source,
+            self._handle.as_raw_handle(),
+            deadline,
+            duplicated,
+            true,
+        )
     }
 
     /// Duplicate a root-local Child reference FROM this retained root object.

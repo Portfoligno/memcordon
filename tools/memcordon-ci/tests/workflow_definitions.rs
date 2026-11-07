@@ -109,6 +109,8 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
     for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
         for name in [
             "result.callback-failure.json",
+            "result.failed-frontend.json",
+            "result.failed-terminal-observation.json",
             "result.stderr.bin",
             "result.winsock-startup-trace.json",
             "result.listener-call-trace.json",

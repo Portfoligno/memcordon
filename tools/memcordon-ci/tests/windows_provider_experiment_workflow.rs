@@ -48,6 +48,48 @@ fn provider_experiments_are_payload_ready_siblings_of_unchanged_mandatory_consum
             assert!(retained.lines().any(|path|path == format!("target/ci/provider-input-experiment/cases/{leaf}")));
         }
         assert!(!retained.contains("**"));
+        // Independent job/command gives the FILE layout a fresh installation
+        // and original cutoff; it is never a fallback after directory failure.
+        let alternate =
+            &workflow["jobs"][format!("windows-provider-file-input-experiment-{architecture}")];
+        assert_eq!(alternate["needs"], job["needs"]);
+        assert_eq!(alternate["strategy"], job["strategy"]);
+        let alternate_steps = alternate["steps"].as_sequence().unwrap();
+        let alternate_command = alternate_steps
+            .iter()
+            .find(|step| step["id"] == "provider-input-experiment")
+            .unwrap();
+        assert_eq!(
+            alternate_command["run"],
+            "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-file-input-experiment --dot-local-file"
+        );
+        assert_eq!(
+            alternate_command["timeout-minutes"],
+            command["timeout-minutes"]
+        );
+        assert!(alternate_command["continue-on-error"].is_null());
+        let artifact = alternate_steps
+            .iter()
+            .find(|step| {
+                step["with"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("provider-file-input-experiment-"))
+            })
+            .unwrap();
+        let alternate_paths = artifact["with"]["path"].as_str().unwrap();
+        assert_eq!(alternate_paths.lines().count(), retained.lines().count());
+        assert!(
+            alternate_paths
+                .lines()
+                .all(|path| path.starts_with("target/ci/provider-file-input-experiment/cases/"))
+        );
+        assert!(!alternate_paths.contains("**"));
+        assert!(
+            !command["run"]
+                .as_str()
+                .unwrap()
+                .contains("--dot-local-file")
+        );
         let original_name = format!("windows-installed-{architecture}");
         let originals = workflow["jobs"][&original_name]["steps"]
             .as_sequence()

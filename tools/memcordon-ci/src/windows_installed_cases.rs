@@ -1002,7 +1002,13 @@ mod native {
         root: &Path,
         config: &InstalledWindowsPayload,
         deadlines: WindowsLeaseDeadlines,
+        dot_local_file: bool,
     ) -> Result<()> {
+        let layout = if dot_local_file {
+            "file-marker-siblings"
+        } else {
+            "directory"
+        };
         verify_selected(config)?;
         require_removed(config)?;
         fs::create_dir_all(&config.output_directory)?;
@@ -1014,7 +1020,10 @@ mod native {
                 package(config, "verify", deadlines.work).map_err(CiError::Message)?;
                 drop(quiescent(config)?);
                 crate::windows_consumer_readiness::run_provider_input_experiment_until(
-                    root, config, deadlines,
+                    root,
+                    config,
+                    deadlines,
+                    dot_local_file,
                 )
             },
         ));
@@ -1052,6 +1061,8 @@ mod native {
         };
         let report = serde_json::json!({"format":"memcordon.provider-input-experiment-execution","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target":config.target,"source_commit":config.source_commit,"fixture_sha256":config.fixture.sha256,"experiment":operation.as_ref().ok(),"execution_error":operation.as_ref().err().map(ToString::to_string),"installation_cleanup_verified":cleanup.is_ok(),"installation_cleanup_error":cleanup.as_ref().err().map(ToString::to_string),"mandatory_unprojected_case_unchanged":true});
         let retained = (|| -> Result<()> {
+            let mut report = report;
+            report["layout"] = serde_json::json!(layout);
             let bytes = serde_json::to_vec(&report)?;
             if bytes.len() > 64 * 1024 {
                 return Err(CiError::Message(
@@ -2084,8 +2095,9 @@ pub fn run_provider_input_experiment_from_source_until(
     root: &Path,
     config: &InstalledWindowsPayload,
     deadlines: WindowsLeaseDeadlines,
+    dot_local_file: bool,
 ) -> Result<()> {
-    native::provider_input_experiment(root, config, deadlines)
+    native::provider_input_experiment(root, config, deadlines, dot_local_file)
 }
 
 #[cfg(not(windows))]

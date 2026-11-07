@@ -2885,11 +2885,15 @@ jobs:
           name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
           path: |-
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-frontend.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-terminal-observation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-native-file-requests.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-frontend.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
@@ -3313,11 +3317,15 @@ jobs:
           name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
           path: |-
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-frontend.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-terminal-observation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.listener-native-file-requests.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-frontend.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-JOINT/restricted/result.listener-call-trace.json
@@ -7345,6 +7353,822 @@ jobs:
             target/ci/provider-input-experiment/cases/package-uninstall.invocation.json
             target/ci/provider-input-experiment/cases/recovery.stdout.bin
             target/ci/provider-input-experiment/cases/recovery.stderr.bin
+          if-no-files-found: warn
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  windows-provider-file-input-experiment-x64:
+    if: github.event.deleted != true
+    needs: windows-payload-x64
+    runs-on: windows-2025
+    timeout-minutes: 353
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: x64
+            channel: native
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - uses: *action_3
+        with:
+          name: windows-prepared-${{ matrix.id }}
+          path: target/ci/windows-prepared
+          digest-mismatch: error
+        timeout-minutes: 6
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_614_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_614_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_614_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_614_3
+        if: ${{ !cancelled() && steps.acquire_node_614_2.outcome == 'failure' }}
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: driver-bootstrap-cache-windows
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          path: target/ci-bootstrap-in
+          key: mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+      - id: driver-bootstrap-windows
+        if: runner.os == 'Windows' && steps.driver-bootstrap-cache-windows.outcome == 'success' && steps.driver-bootstrap-cache-windows.outputs.cache-matched-key != ''
+        timeout-minutes: 2
+        run: ./target/ci-bootstrap-in/memcordon-ci.exe ci driver-bootstrap
+        continue-on-error: true
+      - id: driver-context-windows
+        if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
+        timeout-minutes: 5
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-context
+      - id: driver-context-windows-image-restore
+        if: steps.driver-context-windows.outputs.image-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.image-key }}
+          path: ${{ steps.driver-context-windows.outputs.image-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.image-prefix }}
+      - id: driver-selection-windows
+        if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
+        timeout-minutes: 4
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-select
+      - id: driver-context-windows-source-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.source-key }}
+          path: ${{ steps.driver-context-windows.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.source-prefix }}
+      - id: driver-context-windows-archives-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.archives-partial-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.archives-partial-prefix }}
+      - id: driver-context-windows-index-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.index-partial-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.index-partial-prefix }}
+      - id: driver-context-windows-compiled-complete-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.compiled-complete-key }}
+          path: ${{ steps.driver-context-windows.outputs.compiled-complete-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.compiled-complete-prefix }}
+      - id: driver-context-windows-compiled-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.compiled-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.compiled-partial-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.compiled-partial-prefix }}
+      - id: driver-managed-build-windows
+        if: steps.driver-selection-windows.outputs.build-required == 'true'
+        timeout-minutes: 50
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-build
+      - id: driver-managed-build-windows-bootstrap-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.bootstrap-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-bootstrap-save
+        if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true' && steps.driver-managed-build-windows-bootstrap-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
+      - id: driver-managed-build-windows-image-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.image-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-image-save
+        if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true' && steps.driver-managed-build-windows-image-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
+      - id: driver-managed-build-windows-compiled-complete-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.compiled-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-compiled-complete-save
+        if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-windows-compiled-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
+      - id: driver-managed-build-windows-compiled-partial-save
+        if: always() && steps.driver-managed-build-windows.outputs.compiled-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-path }}
+      - id: driver-managed-build-windows-source-complete-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-source-complete-save
+        if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true' && steps.driver-managed-build-windows-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
+      - id: driver-managed-build-windows-archives-partial-save
+        if: always() && steps.driver-managed-build-windows.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.archives-partial-path }}
+      - id: driver-managed-build-windows-index-partial-save
+        if: always() && steps.driver-managed-build-windows.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.index-partial-path }}
+      - id: driver-managed-cleanup-windows
+        if: always() && (steps.driver-managed-build-windows.outcome == 'success' || steps.driver-managed-build-windows.outcome == 'failure')
+        timeout-minutes: 2
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-cleanup
+      - id: driver-cold-build-windows
+        if: runner.os == 'Windows' && steps.driver-bootstrap-windows.outputs.bootstrap-ready != 'true'
+        timeout-minutes: 30
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci
+      - id: driver-cold-adopt-windows
+        if: steps.driver-cold-build-windows.outcome == 'success'
+        timeout-minutes: 15
+        run: ./target/ci-driver-cold/release/memcordon-ci.exe ci driver-adopt-cold
+      - id: driver-cold-adopt-windows-bootstrap-probe
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
+          lookup-only: true
+      - id: driver-cold-adopt-windows-bootstrap-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
+      - id: driver-cold-adopt-windows-source-complete-probe
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
+          lookup-only: true
+      - id: driver-cold-adopt-windows-source-complete-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
+      - id: driver-cold-adopt-windows-archives-partial-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
+      - id: driver-cold-adopt-windows-index-partial-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
+      - id: driver-cold-cleanup-windows
+        if: always() && steps.driver-cold-adopt-windows.outcome == 'success'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci driver-cleanup
+      - id: driver-workflows-check-windows
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
+      - id: workspace-fetch-request
+        timeout-minutes: 5
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci cache-requests workspace-fetch
+        if: runner.os == 'Windows'
+      - id: workspace-fetch-request-source-restore
+        if: steps.workspace-fetch-request.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch-request.outputs.source-key }}
+          path: ${{ steps.workspace-fetch-request.outputs.source-path }}
+          restore-keys: ${{ steps.workspace-fetch-request.outputs.source-prefix }}
+      - id: workspace-fetch-request-archives-partial-restore
+        if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
+          restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
+      - id: workspace-fetch-request-index-partial-restore
+        if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
+          restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci segment workspace-fetch
+        if: runner.os == 'Windows'
+        timeout-minutes: 25
+      - id: workspace-fetch-source-complete-probe
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
+          path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
+          lookup-only: true
+      - id: workspace-fetch-source-complete-save
+        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
+          path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
+      - id: workspace-fetch-archives-partial-save
+        if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
+          path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
+      - id: workspace-fetch-index-partial-save
+        if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
+          path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
+      - id: workspace-fetch-cleanup
+        if: always() && (steps.workspace-fetch.outcome == 'success' || steps.workspace-fetch.outcome == 'failure')
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers workspace-fetch
+      - id: context
+        if: (matrix.channel == 'cargo') && runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime
+        timeout-minutes: 20
+      - id: provider-input-experiment
+        if: (matrix.channel == 'native') && runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-file-input-experiment --dot-local-file
+        timeout-minutes: 135
+      - name: Retain passive Win32 module evidence
+        if: '!cancelled() && runner.os == ''Windows'''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/namespace-win32
+          if-no-files-found: ignore
+          retention-days: 7
+        timeout-minutes: 6
+      - name: Retain finite declared provider experiment facts
+        if: '!cancelled()'
+        uses: ./.github/actions/upload-artifact
+        timeout-minutes: 2
+        with:
+          name: provider-file-input-experiment-${{ matrix.id }}
+          path: |-
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/declaration.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/result.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/*.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.stdout.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
+            target/ci/provider-file-input-experiment/cases/package-uninstall.stdout.bin
+            target/ci/provider-file-input-experiment/cases/package-uninstall.stderr.bin
+            target/ci/provider-file-input-experiment/cases/package-uninstall.capture.json
+            target/ci/provider-file-input-experiment/cases/package-uninstall.invocation.json
+            target/ci/provider-file-input-experiment/cases/recovery.stdout.bin
+            target/ci/provider-file-input-experiment/cases/recovery.stderr.bin
+          if-no-files-found: warn
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  windows-provider-file-input-experiment-arm64:
+    if: github.event.deleted != true
+    needs: windows-payload-arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 353
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: arm64
+            channel: native
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - uses: *action_3
+        with:
+          name: windows-prepared-${{ matrix.id }}
+          path: target/ci/windows-prepared
+          digest-mismatch: error
+        timeout-minutes: 6
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_713_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_713_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_713_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_713_3
+        if: ${{ !cancelled() && steps.acquire_node_713_2.outcome == 'failure' }}
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - id: driver-bootstrap-cache-windows
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          path: target/ci-bootstrap-in
+          key: mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+      - id: driver-bootstrap-windows
+        if: runner.os == 'Windows' && steps.driver-bootstrap-cache-windows.outcome == 'success' && steps.driver-bootstrap-cache-windows.outputs.cache-matched-key != ''
+        timeout-minutes: 2
+        run: ./target/ci-bootstrap-in/memcordon-ci.exe ci driver-bootstrap
+        continue-on-error: true
+      - id: driver-context-windows
+        if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
+        timeout-minutes: 5
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-context
+      - id: driver-context-windows-image-restore
+        if: steps.driver-context-windows.outputs.image-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.image-key }}
+          path: ${{ steps.driver-context-windows.outputs.image-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.image-prefix }}
+      - id: driver-selection-windows
+        if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
+        timeout-minutes: 4
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-select
+      - id: driver-context-windows-source-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.source-key }}
+          path: ${{ steps.driver-context-windows.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.source-prefix }}
+      - id: driver-context-windows-archives-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.archives-partial-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.archives-partial-prefix }}
+      - id: driver-context-windows-index-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.index-partial-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.index-partial-prefix }}
+      - id: driver-context-windows-compiled-complete-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.compiled-complete-key }}
+          path: ${{ steps.driver-context-windows.outputs.compiled-complete-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.compiled-complete-prefix }}
+      - id: driver-context-windows-compiled-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.compiled-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.compiled-partial-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.compiled-partial-prefix }}
+      - id: driver-managed-build-windows
+        if: steps.driver-selection-windows.outputs.build-required == 'true'
+        timeout-minutes: 50
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-build
+      - id: driver-managed-build-windows-bootstrap-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.bootstrap-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-bootstrap-save
+        if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true' && steps.driver-managed-build-windows-bootstrap-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
+      - id: driver-managed-build-windows-image-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.image-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-image-save
+        if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true' && steps.driver-managed-build-windows-image-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
+      - id: driver-managed-build-windows-compiled-complete-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.compiled-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-compiled-complete-save
+        if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-windows-compiled-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
+      - id: driver-managed-build-windows-compiled-partial-save
+        if: always() && steps.driver-managed-build-windows.outputs.compiled-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-path }}
+      - id: driver-managed-build-windows-source-complete-probe
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
+          lookup-only: true
+      - id: driver-managed-build-windows-source-complete-save
+        if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true' && steps.driver-managed-build-windows-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
+      - id: driver-managed-build-windows-archives-partial-save
+        if: always() && steps.driver-managed-build-windows.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.archives-partial-path }}
+      - id: driver-managed-build-windows-index-partial-save
+        if: always() && steps.driver-managed-build-windows.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-managed-build-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-managed-build-windows.outputs.index-partial-path }}
+      - id: driver-managed-cleanup-windows
+        if: always() && (steps.driver-managed-build-windows.outcome == 'success' || steps.driver-managed-build-windows.outcome == 'failure')
+        timeout-minutes: 2
+        run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-cleanup
+      - id: driver-cold-build-windows
+        if: runner.os == 'Windows' && steps.driver-bootstrap-windows.outputs.bootstrap-ready != 'true'
+        timeout-minutes: 30
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci
+      - id: driver-cold-adopt-windows
+        if: steps.driver-cold-build-windows.outcome == 'success'
+        timeout-minutes: 15
+        run: ./target/ci-driver-cold/release/memcordon-ci.exe ci driver-adopt-cold
+      - id: driver-cold-adopt-windows-bootstrap-probe
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
+          lookup-only: true
+      - id: driver-cold-adopt-windows-bootstrap-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
+      - id: driver-cold-adopt-windows-source-complete-probe
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
+          lookup-only: true
+      - id: driver-cold-adopt-windows-source-complete-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
+      - id: driver-cold-adopt-windows-archives-partial-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
+      - id: driver-cold-adopt-windows-index-partial-save
+        if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
+      - id: driver-cold-cleanup-windows
+        if: always() && steps.driver-cold-adopt-windows.outcome == 'success'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci driver-cleanup
+      - id: driver-workflows-check-windows
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
+      - id: workspace-fetch-request
+        timeout-minutes: 5
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci cache-requests workspace-fetch
+        if: runner.os == 'Windows'
+      - id: workspace-fetch-request-source-restore
+        if: steps.workspace-fetch-request.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch-request.outputs.source-key }}
+          path: ${{ steps.workspace-fetch-request.outputs.source-path }}
+          restore-keys: ${{ steps.workspace-fetch-request.outputs.source-prefix }}
+      - id: workspace-fetch-request-archives-partial-restore
+        if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
+          restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
+      - id: workspace-fetch-request-index-partial-restore
+        if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
+          restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci segment workspace-fetch
+        if: runner.os == 'Windows'
+        timeout-minutes: 25
+      - id: workspace-fetch-source-complete-probe
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: *action_1
+        with:
+          key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
+          path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
+          lookup-only: true
+      - id: workspace-fetch-source-complete-save
+        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
+          path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
+      - id: workspace-fetch-archives-partial-save
+        if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
+          path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
+      - id: workspace-fetch-index-partial-save
+        if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_2
+        with:
+          key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
+          path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
+      - id: workspace-fetch-cleanup
+        if: always() && (steps.workspace-fetch.outcome == 'success' || steps.workspace-fetch.outcome == 'failure')
+        timeout-minutes: 2
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers workspace-fetch
+      - id: context
+        if: (matrix.channel == 'cargo') && runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime
+        timeout-minutes: 20
+      - id: provider-input-experiment
+        if: (matrix.channel == 'native') && runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-file-input-experiment --dot-local-file
+        timeout-minutes: 135
+      - name: Retain passive Win32 module evidence
+        if: '!cancelled() && runner.os == ''Windows'''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: namespace-win32-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/reports/namespace-win32
+          if-no-files-found: ignore
+          retention-days: 7
+        timeout-minutes: 6
+      - name: Retain finite declared provider experiment facts
+        if: '!cancelled()'
+        uses: ./.github/actions/upload-artifact
+        timeout-minutes: 2
+        with:
+          name: provider-file-input-experiment-${{ matrix.id }}
+          path: |-
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/declaration.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/result.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/*.json
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.stdout.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.stderr.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stdout.bin
+            target/ci/provider-file-input-experiment/cases/provider-input-experiment/*/facts/result.guardian-query.stderr.bin
+            target/ci/provider-file-input-experiment/cases/package-uninstall.stdout.bin
+            target/ci/provider-file-input-experiment/cases/package-uninstall.stderr.bin
+            target/ci/provider-file-input-experiment/cases/package-uninstall.capture.json
+            target/ci/provider-file-input-experiment/cases/package-uninstall.invocation.json
+            target/ci/provider-file-input-experiment/cases/recovery.stdout.bin
+            target/ci/provider-file-input-experiment/cases/recovery.stderr.bin
           if-no-files-found: warn
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home

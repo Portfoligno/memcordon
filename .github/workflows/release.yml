@@ -2856,11 +2856,15 @@ jobs:
           name: installed-listener-failure-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |-
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.callback-failure.json
+            target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.failed-frontend.json
+            target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.failed-terminal-observation.json
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.stderr.bin
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.winsock-startup-trace.json
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.listener-call-trace.json
             target/ci/reports/installed/raw/windows-installed/C-IO/empty-message/result.listener-native-file-requests.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.callback-failure.json
+            target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.failed-frontend.json
+            target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.failed-terminal-observation.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.stderr.bin
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.winsock-startup-trace.json
             target/ci/reports/installed/raw/windows-installed/W-JOINT/restricted/result.listener-call-trace.json

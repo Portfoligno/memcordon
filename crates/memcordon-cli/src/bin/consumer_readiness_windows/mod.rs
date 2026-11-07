@@ -536,13 +536,22 @@ fn send_peer_registry(
             }
             let mut references = Vec::with_capacity(roles.len());
             for ((role, index), file) in roles.into_iter().zip(files) {
-                let handle =
+                let handle = if role == descriptor::controller_start::DirectoryRole::LocalMarkerFile
+                {
+                    memcordon_platform::test_support::duplicate_marker_metadata_into_child(
+                        peer,
+                        file,
+                        deadline,
+                        &mut duplicated,
+                    )?
+                } else {
                     memcordon_platform::test_support::duplicate_directory_metadata_into_child(
                         peer,
                         file,
                         deadline,
                         &mut duplicated,
-                    )?;
+                    )?
+                };
                 references.push(descriptor::controller_start::DirectoryReference {
                     role,
                     index,
@@ -551,7 +560,7 @@ fn send_peer_registry(
                 });
             }
             let transfer = descriptor::controller_start::DirectoryTransfer {
-                version: 1,
+                version: expected.transfer_version(),
                 manifest_sha256: expected.manifest_sha256,
                 references,
             };

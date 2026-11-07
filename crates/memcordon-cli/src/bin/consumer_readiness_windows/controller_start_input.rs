@@ -155,6 +155,11 @@ impl Session {
         if self.private_files.len() != transfer.references.len()
             || input_count == 0
             || input_count + 1 >= self.private_files.len()
+            || !matches!(
+                transfer.references[input_count].role,
+                controller_start::DirectoryRole::LocalDirectory
+                    | controller_start::DirectoryRole::LocalMarkerFile
+            )
         {
             return Err(io::Error::other(
                 "owned private directory set unavailable or already closed",

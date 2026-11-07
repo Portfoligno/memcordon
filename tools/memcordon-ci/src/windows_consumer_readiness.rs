@@ -715,7 +715,7 @@ pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -
             descriptor::StartTransport::ControllerStdin {
                 version
             } if version == descriptor::controller_start::REGISTRY_VERSION
-                || (descriptor.provider_input_experiment && version == descriptor::controller_start::PRIVATE_VERSION)
+                || (descriptor.provider_input_experiment && version == if descriptor.provider_input_binding.as_ref().is_some_and(|binding| binding.file_layout()) { descriptor::controller_start::PRIVATE_FILE_VERSION } else { descriptor::controller_start::PRIVATE_VERSION })
         );
     if !explicit_registry && descriptor.start_transport != expected_start_transport(key) {
         return Err(CiError::Message(
@@ -1625,8 +1625,9 @@ pub fn run_provider_input_experiment_until(
     root: &Path,
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
     deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+    dot_local_file: bool,
 ) -> Result<serde_json::Value> {
-    native::provider_input_experiment(root, config, deadlines)
+    native::provider_input_experiment(root, config, deadlines, dot_local_file)
 }
 
 #[cfg(windows)]
@@ -4192,7 +4193,16 @@ pub(crate) mod native {
                 declared.descriptor.winsock_registry = Some(projection.declaration().clone());
                 declared.descriptor.start_transport = descriptor::StartTransport::ControllerStdin {
                     version: if declared.descriptor.provider_input_experiment {
-                        descriptor::controller_start::PRIVATE_VERSION
+                        if declared
+                            .descriptor
+                            .provider_input_binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.file_layout())
+                        {
+                            descriptor::controller_start::PRIVATE_FILE_VERSION
+                        } else {
+                            descriptor::controller_start::PRIVATE_VERSION
+                        }
                     } else {
                         descriptor::controller_start::REGISTRY_VERSION
                     },
@@ -4211,7 +4221,16 @@ pub(crate) mod native {
                 declared.descriptor.winsock_registry = Some(owner.declaration().clone());
                 declared.descriptor.start_transport = descriptor::StartTransport::ControllerStdin {
                     version: if declared.descriptor.provider_input_experiment {
-                        descriptor::controller_start::PRIVATE_VERSION
+                        if declared
+                            .descriptor
+                            .provider_input_binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.file_layout())
+                        {
+                            descriptor::controller_start::PRIVATE_FILE_VERSION
+                        } else {
+                            descriptor::controller_start::PRIVATE_VERSION
+                        }
                     } else {
                         descriptor::controller_start::REGISTRY_VERSION
                     },
@@ -6799,6 +6818,7 @@ pub(crate) mod native {
         root: &Path,
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+        dot_local_file: bool,
     ) -> Result<serde_json::Value> {
         use crate::windows_provider_projection::native::Deployment;
         use crate::windows_provider_projection_record::{self as facts, BindingExpectation};
@@ -6856,6 +6876,7 @@ pub(crate) mod native {
                 &config.target,
                 &attempt_directory,
                 deadlines.work,
+                dot_local_file,
             )?;
             let mut selected = config.clone();
             selected.fixture = deployment.fixture.clone();
@@ -6934,7 +6955,7 @@ pub(crate) mod native {
                 input.descriptor.provider_input_binding = Some(fixture_binding.clone());
                 publish(
                     &attempt_directory.join("declaration.json"),
-                    &serde_json::json!({"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"registry_declaration_sha256":declaration_sha,"inputs":deployment.inventory,"diagnostic_only":true,"acceptance_authority":false}),
+                    &serde_json::json!({"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"registry_declaration_sha256":declaration_sha,"inputs":deployment.inventory,"layout_binding":fixture_binding,"diagnostic_only":true,"acceptance_authority":false}),
                 )?;
                 let provider_root = config.installed_agent.path.parent().ok_or_else(|| {
                     CiError::Message("experiment installed provider root absent".into())
@@ -7096,12 +7117,13 @@ pub(crate) mod native {
                         16 * 1024,
                         phase,
                     )?;
-                    facts::mutation_witness(
+                    facts::mutation_witness_for_layout(
                         &probes,
                         pid,
                         peer,
                         input.expected_token.restricted,
                         &paths,
+                        dot_local_file,
                     )
                     .map_err(CiError::Message)?;
                     images.push(

@@ -1,6 +1,6 @@
 use memcordon_ci::windows_provider_projection_record::{
     BindingExpectation, CatalogProvider, CatalogSnapshot, PrivateInput, image_witness,
-    mutation_witness, select, verify_expansion,
+    mutation_witness, mutation_witness_for_layout, select, verify_expansion,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -168,6 +168,19 @@ fn restricted_mutations_need_every_exact_owned_input_and_security_authority_deni
         "restricted":false,"performed":false,"complete":false,"state":"not-required-for-ordinary-baseline"});
     mutation_witness(&ordinary, 100, false, false, &paths).unwrap();
     assert!(mutation_witness(&ordinary, 100, false, true, &paths).is_err());
+    let file_paths = (0..10)
+        .map(|index| hex::encode(Sha256::digest(format!("owned-file-target-{index}"))))
+        .collect::<Vec<_>>();
+    let mut file_value = value.clone();
+    file_value["rows"] = json!(file_paths.iter().map(|path| json!({"path_sha256":path,"write_dac_error":5,"write_owner_error":5,"write_error":5,"delete_error":32,"rename_error":32,"substitution_error":5,"all_mutations_refused":true})).collect::<Vec<_>>());
+    file_value["directory_authority"] = json!([{"write_dac_error":5,"write_owner_error":5}]);
+    mutation_witness_for_layout(&file_value, 100, false, true, &file_paths, true).unwrap();
+    assert!(mutation_witness(&file_value, 100, false, true, &file_paths).is_err());
+    let mut missing_marker = file_value.clone();
+    missing_marker["rows"].as_array_mut().unwrap().remove(1);
+    assert!(
+        mutation_witness_for_layout(&missing_marker, 100, false, true, &file_paths, true).is_err()
+    );
 }
 
 fn provider(id: u32, path: &str) -> CatalogProvider {

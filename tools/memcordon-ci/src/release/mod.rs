@@ -151,6 +151,9 @@ pub enum ReleaseCommand {
         prepared: PathBuf,
         #[arg(long)]
         destination: PathBuf,
+        /// Independent file-marker experiment; directory layout remains the default.
+        #[arg(long)]
+        dot_local_file: bool,
     },
     ConsumerCache {
         /// Stable ordinary preparation owns job-local sources; ephemeral only reports downloads.
@@ -414,9 +417,13 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::WorkingWindowsProviderExperiment {
             prepared,
             destination,
-        } => {
-            windows_installed_consumer::run_provider_input_experiment(root, &prepared, &destination)
-        }
+            dot_local_file,
+        } => windows_installed_consumer::run_provider_input_experiment(
+            root,
+            &prepared,
+            &destination,
+            dot_local_file,
+        ),
         ReleaseCommand::ConsumerCache {
             layout,
             for_save,

@@ -1,7 +1,7 @@
 #![cfg(all(windows, feature = "test-support"))]
 
 use memcordon_platform::test_support::{
-    ProcessIdentity, duplicate_directory_metadata_into_child,
+    ProcessIdentity, duplicate_directory_metadata_into_child, duplicate_marker_metadata_into_child,
     windows_fixture_input_processes_for_image_until, windows_held_file_metadata,
 };
 use std::{
@@ -269,6 +269,45 @@ fn held_child_admission_and_metadata_references_preserve_exact_owners_and_rights
     input.write_all(&metadata.file_index.to_le_bytes()).unwrap();
     input
         .write_all(&metadata.volume_serial.to_le_bytes())
+        .unwrap();
+    drop(input);
+    assert!(child.wait_until_exit().unwrap().success());
+    assert!(admitted.has_exited().unwrap());
+    assert!(pending.has_exited().unwrap());
+
+    // FILE marker transfer is distinct from directory ancestry transfer and
+    // still yields exact query-only/noninheritable rights in the real child.
+    let marker_path = directory.path().join("fixture.exe.local");
+    std::fs::write(&marker_path, []).unwrap();
+    let marker = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&marker_path)
+        .unwrap();
+    let marker_metadata = windows_held_file_metadata(&marker).unwrap();
+    let mut child = spawn(cutoff);
+    let expected = identity(&child);
+    let pending = root
+        .duplicate_pending_child(child.as_raw_handle() as usize as u64, cutoff)
+        .unwrap();
+    let admitted = pending.admit(&root, expected, &executable, cutoff).unwrap();
+    let mut count = 0;
+    assert!(duplicate_directory_metadata_into_child(&child, &marker, cutoff, &mut count).is_err());
+    assert!(duplicate_marker_metadata_into_child(&child, &source, cutoff, &mut count).is_err());
+    assert_eq!(count, 0);
+    duplicate_marker_metadata_into_child(&child, &marker, cutoff, &mut count).unwrap();
+    let transferred = admitted
+        .duplicate_marker_metadata(&marker, cutoff, &mut count)
+        .unwrap();
+    assert_eq!(count, 2);
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(&transferred.to_le_bytes()).unwrap();
+    input
+        .write_all(&marker_metadata.file_index.to_le_bytes())
+        .unwrap();
+    input
+        .write_all(&marker_metadata.volume_serial.to_le_bytes())
         .unwrap();
     drop(input);
     assert!(child.wait_until_exit().unwrap().success());

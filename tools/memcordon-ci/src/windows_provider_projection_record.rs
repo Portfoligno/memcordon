@@ -206,6 +206,17 @@ pub fn mutation_witness(
     restricted: bool,
     paths: &[String],
 ) -> Result<(), String> {
+    mutation_witness_for_layout(value, pid, peer, restricted, paths, false)
+}
+
+pub fn mutation_witness_for_layout(
+    value: &serde_json::Value,
+    pid: u32,
+    peer: bool,
+    restricted: bool,
+    paths: &[String],
+    file_layout: bool,
+) -> Result<(), String> {
     if pid == 0
         || value["format"] != "memcordon.private-provider-input-mutation-probes"
         || value["revision"] != 1
@@ -230,8 +241,8 @@ pub fn mutation_witness(
     if value["performed"] != true
         || value["complete"] != true
         || rows.len() != paths.len()
-        || rows.len() < 2
-        || rows.len() > 9
+        || rows.len() < if file_layout { 3 } else { 2 }
+        || rows.len() > if file_layout { 10 } else { 9 }
     {
         return Err("restricted private mutation probes incomplete".into());
     }
@@ -262,7 +273,7 @@ pub fn mutation_witness(
     let dirs = value["directory_authority"]
         .as_array()
         .ok_or("private directory security probes unavailable")?;
-    if dirs.len() != 2
+    if dirs.len() != if file_layout { 1 } else { 2 }
         || dirs
             .iter()
             .any(|row| row["write_dac_error"] != 5 || row["write_owner_error"] != 5)
