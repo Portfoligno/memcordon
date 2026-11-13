@@ -718,7 +718,7 @@ pub(super) fn failure(
             .as_ref()
             .map(|association| association.provider.clone()),
     )?;
-    report.provider_failure = error.provider_failure.clone();
+    report.provider_failure = error.provider_failure.as_deref().cloned();
     #[cfg(windows)]
     {
         report.windows_attempt = error.provider_association.as_deref().cloned();

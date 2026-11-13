@@ -56,6 +56,76 @@ pub(crate) fn observed_terminal_delivery(
     Ok(delivery)
 }
 
+/// Complete only the caller's already selected terminal obligation. Canonical
+/// authority is bound once and reused for both ACK and delivery evidence;
+/// diagnostic-bearing wire bytes can never enter either authority digest.
+pub(crate) fn complete_terminal_ack(
+    response: &WindowsProviderResponseV4,
+    context: &RejectionContext<'_>,
+    acknowledge: impl FnOnce(&str) -> Result<Vec<u8>, Box<Error>>,
+) -> Result<WindowsFrontendDeliveryV3, Box<Error>> {
+    let receipt_matches = |receipt: &memcordon_core::WindowsTerminalReceiptV3| {
+        receipt.attempt_id == context.attempt_id
+            && receipt.nonce == context.nonce
+            && receipt.request_sha256 == context.request_sha256
+            && receipt.retirement_proof.provider_generation == context.provider.generation.as_str()
+            && receipt.validate_for_attempt().is_ok()
+    };
+    let bound = match response {
+        WindowsProviderResponseV4::Terminal(receipt) => receipt_matches(receipt),
+        WindowsProviderResponseV4::Reject {
+            schema_version,
+            attempt_id,
+            nonce,
+            request_sha256,
+            rejection,
+        } => {
+            *schema_version == memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
+                && attempt_id == context.attempt_id
+                && nonce == context.nonce
+                && request_sha256 == context.request_sha256
+                && rejection.is_consistent()
+                && rejection.terminal_ack_required()
+                && rejection.terminal_receipt().is_none_or(receipt_matches)
+        }
+        _ => false,
+    };
+    if !bound {
+        return Err(Box::new(transport_error(
+            "terminal acknowledgment response binding differs",
+        )));
+    }
+    let authority = response
+        .terminal_authority_json()
+        .map_err(|error| Box::new(transport_error(error.to_string())))?;
+    let digest = digest_bytes(authority.as_bytes());
+    let retired_raw = acknowledge(&digest)?;
+    if retired_raw.is_empty()
+        || retired_raw.len() > memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+    {
+        return Err(Box::new(transport_error(
+            "terminal retirement exceeds its native frame bound",
+        )));
+    }
+    let retired: WindowsProviderResponseV4 = serde_json::from_slice(&retired_raw)
+        .map_err(|error| Box::new(transport_error(error.to_string())))?;
+    if !matches!(&retired, WindowsProviderResponseV4::TerminalRetiredV2(retired)
+        if retired.provider_generation == context.provider.generation.as_str()
+            && retired.is_consistent_for(context.attempt_id,context.nonce,context.request_sha256,&digest))
+    {
+        return Err(Box::new(transport_error(
+            "provider did not confirm exact terminal retirement",
+        )));
+    }
+    observed_terminal_delivery(
+        context.attempt_id,
+        context.nonce,
+        context.request_sha256,
+        authority.as_bytes(),
+        &retired_raw,
+    )
+}
+
 pub(crate) fn complete_rejection_ack(
     mut primary: Error,
     response: &WindowsProviderResponseV4,
@@ -105,30 +175,7 @@ pub(crate) fn complete_rejection_ack(
         if !rejection.terminal_ack_required() {
             return Ok(None);
         }
-        let authority = response
-            .terminal_authority_json()
-            .map_err(|error| Box::new(transport_error(error.to_string())))?;
-        let digest = digest_bytes(authority.as_bytes());
-        let retired_raw = acknowledge(&digest)?;
-        let retired: WindowsProviderResponseV4 = serde_json::from_slice(&retired_raw)
-            .map_err(|error| Box::new(transport_error(error.to_string())))?;
-        if !matches!(&retired, WindowsProviderResponseV4::TerminalRetiredV2(retired)
-            if retired.provider_generation == context.provider.generation.as_str()
-                && retired.is_consistent_for(context.attempt_id, context.nonce,
-                    context.request_sha256, &digest))
-        {
-            return Err(Box::new(transport_error(
-                "provider did not confirm exact terminal retirement",
-            )));
-        }
-        observed_terminal_delivery(
-            context.attempt_id,
-            context.nonce,
-            context.request_sha256,
-            authority.as_bytes(),
-            &retired_raw,
-        )
-        .map(Some)
+        complete_terminal_ack(response, context, acknowledge).map(Some)
     })();
     match completion {
         Ok(Some(delivery)) => primary.windows_frontend_delivery = Some(delivery),

@@ -426,6 +426,12 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
     // Classification only: no state operation occurs before hardening. These
     // two queries retain an authenticated failure instead of an opaque EOF.
     let request: WindowsProviderRequestV4 = pipe::read_frame_until(public, initial_cutoff)?;
+    if matches!(
+        &request,
+        WindowsProviderRequestV4::ObserveAttemptDiagnostics { .. }
+    ) {
+        return handle_attempt_diagnostics(public, request, initial_cutoff);
+    }
     let diagnostic_query = matches!(
         &request,
         WindowsProviderRequestV4::ObserveGuardianAttempt { schema_version, .. }
@@ -815,6 +821,76 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
         }
         _ => Err("unsupported Windows public provider request".to_owned()),
     }
+}
+
+fn handle_attempt_diagnostics(
+    public: HANDLE,
+    request: WindowsProviderRequestV4,
+    cutoff: std::time::Instant,
+) -> Result<(), String> {
+    let WindowsProviderRequestV4::ObserveAttemptDiagnostics {
+        schema_version,
+        attempt_id,
+        nonce,
+        request_sha256,
+        challenge,
+    } = request
+    else {
+        return Err("attempt diagnostic request kind differs".into());
+    };
+    memcordon_core::validate_windows_attempt_diagnostics_request(
+        schema_version,
+        &attempt_id,
+        &nonce,
+        &request_sha256,
+        &challenge,
+    )?;
+    let provider = super::package::installed_public_provider_binding()?;
+    let mut response = memcordon_core::WindowsAttemptDiagnosticsV1 {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+        challenge: challenge.clone(),
+        attempt_id: attempt_id.clone(),
+        request_sha256: request_sha256.clone(),
+        provider_binding: provider.clone(),
+        status: memcordon_core::WindowsAttemptDiagnosticsStatusV1::Denied,
+        diagnostic_availability: None,
+        provider_failure: None,
+    };
+    if let Ok(caller) = authenticated_recovery_caller(public) {
+        let (launcher, _process, _identity) = authenticated_launcher()?;
+        pipe::write_frame_until(
+            launcher.raw(),
+            &WindowsLauncherRequestV4::ObserveAttemptDiagnostics {
+                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+                attempt_id: attempt_id.clone(),
+                nonce,
+                request_sha256: request_sha256.clone(),
+                challenge: challenge.clone(),
+                caller,
+            },
+            cutoff,
+        )?;
+        let returned: WindowsLauncherResponseV4 =
+            pipe::read_response_frame_until(launcher.raw(), cutoff)?;
+        let WindowsLauncherResponseV4::AttemptDiagnostics(mut observed) = returned else {
+            return Err("launcher attempt diagnostic reply kind differs".into());
+        };
+        observed.validate_bound(
+            WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+            &challenge,
+            &attempt_id,
+            &request_sha256,
+            &provider,
+        )?;
+        observed.schema_version = WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION;
+        response = observed;
+    }
+    // A single diagnostic reply has no delivery/ACK/settlement continuation.
+    pipe::write_frame_until(
+        public,
+        &WindowsProviderResponseV4::AttemptDiagnostics(response),
+        cutoff,
+    )
 }
 
 fn handle_read_only_query(public: HANDLE, request: WindowsProviderRequestV4) -> Result<(), String> {
@@ -1240,8 +1316,8 @@ fn launch_client_inner(
     if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
         return Err(io::Error::last_os_error().to_string());
     }
-    let (primary_token, mut caller_token_envelope, frontend, before) =
-        super::token::authenticate_pipe_client(public, client_pid, None)?;
+    let (primary_token, mut caller_token_envelope, frontend, before, native_input_capture) =
+        super::token::authenticate_launch_pipe_client(public, client_pid, None)?;
     if certification_mutant == Some(WindowsSealedMutant::TrustClientToken) {
         // The executable mutant replaces the authenticated envelope with the
         // certification client's untrusted claim. The launcher's independent
@@ -1250,13 +1326,21 @@ fn launch_client_inner(
             caller_token_envelope.authentication_id.wrapping_add(1);
     }
     let request_bytes = serde_json::to_vec(&launch).map_err(|error| error.to_string())?;
-    let request_sha256 = hex(Sha256::digest(request_bytes));
+    let request_digest: [u8; 32] = Sha256::digest(request_bytes).into();
+    let request_sha256 = hex(request_digest);
     let mut attempt_digest = Sha256::new();
     attempt_digest.update(launch.nonce.as_bytes());
     attempt_digest.update(before.process_id.to_le_bytes());
     attempt_digest.update(before.creation_time_100ns.to_le_bytes());
     attempt_digest.update(request_sha256.as_bytes());
-    let attempt_id = hex(attempt_digest.finalize());
+    let attempt_digest: [u8; 32] = attempt_digest.finalize().into();
+    let attempt_id = hex(attempt_digest);
+    let native_inputs = memcordon_core::WindowsNativeInputObservationV1::new(
+        attempt_digest,
+        request_digest,
+        before.clone(),
+        native_input_capture,
+    );
     progress.binding = Some(LaunchBinding {
         attempt_id: attempt_id.clone(),
         nonce: launch.nonce.clone(),
@@ -1481,6 +1565,7 @@ fn launch_client_inner(
         request_sha256: request_sha256.clone(),
         caller_process_identity: before,
         caller_token_envelope,
+        native_inputs: Some(native_inputs),
         remote_primary_token_handle: remote_token,
         remote_frontend_process_handle: remote_frontend,
         remote_frontend_canary_handles: Vec::new(),

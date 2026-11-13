@@ -95,7 +95,9 @@ fn unsafe_cache(error: &CiError) -> bool {
 pub fn cache_safety_error(error: &CiError) -> bool {
     match error {
         CiError::CacheSafety(_) => true,
-        CiError::OwnedWork { source, .. } => cache_safety_error(source),
+        CiError::OwnedWork { source, .. } | CiError::Context { source, .. } => {
+            cache_safety_error(source)
+        }
         CiError::LaneFailures { primary, secondary } => {
             cache_safety_error(primary) || cache_safety_error(secondary)
         }

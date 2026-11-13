@@ -29,8 +29,18 @@ fn selected(root: &Path) -> Result<TargetDistribution> {
 pub fn prepare_working(root: &Path, destination: &Path) -> Result<()> {
     let selection = selected(root)?;
     let source = BuildSourceIdentity::working(root)?;
-    target::build_selected(root, &source, &selection, destination)?;
-    source.recheck(root)
+    let original = std::time::Instant::now() + std::time::Duration::from_secs(140 * 60);
+    let deadline =
+        crate::preparation::active_group().map_or(original, |group| original.min(group.deadline()));
+    crate::preparation::with_operation(
+        crate::failure_mode::FailureMode::StopAfterFailure,
+        deadline,
+        || {
+            target::build_selected(root, &source, &selection, destination)?;
+            target::prepare_linux_readiness_fixture(root, &source, &selection.target, deadline)?;
+            source.recheck(root)
+        },
+    )
 }
 
 pub fn run_prepared(root: &Path, prepared: &Path, destination: &Path) -> Result<()> {

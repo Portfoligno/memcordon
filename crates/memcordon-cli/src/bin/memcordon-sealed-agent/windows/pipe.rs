@@ -1406,38 +1406,7 @@ pub fn write_frame_until<T: Serialize>(
     write_frame_detailed_until(handle, value, cutoff).map_err(|error| error.to_string())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrameWritePhase {
-    Serialize,
-    Length,
-    Payload,
-    Drain,
-}
-
-#[derive(Debug)]
-pub struct FrameWriteError {
-    pub phase: FrameWritePhase,
-    pub expected_bytes: usize,
-    pub transferred_bytes: usize,
-    pub native_code: Option<u32>,
-    pub peer_closed: bool,
-    detail: String,
-}
-
-impl std::fmt::Display for FrameWriteError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "MCSEALED-WINDOWS-PIPE-WRITE: phase={:?} expected_bytes={} transferred_bytes={} native_code={:?} peer_closed={} detail={}",
-            self.phase,
-            self.expected_bytes,
-            self.transferred_bytes,
-            self.native_code,
-            self.peer_closed,
-            self.detail
-        )
-    }
-}
+pub use super::frame_write::{FrameWriteError, FrameWritePhase};
 
 fn frame_write_error(
     phase: FrameWritePhase,
@@ -1446,19 +1415,19 @@ fn frame_write_error(
     native_code: Option<u32>,
     detail: String,
 ) -> FrameWriteError {
-    FrameWriteError {
+    FrameWriteError::new(
         phase,
         expected_bytes,
         transferred_bytes,
         native_code,
-        peer_closed: native_code.is_some_and(|code| {
+        native_code.is_some_and(|code| {
             matches!(
                 code,
                 ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
             )
         }),
         detail,
-    }
+    )
 }
 
 pub fn write_frame_detailed<T: Serialize>(
@@ -1477,149 +1446,136 @@ fn write_frame_detailed_until<T: Serialize>(
     value: &T,
     cutoff: std::time::Instant,
 ) -> Result<(), FrameWriteError> {
-    let transport = SynchronousIoDeadline::start(cutoff)
-        .map_err(|detail| frame_write_error(FrameWritePhase::Serialize, 0, 0, None, detail))?;
-    let result = write_frame_detailed_inner(handle, value).and_then(|()| {
-        // SAFETY: the exact live pipe is drained only while its own-thread
-        // transport cancellation guard is active; no record mutation occurs.
-        if unsafe { FlushFileBuffers(handle) } == 0 {
-            let error = io::Error::last_os_error();
-            Err(frame_write_error(
-                FrameWritePhase::Drain,
-                0,
-                0,
-                error
-                    .raw_os_error()
-                    .and_then(|code| u32::try_from(code).ok()),
-                error.to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    });
-    match (result, transport.finish()) {
-        (Err(mut primary), Err(secondary)) => {
-            primary.detail.push_str("; transport settlement: ");
-            primary.detail.push_str(&secondary);
-            Err(primary)
-        }
-        (Err(primary), _) => Err(primary),
-        (Ok(()), Err(detail)) => Err(frame_write_error(
-            FrameWritePhase::Drain,
-            0,
-            0,
-            None,
-            detail,
-        )),
-        (Ok(()), Ok(())) => Ok(()),
-    }
+    write_frame_detailed_observed_until(handle, value, cutoff, &mut |_| {})
 }
 
-fn write_frame_detailed_inner<T: Serialize>(
+/// Only the two terminal-delivery callers supply this diagnostic observer.
+/// It does not own a lane, pipe, watcher or any publication/retirement decision.
+pub(super) fn write_frame_observed<T: Serialize>(
     handle: HANDLE,
     value: &T,
-) -> Result<(), FrameWriteError> {
-    write_frame_using(value, |bytes| {
-        let requested = u32::try_from(bytes.len()).expect("bounded frame segment");
-        let mut written = 0u32;
-        // SAFETY: this synchronous call borrows live bytes and writable count;
-        // native last-error is retained immediately, before formatting.
-        if unsafe {
-            WriteFile(
-                handle,
-                bytes.as_ptr(),
-                requested,
-                &raw mut written,
-                ptr::null_mut(),
-            )
-        } == 0
-        {
-            let error = io::Error::last_os_error();
-            Err((
-                error
-                    .raw_os_error()
-                    .map(|code| u32::from_ne_bytes(code.to_ne_bytes())),
-                written as usize,
-                error.to_string(),
-            ))
+    outer_cutoff: std::time::Instant,
+    mut observe: impl FnMut(super::writer_lifecycle::TransportUpdate),
+) -> Result<(), String> {
+    // This is the original independently selected inner write_frame budget.
+    let inner_cutoff = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // Capture on this executing caller, never on the cancellation watcher or
+    // by reopening a numeric TID. Observation cannot change last-error/result.
+    let executing_thread = unsafe {
+        use super::writer_lifecycle::ExecutingThread;
+        use windows_sys::Win32::Foundation::{FILETIME, GetLastError, SetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetCurrentThreadId, GetThreadTimes,
+        };
+        let saved = GetLastError();
+        let tid = GetCurrentThreadId();
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let result = GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        );
+        let identity = if result == 0 {
+            ExecutingThread::Unavailable {
+                tid,
+                native_code: GetLastError(),
+            }
         } else {
-            Ok(written as usize)
-        }
+            ExecutingThread::Observed {
+                tid,
+                birth: (u64::from(creation.dwHighDateTime) << 32)
+                    | u64::from(creation.dwLowDateTime),
+            }
+        };
+        SetLastError(saved);
+        identity
+    };
+    write_frame_detailed_observed_until(handle, value, inner_cutoff, &mut |progress| {
+        observe(super::writer_lifecycle::TransportUpdate {
+            progress,
+            outer_cutoff,
+            inner_cutoff,
+            executing_thread,
+            observed_at: Some(std::time::Instant::now()),
+        });
     })
+    .map_err(|error| error.to_string())
 }
 
+fn write_frame_detailed_observed_until<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+    cutoff: std::time::Instant,
+    observe: &mut dyn FnMut(super::frame_write::WriteProgress),
+) -> Result<(), FrameWriteError> {
+    let transport = SynchronousIoDeadline::start(cutoff)
+        .map_err(|detail| frame_write_error(FrameWritePhase::Serialize, 0, 0, None, detail))?;
+    super::frame_write::complete_frame_using(
+        value,
+        |bytes| native_frame_write(handle, bytes),
+        observe,
+        frame_write_error,
+        || {
+            // SAFETY: the exact live pipe is drained only while its own-thread
+            // transport cancellation guard is active; no record mutation occurs.
+            if unsafe { FlushFileBuffers(handle) } == 0 {
+                let error = io::Error::last_os_error();
+                Err(frame_write_error(
+                    FrameWritePhase::Drain,
+                    0,
+                    0,
+                    error
+                        .raw_os_error()
+                        .and_then(|code| u32::try_from(code).ok()),
+                    error.to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        || transport.finish(),
+    )
+}
+
+fn native_frame_write(handle: HANDLE, bytes: &[u8]) -> Result<usize, (Option<u32>, usize, String)> {
+    let requested = u32::try_from(bytes.len()).expect("bounded frame segment");
+    let mut written = 0u32;
+    // SAFETY: this synchronous call borrows live bytes and writable count;
+    // native last-error is retained immediately, before formatting.
+    if unsafe {
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            requested,
+            &raw mut written,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        Err((
+            error
+                .raw_os_error()
+                .map(|code| u32::from_ne_bytes(code.to_ne_bytes())),
+            written as usize,
+            error.to_string(),
+        ))
+    } else {
+        Ok(written as usize)
+    }
+}
+
+#[cfg(test)]
 fn write_frame_using<T: Serialize>(
     value: &T,
-    mut write: impl FnMut(&[u8]) -> Result<usize, (Option<u32>, usize, String)>,
+    write: impl FnMut(&[u8]) -> Result<usize, (Option<u32>, usize, String)>,
 ) -> Result<(), FrameWriteError> {
-    let payload = serde_json::to_vec(value).map_err(|error| {
-        frame_write_error(FrameWritePhase::Serialize, 0, 0, None, error.to_string())
-    })?;
-    if let Ok(limit) = memcordon_core::windows_response_frame_limit(
-        &payload[..payload
-            .len()
-            .min(memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES)],
-    ) {
-        if payload.len() > limit {
-            return Err(frame_write_error(
-                FrameWritePhase::Serialize,
-                payload.len(),
-                0,
-                None,
-                "diagnostic control frame exceeds its reserved bound".into(),
-            ));
-        }
-    }
-    if payload.len() > WINDOWS_MAX_FRAME_BYTES {
-        return Err(frame_write_error(
-            FrameWritePhase::Serialize,
-            payload.len(),
-            0,
-            None,
-            "Windows provider frame exceeds the protocol bound".into(),
-        ));
-    }
-    let length = u32::try_from(payload.len()).map_err(|_| {
-        frame_write_error(
-            FrameWritePhase::Serialize,
-            payload.len(),
-            0,
-            None,
-            "Windows provider frame length is not representable".into(),
-        )
-    })?;
-    let header = length.to_le_bytes();
-    for (phase, segment) in [
-        (FrameWritePhase::Length, header.as_slice()),
-        (FrameWritePhase::Payload, payload.as_slice()),
-    ] {
-        let mut transferred = 0;
-        while transferred < segment.len() {
-            let remaining = &segment[transferred..];
-            match write(remaining) {
-                Ok(written) if written > 0 && written <= remaining.len() => transferred += written,
-                Ok(_) => {
-                    return Err(frame_write_error(
-                        phase,
-                        segment.len(),
-                        transferred,
-                        None,
-                        "zero-progress or invalid native write count".into(),
-                    ));
-                }
-                Err((code, written, detail)) => {
-                    return Err(frame_write_error(
-                        phase,
-                        segment.len(),
-                        transferred.saturating_add(written),
-                        code,
-                        detail,
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+    super::frame_write::write_frame_using(value, write, &mut |_| {}, frame_write_error)
 }
 
 #[cfg(test)]
@@ -1680,6 +1636,14 @@ pub fn read_response_frame<T: memcordon_core::WindowsResponseFrame>(
     handle: HANDLE,
 ) -> Result<T, String> {
     read_response_frame_detailed(handle).map_err(|error| error.to_string())
+}
+
+pub fn read_response_frame_until<T: memcordon_core::WindowsResponseFrame>(
+    handle: HANDLE,
+    cutoff: std::time::Instant,
+) -> Result<T, String> {
+    read_frame_with_kind_limit_until(handle, Some(T::frame_limit), cutoff)
+        .map_err(|error| error.to_string())
 }
 
 pub fn read_response_frame_detailed<T: memcordon_core::WindowsResponseFrame>(

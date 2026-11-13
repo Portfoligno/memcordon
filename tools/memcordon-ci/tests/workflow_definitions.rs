@@ -8,6 +8,341 @@ use std::{
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
+
+const SELECTION_ID: &str = "${{ needs.select.outputs.selection-artifact-id }}";
+
+#[test]
+fn native_storage_baseline_is_uploaded_before_heavy_work_without_admission_authority() {
+    for document in sources("ci.yml") {
+        let sequence = steps(&document, "native");
+        let find = |id: &str| {
+            let matches = sequence
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["id"] == id)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected one {id}");
+            matches[0]
+        };
+        let (checkpoint_index, checkpoint) = find("native-storage-checkpoint");
+        let (upload_index, upload) = find("native-storage-retain");
+        let (compile_index, _) = find("native-compile");
+        for restore in [
+            "native-compile-request-native-tests-complete-restore",
+            "native-compile-request-native-tests-partial-restore",
+        ] {
+            assert!(
+                find(restore).0 < checkpoint_index,
+                "baseline must observe restored capacity"
+            );
+        }
+        assert_eq!(upload_index, checkpoint_index + 1);
+        assert_eq!(compile_index, upload_index + 1);
+        assert_eq!(checkpoint["if"], "!cancelled() && runner.os == 'Linux'");
+        assert_eq!(
+            upload["if"],
+            "!cancelled() && runner.os == 'Linux' && steps.native-storage-checkpoint.outcome == 'success'"
+        );
+        for step in [checkpoint, upload] {
+            assert_eq!(step["continue-on-error"], true);
+            assert!(step["env"].is_null());
+        }
+        assert_eq!(
+            checkpoint["run"],
+            "./target/ci-runtime/current/memcordon-ci ci storage-checkpoint"
+        );
+        assert_eq!(checkpoint["timeout-minutes"].as_u64(), Some(1));
+        assert!(checkpoint["uses"].is_null());
+        assert_eq!(upload["uses"], "./.github/actions/upload-artifact");
+        assert!(upload["run"].is_null());
+        assert_eq!(upload["timeout-minutes"].as_u64(), Some(2));
+        assert_eq!(
+            upload["with"]["path"],
+            "target/ci/reports/storage/native-before-compile.json"
+        );
+        assert_eq!(upload["with"]["if-no-files-found"], "ignore");
+        assert_eq!(upload["with"]["retention-days"].as_u64(), Some(7));
+        assert_eq!(
+            upload["with"]["name"],
+            "native-storage-${{ github.job }}-${{ runner.arch }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        );
+        let mut ids = BTreeSet::new();
+        for step in sequence {
+            if let Some(id) = step["id"].as_str() {
+                assert!(ids.insert(id), "duplicate native step: {id}");
+            }
+        }
+    }
+}
+
+#[test]
+fn backend_original_failure_carriers_precede_the_full_installed_artifact() {
+    for document in sources("backend-certification.yml") {
+        for job in ["windows-installed-x64", "windows-installed-arm64"] {
+            let steps = document["jobs"][job]["steps"].as_sequence().unwrap();
+            let selected: Vec<_> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["name"] == "Retain original Winsock failure carriers")
+                .collect();
+            assert_eq!(selected.len(), 1);
+            let (index, step) = selected[0];
+            assert_eq!(step["if"], "!cancelled() && failure()");
+            assert_eq!(step["continue-on-error"], true);
+            assert_eq!(step["timeout-minutes"].as_u64(), Some(2));
+            assert_eq!(step["uses"], "./.github/actions/upload-artifact");
+            assert_eq!(step["with"]["if-no-files-found"], "ignore");
+            let paths: Vec<_> = step["with"]["path"].as_str().unwrap().lines().collect();
+            let expected = expected_listener_carriers(
+                "target/ci/windows-installed/${{ matrix.channel }}/cases",
+            );
+            assert_eq!(paths, expected);
+            let full = &steps[index + 1];
+            assert_eq!(full["with"]["path"], "target/ci/windows-installed");
+            assert_eq!(full["timeout-minutes"].as_u64(), Some(6));
+        }
+    }
+}
+
+fn expected_listener_carriers(prefix: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
+        for name in [
+            "result.callback-failure.json",
+            "result.failed-frontend.json",
+            "result.failed-terminal-observation.json",
+            "result.stderr.bin",
+            "result.winsock-startup-trace.json",
+            "result.listener-call-trace.json",
+            "result.listener-native-file-requests.json",
+            "result.peer-spawn-call-trace.json",
+            "result.tcp-peer-stdout.json",
+        ] {
+            paths.push(format!("{prefix}/windows-installed/{case}/{name}"));
+        }
+    }
+    paths.push(format!(
+        "{prefix}/windows-installed/W-JOINT/restricted/result.loader-fileio.json"
+    ));
+    paths.push(format!(
+        "{prefix}/windows-installed/fixture-manifest-inventory.json"
+    ));
+    for name in [
+        "result.guardian-query.json",
+        "result.guardian-query.stdout.bin",
+        "result.guardian-query.stderr.bin",
+        "result.callback-failure.json",
+        "result.stderr.bin",
+    ] {
+        paths.push(format!(
+            "{prefix}/windows-installed/C-IO/native-argv/{name}"
+        ));
+    }
+    for name in [
+        "package-uninstall.stdout.bin",
+        "package-uninstall.stderr.bin",
+        "package-uninstall.capture.json",
+        "package-uninstall.invocation.json",
+        "recovery.stdout.bin",
+        "recovery.stderr.bin",
+    ] {
+        paths.push(format!("{prefix}/windows-installed/{name}"));
+    }
+    paths
+}
+
+#[test]
+fn release_finite_listener_carriers_precede_general_retention_in_all_windows_deliveries() {
+    for document in sources("release.yml") {
+        let mut consumers = BTreeSet::new();
+        for (name, job) in document["jobs"].as_mapping().unwrap() {
+            let name = name.as_str().unwrap();
+            let Some(steps) = job["steps"].as_sequence() else {
+                continue;
+            };
+            let carriers = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["name"] == "Retain original listener failure carriers")
+                .collect::<Vec<_>>();
+            if carriers.is_empty() {
+                continue;
+            }
+            assert_eq!(carriers.len(), 1);
+            consumers.insert(name.to_owned());
+            assert!(name.starts_with("candidate-windows-") || name.starts_with("public-windows-"));
+            let (index, step) = carriers[0];
+            assert_eq!(steps[index - 1]["id"], "installed-test");
+            assert_eq!(steps[index - 1]["timeout-minutes"].as_u64(), Some(160));
+            assert_eq!(step["if"], "!cancelled() && failure()");
+            assert_eq!(step["continue-on-error"], true);
+            assert_eq!(step["timeout-minutes"].as_u64(), Some(2));
+            assert_eq!(step["uses"], "./.github/actions/upload-artifact");
+            assert_eq!(step["with"]["if-no-files-found"], "ignore");
+            let paths = step["with"]["path"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                paths,
+                expected_listener_carriers("target/ci/reports/installed/raw")
+            );
+            let general = steps
+                .iter()
+                .position(|step| step["name"] == "Retain bounded installed diagnostics")
+                .unwrap();
+            assert!(index < general);
+            for (other, step) in steps.iter().enumerate() {
+                if matches!(
+                    step["with"]["path"].as_str(),
+                    Some(".release/installed-results" | "target/ci/reports/installed")
+                ) {
+                    assert!(index < other);
+                }
+            }
+        }
+        assert_eq!(
+            consumers,
+            [
+                "candidate-windows-x64-native",
+                "candidate-windows-x64-cargo",
+                "candidate-windows-arm64-native",
+                "candidate-windows-arm64-cargo",
+                "public-windows-x64-native",
+                "public-windows-x64-cargo",
+                "public-windows-arm64-native",
+                "public-windows-arm64-cargo"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+    }
+}
+
+#[test]
+fn every_release_selection_consumer_has_an_adjacent_fatal_exact_retry() {
+    for document in sources("release.yml") {
+        let mut consumers = BTreeSet::new();
+        for (name, job) in document["jobs"].as_mapping().unwrap() {
+            let Some(steps) = job["steps"].as_sequence() else {
+                continue;
+            };
+            let selected: Vec<_> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["with"]["artifact-ids"] == SELECTION_ID)
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            assert!(consumers.insert(name.as_str().unwrap().to_owned()));
+            assert_eq!(selected.len(), 2, "{name:?}");
+            let (first_index, first) = selected[0];
+            let (retry_index, retry) = selected[1];
+            assert_eq!(retry_index, first_index + 1, "{name:?}");
+            assert_eq!(first["id"], "selection-download");
+            assert_eq!(retry["id"], "selection-download-retry");
+            assert_eq!(first["continue-on-error"], true);
+            assert!(first["if"].is_null());
+            assert!(retry["continue-on-error"].is_null());
+            assert_eq!(
+                retry["if"],
+                "${{ !cancelled() && steps.selection-download.outcome == 'failure' }}"
+            );
+            for attempt in [first, retry] {
+                assert_eq!(
+                    attempt["uses"],
+                    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+                );
+                assert_eq!(attempt["timeout-minutes"].as_u64(), Some(3));
+                assert_eq!(attempt["with"]["path"], ".release");
+                assert_eq!(attempt["with"]["merge-multiple"], true);
+                assert_eq!(attempt["with"]["digest-mismatch"], "error");
+                assert_eq!(attempt["with"].as_mapping().unwrap().len(), 4);
+            }
+            assert_eq!(first["with"], retry["with"]);
+            assert_eq!(
+                first["timeout-minutes"].as_u64().unwrap()
+                    + retry["timeout-minutes"].as_u64().unwrap(),
+                6
+            );
+            let mut ids = BTreeSet::new();
+            for step in steps {
+                if let Some(id) = step["id"].as_str() {
+                    assert!(ids.insert(id), "duplicate id in {name:?}: {id}");
+                }
+            }
+        }
+        assert_eq!(consumers.len(), 52);
+        assert!(consumers.contains("native-macos-x64-shard-1"));
+        assert!(consumers.contains("fuzz-setup"));
+    }
+}
+
+#[test]
+fn selection_retry_contract_rejects_missing_optional_or_unbound_attempts() {
+    let baseline = workflow_definitions::definition("release.yml").unwrap();
+    workflow_definitions::validate_semantics(&baseline).unwrap();
+    for job in ["native-macos-x64-shard-1", "fuzz-setup", "assemble-payload"] {
+        let initial = steps(&baseline, job)
+            .iter()
+            .position(|step| step["id"] == "selection-download")
+            .unwrap();
+        for mutation in [
+            "missing-retry",
+            "both-absent",
+            "optional-retry",
+            "wrong-condition",
+            "cancelled-retry",
+            "timeout",
+            "digest",
+            "artifact",
+            "separated",
+        ] {
+            let mut changed = baseline.clone();
+            let selected = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+            match mutation {
+                "missing-retry" => {
+                    selected.remove(initial + 1);
+                }
+                "both-absent" => {
+                    selected.drain(initial..initial + 2);
+                }
+                "optional-retry" => selected[initial + 1]["continue-on-error"] = true.into(),
+                "wrong-condition" => {
+                    selected[initial + 1]["if"] =
+                        "${{ !cancelled() && steps.selection-download.conclusion == 'failure' }}"
+                            .into()
+                }
+                "cancelled-retry" => {
+                    selected[initial + 1]["if"] =
+                        "${{ always() && steps.selection-download.outcome == 'failure' }}".into()
+                }
+                "timeout" => selected[initial]["timeout-minutes"] = 4.into(),
+                "digest" => {
+                    selected[initial]["with"]["digest-mismatch"] = "warn".into();
+                    selected[initial + 1]["with"]["digest-mismatch"] = "warn".into();
+                }
+                "artifact" => {
+                    selected[initial + 1]["with"]["artifact-ids"] =
+                        "${{ needs.other.outputs.artifact-id }}".into()
+                }
+                "separated" => {
+                    let retry = selected.remove(initial + 1);
+                    selected.push(retry);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                workflow_definitions::validate_semantics(&changed).is_err(),
+                "{job}/{mutation}"
+            );
+        }
+    }
+}
 fn sources(file: &str) -> [Value; 2] {
     [
         workflow_definitions::definition(file).unwrap(),
@@ -159,6 +494,8 @@ fn direct_release_tests_require_all_channels_shards_and_rehearsal() {
         "candidate-windows-arm64-cargo",
         "installed-macos-arm64-cargo",
         "native-macos-x64-shard-3",
+        "native-components-linux-x64",
+        "native-components-windows-arm64",
         "rehearse",
     ] {
         let mut changed = baseline.clone();

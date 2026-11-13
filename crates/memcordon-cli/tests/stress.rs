@@ -5,7 +5,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use memcordon_testkit::{assert_stdout_empty, run_with_deadline};
+use memcordon_testkit::assert_stdout_empty;
+use memcordon_testkit::run_with_deadline;
+
+#[cfg(windows)]
+#[path = "support/stress_windows_observation.rs"]
+mod windows_observation;
 
 #[cfg(target_os = "macos")]
 #[path = "support/delivery_evidence.rs"]
@@ -84,17 +89,29 @@ fn short_child_iteration(seed: u64, iteration: u32, code: i32, report_path: &Pat
             "--code",
             &code.to_string(),
         ]);
-    // Native execution retains an absolute four-second retirement and result
-    // delivery bound after terminal observation.
+    // This is the existing total test observation limit, not a product SLA or
+    // a time budget included in the command request.
+    #[cfg(not(windows))]
     let result = run_with_deadline(&mut command, Duration::from_secs(5));
+    #[cfg(windows)]
+    let (result, observation_monitor) = windows_observation::Observer::global().run(
+        command,
+        Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+        Instant::now() + Duration::from_secs(5),
+        || {},
+    );
+    #[cfg(windows)]
+    let windows_observation = observation_monitor.snapshot();
     #[cfg(target_os = "macos")]
     let delivery = delivery.finish();
     #[cfg(not(target_os = "macos"))]
     let delivery = "not applicable";
+    #[cfg(not(windows))]
+    let windows_observation = "not applicable";
     let report = fs::read_to_string(report_path);
     let output = result.unwrap_or_else(|error| {
         panic!(
-            "stress seed {seed}, iteration {iteration}, expected {code}: {error}; report={report:?}; delivery={delivery:?}"
+            "stress seed {seed}, iteration {iteration}, expected {code}: {error}; report={report:?}; delivery={delivery:?}; windows_observation={windows_observation:?}"
         )
     });
     assert_eq!(

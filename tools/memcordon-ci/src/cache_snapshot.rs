@@ -517,18 +517,31 @@ pub fn import_transfer(root: &Path, request: TransferSelection<'_>) -> Result<()
             cleanup_selected(root, &selected)?;
             continue;
         }
-        cleanup_selected(root, &selected)?;
+        // Both restore slots belong to this transfer operation. Once the
+        // preferred import and sanitation have settled, neither restored slot
+        // may remain where the current operation will export fresh output.
+        cleanup_transfers(root, request)?;
         return Ok(());
     }
     Ok(())
 }
 
 pub fn cleanup_transfers(root: &Path, request: TransferSelection<'_>) -> Result<()> {
+    let mut result = Ok(());
     for complete in [true, false] {
-        let stage = transfer_stage(root, request, complete)?;
-        cleanup_stage(root, &stage)?;
+        let removal =
+            transfer_stage(root, request, complete).and_then(|stage| cleanup_stage(root, &stage));
+        if let Err(error) = removal {
+            result = match result {
+                Ok(()) => Err(error),
+                Err(primary) => Err(CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(error),
+                }),
+            };
+        }
     }
-    Ok(())
+    result
 }
 
 fn source_selection(root: &Path, kind: SnapshotKind) -> Result<Selection> {
@@ -1620,19 +1633,19 @@ pub fn import(
 }
 
 fn cleanup_stage(root: &Path, stage: &Path) -> Result<()> {
-    let relative = stage
-        .strip_prefix(root.canonicalize()?)
-        .map_err(|_| CiError::Message("snapshot staging escaped checkout".into()))?;
-    let checked = cache_restore::safe_root(root, relative)?;
-    let removal = if checked.try_exists()? {
-        fs::remove_dir_all(checked)
-    } else {
+    let removal = (|| -> Result<()> {
+        let relative = stage
+            .strip_prefix(root.canonicalize()?)
+            .map_err(|_| CiError::Message("snapshot staging escaped checkout".into()))?;
+        let checked = cache_restore::safe_root(root, relative)?;
+        if checked.try_exists()? {
+            fs::remove_dir_all(checked)?;
+        }
         Ok(())
-    };
-    if let Err(error) = removal {
-        eprintln!("optional owned snapshot staging cleanup incomplete: {error}");
-    }
-    Ok(())
+    })();
+    // A failed retirement cannot be treated as optional: a later export must
+    // not reuse an occupied immutable staging slot.
+    removal.map_err(|error| CiError::CacheSafety(Box::new(error)))
 }
 
 fn cleanup_selected(root: &Path, selected: &Selection) -> Result<()> {

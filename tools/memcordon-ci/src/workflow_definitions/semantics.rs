@@ -5,6 +5,9 @@ use crate::{CiError, Result};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
 
+#[path = "windows_fixture_semantics.rs"]
+mod windows_fixture;
+
 fn reject(reason: &str) -> CiError {
     CiError::Message(reason.into())
 }
@@ -59,6 +62,231 @@ fn operation<'a>(document: &'a Value, owner: &str, command: &str) -> Result<&'a 
         ));
     }
     Ok(selected[0])
+}
+
+fn command_index(steps: &[Value], command: &str) -> Result<usize> {
+    let matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "run") == command)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(reject("required phase operation missing or duplicated"));
+    }
+    Ok(matches[0])
+}
+
+fn private_segment_index(steps: &[Value], command: &str, minutes: u64) -> Result<usize> {
+    let index = command_index(steps, command)?;
+    let step = &steps[index];
+    required(step)?;
+    if field(step, "if") != "runner.os != 'Windows'"
+        || step["timeout-minutes"].as_u64() != Some(minutes)
+    {
+        return Err(reject(
+            "private segment lost its required Linux guard or cutoff",
+        ));
+    }
+    Ok(index)
+}
+
+fn validate_private_export(
+    document: &Value,
+    owner: &str,
+    kind: &str,
+    artifact: &str,
+) -> Result<usize> {
+    let (upload_id, tar, tar_command) = match kind {
+        "private-driver" => (
+            "private-driver-upload",
+            "target/ci/private-driver.tar",
+            "tar -cf target/ci/private-driver.tar target/ci-runtime/current target/ci-preparation/private-driver.json",
+        ),
+        "private" => (
+            "private-prepared-upload",
+            "target/ci/private-prepared.tar",
+            "tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture",
+        ),
+        _ => return Err(reject("unknown private executable transport")),
+    };
+    let job = &document["jobs"][owner];
+    let steps = job["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("private producer steps absent"))?;
+    let package = format!(
+        "./target/ci-runtime/current/memcordon-ci ci preparation-tools package --kind {kind}"
+    );
+    operation(document, owner, &package)?;
+    operation(document, owner, tar_command)?;
+    let package_index = command_index(steps, &package)?;
+    let tar_index = command_index(steps, tar_command)?;
+    let uploads = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "id") == upload_id)
+        .collect::<Vec<_>>();
+    if uploads.len() != 1 {
+        return Err(reject("private producer upload missing or duplicated"));
+    }
+    let (upload_index, upload) = uploads[0];
+    required(upload)?;
+    if package_index >= tar_index
+        || tar_index >= upload_index
+        || !upload["if"].is_null()
+        || !field(upload, "uses").starts_with("actions/upload-artifact@")
+        || upload["with"]["name"] != artifact
+        || upload["with"]["path"] != tar
+        || upload["with"]["if-no-files-found"] != "error"
+        || upload["with"]["include-hidden-files"] != true
+        || job["outputs"]["artifact-id"]
+            != format!("${{{{ steps.{upload_id}.outputs.artifact-id }}}}")
+    {
+        return Err(reject(
+            "private producer must package and expose its exact native inputs",
+        ));
+    }
+    Ok(package_index)
+}
+
+fn validate_private_input(
+    document: &Value,
+    owner: &str,
+    predecessor: &str,
+    kind: &str,
+) -> Result<usize> {
+    requires(document, owner, &[predecessor])?;
+    let job = &document["jobs"][owner];
+    if dependencies(job) != [predecessor] {
+        return Err(reject(
+            "private phase must depend only on its exact input producer",
+        ));
+    }
+    let (destination, extraction, segment, minutes) = match kind {
+        "private-driver" => (
+            "target/ci/private-driver-transfer",
+            "tar -xf target/ci/private-driver-transfer/private-driver.tar",
+            "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-prepare",
+            190,
+        ),
+        "private" => (
+            "target/ci/private-transfer",
+            "tar -xf target/ci/private-transfer/private-prepared.tar",
+            "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-runtime",
+            195,
+        ),
+        _ => return Err(reject("unknown private executable transport")),
+    };
+    let steps = job["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("private consumer steps absent"))?;
+    let downloads = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| !step["with"]["artifact-ids"].is_null())
+        .collect::<Vec<_>>();
+    if downloads.len() != 1 {
+        return Err(reject(
+            "private phase exact artifact acquisition missing or duplicated",
+        ));
+    }
+    let (download_index, download) = downloads[0];
+    required(download)?;
+    if !download["if"].is_null()
+        || !field(download, "uses").starts_with("actions/download-artifact@")
+        || download["with"]["artifact-ids"]
+            != format!("${{{{ needs.{predecessor}.outputs.artifact-id }}}}")
+        || download["with"]["path"] != destination
+        || download["with"]["digest-mismatch"] != "error"
+        || !download["with"]["name"].is_null()
+    {
+        return Err(reject(
+            "private phase must acquire its exact same-host artifact",
+        ));
+    }
+    let check = format!(
+        "./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind {kind}"
+    );
+    operation(document, owner, extraction)?;
+    operation(document, owner, &check)?;
+    let extraction_index = command_index(steps, extraction)?;
+    let check_index = command_index(steps, &check)?;
+    let fetch_index = private_segment_index(
+        steps,
+        "./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch",
+        25,
+    )?;
+    let segment_index = private_segment_index(steps, segment, minutes)?;
+    if !(download_index < extraction_index
+        && extraction_index < check_index
+        && check_index < fetch_index
+        && fetch_index < segment_index)
+        || steps[..check_index]
+            .iter()
+            .any(|step| field(step, "run").contains("memcordon-ci"))
+        || steps.iter().any(|step| {
+            let command = field(step, "run");
+            command.contains(" ci driver-")
+                || command.contains("--target-dir target/ci-driver-cold")
+        })
+    {
+        return Err(reject(
+            "private consumer must validate transported inputs before real work",
+        ));
+    }
+    Ok(segment_index)
+}
+
+fn validate_private_phases(document: &Value) -> Result<()> {
+    for (arch, runner, runtime) in [
+        ("x64", "ubuntu-24.04", "private-linux"),
+        ("arm64", "ubuntu-24.04-arm", "private-linux-arm64"),
+    ] {
+        let host = format!("linux-{arch}");
+        let tools = format!("private-linux-tools-{arch}");
+        let prepare = format!("private-linux-prepare-{arch}");
+        let mut row = serde_yaml::Mapping::new();
+        row.insert(text("id"), text(&host));
+        row.insert(text("runner"), text(runner));
+        let expected = Value::Sequence(vec![Value::Mapping(row)]);
+        for owner in [tools.as_str(), prepare.as_str(), runtime] {
+            let job = &document["jobs"][owner];
+            required(job)?;
+            let matrix = &job["strategy"]["matrix"];
+            if matrix.as_mapping().is_none_or(|matrix| matrix.len() != 1)
+                || matrix["include"] != expected
+                || job["runs-on"] != "${{ matrix.runner }}"
+                || job["if"] != "github.event.deleted != true"
+            {
+                return Err(reject(
+                    "private phases must retain their exact native host and source gate",
+                ));
+            }
+        }
+        if !document["jobs"][&tools]["needs"].is_null() {
+            return Err(reject(
+                "private tools must remain an independent prerequisite",
+            ));
+        }
+        validate_private_export(
+            document,
+            &tools,
+            "private-driver",
+            &format!("private-driver-{host}"),
+        )?;
+        let prepared = validate_private_input(document, &prepare, &tools, "private-driver")?;
+        let packaged = validate_private_export(
+            document,
+            &prepare,
+            "private",
+            &format!("private-prepared-{host}"),
+        )?;
+        if prepared >= packaged {
+            return Err(reject("private payload must be prepared before packaging"));
+        }
+        validate_private_input(document, runtime, &prepare, "private")?;
+    }
+    Ok(())
 }
 
 fn validate_current_graph(document: &Value) -> Result<()> {
@@ -136,6 +364,7 @@ fn validate_current_graph(document: &Value) -> Result<()> {
                 ));
             }
             if let Some(host) = name.as_str().and_then(|name| name.strip_prefix("native-")) {
+                let host = host.strip_prefix("components-").unwrap_or(host);
                 let host = host.split("-shard-").next().unwrap_or(host);
                 let expected = format!("${{{{ needs.test-tools-{host}.outputs.artifact-id }}}}");
                 if initial["with"]["artifact-ids"] != expected {
@@ -204,6 +433,9 @@ fn validate_current_graph(document: &Value) -> Result<()> {
             )?;
         }
     }
+    if document["name"] == "Native backend tests" {
+        validate_private_phases(document)?;
+    }
     if document["name"] != "Release" {
         return Ok(());
     }
@@ -247,13 +479,80 @@ fn validate_current_graph(document: &Value) -> Result<()> {
             ),
         )?;
         if host.starts_with("linux-") || host.starts_with("windows-") {
+            let components = format!("native-components-{host}");
+            requires(document, &components, &["select", &tools, &native])?;
+            let phase = &document["jobs"][&components];
+            let producer = &document["jobs"][&native];
+            if phase["strategy"] != producer["strategy"]
+                || phase["runs-on"] != producer["runs-on"]
+                || phase["if"] != producer["if"]
+            {
+                return Err(reject(
+                    "component phase must select its exact payload host and source",
+                ));
+            }
+            let steps = phase["steps"]
+                .as_sequence()
+                .ok_or_else(|| reject("component phase steps absent"))?;
+            let downloads = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| field(step, "id") == "native-payload-download")
+                .collect::<Vec<_>>();
+            if downloads.len() != 1 {
+                return Err(reject(
+                    "component native payload acquisition absent or duplicated",
+                ));
+            }
+            let (index, first) = downloads[0];
+            let retry = steps
+                .get(index + 1)
+                .ok_or_else(|| reject("component native payload retry absent"))?;
+            let execution = steps
+                .iter()
+                .position(|step| field(step, "id") == "native-components")
+                .ok_or_else(|| reject("component native execution absent"))?;
+            if first["with"]["artifact-ids"]
+                != format!("${{{{ needs.{native}.outputs.artifact-id }}}}")
+                || first["with"]["path"] != ".release/target"
+                || first["with"]["digest-mismatch"] != "error"
+                || first["with"]["merge-multiple"] != false
+                || first["timeout-minutes"].as_u64() != Some(3)
+                || first["continue-on-error"].as_bool() != Some(true)
+                || !first["if"].is_null()
+                || first["with"] != retry["with"]
+                || first["uses"] != retry["uses"]
+                || retry["timeout-minutes"].as_u64() != Some(3)
+                || !retry["continue-on-error"].is_null()
+                || field(retry, "id") != "native-payload-download-retry"
+                || field(retry, "if")
+                    != "!cancelled() && steps.native-payload-download.outcome == 'failure'"
+                || execution <= index + 1
+            {
+                return Err(reject(
+                    "component phase requires bounded exact native payload acquisition",
+                ));
+            }
+            requires(document, "assemble-payload", &[&components])?;
+            requires(document, "assemble", &[&components])?;
             operation(
                 document,
-                &native,
+                &components,
                 &format!(
                     "{driver} release test-components --diagnostics target/ci/reports/components"
                 ),
             )?;
+        } else if document["jobs"][&native]["steps"]
+            .as_sequence()
+            .is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| field(step, "run").contains(" release test-components "))
+            })
+        {
+            return Err(reject(
+                "macOS cannot select the Linux or Windows component operation",
+            ));
         }
         for channel in ["native", "cargo"] {
             let candidate = if host.starts_with("macos-") {
@@ -266,6 +565,15 @@ fn validate_current_graph(document: &Value) -> Result<()> {
                 &candidate,
                 &["select", "packages", &native, &tools],
             )?;
+            if !host.starts_with("macos-")
+                && dependencies(&document["jobs"][&candidate])
+                    .iter()
+                    .any(|need| !["select", "packages", &native, &tools].contains(need))
+            {
+                return Err(reject(
+                    "candidate validation peers must depend only on their actual inputs",
+                ));
+            }
             requires(document, "assemble", &[&candidate])?;
             operation(
                 document,
@@ -485,7 +793,322 @@ pub fn validate(document: &Value) -> Result<()> {
     if jobs.contains_key(text("fuzz-setup")) && document["name"].as_str() == Some("Deep CI") {
         validate_fuzz_split(document)?;
     }
+    if document["name"] == "Release" {
+        validate_release_selection_downloads(document)?;
+        validate_release_fuzz(document)?;
+    }
+    if document["name"] == "CI" {
+        windows_fixture::validate(document)?;
+    }
     validate_current_graph(document)?;
+    Ok(())
+}
+
+fn release_fuzz_step_index(steps: &[Value], id: &str) -> Result<usize> {
+    let matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "id") == id)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(reject("Release fuzz checkpoint missing or duplicated"));
+    }
+    Ok(matches[0])
+}
+
+fn release_fuzz_download(
+    steps: &[Value],
+    destination: &str,
+    artifact: &str,
+    merge: Option<bool>,
+) -> Result<usize> {
+    let matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step["with"]["path"] == destination)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(reject(
+            "Release fuzz exact input acquisition missing or duplicated",
+        ));
+    }
+    let (index, step) = matches[0];
+    required(step)?;
+    if !step["if"].is_null()
+        || !field(step, "uses").starts_with("actions/download-artifact@")
+        || step["with"]["artifact-ids"] != artifact
+        || step["with"]["digest-mismatch"] != "error"
+        || !step["with"]["name"].is_null()
+        || match merge {
+            Some(expected) => step["with"]["merge-multiple"].as_bool() != Some(expected),
+            None => !step["with"]["merge-multiple"].is_null(),
+        }
+    {
+        return Err(reject(
+            "Release fuzz must acquire its exact selected executable inputs",
+        ));
+    }
+    Ok(index)
+}
+
+fn release_selection_download(steps: &[Value]) -> Result<usize> {
+    let selected = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["with"]["artifact-ids"] == "${{ needs.select.outputs.selection-artifact-id }}"
+                || matches!(
+                    field(step, "id"),
+                    "selection-download" | "selection-download-retry"
+                )
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != 2 || selected[1].0 != selected[0].0 + 1 {
+        return Err(reject(
+            "Release selection acquisition requires adjacent bounded attempts",
+        ));
+    }
+    let (first_index, first) = selected[0];
+    let (retry_index, retry) = selected[1];
+    if field(first, "id") != "selection-download"
+        || field(retry, "id") != "selection-download-retry"
+        || first["continue-on-error"] != true
+        || !first["if"].is_null()
+        || !retry["continue-on-error"].is_null()
+        || field(retry, "if")
+            != "${{ !cancelled() && steps.selection-download.outcome == 'failure' }}"
+    {
+        return Err(reject(
+            "Release selection retry lost its failure outcome, cancellation or fatal boundary",
+        ));
+    }
+    for attempt in [first, retry] {
+        if field(attempt, "uses")
+            != "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+            || attempt["timeout-minutes"].as_u64() != Some(3)
+            || attempt["with"]
+                .as_mapping()
+                .is_none_or(|fields| fields.len() != 4)
+            || attempt["with"]["artifact-ids"]
+                != "${{ needs.select.outputs.selection-artifact-id }}"
+            || attempt["with"]["path"] != ".release"
+            || attempt["with"]["merge-multiple"] != true
+            || attempt["with"]["digest-mismatch"] != "error"
+        {
+            return Err(reject(
+                "Release selection acquisition changed its exact immutable input or configured budget",
+            ));
+        }
+    }
+    if first["with"] != retry["with"] || first_index >= retry_index {
+        return Err(reject(
+            "Release selection attempts do not share the exact input",
+        ));
+    }
+    Ok(retry_index)
+}
+
+fn validate_release_selection_downloads(document: &Value) -> Result<()> {
+    let mut consumers = 0;
+    for job in document["jobs"]
+        .as_mapping()
+        .ok_or_else(|| reject("Release jobs absent"))?
+        .values()
+    {
+        let Some(steps) = job["steps"].as_sequence() else {
+            continue;
+        };
+        if steps.iter().any(|step| {
+            step["with"]["artifact-ids"] == "${{ needs.select.outputs.selection-artifact-id }}"
+                || matches!(
+                    field(step, "id"),
+                    "selection-download" | "selection-download-retry"
+                )
+        }) {
+            release_selection_download(steps)?;
+            consumers += 1;
+        }
+    }
+    // The current closed Release graph has 52 required consumers. Count the
+    // inventory as well as each pair so deleting both attempts cannot pass.
+    if consumers != 52 {
+        return Err(reject(
+            "Release selection acquisition lost a required consumer",
+        ));
+    }
+    Ok(())
+}
+
+fn release_fuzz_source(steps: &[Value]) -> Result<usize> {
+    let checkout = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| field(step, "uses").starts_with("actions/checkout@"))
+        .collect::<Vec<_>>();
+    if checkout.len() != 1 {
+        return Err(reject(
+            "Release fuzz selected checkout missing or duplicated",
+        ));
+    }
+    let (checkout_index, checkout) = checkout[0];
+    required(checkout)?;
+    if !checkout["if"].is_null()
+        || checkout["with"]["ref"] != "${{ needs.select.outputs.selected-commit }}"
+        || checkout["with"]["persist-credentials"] != false
+        || checkout["with"]["fetch-depth"].as_u64() != Some(0)
+    {
+        return Err(reject(
+            "Release fuzz must use the exact selected source checkout",
+        ));
+    }
+    let selection = release_selection_download(steps)?;
+    if checkout_index >= selection {
+        return Err(reject(
+            "Release fuzz selection must follow its source checkout",
+        ));
+    }
+    Ok(selection)
+}
+
+fn validate_release_fuzz(document: &Value) -> Result<()> {
+    requires(document, "fuzz-setup", &["select"])?;
+    requires(document, "fuzz", &["select", "fuzz-setup"])?;
+    let setup = &document["jobs"]["fuzz-setup"];
+    let shard = &document["jobs"]["fuzz"];
+    required(setup)?;
+    required(shard)?;
+    if dependencies(setup) != ["select"]
+        || dependencies(shard) != ["select", "fuzz-setup"]
+        || field(setup, "if") != "needs.select.outputs.recovery-mode == 'reprepare'"
+        || field(shard, "if")
+            != "!cancelled() && needs.select.result == 'success' && (needs.select.outputs.recovery-mode == 'reprepare')"
+        || setup["runs-on"] != "ubuntu-24.04"
+        || shard["runs-on"] != "ubuntu-24.04"
+        || !setup["strategy"].is_null()
+        || shard["strategy"]["fail-fast"] != false
+        || shard["strategy"]["max-parallel"].as_u64() != Some(4)
+        || shard["strategy"]["matrix"]
+            .as_mapping()
+            .is_none_or(|matrix| matrix.len() != 1)
+        || shard["strategy"]["matrix"]["shard"]
+            != Value::Sequence(
+                ["one", "two", "three", "four"]
+                    .map(|quarter| text(&format!("quarter-{quarter}")))
+                    .to_vec(),
+            )
+    {
+        return Err(reject(
+            "Release fuzz must retain selected setup and four independent shards",
+        ));
+    }
+    let early = setup["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("Release fuzz setup steps absent"))?;
+    let late = shard["steps"]
+        .as_sequence()
+        .ok_or_else(|| reject("Release fuzz shard steps absent"))?;
+    let selected_setup = release_fuzz_source(early)?;
+    let selected_shard = release_fuzz_source(late)?;
+    let admission = release_fuzz_step_index(late, "fuzz-setup-required")?;
+    required(&late[admission])?;
+    if admission != 0
+        || field(&late[admission], "run") != "false"
+        || field(&late[admission], "if") != "needs.fuzz-setup.result != 'success'"
+        || late[admission]["timeout-minutes"].as_u64() != Some(1)
+    {
+        return Err(reject(
+            "Release fuzz setup failure must fail selected shards immediately",
+        ));
+    }
+    let tools = release_fuzz_download(
+        early,
+        ".release/tool",
+        "${{ needs.select.outputs.preparation-tool-artifact-id }}",
+        Some(true),
+    )?;
+    let unpack = "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool";
+    let prepare = "./.release/tool/memcordon-ci ci segment prepare-fuzz";
+    let package = "./.release/tool/memcordon-ci ci preparation-tools package --kind release-fuzz";
+    let archive = "tar -czf target/release-fuzz-setup.tar.gz .release/tool/memcordon-ci target/ci-tools/bin/cargo-fuzz target/ci-preparation/release-fuzz.json";
+    for command in [unpack, prepare, package, archive] {
+        operation(document, "fuzz-setup", command)?;
+    }
+    let unpack = command_index(early, unpack)?;
+    let prepare = command_index(early, prepare)?;
+    let package = command_index(early, package)?;
+    let archive = command_index(early, archive)?;
+    let upload = release_fuzz_step_index(early, "fuzz-setup-upload")?;
+    required(&early[upload])?;
+    if !(selected_setup < tools
+        && tools < unpack
+        && unpack < prepare
+        && prepare < package
+        && package < archive
+        && archive < upload)
+        || package != release_fuzz_step_index(early, "fuzz-setup-inputs")?
+        || archive != release_fuzz_step_index(early, "fuzz-setup-package")?
+        || !early[upload]["if"].is_null()
+        || !field(&early[upload], "uses").starts_with("actions/upload-artifact@")
+        || early[upload]["with"]["path"] != "target/release-fuzz-setup.tar.gz"
+        || early[upload]["with"]["if-no-files-found"] != "error"
+        || early[upload]["with"]["overwrite"] != false
+        || setup["outputs"]["artifact-id"] != "${{ steps.fuzz-setup-upload.outputs.artifact-id }}"
+    {
+        return Err(reject(
+            "Release fuzz setup must expose its actual prepared executable archive",
+        ));
+    }
+    let download = release_fuzz_download(
+        late,
+        "target/ci/release-fuzz-download",
+        "${{ needs.fuzz-setup.outputs.artifact-id }}",
+        None,
+    )?;
+    let extract = "tar -xzf target/ci/release-fuzz-download/release-fuzz-setup.tar.gz -C .";
+    let check = "./.release/tool/memcordon-ci ci preparation-tools check --kind release-fuzz";
+    let fetch = "./.release/tool/memcordon-ci ci segment workspace-fetch";
+    for command in [extract, check, fetch] {
+        operation(document, "fuzz", command)?;
+    }
+    let extract = command_index(late, extract)?;
+    let check = command_index(late, check)?;
+    let fetch = command_index(late, fetch)?;
+    if !(selected_shard < download && download < extract && extract < check && check < fetch)
+        || download != release_fuzz_step_index(late, "fuzz-setup-download")?
+        || extract != release_fuzz_step_index(late, "fuzz-setup-extract")?
+        || check != release_fuzz_step_index(late, "fuzz-setup-check")?
+        || late
+            .iter()
+            .any(|step| recipe(field(step, "run")) == Some("prepare-fuzz"))
+    {
+        return Err(reject(
+            "Release fuzz must validate setup bytes before shard work",
+        ));
+    }
+    for quarter in ["one", "two", "three", "four"] {
+        let compile =
+            format!("./.release/tool/memcordon-ci ci segment fuzz-compile-quarter-{quarter}");
+        let execute =
+            format!("./.release/tool/memcordon-ci ci segment fuzz-execute-quarter-{quarter}");
+        let compile = command_index(late, &compile)?;
+        let execute = command_index(late, &execute)?;
+        for index in [compile, execute] {
+            required(&late[index])?;
+            if field(&late[index], "if") != format!("matrix.shard == 'quarter-{quarter}'")
+                || late[index]["timeout-minutes"].as_u64() != Some(70)
+            {
+                return Err(reject(
+                    "Release fuzz quarter lost its exact guard or operation ceiling",
+                ));
+            }
+        }
+        if !(fetch < compile && compile < execute) {
+            return Err(reject(
+                "Release fuzz must compile each quarter before executing it",
+            ));
+        }
+    }
     Ok(())
 }
 

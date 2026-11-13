@@ -112,10 +112,10 @@ impl Drop for ProbeRun {
             if self.process.is_none() {
                 self.process = self.created.try_recv().ok();
             }
-            if let Some(process) = &self.process {
-                if let Err(error) = process.signal_kill() {
-                    eprintln!("original source probe unwind signal: {error}");
-                }
+            if let Some(process) = &self.process
+                && let Err(error) = process.signal_kill()
+            {
+                eprintln!("original source probe unwind signal: {error}");
             }
         }
     }
@@ -298,29 +298,47 @@ impl ProbeRun {
             .ok_or_else(|| CiError::Message("source probe already joined".into()))?
             .join()
             .map_err(|_| CiError::Message("source probe supervisor panicked".into()))??;
-        initialization?;
-        let process = self
-            .process
-            .as_ref()
-            .ok_or_else(|| CiError::Message("original source probe query holder absent".into()))?;
-        if !process.exited().map_err(CiError::Message)? {
-            return Err(CiError::Message(
-                "original source probe child not retired".into(),
-            ));
-        }
-        use std::os::unix::process::ExitStatusExt;
-        let wait = json!({"pid":process.process_id,"birth":process.birth,"held_before_input":true,"retired":true,"raw_wait_status":observed.status.into_raw()});
+        let status = crate::command::require_successful_output(
+            "actual ordinary caller snapshot file effect",
+            &observed,
+        );
+        let retirement = (|| -> Result<Value> {
+            let process = self.process.as_ref().ok_or_else(|| {
+                CiError::Message("original source probe query holder absent".into())
+            })?;
+            if !process.exited().map_err(CiError::Message)? {
+                return Err(CiError::Message(
+                    "original source probe child not retired".into(),
+                ));
+            }
+            use std::os::unix::process::ExitStatusExt;
+            let wait = json!({"pid":process.process_id,"birth":process.birth,"held_before_input":true,"retired":true,"raw_wait_status":observed.status.into_raw()});
+            Ok(wait)
+        })();
+        let (wait, retirement) = match retirement {
+            Ok(wait) => (Some(wait), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        crate::linux_relay_sample::combine(
+            crate::linux_relay_sample::combine(status, initialization),
+            retirement,
+        )?;
+        let wait = wait.expect("validated original helper retirement");
         let result = BTreeMap::from([
             ("probe-input.json".into(), self.request.clone()),
             ("probe-stdout.bin".into(), observed.stdout.clone()),
             ("probe-stderr.bin".into(), observed.stderr.clone()),
             ("probe-wait.json".into(), serde_json::to_vec(&wait)?),
-            ("probe-receipt.json".into(), std::fs::read(&self.receipt)?),
+            (
+                "probe-receipt.json".into(),
+                std::fs::read(&self.receipt).map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "successful original source probe receipt read path={}",
+                        self.receipt.display()
+                    ))
+                })?,
+            ),
         ]);
-        crate::command::require_successful_output(
-            "actual ordinary caller snapshot file effect",
-            &observed,
-        )?;
         Ok(result)
     }
 }
@@ -338,7 +356,7 @@ pub fn run_installed(
     work: Instant,
     cleanup: Instant,
 ) -> Result<()> {
-    let execution = (|| -> Result<()> {
+    (|| -> Result<()> {
         for scenario in ["caller-writable-source", "retained-writable-alias"] {
             let controller = controller_directory.join(format!("snapshot-{scenario}"));
             std::fs::create_dir(&controller)?;
@@ -499,8 +517,7 @@ pub fn run_installed(
             cleanup,
         )?;
         Ok(())
-    })();
-    execution
+    })()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -781,14 +798,11 @@ fn run_substitution(
         serde_json::from_slice(response.get("probe-receipt.json").ok_or_else(|| {
             CiError::Message("source substitution native response absent".into())
         })?)?;
-    if effect["opened"]["inode"] == effect["named"]["inode"]
-        || effect["opened"]["sha256"] == effect["named"]["sha256"]
-        || proof.borrow()["permission"]["process_id"] != proof.borrow()["frontend"]["pid"]
-    {
-        return Err(CiError::Message(
-            "source-FD substitution did not replace the name after the held frontend open".into(),
-        ));
-    }
+    crate::linux_source_substitution::validate(
+        &proof.borrow()["permission"],
+        &proof.borrow()["frontend"],
+        &effect,
+    )?;
     assert_snapshot(&case, &token)?;
     acknowledge(caller, &case, cleanup)
 }
@@ -871,6 +885,13 @@ fn run_corruptions(
             replacement: None,
             backup: None,
         };
+        let publication = if scenario == "source-mutation-during-copy" {
+            Some(super::linux_journal_publication::JournalPublication::new(
+                work,
+            )?)
+        } else {
+            None
+        };
         let mut actor = ProbeRun::start(caller, probe, &source, &request, work)?;
         actor.phase("opened")?;
         let gate = if scenario == "source-mutation-during-copy" {
@@ -895,26 +916,31 @@ fn run_corruptions(
         let mut actor = Some(actor);
         let (copy_tx, copy_rx) = mpsc::sync_channel(1);
         let copy_observer: Option<crate::command::AfterReleaseObserver> = if let Some(gate) = gate {
-            let bundle = bundle.try_clone()?;
-            let directory = directory.clone();
-            let original_actor = actor.take().expect("retained original source actor");
+            let publication =
+                publication.expect("copy watch admitted before source actor/frontend launch");
+            let boundary = CopyBoundary {
+                gate,
+                bundle: bundle.try_clone()?,
+                actor: actor.take().expect("retained original source actor"),
+                directory: directory.clone(),
+                work,
+                cleanup,
+                publication,
+            };
             Some(Box::new(move |child| {
-                let result = copy_boundary(
-                    child,
-                    gate,
-                    bundle,
-                    original_actor,
-                    &directory,
-                    work,
-                    cleanup,
-                );
-                let failure = result.as_ref().err().map(ToString::to_string);
-                copy_tx
-                    .send(result.map_err(|error| error.to_string()))
-                    .map_err(|_| CiError::Message("original copy observer receiver lost".into()))?;
-                match failure {
-                    Some(error) => Err(CiError::Message(error)),
-                    None => Ok(()),
+                let result = boundary.observe(child);
+                match result {
+                    Ok(value) => copy_tx.send(Ok(value)).map_err(|_| {
+                        CiError::Message("original copy observer receiver lost".into())
+                    }),
+                    Err(primary) => {
+                        let delivered = copy_tx.send(Err(())).map_err(|_| {
+                            CiError::Message(
+                                "original copy observer failure marker receiver lost".into(),
+                            )
+                        });
+                        crate::linux_relay_sample::combine(Err(primary), delivered)
+                    }
                 }
             }))
         } else {
@@ -946,25 +972,41 @@ fn run_corruptions(
             )?,
             None => super::linux_request_launch::RequestLaunch::start(launch_input)?,
         };
-        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+        let mut source_settled = false;
+        let mut failure_context =
+            format!("corrupt snapshot scenario={scenario}; original frontend not yet observed");
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let frontend = launch.retain_frontend(work)?;
             let frontend_identity = (frontend.process_id, frontend.birth);
+            failure_context = format!(
+                "corrupt snapshot scenario={scenario}; original frontend={frontend_identity:?}"
+            );
             launch.close_input();
             let captured = launch.capture_until(cleanup)?;
+            let original_status = captured.status;
             let stdout = captured.stdout.clone();
             let stderr = captured.stderr.clone();
-            let wait = json!({"process":{"pid":frontend_identity.0,"birth":frontend_identity.1},"raw_wait_status":captured.status.into_raw(),"status":captured.status.code(),"held_before_input":true,"retired":true});
+            failure_context = format!(
+                "corrupt snapshot scenario={scenario}; original frontend={frontend_identity:?}; original status={original_status:?}; stderr={}",
+                crate::linux_result_publication::stderr_detail(&stderr)
+            );
             let result = launch.result()?;
             let association = launch.association()?;
             let recovery = launch.recover()?;
+            crate::command::require_successful_output(
+                "corrupt snapshot original recovery",
+                &recovery.process,
+            )?;
             let (phase, helper) = if let Some(actor) = actor.as_mut() {
                 actor.send(b"D\n")?;
-                (Value::Null, actor.finish(cleanup)?)
+                let helper = actor.finish(cleanup)?;
+                source_settled = true;
+                (Value::Null, helper)
             } else {
                 copy_rx
                     .recv_timeout(cleanup.saturating_duration_since(Instant::now()))
                     .map_err(|error| CiError::Message(error.to_string()))?
-                    .map_err(CiError::Message)?
+                    .map_err(|()|CiError::Message("original copy observer failed; typed primary retained by original capture owner".into()))?
             };
             let prepared = observation.join(format!(
                 "{}.prepared.json",
@@ -975,203 +1017,334 @@ fn run_corruptions(
                     "corrupted snapshot reached native Prepared".into(),
                 ));
             }
-            let start = std::fs::read(
+            let _start = std::fs::read(
                 observation.join(format!("{}.start.json", hex::encode(association.attempt))),
             )?;
-            Ok((
-                phase,
-                stdout,
-                stderr,
-                wait,
-                result,
-                association,
-                recovery.raw_terminal,
-                helper,
-                start,
-            ))
+            let request_bytes = std::fs::read(&fixture.request)?;
+            let request =
+                memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+            if result.provider.as_ref() != Some(provider) {
+                return Err(CiError::Message(
+                    "corrupt snapshot report original provider differs".into(),
+                ));
+            }
+            crate::linux_snapshot_rejection::validate(
+                &result,
+                &recovery.terminal,
+                &association,
+                &request
+                    .digest()
+                    .map_err(|error| CiError::Message(error.to_string()))?,
+                frontend_identity,
+                original_status.code(),
+            )
+            .map_err(CiError::Message)?;
+            if original_status.into_raw() != 125 * 256 {
+                return Err(CiError::Message(
+                    "corrupt snapshot original raw frontend wait differs from 125".into(),
+                ));
+            }
+            if !stdout.is_empty() {
+                return Err(CiError::Message(
+                    "corrupt snapshot produced target stdout".into(),
+                ));
+            }
+            assert_helper_change(
+                &helper,
+                &original_bundle,
+                &super::artifacts::read_file(&fixture.bundle)?,
+            )?;
+            if scenario == "source-mutation-during-copy"
+                && (phase["changed"].is_null() || phase["original_child_wait_not_started"] != true)
+            {
+                return Err(CiError::Message(
+                    "source mutation was not observed at the held native copy boundary".into(),
+                ));
+            }
+            let _retirement = crate::cancellation::retirement_scope(cleanup);
+            let ack = caller
+                .command(&directory, cleanup)?
+                .args(["workload", "acknowledge", "--observation"])
+                .arg(directory.join("workload-observation.json"))
+                .output()?;
+            crate::command::require_successful_output("rejected snapshot acknowledgment", &ack)?;
+            let ack =
+                memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&ack.stdout)
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+            if ack.association != association {
+                return Err(CiError::Message(
+                    "corruption ACK differs from original association".into(),
+                ));
+            }
+            let _ = memory_bytes;
+            launch.retire_bundle_exact(&fixture)?;
+            Ok(())
         }));
         let _retirement = crate::cancellation::retirement_scope(cleanup);
         let execution = match execution {
             Ok(result) => result,
             Err(panic) => {
-                if let Err(error) = launch.cancel_and_settle(cleanup) {
-                    eprintln!("corrupt snapshot native settlement after unwind: {error}");
-                }
-                if let Some(actor) = actor.as_mut() {
-                    let _ = actor.send(b"D\n");
-                    if let Err(error) = actor.finish(cleanup) {
-                        eprintln!("corrupt snapshot source settlement after unwind: {error}");
+                let settled = match launch.cancel_and_settle(cleanup) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "corrupt snapshot native settlement after unwind: {error}"
+                        );
+                        false
+                    }
+                };
+                if !source_settled
+                    && let Some(actor) = actor.as_mut()
+                    && actor.worker.is_some()
+                {
+                    if let Err(error) = actor.send(b"A\n") {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "corrupt snapshot source abort after unwind: {error}"
+                        );
+                    }
+                    match actor.finish(cleanup) {
+                        Ok(_) => source_settled = true,
+                        Err(error) => {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "corrupt snapshot source settlement after unwind: {error}"
+                            );
+                        }
                     }
                 }
-                if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                    eprintln!("corrupt snapshot input retirement after unwind: {error}");
+                if settled
+                    && (source_settled || actor.is_none())
+                    && let Err(error) = launch.retire_bundle_exact(&fixture)
+                {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "corrupt snapshot input retirement after unwind: {error}"
+                    );
                 }
                 std::panic::resume_unwind(panic)
             }
         };
-        let (phase, stdout, stderr, wait, result, association, recovery, helper, start) =
-            match execution {
-                Ok(value) => value,
-                Err(primary) => {
-                    let settlement = launch.cancel_and_settle(cleanup);
-                    let helper = if let Some(actor) = actor.as_mut() {
-                        let _ = actor.send(b"D\n");
-                        actor.finish(cleanup).map(|_| ())
-                    } else {
-                        Ok(())
+        if let Err(primary) = execution {
+            let mut failure = primary.context(failure_context);
+            let settlement = launch.cancel_and_settle(cleanup);
+            let settled = settlement.is_ok();
+            if let Err(error) = settlement {
+                failure = CiError::LaneFailures {
+                    primary: Box::new(failure),
+                    secondary: Box::new(error.context("original corrupt-input settlement")),
+                };
+            }
+            if !source_settled
+                && let Some(actor) = actor.as_mut()
+                && actor.worker.is_some()
+            {
+                if let Err(error) = actor.send(b"A\n") {
+                    failure = CiError::LaneFailures {
+                        primary: Box::new(failure),
+                        secondary: Box::new(error.context("caller source phase-aware abort")),
                     };
-                    return Err(CiError::Message(format!(
-                        "{primary}; original corrupt-input settlement: {:?}; caller source settlement: {:?}",
-                        settlement.as_ref().err(),
-                        helper.as_ref().err()
-                    )));
                 }
-            };
-        let raw = serde_json::to_value(&result)?;
-        let terminal: Value = serde_json::from_slice(&recovery)?;
-        let request_bytes = std::fs::read(&fixture.request)?;
-        let request = memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
-            .map_err(CiError::Message)?;
-        if raw["release"] != "not-released"
-            || raw["runtime"]["kind"] != "preparation-failed"
-            || raw["outcome"]["kind"] != "launch-failure"
-            || raw["outcome"]["wrapper_status"] != 125
-            || raw["delivery"] != "complete"
-            || raw["cleanup"]["state"] != "complete"
-            || raw["request"]["request_sha256"]
-                != serde_json::to_value(request.digest().map_err(CiError::Message)?)?
-            || raw["provider"] != serde_json::to_value(provider)?
-            || raw["workload_attempt"] != serde_json::to_value(&association)?
-            || terminal["association"] != serde_json::to_value(&association)?
-            || terminal["release"] != "not-released"
-            || !terminal["native"].is_null()
-            || terminal["outcome"]["kind"] != "setup-failure"
-            || terminal["cleanup"]["state"] != "complete"
-            || wait["status"] != 125
-            || wait["raw_wait_status"] != 125 * 256
-            || !stdout.is_empty()
-            || !terminal["failures"].as_array().is_some_and(|failures| {
-                failures.iter().any(|item| {
-                    item.as_str()
-                        .is_some_and(|text| text.contains("member content digest differs"))
-                })
-            })
-        {
-            return Err(CiError::Message(
-                "corrupted input reached execution or lost actual request/cleanup binding".into(),
-            ));
+                match actor.finish(cleanup) {
+                    Ok(_) => source_settled = true,
+                    Err(error) => {
+                        failure = CiError::LaneFailures {
+                            primary: Box::new(failure),
+                            secondary: Box::new(error.context("caller source settlement")),
+                        };
+                    }
+                }
+            }
+            if settled
+                && (source_settled || actor.is_none())
+                && let Err(error) = launch.retire_bundle_exact(&fixture)
+            {
+                failure = CiError::LaneFailures {
+                    primary: Box::new(failure),
+                    secondary: Box::new(
+                        error.context("original corrupt snapshot bundle retirement"),
+                    ),
+                };
+            }
+            if settled && !source_settled && actor.is_some() {
+                failure = failure.context("exact corrupt snapshot bundle retirement not admitted: original source writer settlement is unproved");
+            }
+            return Err(failure);
         }
-        assert_helper_change(
-            &helper,
-            &original_bundle,
-            &super::artifacts::read_file(&fixture.bundle)?,
-        )?;
-        if scenario == "source-mutation-during-copy"
-            && (phase["changed"].is_null() || phase["original_child_wait_not_started"] != true)
-        {
-            return Err(CiError::Message(
-                "source mutation was not observed at the held native copy boundary".into(),
-            ));
-        }
-        let _ = (stderr, start, memory_bytes);
-        let ack = caller
-            .command(&directory, cleanup)?
-            .args(["workload", "acknowledge", "--observation"])
-            .arg(directory.join("workload-observation.json"))
-            .output()?;
-        crate::command::require_successful_output("rejected snapshot acknowledgment", &ack)?;
-        let ack = memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&ack.stdout)
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        if ack.association != association {
-            return Err(CiError::Message(
-                "corruption ACK differs from original association".into(),
-            ));
-        }
-        launch.retire_bundle_exact(&fixture)?;
     }
     Ok(())
 }
 
-fn copy_boundary(
-    child: &std::process::Child,
+/// Resources retained for one original source-copy observation and settlement.
+struct CopyBoundary {
     gate: super::linux_current_phase_gate::NativeReadGate,
     bundle: std::fs::File,
-    mut actor: ProbeRun,
-    directory: &Path,
+    actor: ProbeRun,
+    directory: PathBuf,
     work: Instant,
     cleanup: Instant,
-) -> Result<(Value, BTreeMap<String, Vec<u8>>)> {
-    let execution = (|| -> Result<Value> {
-        let birth =
-            crate::linux_consumer_readiness::process_birth(child.id()).map_err(CiError::Message)?;
-        let frontend =
-            crate::linux_consumer_readiness::HeldLinuxProcess::acquire(child.id(), birth)
-                .map_err(CiError::Message)?;
-        let mut permission = gate.wait_for(&frontend)?;
-        if permission.process_id != child.id() {
-            return Err(CiError::Message(
-                "copy permission event differs from original Child".into(),
-            ));
-        }
-        let mut trace = super::linux_current_phase_gate::NativeTraceStop::attach(
-            frontend,
-            &mut permission,
+    publication: super::linux_journal_publication::JournalPublication,
+}
+
+impl CopyBoundary {
+    fn observe(self, child: &std::process::Child) -> Result<(Value, BTreeMap<String, Vec<u8>>)> {
+        let Self {
+            gate,
+            bundle,
+            mut actor,
+            directory,
             work,
-        )?;
-        let locator_path = directory.join("workload-observation.json");
-        let read = trace.after_source_read(&bundle, 65536, || locator_path.is_file())?;
-        let association: memcordon_core::workload_request::WorkloadAttemptAssociationV1 =
-            serde_json::from_slice(&std::fs::read(&locator_path)?)?;
-        association
-            .validate()
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        let journal_path = Path::new("/var/lib/memcordon/workload-attempts")
-            .join(hex::encode(association.attempt));
-        let journal = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(journal_path)?;
-        let metadata = journal.metadata()?;
-        if metadata.uid() != 0
-            || !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o777 != 0o600
-            || metadata.len() > 512 * 1024
-        {
-            return Err(CiError::Message(
-                "copy boundary lost protected native journal custody".into(),
-            ));
+            cleanup,
+            publication,
+        } = self;
+        let mut trace = None;
+        let execution = (|| -> Result<Value> {
+            let birth =
+                crate::linux_consumer_readiness::process_birth(child.id()).map_err(|error| {
+                    CiError::Message(error).context("copy original Child native birth observation")
+                })?;
+            let frontend =
+                crate::linux_consumer_readiness::HeldLinuxProcess::acquire(child.id(), birth)
+                    .map_err(|error| {
+                        CiError::Message(error)
+                            .context("copy original Child query holder acquisition")
+                    })?;
+            let mut permission = gate
+                .wait_for(&frontend)
+                .map_err(|error| error.context("copy original source permission event"))?;
+            if permission.process_id != child.id() {
+                return Err(CiError::Message(
+                    "copy permission event differs from original Child".into(),
+                ));
+            }
+            trace = Some(
+                super::linux_current_phase_gate::NativeTraceStop::attach(
+                    frontend,
+                    &mut permission,
+                    work,
+                )
+                .map_err(|error| error.context("copy original frontend trace attach"))?,
+            );
+            let trace = trace.as_mut().expect("retained original trace");
+            let locator_path = directory.join("workload-observation.json");
+            let read = trace
+                .after_source_read(&bundle, 65536, || {
+                    locator_path.try_exists().map_err(|error| {
+                        CiError::from(error).context(format!(
+                            "copy assigned locator presence path={}",
+                            locator_path.display()
+                        ))
+                    })
+                })
+                .map_err(|error| {
+                    error.context("copy original source native read/fdinfo boundary")
+                })?;
+            let source = bundle
+                .metadata()
+                .map_err(|error| CiError::from(error).context("copy held source metadata"))?;
+            let request: ProbeInput = serde_json::from_slice(&actor.request)?;
+            if (source.dev(), source.ino()) != (request.device, request.inode) {
+                return Err(CiError::Message(
+                    "copy mutation actor does not hold original source identity".into(),
+                ));
+            }
+            crate::snapshot_copy_contract::mutation_extent(
+                read["position"]
+                    .as_u64()
+                    .ok_or_else(|| CiError::Message("copy original read cursor absent".into()))?,
+                request.offset,
+                request.bytes.len() as u64,
+                source.len(),
+            )?;
+            let association: memcordon_core::workload_request::WorkloadAttemptAssociationV1 =
+                serde_json::from_slice(&std::fs::read(&locator_path).map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "copy assigned locator read path={}",
+                        locator_path.display()
+                    ))
+                })?)
+                .map_err(|error| CiError::from(error).context("copy assigned locator parse"))?;
+            association
+                .validate()
+                .map_err(|error| CiError::Message(error.to_string()))?;
+            let journal=publication.wait_open(&hex::encode(association.attempt),trace).map_err(|error|error.context("copy exact protected journal publication while original frontend remains stopped"))?;
+            let metadata = journal
+                .metadata()
+                .map_err(|error| CiError::from(error).context("copy protected journal metadata"))?;
+            if metadata.uid() != 0
+                || !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.len() > 512 * 1024
+            {
+                return Err(CiError::Message(
+                    "copy boundary lost protected native journal custody".into(),
+                ));
+            }
+            let mut raw = Vec::new();
+            (&journal)
+                .take(512 * 1024 + 1)
+                .read_to_end(&mut raw)
+                .map_err(|error| {
+                    CiError::from(error).context("copy protected journal bounded read")
+                })?;
+            if raw.len() > 512 * 1024 {
+                return Err(CiError::Message(
+                    "copy protected journal exceeded read bound".into(),
+                ));
+            }
+            memcordon_core::canonical_json::reject_duplicate_json_keys(&raw)
+                .map_err(CiError::Message)?;
+            let record: Value = serde_json::from_slice(&raw)
+                .map_err(|error| CiError::from(error).context("copy protected journal parse"))?;
+            publication.revalidate()?;
+            if record["association"] != serde_json::to_value(&association)?
+                || !record.get("native").is_some_and(Value::is_null)
+                || record["release"] != "not-released"
+                || !record.get("outcome").is_some_and(Value::is_null)
+                || !record.get("terminal").is_some_and(Value::is_null)
+            {
+                return Err(CiError::Message(
+                    "source mutation did not hold original pre-execution intake".into(),
+                ));
+            }
+            actor
+                .send(b"W\n")
+                .map_err(|error| error.context("copy source actor mutation send"))?;
+            let changed = actor
+                .phase("changed")
+                .map_err(|error| error.context("copy original source actor changed observation"))?;
+            let phase = json!({"format":"memcordon.current-snapshot-copy-boundary","revision":1,"permission":permission.observation(),"read":read,"journal":record,"journal_custody":{"uid":metadata.uid(),"mode":metadata.mode(),"device":metadata.dev(),"inode":metadata.ino(),"links":metadata.nlink()},"changed":changed,"original_child_wait_not_started":true});
+            Ok(phase)
+        })();
+        let detached = trace.as_mut().map_or(Ok(()), |trace| {
+            trace
+                .detach()
+                .map_err(|error| error.context("copy original trace explicit detach/continuation"))
+        });
+        drop(gate);
+        let release = actor
+            .send(if execution.is_ok() { b"D\n" } else { b"A\n" })
+            .map_err(|error| error.context("copy original actor phase-aware release/abort"));
+        let settled = actor.finish(cleanup);
+        let cleanup = crate::linux_relay_sample::combine(detached, release);
+        match (execution, settled) {
+            (Ok(phase), Ok(helper)) => {
+                cleanup?;
+                Ok((phase, helper))
+            }
+            (Ok(_), Err(error)) => {
+                crate::linux_relay_sample::combine(Err(error), cleanup)?;
+                unreachable!()
+            }
+            (Err(primary), settled) => {
+                let secondary = crate::linux_relay_sample::combine(cleanup, settled.map(|_| ()));
+                crate::linux_relay_sample::combine(Err(primary), secondary)?;
+                unreachable!()
+            }
         }
-        let mut raw = Vec::new();
-        (&journal).take(512 * 1024 + 1).read_to_end(&mut raw)?;
-        memcordon_core::canonical_json::reject_duplicate_json_keys(&raw)
-            .map_err(CiError::Message)?;
-        let record: Value = serde_json::from_slice(&raw)?;
-        if record["association"] != serde_json::to_value(&association)?
-            || !record["native"].is_null()
-        {
-            return Err(CiError::Message(
-                "source mutation did not hold original pre-execution intake".into(),
-            ));
-        }
-        actor.send(b"W\n")?;
-        let changed = actor.phase("changed")?;
-        let phase = json!({"format":"memcordon.current-snapshot-copy-boundary","revision":1,"permission":permission.observation(),"read":read,"journal":record,"journal_custody":{"uid":metadata.uid(),"mode":metadata.mode(),"device":metadata.dev(),"inode":metadata.ino(),"links":metadata.nlink()},"changed":changed,"original_child_wait_not_started":true});
-        trace.detach()?;
-        Ok(phase)
-    })();
-    drop(gate);
-    let release = actor.send(b"D\n");
-    let settled = actor.finish(cleanup);
-    match execution {
-        Ok(phase) => {
-            release?;
-            Ok((phase, settled?))
-        }
-        Err(primary) => Err(CiError::Message(format!(
-            "{primary}; source mutation helper release: {release:?}; settlement: {:?}",
-            settled.as_ref().err()
-        ))),
     }
 }
 
@@ -1225,7 +1398,8 @@ fn assert_helper_change(
         .ok_or_else(|| CiError::Message("actual source mutation response absent".into()))?;
     memcordon_core::canonical_json::reject_duplicate_json_keys(bytes).map_err(CiError::Message)?;
     let effect: Value = serde_json::from_slice(bytes)?;
-    if effect["opened"]["sha256"] != super::artifacts::checksum(before)
+    if effect["aborted"] == true
+        || effect["opened"]["sha256"] != super::artifacts::checksum(before)
         || effect["changed"]["sha256"] != super::artifacts::checksum(after)
         || effect["opened"]["device"] != effect["changed"]["device"]
         || effect["opened"]["inode"] != effect["changed"]["inode"]
@@ -1249,7 +1423,7 @@ fn acknowledge(caller: &CallerSession, case: &ExecutedCase, cleanup: Instant) ->
     crate::command::require_successful_output("current snapshot acknowledgment", &output)?;
     let response =
         memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&output.stdout)
-            .map_err(CiError::Message)?;
+            .map_err(|error| CiError::Message(error.to_string()))?;
     if response.association != case.locator {
         return Err(CiError::Message(
             "snapshot acknowledgment names a different attempt".into(),

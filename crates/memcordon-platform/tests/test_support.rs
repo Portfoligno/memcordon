@@ -36,6 +36,47 @@ fn windows_held_identity_observes_original_process_retirement() {
         }
     }
     let image = std::env::current_exe().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let candidate = memcordon_platform::test_support::windows_process_candidate_for_image_until(
+        &image,
+        std::process::id(),
+        deadline,
+    )
+    .unwrap();
+    let memcordon_platform::test_support::WindowsProcessCandidate::Held(candidate) = candidate
+    else {
+        panic!("current published candidate must be held");
+    };
+    assert_eq!(candidate.identity.pid, std::process::id());
+    assert_ne!(candidate.identity.birth, 0);
+    assert!(!candidate.has_exited().unwrap());
+    assert!(
+        memcordon_platform::test_support::windows_process_candidate_for_image_until(
+            &image,
+            std::process::id(),
+            std::time::Instant::now(),
+        )
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        memcordon_platform::test_support::windows_process_candidate_for_image_until(
+            &image, 0, deadline,
+        )
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    let different_image = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(
+        memcordon_platform::test_support::windows_process_candidate_for_image_until(
+            &different_image,
+            std::process::id(),
+            deadline,
+        )
+        .is_err()
+    );
     let console_path = memcordon_platform::test_support::windows_console_host_path().unwrap();
     assert!(console_path.is_absolute());
     assert_eq!(console_path.file_name().unwrap(), "conhost.exe");
@@ -80,6 +121,7 @@ fn windows_held_identity_observes_original_process_retirement() {
         .into_iter()
         .find(|process| process.identity.pid == std::process::id())
         .unwrap();
+    assert_eq!(candidate.identity, root.identity);
     let direct = root
         .direct_children_for_image_until(
             &image,

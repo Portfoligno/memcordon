@@ -57,7 +57,7 @@ fn node_1192() -> Value {
     let mut values = Vec::new();
     values.push(node_1193());
     values.push(node_1194());
-    values.push(node_1196());
+    values.extend(node_1196());
     values.push(node_1197());
     values.push(node_1199());
     values.push(node_1201());
@@ -164,7 +164,7 @@ fn node_1198() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1196() -> Value {
+fn node_1196() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -172,7 +172,7 @@ fn node_1196() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1196", Value::Mapping(values))
 }
 
 fn node_1194() -> Value {
@@ -231,7 +231,7 @@ fn node_1175() -> Value {
     let mut values = Vec::new();
     values.push(node_1176());
     values.push(node_1177());
-    values.push(node_1179());
+    values.extend(node_1179());
     values.push(node_1180());
     values.push(node_1182());
     values.push(node_1184());
@@ -288,7 +288,7 @@ fn node_1186() -> Value {
 fn node_1184() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Current external consumer contracts"));
-    values.insert(text("run"), text("rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy"));
+    values.insert(text("run"), text("rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow --test suite_failure_policy --test windows_consumer_readiness --test launch_event_wait"));
     values.insert(text("timeout-minutes"), Value::Number(10.into()));
     Value::Mapping(values)
 }
@@ -338,7 +338,7 @@ fn node_1181() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1179() -> Value {
+fn node_1179() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -346,7 +346,7 @@ fn node_1179() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1179", Value::Mapping(values))
 }
 
 fn node_1177() -> Value {
@@ -405,7 +405,7 @@ fn node_1153() -> Value {
     let mut values = Vec::new();
     values.push(node_1154());
     values.push(node_1155());
-    values.push(node_1157());
+    values.extend(node_1157());
     values.push(node_1158());
     values.push(node_1160());
     values.push(node_1162());
@@ -560,7 +560,7 @@ fn node_1159() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1157() -> Value {
+fn node_1157() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -568,7 +568,7 @@ fn node_1157() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1157", Value::Mapping(values))
 }
 
 fn node_1155() -> Value {
@@ -623,7 +623,7 @@ fn node_1139() -> Value {
     let mut values = Vec::new();
     values.push(node_1140());
     values.push(node_1141());
-    values.push(node_1143());
+    values.extend(node_1143());
     values.push(node_1144());
     values.push(node_1146());
     values.push(node_1147());
@@ -710,7 +710,7 @@ fn node_1145() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1143() -> Value {
+fn node_1143() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -718,7 +718,7 @@ fn node_1143() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1143", Value::Mapping(values))
 }
 
 fn node_1141() -> Value {
@@ -820,7 +820,7 @@ fn node_1008() -> Value {
     let mut values = Vec::new();
     values.push(node_1009());
     values.push(node_1010());
-    values.push(node_1012());
+    values.extend(node_1012());
     values.push(node_1013());
     values.push(node_1015());
     values.push(node_1017());
@@ -2682,14 +2682,14 @@ fn node_1014() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1012() -> Value {
+fn node_1012() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1012", Value::Mapping(values))
 }
 
 fn node_1010() -> Value {
@@ -2746,7 +2746,7 @@ fn node_937() -> Value {
     values.push(node_938());
     values.push(node_939());
     values.push(node_941());
-    values.push(node_943());
+    values.extend(node_943());
     values.push(node_944());
     values.push(node_946());
     values.push(node_948());
@@ -3692,14 +3692,14 @@ fn node_945() -> Value {
     Value::Mapping(values)
 }
 
-fn node_943() -> Value {
+fn node_943() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_943", Value::Mapping(values))
 }
 
 fn node_941() -> Value {
@@ -3783,7 +3783,7 @@ fn node_751() -> Value {
     let mut values = Vec::new();
     values.push(node_752());
     values.push(node_753());
-    values.push(node_755());
+    values.extend(node_755());
     values.push(node_756());
     values.push(node_758());
     values.push(node_760());
@@ -6596,14 +6596,14 @@ fn node_757() -> Value {
     Value::Mapping(values)
 }
 
-fn node_755() -> Value {
+fn node_755() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_755", Value::Mapping(values))
 }
 
 fn node_753() -> Value {
@@ -6676,7 +6676,7 @@ fn node_564() -> Value {
     let mut values = Vec::new();
     values.push(node_565());
     values.push(node_566());
-    values.push(node_568());
+    values.extend(node_568());
     values.push(node_569());
     values.push(node_571());
     values.push(node_573());
@@ -9492,14 +9492,14 @@ fn node_570() -> Value {
     Value::Mapping(values)
 }
 
-fn node_568() -> Value {
+fn node_568() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_568", Value::Mapping(values))
 }
 
 fn node_566() -> Value {
@@ -9572,7 +9572,7 @@ fn node_377() -> Value {
     let mut values = Vec::new();
     values.push(node_378());
     values.push(node_379());
-    values.push(node_381());
+    values.extend(node_381());
     values.push(node_382());
     values.push(node_384());
     values.push(node_386());
@@ -12385,14 +12385,14 @@ fn node_383() -> Value {
     Value::Mapping(values)
 }
 
-fn node_381() -> Value {
+fn node_381() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_381", Value::Mapping(values))
 }
 
 fn node_379() -> Value {
@@ -12452,7 +12452,7 @@ fn node_244() -> Value {
     let mut values = Vec::new();
     values.push(node_245());
     values.push(node_246());
-    values.push(node_248());
+    values.extend(node_248());
     values.push(node_249());
     values.push(node_251());
     values.push(node_252());
@@ -14407,14 +14407,14 @@ fn node_250() -> Value {
     Value::Mapping(values)
 }
 
-fn node_248() -> Value {
+fn node_248() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_248", Value::Mapping(values))
 }
 
 fn node_246() -> Value {
@@ -14502,7 +14502,7 @@ fn node_79() -> Value {
     let mut values = Vec::new();
     values.push(node_80());
     values.push(node_81());
-    values.push(node_83());
+    values.extend(node_83());
     values.push(node_84());
     values.push(node_86());
     values.push(node_88());
@@ -16948,14 +16948,14 @@ fn node_85() -> Value {
     Value::Mapping(values)
 }
 
-fn node_83() -> Value {
+fn node_83() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_83", Value::Mapping(values))
 }
 
 fn node_81() -> Value {
@@ -17030,7 +17030,7 @@ fn node_11() -> Value {
     let mut values = Vec::new();
     values.push(node_12());
     values.push(node_13());
-    values.push(node_15());
+    values.extend(node_15());
     values.push(node_16());
     values.push(node_18());
     values.push(node_20());
@@ -17927,14 +17927,14 @@ fn node_17() -> Value {
     Value::Mapping(values)
 }
 
-fn node_15() -> Value {
+fn node_15() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_15", Value::Mapping(values))
 }
 
 fn node_13() -> Value {

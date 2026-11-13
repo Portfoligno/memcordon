@@ -29,6 +29,7 @@ struct Snapshot {
 }
 
 struct Lane {
+    observation: Option<Arc<super::writer_observation::Cell>>,
     publisher_error: Arc<OnceLock<PublisherError>>,
     sender: SyncSender<Snapshot>,
     quarantined: Arc<AtomicBool>,
@@ -76,13 +77,32 @@ fn lane(record: &WindowsAttemptRecordV1) -> Result<Arc<Lane>, String> {
         return Err("attempt writer capacity exhausted".to_owned());
     }
     super::record::reserve_writer_admission(&record.attempt_id, &record.request_sha256)?;
-    let lane = new_lane(|record, revision| record.publish_exclusive(revision))?;
+    let observation = super::writer_observation::get(&record.attempt_id);
+    let lane = new_lane_observed(
+        |record, revision| record.publish_exclusive(revision),
+        observation,
+    )?;
     lanes.insert(record.attempt_id.clone(), Arc::clone(&lane));
+    if let Some(cell) = &lane.observation {
+        super::writer_observation::stage_cell(
+            cell,
+            super::writer_lifecycle::Stage::Registered,
+            None,
+        );
+    }
     Ok(lane)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn new_lane(
+    publish: impl FnMut(&mut WindowsAttemptRecordV1, u64) -> Result<(), String> + Send + 'static,
+) -> Result<Arc<Lane>, String> {
+    new_lane_observed(publish, None)
+}
+
+fn new_lane_observed(
     mut publish: impl FnMut(&mut WindowsAttemptRecordV1, u64) -> Result<(), String> + Send + 'static,
+    observation: Option<Arc<super::writer_observation::Cell>>,
 ) -> Result<Arc<Lane>, String> {
     let (sender, receiver) = mpsc::sync_channel::<Snapshot>(PENDING_SNAPSHOTS);
     let quarantined = Arc::new(AtomicBool::new(false));
@@ -95,7 +115,15 @@ fn new_lane(
     let worker_failure = Arc::clone(&failure);
     let publisher_error = Arc::new(OnceLock::new());
     let worker_publisher_error = Arc::clone(&publisher_error);
-    std::thread::Builder::new()
+    if let Some(cell) = &observation {
+        super::writer_observation::stage_cell(
+            cell,
+            super::writer_lifecycle::Stage::WorkerCreateRequested,
+            None,
+        );
+    }
+    let worker_observation = observation.as_ref().map(Arc::downgrade);
+    let thread = std::thread::Builder::new()
         .name("memcordon-attempt-writer".to_owned())
         .spawn(move || {
             while let Ok(mut next) = receiver.recv() {
@@ -106,7 +134,19 @@ fn new_lane(
                 super::diagnostics::set_phase(
                     memcordon_core::AttemptObservationPhaseV1::Terminalizing,
                 );
+                super::writer_observation::stage_weak(
+                    &worker_observation,
+                    super::writer_lifecycle::Stage::PublicationStarted,
+                    None,
+                );
                 let result = publish(&mut next.record, next.expected_revision);
+                if result.is_ok() {
+                    super::writer_observation::stage_weak(
+                        &worker_observation,
+                        super::writer_lifecycle::Stage::PublicationCompleted,
+                        None,
+                    );
+                }
                 if let Err(error) = &result {
                     let mut observations = memcordon_core::WindowsCausalDiagnosticsV1::default();
                     super::diagnostics::merge_into(&mut observations);
@@ -129,6 +169,15 @@ fn new_lane(
                             terminalization_reference: None,
                         },
                     };
+                    let native_code = match &event.native_code {
+                        Some(memcordon_core::NativeFailureCodeV1::Win32(code)) => Some(*code),
+                        _ => None,
+                    };
+                    super::writer_observation::stage_weak(
+                        &worker_observation,
+                        super::writer_lifecycle::Stage::PublicationFailed,
+                        native_code,
+                    );
                     if worker_publisher_error.get().is_none() {
                         let mut end = error.len().min(2048);
                         while !error.is_char_boundary(end) {
@@ -155,9 +204,30 @@ fn new_lane(
                     let _ = completion.try_send(result.map(|()| next.record));
                 }
             }
-        })
-        .map_err(|error| error.to_string())?;
+        });
+    let thread = match thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            if let Some(cell) = &observation {
+                super::writer_observation::stage_cell(
+                    cell,
+                    super::writer_lifecycle::Stage::WorkerCreateFailed,
+                    error.raw_os_error().map(|code| code as u32),
+                );
+            }
+            return Err(error.to_string());
+        }
+    };
+    if let Some(cell) = &observation {
+        super::writer_observation::stage_cell(
+            cell,
+            super::writer_lifecycle::Stage::WorkerCreated,
+            None,
+        );
+    }
+    super::writer_observation::retain_thread(&observation, thread);
     let lane = Arc::new(Lane {
+        observation,
         sender,
         quarantined,
         pending,
@@ -264,23 +334,47 @@ fn take_failure(lane: &Lane) -> Option<memcordon_core::CausalEventV1> {
 }
 
 fn try_submit(lane: &Lane, snapshot: Snapshot) -> Result<(), String> {
-    let _submission = lane
-        .completion_signal
-        .0
-        .try_lock()
-        .map_err(|_| "attempt writer completion is busy".to_owned())?;
+    let _submission = lane.completion_signal.0.try_lock().map_err(|_| {
+        if let Some(cell) = &lane.observation {
+            super::writer_observation::stage_cell(
+                cell,
+                super::writer_lifecycle::Stage::SubmissionRefused,
+                None,
+            );
+        }
+        "attempt writer completion is busy".to_owned()
+    })?;
     if lane.quarantined.load(Ordering::Acquire) {
+        if let Some(cell) = &lane.observation {
+            super::writer_observation::stage_cell(
+                cell,
+                super::writer_lifecycle::Stage::SubmissionRefused,
+                None,
+            );
+        }
         return Err(quarantined_error(lane, &snapshot.record.attempt_id));
     }
     lane.pending.fetch_add(1, Ordering::AcqRel);
-    lane.sender.try_send(snapshot).map_err(|error| {
+    let result = lane.sender.try_send(snapshot).map_err(|error| {
         lane.pending.fetch_sub(1, Ordering::AcqRel);
         match error {
             TrySendError::Full(_) => "attempt writer queue full",
             TrySendError::Disconnected(_) => "attempt writer unavailable",
         }
         .to_owned()
-    })
+    });
+    if let Some(cell) = &lane.observation {
+        super::writer_observation::stage_cell(
+            cell,
+            if result.is_ok() {
+                super::writer_lifecycle::Stage::SubmissionAccepted
+            } else {
+                super::writer_lifecycle::Stage::SubmissionRefused
+            },
+            None,
+        );
+    }
+    result
 }
 
 pub(super) fn commit(record: &mut WindowsAttemptRecordV1) -> Result<(), String> {
@@ -347,18 +441,48 @@ pub(super) fn try_commit_diagnostics(record: &mut WindowsAttemptRecordV1) -> Res
     Ok(())
 }
 
-pub(super) fn ensure_no_quarantined_writer() -> Result<(), String> {
+#[derive(Debug)]
+pub(super) enum WriterRegistryCheckError {
+    Unavailable,
+    Unconfirmed {
+        detail: String,
+        native_code: Option<u32>,
+    },
+}
+
+impl std::fmt::Display for WriterRegistryCheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("attempt writer registry unavailable"),
+            Self::Unconfirmed { detail, .. } => formatter.write_str(detail),
+        }
+    }
+}
+
+pub(super) fn ensure_no_quarantined_writer() -> Result<(), WriterRegistryCheckError> {
     let lanes = LANES
         .try_lock()
-        .map_err(|_| "attempt writer registry unavailable".to_owned())?;
+        .map_err(|_| WriterRegistryCheckError::Unavailable)?;
     if let Some((attempt_id, lane)) = lanes
         .iter()
         .find(|(_, lane)| lane.quarantined.load(Ordering::Acquire))
     {
-        return Err(format!(
-            "attempt writer publication remains unconfirmed; attempt={attempt_id}; {}",
-            quarantine_detail(lane)
-        ));
+        // Preserve an already observed Win32 publisher error, without parsing
+        // its display text or reinterpreting another native error domain.
+        let native_code =
+            lane.publisher_error
+                .get()
+                .and_then(|error| match error.event.native_code {
+                    Some(memcordon_core::NativeFailureCodeV1::Win32(code)) => Some(code),
+                    _ => None,
+                });
+        return Err(WriterRegistryCheckError::Unconfirmed {
+            detail: format!(
+                "attempt writer publication remains unconfirmed; attempt={attempt_id}; {}",
+                quarantine_detail(lane)
+            ),
+            native_code,
+        });
     }
     Ok(())
 }
@@ -373,19 +497,118 @@ pub(super) fn retire(attempt_id: &str) -> Result<(), String> {
         close_lane(lane)?;
     }
     let local_writer_stopped = lanes.remove(attempt_id).is_some();
-    super::record::retire_writer_admission(attempt_id, local_writer_stopped)
+    if local_writer_stopped {
+        super::writer_observation::stage(
+            attempt_id,
+            super::writer_lifecycle::Stage::RegistryRemoved,
+            None,
+        );
+    }
+    super::writer_observation::stage(
+        attempt_id,
+        super::writer_lifecycle::Stage::AdmissionRetireRequested,
+        None,
+    );
+    let result = super::record::retire_writer_admission(attempt_id, local_writer_stopped);
+    super::writer_observation::stage(
+        attempt_id,
+        if result.is_ok() {
+            super::writer_lifecycle::Stage::AdmissionRetired
+        } else {
+            super::writer_lifecycle::Stage::AdmissionRetireFailed
+        },
+        None,
+    );
+    result
 }
 
 fn close_lane(lane: &Lane) -> Result<(), String> {
-    let _submission = lane
-        .completion_signal
-        .0
-        .try_lock()
-        .map_err(|_| "attempt writer publication is completing".to_owned())?;
-    if lane.quarantined.swap(true, Ordering::AcqRel) || lane.pending.load(Ordering::Acquire) != 0 {
-        return Err("cannot retire an unconfirmed attempt writer".to_owned());
+    if let Some(cell) = &lane.observation {
+        super::writer_observation::stage_cell(
+            cell,
+            super::writer_lifecycle::Stage::CloseRequested,
+            None,
+        );
     }
-    Ok(())
+    let result = (|| {
+        let _submission = lane
+            .completion_signal
+            .0
+            .try_lock()
+            .map_err(|_| "attempt writer publication is completing".to_owned())?;
+        if lane.quarantined.swap(true, Ordering::AcqRel)
+            || lane.pending.load(Ordering::Acquire) != 0
+        {
+            return Err("cannot retire an unconfirmed attempt writer".to_owned());
+        }
+        Ok(())
+    })();
+    if let Some(cell) = &lane.observation {
+        super::writer_observation::stage_cell(
+            cell,
+            if result.is_ok() {
+                super::writer_lifecycle::Stage::CloseSucceeded
+            } else {
+                super::writer_lifecycle::Stage::CloseFailed
+            },
+            None,
+        );
+    }
+    result
+}
+
+pub(super) fn lifecycle_snapshot(cutoff: std::time::Instant) -> super::writer_lifecycle::Snapshot {
+    super::writer_observation::snapshot(cutoff, || {
+        use super::{
+            writer_lifecycle::Availability,
+            writer_observation::{Local, LocalRegistry},
+        };
+        match LANES.try_lock() {
+            Ok(lanes) => LocalRegistry {
+                availability: Availability::Available,
+                total: Some(lanes.len()),
+                rows: lanes
+                    .iter()
+                    .map(|(attempt_id, lane)| Local {
+                        attempt_id: attempt_id.clone(),
+                        generation: lane.observation.as_ref().map(|cell| cell.generation),
+                        pending: lane.pending.load(Ordering::Acquire),
+                        quarantined: lane.quarantined.load(Ordering::Acquire),
+                        publisher_native_code: lane.publisher_error.get().and_then(|error| {
+                            match &error.event.native_code {
+                                Some(memcordon_core::NativeFailureCodeV1::Win32(code)) => {
+                                    Some(*code)
+                                }
+                                _ => None,
+                            }
+                        }),
+                        publisher_failure: lane
+                            .publisher_error
+                            .get()
+                            .zip(lane.observation.as_ref())
+                            .map(|(error, cell)| {
+                                super::writer_lifecycle::PublisherFailureSnapshot::retained(
+                                    cell.publisher_binding(),
+                                    &error.event,
+                                    &error.detail,
+                                    error.truncated,
+                                )
+                            }),
+                    })
+                    .collect(),
+            },
+            Err(std::sync::TryLockError::WouldBlock) => LocalRegistry {
+                availability: Availability::Busy,
+                total: None,
+                rows: Vec::new(),
+            },
+            Err(std::sync::TryLockError::Poisoned(_)) => LocalRegistry {
+                availability: Availability::Poisoned,
+                total: None,
+                rows: Vec::new(),
+            },
+        }
+    })
 }
 
 pub(super) struct PublicationGuard(super::pipe::OwnedHandle);

@@ -67,34 +67,9 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
 fn retain_failure_output(source: &Path, diagnostics: &Path) -> Result<()> {
     const FILE_BOUND: u64 = 16 * 1024 * 1024;
     const TOTAL_BOUND: u64 = 64 * 1024 * 1024;
-    let mut selected = Vec::new();
-    for (index, entry) in walkdir::WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .enumerate()
-    {
-        if index >= 4096 {
-            eprintln!("optional installed diagnostics truncated at entry bound");
-            break;
-        }
-        let entry = entry.map_err(|error| CiError::Message(error.to_string()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if !path.extension().is_some_and(|extension| {
-            extension == "json" || extension == "txt" || extension == "bin"
-        }) {
-            continue;
-        }
-        let metadata = entry
-            .metadata()
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        selected.push((metadata.modified()?, path.to_owned()));
-    }
-    selected.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let selected = crate::installed_failure_carriers::select(source)?;
     let mut retained = 0;
-    for (_, path) in selected.into_iter().take(128) {
+    for path in selected {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]

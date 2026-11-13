@@ -210,13 +210,54 @@ struct StableToken {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct Snapshot {
+pub(super) struct Snapshot {
     stable: StableToken,
     modified_id: u64,
     default_acl: Option<Vec<u8>>,
 }
 
-fn snapshot(token: HANDLE) -> io::Result<Snapshot> {
+impl Snapshot {
+    pub(super) fn envelope(&self) -> &WindowsCallerTokenEnvelopeV1 {
+        &self.stable.envelope
+    }
+
+    pub(super) fn stable_eq(&self, other: &Self) -> bool {
+        self.stable == other.stable && self.default_acl == other.default_acl
+    }
+
+    /// A newly created primary token can have a distinct token object id.
+    /// Its effective envelope and default ACL must still match the held input.
+    pub(super) fn same_input(&self, other: &Self) -> bool {
+        self.stable.envelope == other.stable.envelope
+            && self.stable.expiration == other.stable.expiration
+            && self.stable.group_count == other.stable.group_count
+            && self.stable.privilege_count == other.stable.privilege_count
+            && self.default_acl == other.default_acl
+    }
+    pub(super) fn default_acl(&self) -> Option<&[u8]> {
+        self.default_acl.as_deref()
+    }
+    pub(super) fn measurement(&self) -> serde_json::Value {
+        use sha2::Digest;
+        let default_acl_sha256 = self
+            .default_acl
+            .as_deref()
+            .map(|bytes| -> [u8; 32] { sha2::Sha256::digest(bytes).into() });
+        serde_json::json!({"envelope":self.stable.envelope,"token_id":self.stable.token_id,
+            "expiration":self.stable.expiration,"group_count":self.stable.group_count,"privilege_count":self.stable.privilege_count,
+            "modified_id":self.modified_id,"default_acl_bytes":self.default_acl.as_ref().map(Vec::len),
+            "default_acl_sha256":default_acl_sha256})
+    }
+    pub(super) fn input_summary(
+        &self,
+    ) -> Result<memcordon_core::NativeTokenSummaryV1, &'static str> {
+        memcordon_core::NativeTokenSummaryV1::from_envelope(&self.stable.envelope).map(|summary| {
+            summary.with_counts(self.stable.group_count, self.stable.privilege_count)
+        })
+    }
+}
+
+pub(super) fn snapshot(token: HANDLE) -> io::Result<Snapshot> {
     let envelope =
         memcordon_windows_launch_core::query_token_envelope(token).map_err(io::Error::other)?;
     let captured = query(token, TokenStatistics)?;

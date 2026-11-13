@@ -1,5 +1,8 @@
 //! Cleanup-only recovery reacquires exact native owners. Serialized locators
 //! select no execution identity, release gate, host source or output destination.
+#[path = "../../workload_terminal_refinement.rs"]
+mod terminal_refinement;
+
 use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4};
 use super::workload_attempt::{
     DirectoryIdentity, RecoveryJournal, RecoveryJournalError, WorkloadAttemptRecordV1,
@@ -387,24 +390,22 @@ pub(super) fn recover_brokered(
             // Native retirement cannot certify the still-independent public
             // control's forwarded handles. Observe that exact process absent
             // before reporting their already-completed closure on a retry.
-            let mut observed = terminal.clone();
-            let mut obligations = BoundedVec::default();
-            for obligation in observed.cleanup.obligations.as_slice() {
-                if obligation.resource != CleanupResourceV3::ControlHandles {
-                    obligations
-                        .try_push(obligation.clone())
-                        .map_err(|_| "cleanup obligation ceiling")?;
-                }
+            if !journal.record().outstanding.as_slice().is_empty() {
+                return Err("retired complete workload retains outstanding resources".into());
             }
-            obligations
-                .try_push(CleanupObligationV3 {
-                    resource: CleanupResourceV3::ControlHandles,
-                    settled: true,
-                })
-                .map_err(|_| "cleanup obligation ceiling")?;
-            observed.cleanup.obligations = obligations;
-            observed.validate()?;
-            return terminal_frame(frame, &observed);
+            if let Some(observed) = terminal_refinement::settle_control_handles(terminal)? {
+                let mut next = journal.record().clone();
+                next.terminal = Some(observed);
+                journal.update(next)?;
+            }
+            return terminal_frame(
+                frame,
+                journal
+                    .record()
+                    .terminal
+                    .as_ref()
+                    .expect("retained terminal"),
+            );
         }
     }
     let cutoff = recovery_cutoff(&mut journal, boot.trim(), same_boot)?;
@@ -1400,6 +1401,44 @@ fn recognized_journal_auxiliary(name: &str) -> Option<&str> {
             name.strip_suffix(suffix)
                 .filter(|attempt| super::cgroup::valid_attempt_identity(attempt))
         })
+}
+
+/// Only the authenticated uninstall owner may retire these drained roots.
+/// Upgrade retains its existing directory and coordination lifetime.
+pub(crate) fn retire_empty_roots_for_uninstall(
+    guard: &crate::package::PackageDrainGuard<'_>,
+    cutoff: Instant,
+) -> Result<(), String> {
+    guard.validate()?;
+    for path in [
+        super::workload_attempt::JOURNAL_ROOT,
+        super::workload_attempt::INPUT_ROOT,
+        super::workload_resources::RESOURCE_ROOT,
+    ] {
+        remaining(cutoff)?;
+        let path = Path::new(path);
+        let (parent, name) = match parent_name(path) {
+            Ok(value) => value,
+            Err(error) => {
+                require_absent(path).map_err(|absence| {
+                    format!("current root parent custody: {error}; absence check: {absence}")
+                })?;
+                continue;
+            }
+        };
+        let held = match open_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(held) => held,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                require_absent(path)?;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        super::empty_runtime_directory::retire(&parent, &name, &held, 0, cutoff).map_err(
+            |error| format!("current empty root retirement {}: {error}", path.display()),
+        )?;
+    }
+    guard.validate()
 }
 fn protected_auxiliary(file: &File) -> Result<(), String> {
     let metadata = file.metadata().map_err(|error| error.to_string())?;

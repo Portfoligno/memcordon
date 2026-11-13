@@ -1,5 +1,35 @@
 //! Native containment used only by black-box process tests.
 
+#[cfg(windows)]
+#[path = "windows_access_failure.rs"]
+pub mod windows_access_failure;
+#[cfg(windows)]
+#[path = "windows_access_failure_probe.rs"]
+pub mod windows_access_failure_probe;
+#[cfg(windows)]
+#[path = "windows_fileio.rs"]
+pub mod windows_fileio;
+#[cfg(windows)]
+#[path = "windows_private_fixture.rs"]
+pub mod windows_private_fixture;
+#[cfg(windows)]
+#[path = "windows_private_process.rs"]
+pub mod windows_private_process;
+#[cfg(windows)]
+pub use windows_private_process::{
+    WindowsPendingChildProcess, duplicate_directory_metadata_into_child,
+    duplicate_marker_metadata_into_child,
+};
+#[cfg(windows)]
+#[path = "windows_private_input.rs"]
+pub mod windows_private_input;
+#[cfg(windows)]
+#[path = "windows_provider_catalog.rs"]
+pub mod windows_provider_catalog;
+#[cfg(windows)]
+#[path = "windows_winsock_registry.rs"]
+pub mod windows_winsock_registry;
+
 #[cfg(target_os = "linux")]
 pub fn workload_start_bytes(
     policy: &memcordon_core::Policy,
@@ -442,9 +472,9 @@ pub use crate::macos_launch::submillisecond_deadline as macos_submillisecond_dea
 pub use crate::macos_launch::timer_mutation_detected as macos_timer_mutation_detected;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
-    LaunchFault as MacosLaunchFault, StartupDeadlineObservations,
-    cancellation_fault as macos_cancellation_fault, disarm_timeout as macos_disarm_timeout,
-    owned_stop_observation as macos_owned_stop_observation,
+    InspectorStallFault, InspectorStallObservations, LaunchFault as MacosLaunchFault,
+    StartupDeadlineObservations, cancellation_fault as macos_cancellation_fault,
+    disarm_timeout as macos_disarm_timeout, owned_stop_observation as macos_owned_stop_observation,
     rejects_protocol as macos_rejects_protocol,
     startup_deadline_fault as macos_startup_deadline_fault,
     startup_deadline_fault_observations as macos_startup_deadline_fault_observations,
@@ -457,6 +487,7 @@ pub use crate::macos_launch::{
     guardian_inspector_wrapper as macos_guardian_inspector_wrapper,
     inspector_cancel_after_exit as macos_inspector_cancel_after_exit,
     inspector_stall as macos_inspector_stall,
+    inspector_stall_observations as macos_inspector_stall_observations,
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
@@ -947,9 +978,10 @@ fn windows_process_identity_is_live(identity: ProcessIdentity) -> io::Result<boo
 /// Query-only handles retained by the Windows installed-fixture leak observer.
 /// The unique staged image path keeps the observation specific to one case.
 #[cfg(windows)]
+#[derive(Clone)]
 pub struct WindowsImageProcess {
     pub identity: ProcessIdentity,
-    _handle: std::os::windows::io::OwnedHandle,
+    _handle: std::sync::Arc<std::os::windows::io::OwnedHandle>,
 }
 
 #[cfg(windows)]
@@ -985,6 +1017,45 @@ fn windows_process_observation_error(
 
 #[cfg(windows)]
 impl WindowsImageProcess {
+    /// Duplicate a retained registry input into this same live original process.
+    /// No numeric PID is reopened and the target reference is non-inheritable.
+    /// # Safety
+    /// `key` must be a live owned registry reference throughout this call.
+    unsafe fn duplicate_registry_input(
+        &self,
+        key: windows_sys::Win32::System::Registry::HKEY,
+        deadline: std::time::Instant,
+    ) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::DuplicateHandle,
+            System::{Registry::KEY_READ, Threading::GetCurrentProcess},
+        };
+        if std::time::Instant::now() >= deadline || self.has_exited()? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original registry input recipient unavailable at original cutoff",
+            ));
+        }
+        let mut transferred = std::ptr::null_mut();
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                key,
+                self._handle.as_raw_handle(),
+                &mut transferred,
+                KEY_READ,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // A failed later START owns no substitute recipient: native settlement
+        // closes this target-local reference with the original process.
+        Ok(transferred as usize as u64)
+    }
     /// Diagnostic-only token facts from this original retained process. A
     /// retired process or changed binding is unavailable, never a PID lookup.
     pub fn original_token_envelope(
@@ -1186,7 +1257,7 @@ impl WindowsImageProcess {
                         if !is_known && records.len() < 8 {
                             let candidate = WindowsImageProcess {
                                 identity,
-                                _handle: handle,
+                                _handle: std::sync::Arc::new(handle),
                             };
                             match candidate.native_parent_process_id() {
                                 Ok(parent) => {
@@ -1352,7 +1423,7 @@ impl WindowsImageProcess {
 
 #[cfg(windows)]
 pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageProcess>> {
-    windows_processes_for_image_inner(image, None, None)
+    windows_processes_for_image_inner(image, None, None, false)
 }
 
 #[cfg(windows)]
@@ -2081,7 +2152,180 @@ pub fn windows_processes_for_image_until(
     image: &Path,
     deadline: std::time::Instant,
 ) -> io::Result<Vec<WindowsImageProcess>> {
-    windows_processes_for_image_inner(image, Some(deadline), None)
+    windows_processes_for_image_inner(image, Some(deadline), None, false)
+}
+
+/// Capture the original verified fixture once with capability-delivery access.
+/// Ordinary process observations retain their original query-only rights.
+#[cfg(windows)]
+pub fn windows_fixture_input_processes_for_image_until(
+    image: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<Vec<WindowsImageProcess>> {
+    windows_processes_for_image_inner(image, Some(deadline), None, true)
+}
+
+/// Positive admission only. Unavailability does not establish absence or retirement.
+#[cfg(windows)]
+pub enum WindowsProcessCandidate {
+    Held(WindowsImageProcess),
+    CandidateUnavailable {
+        pid: u32,
+        raw_open_error: Option<i32>,
+    },
+}
+
+/// Acquire only the published candidate, retaining image, birth and liveness proof.
+/// This query-only API never grants capability-transfer or cleanup authority.
+#[cfg(windows)]
+pub fn windows_process_candidate_for_image_until(
+    image: &Path,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> io::Result<WindowsProcessCandidate> {
+    windows_process_candidate_with_access(image, pid, deadline, false)
+}
+
+/// Capability transfer to one positively published owned helper only. Open
+/// errors including87 remain failures; this is not a census or retirement API.
+#[cfg(windows)]
+pub fn windows_fixture_input_candidate_for_image_until(
+    image: &Path,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> io::Result<WindowsProcessCandidate> {
+    windows_process_candidate_with_access(image, pid, deadline, true)
+}
+
+#[cfg(windows)]
+fn windows_process_candidate_with_access(
+    image: &Path,
+    pid: u32,
+    deadline: std::time::Instant,
+    fixture_input: bool,
+) -> io::Result<WindowsProcessCandidate> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        QueryFullProcessImageNameW,
+    };
+    let live = || {
+        if std::time::Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original candidate admission cutoff expired",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    live()?;
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "published candidate PID is zero",
+        ));
+    }
+    let expected = std::fs::canonicalize(image)?;
+    live()?;
+    // SAFETY: one published candidate, never inheritable; explicit helper input
+    // additionally requests duplicate capability without weakening error handling.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_SYNCHRONIZE
+                | if fixture_input {
+                    windows_sys::Win32::System::Threading::PROCESS_DUP_HANDLE
+                } else {
+                    0
+                },
+            0,
+            pid,
+        )
+    };
+    let original_error = if raw.is_null() {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    if let Some(error) = original_error {
+        if crate::windows_process_candidate::classify(
+            pid,
+            !fixture_input,
+            false,
+            false,
+            error.raw_os_error(),
+        ) == crate::windows_process_candidate::Acquisition::CandidateUnavailable
+        {
+            live()?;
+            return Ok(WindowsProcessCandidate::CandidateUnavailable {
+                pid,
+                raw_open_error: error.raw_os_error(),
+            });
+        }
+        return Err(windows_process_observation_error(
+            if fixture_input {
+                "positive helper OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE|DUP_HANDLE)"
+            } else {
+                "positive candidate OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)"
+            },
+            Some(pid),
+            error,
+        ));
+    }
+    // SAFETY: the successful OpenProcess handle is uniquely owned on every exit.
+    let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+    live()?;
+    let mut units = [0u16; 32768];
+    let mut length = u32::try_from(units.len()).expect("image path capacity fits u32");
+    // SAFETY: held query handle and writable bounded path buffer.
+    if unsafe { QueryFullProcessImageNameW(raw, 0, units.as_mut_ptr(), &mut length) } == 0 {
+        return Err(windows_process_observation_error(
+            "positive candidate QueryFullProcessImageNameW",
+            Some(pid),
+            io::Error::last_os_error(),
+        ));
+    }
+    live()?;
+    let observed_name = std::ffi::OsString::from_wide(&units[..length as usize]);
+    let observed = std::fs::canonicalize(Path::new(&observed_name))?;
+    if observed != expected {
+        return Err(io::Error::other(
+            "published candidate held image differs from expected fixture",
+        ));
+    }
+    live()?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: same held process object, with query rights and writable outputs.
+    if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(windows_process_observation_error(
+            "positive candidate GetProcessTimes",
+            Some(pid),
+            io::Error::last_os_error(),
+        ));
+    }
+    let process = WindowsImageProcess {
+        identity: ProcessIdentity {
+            pid,
+            birth: (u128::from(creation.dwHighDateTime) << 32) | u128::from(creation.dwLowDateTime),
+        },
+        _handle: std::sync::Arc::new(handle),
+    };
+    live()?;
+    let exited = process.has_exited()?;
+    live()?;
+    if exited {
+        return Ok(WindowsProcessCandidate::CandidateUnavailable {
+            pid,
+            raw_open_error: None,
+        });
+    }
+    Ok(WindowsProcessCandidate::Held(process))
 }
 
 #[cfg(windows)]
@@ -2095,7 +2339,7 @@ impl WindowsImageProcess {
         if self.has_exited()? {
             return Err(io::Error::other("original direct-child root is retired"));
         }
-        let children = windows_processes_for_image_inner(image, Some(deadline), Some(self))?;
+        let children = windows_processes_for_image_inner(image, Some(deadline), Some(self), false)?;
         if self.has_exited()? {
             return Err(io::Error::other(
                 "original direct-child root retired during census",
@@ -2110,6 +2354,7 @@ fn windows_processes_for_image_inner(
     image: &Path,
     deadline: Option<std::time::Instant>,
     root: Option<&WindowsImageProcess>,
+    fixture_input: bool,
 ) -> io::Result<Vec<WindowsImageProcess>> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
@@ -2179,7 +2424,13 @@ fn windows_processes_for_image_inner(
             // SAFETY: query-only access to an enumerated PID.
             let raw = unsafe {
                 OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    PROCESS_QUERY_LIMITED_INFORMATION
+                        | PROCESS_SYNCHRONIZE
+                        | if fixture_input {
+                            windows_sys::Win32::System::Threading::PROCESS_DUP_HANDLE
+                        } else {
+                            0
+                        },
                     0,
                     entry.th32ProcessID,
                 )
@@ -2414,7 +2665,7 @@ fn windows_processes_for_image_inner(
                         birth: (u128::from(creation.dwHighDateTime) << 32)
                             | u128::from(creation.dwLowDateTime),
                     },
-                    _handle: handle,
+                    _handle: std::sync::Arc::new(handle),
                 };
                 match root {
                     Some(owner)

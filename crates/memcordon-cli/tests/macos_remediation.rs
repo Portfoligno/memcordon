@@ -1015,6 +1015,34 @@ fn stalled_inspector_is_bounded_and_guardian_retirement_progresses() {
 }
 
 #[test]
+fn rejected_inspector_measurements_still_observe_child_and_guardian_retirement() {
+    use memcordon_platform::test_support::{
+        InspectorStallFault, macos_inspector_stall_observations,
+    };
+    let _runtime = native_runtime();
+    for (fault, primary) in [
+        (
+            InspectorStallFault::RejectCleanupWitness,
+            "fixture rejected cleanup-lane witness",
+        ),
+        (
+            InspectorStallFault::RejectWorkerReadiness,
+            "fixture rejected stalled inspection worker readiness",
+        ),
+    ] {
+        let observed = macos_inspector_stall_observations(image(), fault).unwrap();
+        assert!(
+            observed.measurement.as_ref().unwrap_err().contains(primary),
+            "{observed:?}"
+        );
+        assert!(observed.child_retirement.is_ok(), "{observed:?}");
+        assert!(observed.guardian_retirement.is_ok(), "{observed:?}");
+        assert!(observed.recovery.is_ok(), "{observed:?}");
+        assert!(observed.into_result().unwrap_err().contains(primary));
+    }
+}
+
+#[test]
 fn inspector_natural_exit_cancellation_preserves_actual_owned_reap() {
     let _runtime = native_runtime();
     memcordon_platform::test_support::macos_inspector_cancel_after_exit(image()).unwrap();

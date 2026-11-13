@@ -1247,6 +1247,7 @@ fn provider_response_variant(response: &WindowsProviderResponseV4) -> &'static s
         WindowsProviderResponseV4::RecoveryAttemptUnavailable { .. } => {
             "recovery-attempt-unavailable"
         }
+        WindowsProviderResponseV4::AttemptDiagnostics(_) => "attempt-diagnostics",
         WindowsProviderResponseV4::PackageCleanupResult { .. } => "package-cleanup-result",
         WindowsProviderResponseV4::CertificationMachineRestart { .. } => {
             "certification-machine-restart"

@@ -19,6 +19,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ProviderCatalogPreparation,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    AccessFailureConsumer,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    AccessFailureCalibration,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    LoaderFileioConsumer,
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     CurrentLinuxOwnerProbe {
@@ -72,6 +84,11 @@ enum TopLevel {
 
 #[derive(Subcommand)]
 enum CiCommand {
+    #[cfg(windows)]
+    AccessFailureProbe {
+        #[arg(long)]
+        output: PathBuf,
+    },
     Workflows {
         #[arg(long, conflicts_with = "write", required_unless_present = "write")]
         check: bool,
@@ -199,6 +216,7 @@ enum CiCommand {
         mode: memcordon_ci::cache_restore::RestoreMode,
     },
     CheckWorkflows,
+    StorageCheckpoint,
     PerformancePlan,
     WorkflowScope,
     AggregateStress {
@@ -222,8 +240,60 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
     ))
 }
 
+fn command_root(
+    current: &Path,
+    command: &Option<TopLevel>,
+    workspace: impl FnOnce(&Path) -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    match command {
+        #[cfg(target_os = "linux")]
+        Some(
+            TopLevel::CurrentLinuxSnapshotProbe { .. } | TopLevel::CurrentLinuxOwnerProbe { .. },
+        ) => Ok(current.to_owned()),
+        Some(TopLevel::ExternalConsumer { .. }) => Ok(current.to_owned()),
+        Some(TopLevel::Release {
+            command:
+                memcordon_ci::release::ReleaseCommand::Publish { .. }
+                | memcordon_ci::release::ReleaseCommand::Inspect { .. }
+                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. }
+                | memcordon_ci::release::ReleaseCommand::RehearsalTransaction { .. },
+        }) => Ok(current.to_owned()),
+        _ => workspace(current),
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/private/standalone_dispatch.rs"]
+mod standalone_dispatch_tests;
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    match &cli.command {
+        Some(TopLevel::ProviderCatalogPreparation) => {
+            return memcordon_ci::windows_provider_catalog::child().map_err(CiError::from);
+        }
+        Some(TopLevel::AccessFailureConsumer) => {
+            return memcordon_ci::windows_access_failure_probe::consumer_stdio()
+                .map_err(CiError::from);
+        }
+        Some(TopLevel::AccessFailureCalibration) => {
+            return memcordon_ci::windows_access_failure_probe::calibration_stdio()
+                .map_err(CiError::from);
+        }
+        Some(TopLevel::Ci {
+            command: CiCommand::AccessFailureProbe { output },
+        }) => {
+            return memcordon_ci::windows_access_failure_probe::collect(output)
+                .map_err(CiError::from);
+        }
+        _ => {}
+    }
+    #[cfg(windows)]
+    if matches!(&cli.command, Some(TopLevel::LoaderFileioConsumer)) {
+        // The consumer is a separately owned helper, not a workflow command.
+        return memcordon_ci::windows_loader_fileio::consume_stdio().map_err(CiError::from);
+    }
     let backend = |suite: &Suite| {
         matches!(
             suite,
@@ -249,6 +319,8 @@ fn run() -> Result<()> {
             command,
             memcordon_ci::release::ReleaseCommand::WorkingWindowsPrepare { .. }
                 | memcordon_ci::release::ReleaseCommand::WorkingWindowsConsumer { .. }
+                | memcordon_ci::release::ReleaseCommand::WorkingWindowsProviderExperiment { .. }
+                | memcordon_ci::release::ReleaseCommand::WorkingWindowsMatchedOwned { .. }
         ),
         _ => false,
     };
@@ -256,20 +328,17 @@ fn run() -> Result<()> {
         .then(memcordon_ci::cancellation::Scope::install)
         .transpose()?;
     let current = std::env::current_dir()?;
-    let root = match &cli.command {
-        #[cfg(target_os = "linux")]
-        Some(TopLevel::CurrentLinuxSnapshotProbe { .. }) => current,
-        Some(TopLevel::ExternalConsumer { .. }) => current,
-        Some(TopLevel::Release {
-            command:
-                memcordon_ci::release::ReleaseCommand::Publish { .. }
-                | memcordon_ci::release::ReleaseCommand::Inspect { .. }
-                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. }
-                | memcordon_ci::release::ReleaseCommand::RehearsalTransaction { .. },
-        }) => current,
-        _ => workspace_root(&current)?,
-    };
+    let root = command_root(&current, &cli.command, workspace_root)?;
     let result = (|| match cli.command {
+        #[cfg(windows)]
+        Some(
+            TopLevel::LoaderFileioConsumer
+            | TopLevel::ProviderCatalogPreparation
+            | TopLevel::AccessFailureConsumer
+            | TopLevel::AccessFailureCalibration,
+        ) => {
+            unreachable!("helper dispatched before workflow setup")
+        }
         #[cfg(target_os = "linux")]
         Some(TopLevel::CurrentLinuxOwnerProbe { input, output }) => {
             memcordon_ci::release::linux_test_owners::probe(&input, &output)
@@ -279,6 +348,10 @@ fn run() -> Result<()> {
             memcordon_ci::linux_snapshot_probe::run(&input, &output)
         }
         Some(TopLevel::Ci { command }) => match command {
+            #[cfg(windows)]
+            CiCommand::AccessFailureProbe { .. } => {
+                unreachable!("calibration dispatched before workflow setup")
+            }
             CiCommand::Workflows { check: _, write } => {
                 memcordon_ci::workflow_definitions::run(&root, write)
             }
@@ -370,6 +443,22 @@ fn run() -> Result<()> {
                 &root, &purpose, &shard, partition, mode,
             ),
             CiCommand::CheckWorkflows => policy::run(&root),
+            CiCommand::StorageCheckpoint => {
+                let mut value = memcordon_ci::storage_observation::snapshot(
+                    &root,
+                    None,
+                    true,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                value["phase"] = serde_json::json!("before-native-compile");
+                value["survivability"] = serde_json::json!(
+                    "precompile baseline only; later peak samples remain best effort"
+                );
+                memcordon_ci::release::source::write_diagnostic_json(
+                    &root.join("target/ci/reports/storage/native-before-compile.json"),
+                    &value,
+                )
+            }
             CiCommand::WorkflowScope => memcordon_ci::workflow_scope::emit_from_github(),
             CiCommand::PerformancePlan => {
                 memcordon_ci::performance_plan::PerformancePlan::read(&root)?.emit()

@@ -1,5 +1,8 @@
 //! Current Windows native terminal and durable record formats.
 use super::*;
+#[path = "attempt_diagnostics.rs"]
+mod attempt_diagnostics;
+pub use attempt_diagnostics::*;
 
 /// Current public-wire4 launch input. Caller identity is always captured natively.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -515,6 +518,21 @@ impl WindowsProviderRejectionV3 {
                         },
                         None,
                     ) => true,
+                    // A held target cancelled before resume retires through the
+                    // Reject carrier with its truthful Interrupted outcome.
+                    (
+                        WindowsTerminalPayloadV3::Execution {
+                            outcome: RunOutcome::Interrupted { .. },
+                            ..
+                        },
+                        diagnostic,
+                    ) => !self.target_released && diagnostic.is_none_or(|failure| {
+                        failure.provider_binding.generation.as_str() == receipt.retirement_proof.provider_generation
+                            && String::from(failure.attempt_id.clone()) == receipt.attempt_id
+                            && String::from(failure.request_sha256.clone()) == receipt.request_sha256
+                            && matches!(failure.original,
+                                crate::OriginalFailureV1::Observed { ref event } if event.sequence > 0)
+                    }),
                     (
                         WindowsTerminalPayloadV3::RecoveredClosure {
                             primary_failure, ..
@@ -633,6 +651,20 @@ pub fn authenticate_decoded_windows_attempt_record_v5(
             .as_ref()
             .is_some_and(|identity| !windows_process_identity_is_valid(identity))
         || !record.causal_diagnostics.is_consistent()
+        || record
+            .causal_diagnostics
+            .native_inputs
+            .as_ref()
+            .is_some_and(|observation| {
+                !observation.is_bound_to(
+                    &record.attempt_id,
+                    &record.request_sha256,
+                    &record.caller_process_identity,
+                ) || observation
+                    .target_identity
+                    .as_ref()
+                    .is_some_and(|target| record.target_identity.as_ref() != Some(target))
+            })
         || !record.diagnostic_retention.is_consistent()
     {
         return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=v5-binding");
@@ -1036,6 +1068,38 @@ impl WindowsProviderResponseV4 {
     }
 }
 
+pub const MAX_WINDOWS_ACCEPTED_OBSERVATION_BYTES: usize = 16 * 1024;
+
+/// Join exact frontend-local custody to an independently held frontend identity.
+/// The receipt does not authorize recovery or replace its caller checks.
+pub fn validate_windows_accepted_observation(
+    accepted: &WindowsWorkloadAcceptedV1,
+    request_bytes: &[u8],
+    provider: &crate::PublicProviderBindingV1,
+    frontend: &WindowsProcessIdentityV1,
+) -> Result<(), String> {
+    accepted.validate().map_err(str::to_owned)?;
+    if request_bytes.len() > crate::WINDOWS_MAX_FRAME_BYTES
+        || frontend.creation_time_100ns == 0
+        || &accepted.provider != provider
+        || &accepted.frontend != frontend
+        || String::from(crate::hash_bytes(request_bytes)) != accepted.request_sha256
+    {
+        return Err(
+            "accepted observation differs from held frontend, provider or exact request".into(),
+        );
+    }
+    crate::canonical_json::reject_duplicate_json_keys(request_bytes)?;
+    let request: WindowsLaunchRequestV2 =
+        serde_json::from_slice(request_bytes).map_err(|error| error.to_string())?;
+    if &request.expected_provider_binding != provider || request.nonce != accepted.nonce {
+        return Err("accepted observation differs from original request binding".into());
+    }
+    crate::bounded_json_bytes(accepted, MAX_WINDOWS_ACCEPTED_OBSERVATION_BYTES, false)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ValidatedWindowsCertificationTerminalV3<'a> {
     pub native: &'a WindowsSealedEvidenceV3,
@@ -1266,6 +1330,17 @@ pub enum WindowsProviderRequestV4 {
         request_sha256: String,
         challenge: String,
     },
+    ObserveAttemptDiagnostics {
+        schema_version: u32,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 64>")]
+        attempt_id: String,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 128>")]
+        nonce: String,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 64>")]
+        request_sha256: String,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 128>")]
+        challenge: String,
+    },
     ConvergeRecovery {
         schema_version: u32,
         challenge: String,
@@ -1440,6 +1515,18 @@ pub enum WindowsLauncherRequestV4 {
         challenge: String,
         caller: crate::WindowsRecoveryCallerEvidenceV1,
     },
+    ObserveAttemptDiagnostics {
+        schema_version: u32,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 64>")]
+        attempt_id: String,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 128>")]
+        nonce: String,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 64>")]
+        request_sha256: String,
+        #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 128>")]
+        challenge: String,
+        caller: crate::WindowsRecoveryCallerEvidenceV1,
+    },
     ConvergeRecovery {
         schema_version: u32,
         challenge: String,
@@ -1501,6 +1588,8 @@ pub struct WindowsLaunchBrokerRequestV2 {
     pub request_sha256: String,
     pub caller_process_identity: WindowsProcessIdentityV1,
     pub caller_token_envelope: WindowsCallerTokenEnvelopeV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_inputs: Option<crate::WindowsNativeInputObservationV1>,
     pub remote_primary_token_handle: u64,
     pub remote_frontend_process_handle: u64,
     /// Certification-only handles created by the authenticated frontend and

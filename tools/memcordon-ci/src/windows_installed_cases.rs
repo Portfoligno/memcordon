@@ -7,6 +7,22 @@ use serde::{Deserialize, Serialize};
 use crate::windows_causal_acceptance::{InstalledCaseResult, InstalledChannel};
 use crate::{CiError, Result};
 
+/// Execution and package retirement remain independent of measured private
+/// availability. Errors never become an unavailable/success verdict.
+pub fn provider_experiment_execution_status(
+    operation: &Result<serde_json::Value>,
+    cleanup: &Result<()>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "execution_completed": operation.is_ok(),
+        "completed": operation.is_ok() && cleanup.is_ok(),
+        "private_availability": operation.as_ref().ok().and_then(|value| value.get("private_availability")),
+        "execution_error": operation.as_ref().err().map(ToString::to_string),
+        "installation_cleanup_verified": cleanup.is_ok(),
+        "installation_cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
+    })
+}
+
 #[derive(Serialize)]
 struct PackageOperationCapture<'a> {
     format: &'static str,
@@ -291,6 +307,8 @@ pub struct InstalledWindowsPayload {
     pub components: Vec<SelectedArtifact>,
     pub installed_components: Vec<SelectedArtifact>,
     pub fixture: SelectedArtifact,
+    /// Diagnostic preparation snapshot, never executable-selection authority.
+    pub fixture_manifest_inventory: serde_json::Value,
     pub installed_agent: SelectedArtifact,
     pub installed_manifest: SelectedArtifact,
     pub provider: memcordon_core::PublicProviderBindingV1,
@@ -473,6 +491,15 @@ fn installed_public_command_format(
 }
 
 impl InstalledWindowsPayload {
+    pub fn fixture_inventory_input(&self) -> crate::windows_fixture_inventory::Input<'_> {
+        crate::windows_fixture_inventory::Input {
+            source_commit: &self.source_commit,
+            target: &self.target,
+            path: &self.fixture.path,
+            sha256: &self.fixture.sha256,
+            embedded: &self.fixture_manifest_inventory,
+        }
+    }
     /// Bind the installed case inputs to the measured channel payload, independently
     /// of any report produced by the workload. This is inventory, not permission.
     #[expect(
@@ -612,13 +639,25 @@ impl InstalledWindowsPayload {
                 "fixture must not be a production runtime component".into(),
             ));
         }
-        let fixture_bytes = files::read_file(&fixture.path)?;
-        target::validate_executable(&fixture_bytes, &distribution.target)?;
-        if files::checksum(&fixture_bytes) != fixture.sha256 {
+        #[cfg(windows)]
+        let fixture_held = crate::windows_native_files::hold_artifact(
+            &fixture.path,
+            Some(&fixture.sha256),
+            512 * 1024 * 1024,
+        )?;
+        #[cfg(windows)]
+        let fixture_bytes = fixture_held.bytes.as_slice();
+        #[cfg(not(windows))]
+        let fixture_bytes_owned = files::read_file(&fixture.path)?;
+        #[cfg(not(windows))]
+        let fixture_bytes = fixture_bytes_owned.as_slice();
+        target::validate_executable(fixture_bytes, &distribution.target)?;
+        if files::checksum(fixture_bytes) != fixture.sha256 {
             return Err(CiError::Message(
                 "selected native fixture bytes changed".into(),
             ));
         }
+        let fixture_manifest_inventory = crate::windows_pe_manifest::inventory(fixture_bytes);
         for artifact in &artifacts {
             if files::checksum(&files::read_file(&artifact.path)?) != artifact.sha256 {
                 return Err(CiError::Message(
@@ -648,6 +687,7 @@ impl InstalledWindowsPayload {
             components,
             installed_components,
             fixture,
+            fixture_manifest_inventory,
             provider: manifest_provider,
             output_directory,
         })
@@ -657,6 +697,7 @@ impl InstalledWindowsPayload {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledWindowsAssessment {
+    pub revision: u32,
     pub channel: InstalledChannel,
     pub target: String,
     pub source_commit: String,
@@ -666,6 +707,7 @@ pub struct InstalledWindowsAssessment {
     pub cases: Vec<InstalledCaseResult>,
     pub positive_cases: Vec<crate::windows_consumer_readiness::CaseAssessment>,
     pub positive_suite: std::result::Result<(), String>,
+    pub readiness: crate::windows_readiness_policy::SuiteDecision,
     pub loss_cases: Vec<crate::windows_readiness_faults::LossAssessment>,
     pub loss_suite: std::result::Result<(), String>,
     pub capacity_cases: Vec<crate::windows_readiness_capacity::CapacityAssessment>,
@@ -679,13 +721,22 @@ pub struct InstalledWindowsAssessment {
 }
 
 impl InstalledWindowsAssessment {
+    /// This is only the finite readiness scope. Independent native suites and
+    /// installation lifecycle remain mandatory in the shared final decision.
+    pub fn readiness_validated(&self) -> bool {
+        self.revision == 2
+            && self.readiness == crate::windows_readiness_policy::assess_suite(&self.positive_cases)
+            && self.readiness.is_validated()
+            && self.positive_suite.is_ok()
+    }
+
     pub fn accepted(&self) -> bool {
-        self.public_smoke_before.is_ok()
+        self.readiness_validated()
+            && self.public_smoke_before.is_ok()
             && self.retained_state_recovery.is_ok()
             && self.public_smoke_after.is_ok()
             && self.package_upgrade.is_ok()
             && self.package_uninstall.is_ok()
-            && self.positive_suite.is_ok()
             && self.loss_suite.is_ok()
             && crate::windows_readiness_faults::accepted(&self.loss_cases)
             && self.capacity_suite.is_ok()
@@ -972,6 +1023,193 @@ mod native {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn provider_input_experiment(
+        root: &Path,
+        config: &InstalledWindowsPayload,
+        deadlines: WindowsLeaseDeadlines,
+        dot_local_file: bool,
+    ) -> Result<()> {
+        let layout = if dot_local_file {
+            "file-marker-siblings"
+        } else {
+            "directory"
+        };
+        verify_selected(config)?;
+        require_removed(config)?;
+        fs::create_dir_all(&config.output_directory)?;
+        let mut started = false;
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<serde_json::Value> {
+                started = true;
+                package(config, "install", deadlines.work).map_err(CiError::Message)?;
+                package(config, "verify", deadlines.work).map_err(CiError::Message)?;
+                drop(quiescent(config)?);
+                crate::windows_consumer_readiness::run_provider_input_experiment_until(
+                    root,
+                    config,
+                    deadlines,
+                    dot_local_file,
+                )
+            },
+        ));
+        let _cleanup_scope = crate::cancellation::retirement_scope(deadlines.cleanup);
+        let cleanup = (|| -> Result<()> {
+            if started {
+                let recovered = recover_retained_state(config, deadlines).map_err(CiError::Message);
+                let removed =
+                    package(config, "uninstall", deadlines.cleanup).map_err(CiError::Message);
+                match (recovered, removed) {
+                    (Err(primary), Err(secondary)) => {
+                        return Err(CiError::LaneFailures {
+                            primary: Box::new(primary),
+                            secondary: Box::new(secondary),
+                        });
+                    }
+                    (Err(primary), _) => return Err(primary),
+                    (Ok(()), result) => result?,
+                }
+                require_removed(config)?;
+            }
+            Ok(())
+        })();
+        let operation = match operation {
+            Ok(result) => result,
+            Err(payload) => {
+                if let Err(error) = cleanup {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "experiment panic cleanup: {error}"
+                    );
+                }
+                std::panic::resume_unwind(payload)
+            }
+        };
+        let report = serde_json::json!({"format":"memcordon.provider-input-experiment-execution","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target":config.target,"source_commit":config.source_commit,"fixture_sha256":config.fixture.sha256,"experiment":operation.as_ref().ok(),"execution_error":operation.as_ref().err().map(ToString::to_string),"installation_cleanup_verified":cleanup.is_ok(),"installation_cleanup_error":cleanup.as_ref().err().map(ToString::to_string),"root_control_scope":"paired listener/context and observed original provider selection only","root_control_records":"provider-input-experiment/*/facts/root-selection.json","peer_spawn_and_full_joint_acceptance":"not established by the root control","existing_joint_operations_retained":true});
+        let retained = (|| -> Result<()> {
+            let mut report = report;
+            let status = provider_experiment_execution_status(&operation, &cleanup);
+            for (key, value) in status.as_object().expect("execution status is an object") {
+                report[key] = value.clone();
+            }
+            report["layout"] = serde_json::json!(layout);
+            let bytes = serde_json::to_vec(&report)?;
+            if bytes.len() > 64 * 1024 {
+                return Err(CiError::Message(
+                    "experiment execution report bound exceeded".into(),
+                ));
+            }
+            drop(crate::windows_native_files::publish_owned_file(
+                &config
+                    .output_directory
+                    .join("provider-input-experiment.json"),
+                &bytes,
+            )?);
+            Ok(())
+        })();
+        let operation = operation.map(|_| ());
+        let result = match (operation, cleanup) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
+        match (result, retained) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        }
+    }
+
+    pub(super) fn matched_owned(
+        config: &InstalledWindowsPayload,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> Result<()> {
+        verify_selected(config)?;
+        require_removed(config)?;
+        fs::create_dir_all(&config.output_directory)?;
+        let mut started = false;
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<serde_json::Value> {
+                started = true;
+                package(config, "install", deadlines.work).map_err(CiError::Message)?;
+                package(config, "verify", deadlines.work).map_err(CiError::Message)?;
+                drop(quiescent(config)?);
+                crate::windows_consumer_readiness::run_matched_owned_until(config, deadlines)
+            },
+        ));
+        let _cleanup_scope = crate::cancellation::retirement_scope(deadlines.cleanup);
+        let cleanup = (|| -> Result<()> {
+            if started {
+                let recovered = recover_retained_state(config, deadlines).map_err(CiError::Message);
+                let removed =
+                    package(config, "uninstall", deadlines.cleanup).map_err(CiError::Message);
+                match (recovered, removed) {
+                    (Err(primary), Err(secondary)) => {
+                        return Err(CiError::LaneFailures {
+                            primary: Box::new(primary),
+                            secondary: Box::new(secondary),
+                        });
+                    }
+                    (Err(primary), _) => return Err(primary),
+                    (Ok(()), result) => result?,
+                }
+                require_removed(config)?;
+            }
+            Ok(())
+        })();
+        let operation = match operation {
+            Ok(result) => result,
+            Err(payload) => {
+                if let Err(error) = cleanup {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "matched scope panic cleanup: {error}"
+                    );
+                }
+                std::panic::resume_unwind(payload)
+            }
+        };
+        let report = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.matched-owned-execution","revision":1,"target":config.target,
+            "source_commit":config.source_commit,"fixture_sha256":config.fixture.sha256,
+            "measurements":operation.as_ref().ok(),"measurement_error":operation.as_ref().err().map(ToString::to_string),
+            "installation_cleanup":cleanup.as_ref().map(|_|()).map_err(ToString::to_string),
+        }))?;
+        let retained = if report.len() > 64 * 1024 {
+            Err(CiError::Message(
+                "matched execution summary exceeds64KiB".into(),
+            ))
+        } else {
+            crate::windows_native_files::publish_owned_file(
+                &config.output_directory.join("matched-owned-execution.json"),
+                &report,
+            )
+            .map(drop)
+            .map_err(CiError::from)
+        };
+        let result = match (operation.map(|_| ()), cleanup) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
+        match (result, retained) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        }
     }
 
     pub(super) fn run_components_from_source_until(
@@ -1644,12 +1882,20 @@ mod native {
         }
         fs::create_dir_all(&config.output_directory)?;
         verify_selected(config)?;
+        crate::windows_fixture_inventory::publish_to(
+            &config.fixture_inventory_input(),
+            &config
+                .output_directory
+                .join(crate::windows_fixture_inventory::REPORT_NAME),
+            deadlines.work,
+        )?;
         if memcordon_testkit::windows_available_memory_bytes()? < 4 * 1024 * 1024 * 1024 {
             return Err(CiError::Message(
                 "selected Windows installed fixture requires 4 GiB available memory".to_owned(),
             ));
         }
         let mut assessment = InstalledWindowsAssessment {
+            revision: 2,
             channel: config.channel,
             target: config.target.clone(),
             source_commit: config.source_commit.clone(),
@@ -1659,6 +1905,7 @@ mod native {
             cases: Vec::new(),
             positive_cases: Vec::new(),
             positive_suite: Err("positive readiness suite was not executed".into()),
+            readiness: crate::windows_readiness_policy::assess_suite(&[]),
             loss_cases: Vec::new(),
             loss_suite: Err("external native loss suite was not executed".into()),
             capacity_cases: Vec::new(),
@@ -1757,6 +2004,8 @@ mod native {
                         deadlines,
                     )
                     .map_err(|error| error.to_string());
+                assessment.readiness =
+                    crate::windows_readiness_policy::assess_suite(&assessment.positive_cases);
                 assessment.positive_suite.clone()?;
                 assessment.loss_suite = crate::windows_readiness_faults::run_until(
                     config,
@@ -1959,6 +2208,24 @@ pub fn run_from_source_with_observer_until(
         ));
     }
     native::run(config, observer, deadlines, Some(root))
+}
+
+#[cfg(windows)]
+pub fn run_matched_owned_until(
+    config: &InstalledWindowsPayload,
+    deadlines: WindowsLeaseDeadlines,
+) -> Result<()> {
+    native::matched_owned(config, deadlines)
+}
+
+#[cfg(windows)]
+pub fn run_provider_input_experiment_from_source_until(
+    root: &Path,
+    config: &InstalledWindowsPayload,
+    deadlines: WindowsLeaseDeadlines,
+    dot_local_file: bool,
+) -> Result<()> {
+    native::provider_input_experiment(root, config, deadlines, dot_local_file)
 }
 
 #[cfg(not(windows))]

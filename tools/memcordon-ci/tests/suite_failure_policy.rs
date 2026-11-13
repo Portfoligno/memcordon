@@ -9,6 +9,7 @@ fn workflow_collection_executes_fixed_suites_with_supported_mode() {
     let mut fixed = 0;
     let mut adaptive = 0;
     let expected_fixed = [
+        Suite::NativeShard,
         Suite::WorkspaceFetch,
         Suite::FuzzFetch,
         Suite::PrepareMiriComponents,
@@ -78,5 +79,5 @@ fn workflow_collection_executes_fixed_suites_with_supported_mode() {
         }
     }
     // SupplyAudit and SupplyDeny are adaptive; their split CLI compatibility leaves remain.
-    assert_eq!((fixed, adaptive), (21, 48));
+    assert_eq!((fixed, adaptive), (22, 48));
 }

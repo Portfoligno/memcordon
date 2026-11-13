@@ -58,6 +58,36 @@ fn exact_bounded_snapshot_requires_original_name_challenge_and_bytes() {
     let mut json = serde_json::to_value(&value).unwrap();
     json["unrecognized"] = true.into();
     assert!(serde_json::from_value::<Input>(json).is_err());
+
+    let components = vec![
+        "synthetic-directory".encode_utf16().collect::<Vec<_>>(),
+        "owned-fixture-gate".encode_utf16().collect::<Vec<_>>(),
+    ];
+    let mut nested = value.clone();
+    nested.namespace = Some(input::namespace::Proof {
+        revision: 1,
+        path_sha256: input::namespace::path_sha256(&components).unwrap(),
+        components: components.clone(),
+        challenge_sha256: value.challenge_sha256.clone(),
+        name_utf16_sha256: value.name_utf16_sha256.clone(),
+        descriptor_sha256: value.descriptor_sha256.clone(),
+        work_cutoff_qpc: value.work_cutoff_qpc,
+        qpc_frequency: value.qpc_frequency,
+        controller_same_original: true,
+        controller_absolute_same_original: true,
+        complete: true,
+    });
+    let decoded: Input = serde_json::from_slice(&serde_json::to_vec(&nested).unwrap()).unwrap();
+    decoded.validate(&name, &challenge).unwrap();
+    let namespace = decoded.namespace.as_ref().unwrap();
+    assert_eq!(
+        namespace.event_parent().unwrap(),
+        &components[..components.len() - 1]
+    );
+    assert_eq!(
+        namespace.event_leaf().unwrap(),
+        components.last().unwrap().as_slice()
+    );
 }
 #[test]
 fn coherent_hash_never_hides_malformed_descriptor_extents() {

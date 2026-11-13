@@ -7,9 +7,9 @@ use std::{
     time::Instant,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NOT_FOUND, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{DuplicateHandle, ERROR_NOT_FOUND, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
-        CreateEventW, GetCurrentThreadId, OpenThread, SetEvent, THREAD_TERMINATE,
+        CreateEventW, GetCurrentProcess, GetCurrentThread, SetEvent, THREAD_TERMINATE,
         WaitForSingleObject,
     },
 };
@@ -26,10 +26,23 @@ impl SynchronousIoDeadline {
         if Instant::now() >= deadline {
             return Err("original terminal transport cutoff already exhausted".into());
         }
-        let thread = unsafe { OpenThread(THREAD_TERMINATE, 0, GetCurrentThreadId()) };
-        if thread.is_null() {
+        let mut thread = std::ptr::null_mut();
+        // Resolve the pseudo handle on this original I/O thread, before moving
+        // its real, non-inheritable reference to the cancellation watcher.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut thread,
+                THREAD_TERMINATE,
+                0,
+                0,
+            )
+        } == 0
+        {
             return Err(format!(
-                "terminal transport own-thread reference: {}",
+                "terminal transport DuplicateHandle own-thread reference: {}",
                 io::Error::last_os_error()
             ));
         }

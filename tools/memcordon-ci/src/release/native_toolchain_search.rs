@@ -49,3 +49,72 @@ pub(super) fn declare(directories: &mut Vec<String>, directory: String) -> Resul
     }
     Ok(())
 }
+
+/// Publish the actual final manifest, retaining only measured empty searches.
+pub(super) fn definition(
+    target: &str,
+    entries: Vec<memcordon_core::workload_files::ImageEntryV1>,
+    entrypoints: Vec<memcordon_core::workload_files::ImageEntrypointV1>,
+    host_candidates: Vec<memcordon_core::workload_files::RootRelativePath>,
+    measured: &[(
+        memcordon_core::workload_files::RootRelativePath,
+        String,
+        String,
+    )],
+) -> Result<memcordon_core::workload_bundle::SnapshotManifestV1, String> {
+    use memcordon_core::{BoundedVec, workload_files::RootRelativePath};
+    fn bounded<T, const N: usize>(
+        values: impl IntoIterator<Item = T>,
+    ) -> Result<BoundedVec<T, N>, String> {
+        let mut result = BoundedVec::default();
+        for value in values {
+            result
+                .try_push(value)
+                .map_err(|_| "final image inventory exceeds bound")?;
+        }
+        Ok(result)
+    }
+    let mut directories = Vec::new();
+    for candidate in host_candidates {
+        if entries
+            .iter()
+            .any(|entry| memcordon_core::workload_files::is_beneath(entry.path(), &candidate))
+        {
+            declare(&mut directories, candidate.as_str().to_owned())?;
+        }
+    }
+    for (member, search, normalized) in measured {
+        if !entries.iter().any(|entry| matches!(entry,memcordon_core::workload_files::ImageEntryV1::Regular{path,..} if path==member))
+            || directory(member.as_str(),search)? != *normalized {
+            return Err("measured toolchain search differs from original member/ORIGIN normalization".into());
+        }
+        declare(&mut directories, normalized.clone())?;
+    }
+    let value = memcordon_core::workload_bundle::SnapshotManifestV1 {
+        format: "memcordon.workload-snapshot".into(),
+        revision: 1,
+        target: target.into(),
+        entries: bounded(entries)?,
+        entrypoints: bounded(entrypoints)?,
+        library_directories: bounded(
+            directories
+                .into_iter()
+                .map(RootRelativePath::new)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?,
+    };
+    value.validate()?;
+    for (_, _, directory) in measured {
+        if !value
+            .library_directories
+            .as_slice()
+            .iter()
+            .any(|path| path.as_str() == directory)
+        {
+            return Err(
+                "measured toolchain search was omitted from the final image catalogue".into(),
+            );
+        }
+    }
+    Ok(value)
+}

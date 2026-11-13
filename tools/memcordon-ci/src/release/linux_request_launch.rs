@@ -46,10 +46,10 @@ pub struct RequestLaunch {
     bundle_identity: (u64, u64),
     provider: PublicProviderBindingV1,
     cleanup_cutoff: Instant,
-    observer: Receiver<std::result::Result<HeldLinuxProcess, String>>,
-    frontend: Option<HeldLinuxProcess>,
+    observer: Receiver<std::result::Result<std::sync::Arc<HeldLinuxProcess>, String>>,
+    frontend: Option<std::sync::Arc<HeldLinuxProcess>>,
     capture: Option<JoinHandle<Result<ObservedOutput>>>,
-    observed: Option<ObservedOutput>,
+    terminal: crate::terminal_capture::TerminalCapture<ObservedOutput>,
     input: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     snapshots: Receiver<memcordon_testkit::OutputSnapshot>,
     snapshot: Option<memcordon_testkit::OutputSnapshot>,
@@ -65,7 +65,7 @@ pub struct RecoveryObservation {
 impl RequestLaunch {
     pub fn retire_bundle_exact(&self, fixture: &CallerRequestFixture) -> Result<()> {
         if self.capture.is_some()
-            || self.observed.is_none()
+            || !self.terminal.has_output()
             || self.request != fixture.request_sha256
             || self.bundle_identity != fixture.bundle_identity()?
         {
@@ -159,7 +159,7 @@ impl RequestLaunch {
         }
         let mut command = input
             .caller
-            .command(input.directory, input.work_cutoff)?
+            .workload_command(input.directory, input.work_cutoff)?
             .arg(input.memory)
             .arg(input.deadline)
             .args(crate::linux_request_arguments::wait_arguments(
@@ -212,13 +212,16 @@ impl RequestLaunch {
         let work_cutoff = input.work_cutoff;
         let capture_directory = input.directory.to_path_buf();
         let (sender, observer) = std::sync::mpsc::sync_channel(1);
+        let input_frontend: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<HeldLinuxProcess>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
         let capture = std::thread::spawn(move || {
+            let observer_frontend = std::sync::Arc::clone(&input_frontend);
             let observe = |child: &std::process::Child| {
                 let held = crate::linux_consumer_readiness::process_birth(child.id())
                     .and_then(|birth| HeldLinuxProcess::acquire(child.id(), birth))
                     .and_then(|mut held| {
                         held.verify_parent(&creator)?;
-                        Ok(held)
+                        Ok(std::sync::Arc::new(held))
                     });
                 let observed_error = held.as_ref().err().cloned();
                 if let Ok(held) = &held {
@@ -276,6 +279,9 @@ impl RequestLaunch {
                     )?;
                     controller.sync_all()?;
                 }
+                if let Ok(held) = &held {
+                    let _ = observer_frontend.set(std::sync::Arc::clone(held));
+                }
                 sender.send(held).map_err(|_| {
                     CiError::Message("original frontend observer receiver lost".into())
                 })?;
@@ -300,6 +306,11 @@ impl RequestLaunch {
                         rustix::fs::fcntl_setfl(&stdin, flags | rustix::fs::OFlags::NONBLOCK)
                             .map_err(std::io::Error::from)?;
                         loop {
+                            if let Some(held) = input_frontend.get()
+                                && held.exited().map_err(std::io::Error::other)?
+                            {
+                                return Ok(());
+                            }
                             let remaining = work_cutoff.saturating_duration_since(Instant::now());
                             if remaining.is_zero() {
                                 return Err(std::io::Error::new(
@@ -318,6 +329,11 @@ impl RequestLaunch {
                             };
                             let mut offset = 0;
                             while offset < bytes.len() {
+                                if let Some(held) = input_frontend.get()
+                                    && held.exited().map_err(std::io::Error::other)?
+                                {
+                                    return Ok(());
+                                }
                                 if Instant::now() >= work_cutoff {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::TimedOut,
@@ -356,7 +372,10 @@ impl RequestLaunch {
                     Some(supplied) => command.output_quiet_with_creation_and_io_descriptor(
                         extra.as_ref(),
                         observe,
-                        move |_, stdin, _| {
+                        move |_, stdin, snapshot| {
+                            snapshot_sender.send(snapshot).map_err(|_| {
+                                std::io::Error::other("original fixture snapshot controller lost")
+                            })?;
                             let size = supplied.metadata()?.len();
                             if size > 65536 {
                                 return Err(std::io::Error::other(
@@ -401,7 +420,7 @@ impl RequestLaunch {
             observer,
             frontend: None,
             capture: Some(capture),
-            observed: None,
+            terminal: crate::terminal_capture::TerminalCapture::default(),
             input: if interactive {
                 Some(input_sender)
             } else {
@@ -446,6 +465,17 @@ impl RequestLaunch {
             .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
+    /// Share the same retained pidfd owner; never reacquire by numeric identity.
+    pub fn retained_frontend(
+        &mut self,
+        cutoff: Instant,
+    ) -> Result<std::sync::Arc<HeldLinuxProcess>> {
+        self.retain_frontend(cutoff)?;
+        Ok(std::sync::Arc::clone(
+            self.frontend.as_ref().expect("original frontend retained"),
+        ))
+    }
+
     pub fn retain_frontend(&mut self, cutoff: Instant) -> Result<&HeldLinuxProcess> {
         if self.frontend.is_none() {
             let remaining = cutoff
@@ -461,7 +491,32 @@ impl RequestLaunch {
                     .map_err(CiError::Message)?,
             );
         }
-        Ok(self.frontend.as_ref().expect("original frontend retained"))
+        Ok(self
+            .frontend
+            .as_deref()
+            .expect("original frontend retained"))
+    }
+
+    /// Wait only while the original frontend can still publish this event.
+    /// Post-exit cleanup evidence uses its separate existing cleanup waits.
+    pub fn wait_for_event(
+        &mut self,
+        cutoff: Instant,
+        label: &str,
+        observed: impl FnMut() -> Result<bool>,
+    ) -> Result<()> {
+        let result = crate::launch_event_wait::wait_for_event(cutoff, label, observed, || {
+            let exited = self
+                .retain_frontend(cutoff)?
+                .exited()
+                .map_err(CiError::Message)?;
+            Ok(exited || self.capture_finished())
+        });
+        if result.is_err() {
+            self.close_input();
+        }
+        // The enclosing actor-error path retains sole capture settlement.
+        result
     }
 
     pub fn association(&self) -> Result<WorkloadAttemptAssociationV1> {
@@ -502,22 +557,15 @@ impl RequestLaunch {
             );
         }
         if let Some(worker) = self.capture.take() {
-            let observed = worker.join().map_err(|_| {
-                CiError::Message(
-                    "original frontend supervisor panicked; native cleanup unresolved".into(),
-                )
-            })??;
-            self.observed = Some(observed);
-            let retained = self
-                .observed
-                .as_ref()
-                .expect("actual capture retained before publication");
+            match worker.join() {
+                Ok(result) => self.terminal.complete(result)?,
+                Err(_) => return Err(self.terminal.panicked()),
+            }
+            let retained = self.terminal.output()?;
             write_record(&self.directory, "stdout.bin", &retained.stdout)?;
             write_record(&self.directory, "stderr.bin", &retained.stderr)?;
         }
-        self.observed
-            .as_ref()
-            .ok_or_else(|| CiError::Message("original frontend capture absent".into()))
+        self.terminal.output()
     }
 
     /// Settle the original supervisor after an actor error. This does not claim
@@ -553,13 +601,16 @@ impl RequestLaunch {
             Ok(capture) => {
                 use std::os::unix::process::ExitStatusExt;
                 serde_json::json!({"format":"memcordon.current-request-settlement","revision":1,"frontend":frontend,"interrupt_sent":interrupted,
-                    "raw_wait_status":capture.status.into_raw(),"stdout_sha256":super::artifacts::checksum(&capture.stdout),"stderr_sha256":super::artifacts::checksum(&capture.stderr),"signal_failure":failure})
+                    "raw_wait_status":capture.status.into_raw(),"stdout_sha256":super::artifacts::checksum(&capture.stdout),"stderr_sha256":super::artifacts::checksum(&capture.stderr),"stderr":crate::command::bounded_excerpt(&capture.stderr),"signal_failure":failure})
             }
             Err(error) => {
-                return Err(CiError::Message(match failure {
-                    Some(first) => format!("{first}; original supervisor settlement: {error}"),
-                    None => error.to_string(),
-                }));
+                return Err(match failure {
+                    Some(first) => CiError::LaneFailures {
+                        primary: Box::new(CiError::Message(first)),
+                        secondary: Box::new(error),
+                    },
+                    None => error,
+                });
             }
         };
         write_record(
@@ -594,6 +645,15 @@ impl RequestLaunch {
             self.caller.uid,
         )?)
         .map_err(CiError::Message)?;
+        let frontend = self
+            .frontend
+            .as_ref()
+            .expect("original native frontend retained");
+        crate::linux_result_publication::publication_writer(
+            result.delivery,
+            (frontend.process_id, frontend.birth),
+        )
+        .map_err(CiError::Message)?;
         if result.workload_attempt.as_ref() != Some(&association)
             || result.provider.as_ref() != Some(&self.provider)
             || result
@@ -609,10 +669,6 @@ impl RequestLaunch {
         if let memcordon_core::result_v3::RuntimeExecutionV3::LinuxPrivate { native, .. } =
             &result.runtime
         {
-            let frontend = self
-                .frontend
-                .as_ref()
-                .expect("original native frontend retained");
             if native.caller.pid != frontend.process_id
                 || native.caller.birth != frontend.birth
                 || native.caller_uid != self.caller.uid
@@ -622,6 +678,12 @@ impl RequestLaunch {
                     "result native caller does not match the original held frontend".into(),
                 ));
             }
+            crate::linux_result_publication::writer(
+                result.delivery,
+                &native.caller,
+                (frontend.process_id, frontend.birth),
+            )
+            .map_err(CiError::Message)?;
         }
         Ok(result)
     }

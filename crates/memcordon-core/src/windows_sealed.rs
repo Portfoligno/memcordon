@@ -2963,6 +2963,7 @@ pub enum WindowsProviderResponse<Terminal, Rejection, Mutant = WindowsMutantNati
         attempt_id: String,
         detail: String,
     },
+    AttemptDiagnostics(crate::WindowsAttemptDiagnosticsV1),
     PackageCleanupResult {
         schema_version: u32,
         challenge: String,
@@ -3045,6 +3046,7 @@ pub enum WindowsLauncherResponse<Terminal, Rejection, Mutant = WindowsMutantNati
         attempt_id: String,
         detail: String,
     },
+    AttemptDiagnostics(crate::WindowsAttemptDiagnosticsV1),
     Membership {
         schema_version: u32,
         attempt_id: String,
@@ -3106,6 +3108,11 @@ macro_rules! terminal_authority_encoding {
                 let mut authority = self.clone();
                 if let Self::Reject { rejection, .. } = &mut authority {
                     rejection.clear_expirable_diagnostics();
+                }
+                if matches!(authority, Self::AttemptDiagnostics(_)) {
+                    return Err(serde::ser::Error::custom(
+                        "diagnostic observation has no terminal authority",
+                    ));
                 }
                 let mut bytes = crate::bounded_json_bytes(
                     &authority,

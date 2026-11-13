@@ -458,36 +458,195 @@ fn installed_image_delete_timeout_names_phase_path_attempt_and_native_error() {
 }
 
 #[test]
+#[ignore = "explicitly invoked owned process-wait fixture"]
+fn pinned_process_wait_child() {
+    use std::io::Read;
+    std::fs::write("pinned-wait.pending", b"ready\n").unwrap();
+    std::fs::rename("pinned-wait.pending", "pinned-wait.ready").unwrap();
+    let mut release = [0];
+    std::io::stdin().read_exact(&mut release).unwrap();
+    assert_eq!(release, [b'R']);
+}
+
+struct ProcessWaitChild(std::process::Child);
+
+impl Drop for ProcessWaitChild {
+    fn drop(&mut self) {
+        self.0.stdin.take();
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.try_wait();
+        }
+    }
+}
+
+#[test]
 fn exact_process_wait_holds_until_the_pinned_process_object_signals() {
+    use std::io::Write;
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
-    let mut child = Command::new("ping.exe")
-        .args(["-n", "2", "-w", "1000", "127.0.0.1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("native delayed process should start");
-    // SAFETY: PID comes from the retained child and the handle is immediately
-    // adopted with only the rights used by service shutdown.
-    let raw = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
-            0,
-            child.id(),
-        )
-    };
-    let handle = OwnedHandle::new(raw).expect("delayed process should be pinnable");
-    let identity = crate::windows::process::process_identity(handle.raw()).unwrap();
-    let process = PinnedServiceProcess { handle, identity };
-    let started = Instant::now();
-    wait_service_process_exit(
-        &process,
-        "MemCordonDelayedStopFixture",
-        Duration::from_secs(5),
-    )
-    .unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(100));
-    assert!(child.wait().unwrap().success());
+    let directory = tempfile::tempdir().unwrap();
+    let cutoff = Instant::now() + Duration::from_secs(5);
+    // Install ownership immediately after spawn, before any fallible pin/setup.
+    let mut child = ProcessWaitChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows_service_manager::pinned_process_wait_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("owned process-wait fixture should start"),
+    );
+    let execution = (|| -> Result<(), String> {
+        // SAFETY: PID comes from the retained child and the handle is immediately
+        // adopted with only the rights used by service shutdown.
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+                0,
+                child.0.id(),
+            )
+        };
+        let handle = OwnedHandle::new(raw)?;
+        let identity = crate::windows::process::process_identity(handle.raw())?;
+        let process = PinnedServiceProcess { handle, identity };
+        loop {
+            match std::fs::read(directory.path().join("pinned-wait.ready")) {
+                Ok(bytes) if bytes == b"ready\n" => break,
+                Ok(_) => return Err("owned child readiness contents differ".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(format!("owned child readiness: {error}")),
+            }
+            if child
+                .0
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+                || Instant::now() >= cutoff
+            {
+                return Err("owned child retired or original readiness cutoff exhausted".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::scope(|scope| -> Result<(), String> {
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let process_ref = &process;
+            let waiter = scope.spawn(move || {
+                let started = Instant::now();
+                let _ = started_tx.send(started);
+                let result = wait_service_process_exit(
+                    process_ref,
+                    "MemCordonDelayedStopFixture",
+                    cutoff.saturating_duration_since(Instant::now()),
+                );
+                let _ = done_tx.send(result.clone());
+                result
+            });
+            let observation = (|| -> Result<(), String> {
+                // This acknowledges thread scheduling, not native syscall entry.
+                let started = started_rx
+                    .recv_timeout(cutoff.saturating_duration_since(Instant::now()))
+                    .map_err(|error| error.to_string())?;
+                let hold = Duration::from_millis(100);
+                if cutoff.saturating_duration_since(Instant::now()) < hold {
+                    return Err("original cutoff cannot contain controlled hold".into());
+                }
+                match done_rx.recv_timeout(hold) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                    result => {
+                        return Err(format!("pinned wait completed before release: {result:?}"));
+                    }
+                }
+                // SAFETY: retained original handle, nonblocking observation only.
+                if unsafe { WaitForSingleObject(process.handle.raw(), 0) } != WAIT_TIMEOUT {
+                    return Err("original process object signaled before release".into());
+                }
+                child
+                    .0
+                    .stdin
+                    .take()
+                    .ok_or("original release pipe absent")?
+                    .write_all(b"R")
+                    .map_err(|error| error.to_string())?;
+                done_rx
+                    .recv_timeout(cutoff.saturating_duration_since(Instant::now()))
+                    .map_err(|error| error.to_string())??;
+                if started.elapsed() < hold {
+                    return Err("controlled hold was shorter than 100ms".into());
+                }
+                // SAFETY: same retained original handle after successful native wait.
+                if unsafe { WaitForSingleObject(process.handle.raw(), 0) } != WAIT_OBJECT_0 {
+                    return Err("original object is not signaled after release".into());
+                }
+                Ok(())
+            })();
+            let mut cleanup = Vec::new();
+            if observation.is_err() {
+                child.0.stdin.take();
+                match child.0.kill() {
+                    Err(error) if !matches!(child.0.try_wait(), Ok(Some(_))) => {
+                        cleanup.push(format!("original child termination: {error}"));
+                    }
+                    _ => (),
+                }
+            }
+            let joined = waiter
+                .join()
+                .map_err(|_| "original pinned waiter panicked".to_owned())
+                .and_then(|result| result);
+            if let Err(error) = joined {
+                cleanup.push(format!("original pinned waiter: {error}"));
+            }
+            match observation {
+                Err(primary) => Err(format!("{primary}; cleanup={cleanup:?}")),
+                Ok(()) if cleanup.is_empty() => Ok(()),
+                Ok(()) => Err(format!("original waiter cleanup={cleanup:?}")),
+            }
+        })
+    })();
+    child.0.stdin.take();
+    let mut cleanup_errors = Vec::new();
+    if execution.is_err() {
+        match child.0.kill() {
+            Err(error) if !matches!(child.0.try_wait(), Ok(Some(_))) => {
+                cleanup_errors.push(format!("original child termination: {error}"));
+            }
+            _ => (),
+        }
+    }
+    loop {
+        match child.0.try_wait() {
+            Ok(Some(status)) => {
+                if execution.is_ok() && !status.success() {
+                    cleanup_errors.push(format!("released original child failed: {status}"));
+                }
+                break;
+            }
+            Err(error) => {
+                cleanup_errors.push(format!("original child settlement: {error}"));
+                break;
+            }
+            Ok(None) if Instant::now() >= cutoff => {
+                cleanup_errors
+                    .push("original child settlement incomplete at original cutoff".into());
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(
+        execution.is_ok() && cleanup_errors.is_empty(),
+        "primary={execution:?}; cleanup={cleanup_errors:?}"
+    );
 }

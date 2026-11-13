@@ -9,6 +9,7 @@ use memcordon_core::{
     },
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 fn fail(message: &str) -> CiError {
     CiError::Message(message.into())
@@ -114,11 +115,11 @@ fn allocations(experiment: &Experiment, before: &Value) -> Result<()> {
             Some("footprint") => None,
             _ => return Err(fail("unknown actual native allocation")),
         };
-        if let Some(field) = field {
-            if item["device"] != before[field]["device"] || item["inode"] != before[field]["inode"]
-            {
-                return Err(fail("native allocation differs from actual durable owner"));
-            }
+        if let Some(field) = field
+            && (item["device"] != before[field]["device"]
+                || item["inode"] != before[field]["inode"])
+        {
+            return Err(fail("native allocation differs from actual durable owner"));
         }
     }
     Ok(())
@@ -301,14 +302,31 @@ pub(super) fn assert_experiment(
         let terminal = LinuxWorkloadTerminalV1::parse(raw(experiment, "recovery.json")?)
             .map_err(CiError::Message)?;
         let recovered = serde_json::to_value(&terminal)?;
-        if terminal.association != association
-            || terminal.request != prepared.request
-            || doc(experiment, "recovery-process.json")?["status"] != 0
-            || after["terminal"] != recovered
-        {
+        if terminal.association != association {
             return Err(fail(
-                "current public recovery differs from original durable attempt",
+                "current public recovery association differs from original durable attempt",
             ));
+        }
+        if terminal.request != prepared.request {
+            return Err(fail(
+                "current public recovery request differs from original durable attempt",
+            ));
+        }
+        let recovery_process = doc(experiment, "recovery-process.json")?;
+        let recovery_status = &recovery_process["status"];
+        if recovery_process["status"] != 0 {
+            return Err(fail(&format!(
+                "current public recovery process failed; integer-status={:?}; status-is-null={}",
+                recovery_status.as_i64(),
+                recovery_status.is_null(),
+            )));
+        }
+        if after["terminal"] != recovered {
+            return Err(fail(&format!(
+                "current public recovery terminal differs from original durable attempt; recovery-json-sha256={}; journal-after-json-sha256={}",
+                hex::encode(Sha256::digest(raw(experiment, "recovery.json")?)),
+                hex::encode(Sha256::digest(raw(experiment, "journal-after.json")?)),
+            )));
         }
         cleanup(&recovered["cleanup"])?;
         for field in [
@@ -497,19 +515,10 @@ fn allocation(
         .strip_suffix("-allocation")
         .ok_or_else(|| fail("allocation actor absent"))?;
     if before["association"] != *value
-        || before["phase"] != "guardian-ready"
-        || before["release"] != "not-released"
-        || before["intents"]["namespace_init"] != false
-        || before["intents"]["target"] != false
-        || before["intents"]["guardian"] != true
-        || !before["namespace_init"].is_null()
-        || !before["target"].is_null()
-        || !before["native"].is_null()
-        || !before["outcome"].is_null()
-        || !before["terminal"].is_null()
+        || !crate::linux_allocation_checkpoint::acquired_guardian_ready(&before)
     {
         return Err(fail(
-            "allocation fault did not reach incomplete pre-target state",
+            "allocation fault did not reach incomplete state before TargetGated publication",
         ));
     }
     let blocked = &action["blocked"];
@@ -541,7 +550,14 @@ fn allocation(
         &doc(experiment, "held-before.json")?,
         &doc(experiment, "held-after.json")?,
         &before,
-        &["frontend", "worker", "control", "guardian"],
+        &[
+            "frontend",
+            "worker",
+            "control",
+            "guardian",
+            "namespace_init",
+            "target",
+        ],
     )?;
     let terminal = LinuxWorkloadTerminalV1::parse(raw(experiment, "recovery.json")?)
         .map_err(CiError::Message)?;

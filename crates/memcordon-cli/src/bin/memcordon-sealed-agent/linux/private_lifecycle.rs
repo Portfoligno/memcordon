@@ -26,7 +26,7 @@ pub(super) struct PreparedPrivateLaunch {
     pub filter: [u8; 32],
 }
 use super::namespace::{NamespaceInit, NamespaceMode};
-use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4};
+use super::native_process::{PrivateAttemptPhase, ProcessIdentityV4, ReleaseCheckpoint};
 use super::network_filter::NativeAbi;
 use super::network_profile::PrivateNetworkSetup;
 use super::private_guardian::PrivateGuardian;
@@ -221,6 +221,12 @@ pub enum PrivateMonitorOutcome {
 
 pub trait PrivateNativeJournal {
     fn namespace_intent(&mut self) -> Result<(), String>;
+    fn init_acquired(&mut self, init: ProcessIdentityV4) -> Result<(), String>;
+    fn target_acquired(
+        &mut self,
+        init: ProcessIdentityV4,
+        target: ProcessIdentityV4,
+    ) -> Result<(), String>;
     fn guardian_intent(&mut self) -> Result<(), String>;
     fn boundary_intent(&mut self) -> Result<(), String>;
     fn root_received(&mut self, device: u64, inode: u64) -> Result<(), String>;
@@ -569,8 +575,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         }
         self.namespace_init = Some(init);
         let init = self.namespace_init.as_ref().expect("init was just stored");
-        ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
-        Ok(())
+        let identity = ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
+        self.record_mut().init_acquired(identity)
     }
 
     pub fn start_guardian(
@@ -716,6 +722,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 .as_fd(),
         )?;
         let namespace_init = ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
+        self.record_mut()
+            .target_acquired(namespace_init.clone(), target.clone())?;
         self.record_mut().target_gated(
             namespace_init.clone(),
             target.clone(),
@@ -779,12 +787,10 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     fn validate_gated_native_resources(
         &self,
         observed: &PrivateObservedTarget,
+        checkpoint: ReleaseCheckpoint,
     ) -> Result<(), String> {
-        if self.record.as_ref().expect("owner retains record").phase()
-            != PrivateAttemptPhase::TargetGated
-            || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
-            || self.relay.is_none()
-        {
+        checkpoint.validate(self.record.as_ref().expect("owner retains record").phase())?;
+        if !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live) || self.relay.is_none() {
             return Err(
                 "MCSEALED-PRIVATE-CHECKPOINT: target or guardian is not gated and live".into(),
             );
@@ -1771,7 +1777,7 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
         frontend: BorrowedFd<'_>,
         deadline: Instant,
     ) -> Result<Instant, String> {
-        self.validate_gated_native_resources(observed)?;
+        self.validate_gated_native_resources(observed, ReleaseCheckpoint::BeforeIntent)?;
         if Instant::now() >= deadline || pidfd_exited(frontend)? {
             return Err("workload original owner/deadline lost before release".into());
         }
@@ -1785,7 +1791,7 @@ impl PrivateAttemptOwner<super::workload_attempt::DurableWorkloadAttempt> {
         self.record_mut().read_back_native()?;
         // Durable publication may block. Recheck the original owners and cutoff
         // after it, before the only release byte can leave this process.
-        self.validate_gated_native_resources(observed)?;
+        self.validate_gated_native_resources(observed, ReleaseCheckpoint::AfterIntent)?;
         self.require_live_target_identity(&observed.target)?;
         if self.mixed_root.is_none()
             || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)

@@ -6,6 +6,47 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
+fn catalogue_failure(
+    member: &str,
+    search: &str,
+    expanded: &str,
+    catalogue: &[RootRelativePath],
+) -> String {
+    use sha2::{Digest, Sha256};
+    fn field(value: &str) -> String {
+        const FIELD_BYTES: usize = 128;
+        if value.len() <= FIELD_BYTES {
+            return format!("{value:?}");
+        }
+        let mut end = FIELD_BYTES;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "{:?} [bytes={};sha256={}]",
+            &value[..end],
+            value.len(),
+            String::from(memcordon_core::hash_bytes(value.as_bytes()))
+        )
+    }
+    let mut hash = Sha256::new();
+    for directory in catalogue {
+        let bytes = directory.as_str().as_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    let digest = String::from(memcordon_core::DiagnosticSha256::from_bytes(
+        hash.finalize().into(),
+    ));
+    format!(
+        "ELF loader search directory is outside the declared immutable search catalogue; member={}; original-search={}; expanded-directory={}; catalogue-count={}; catalogue-sha256={digest}",
+        field(member),
+        field(search),
+        field(expanded),
+        catalogue.len()
+    )
+}
+
 pub(crate) fn validate_initial_environment(
     launch: &crate::request::LaunchRequestV2,
 ) -> Result<(), String> {
@@ -190,7 +231,12 @@ pub(super) fn validate(
                 }
                 let directory = RootRelativePath::new(components.join("/"))?;
                 if !directories.contains(&directory) {
-                    return Err("ELF loader search directory is outside the declared immutable search catalogue".into());
+                    return Err(catalogue_failure(
+                        path.as_str(),
+                        &search,
+                        directory.as_str(),
+                        &directories,
+                    ));
                 }
             }
             for name in dependency.needed {

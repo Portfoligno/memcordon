@@ -5,6 +5,8 @@ pub mod cgroup;
 mod cgroup_membership;
 pub mod clock;
 pub(crate) mod descriptor_custody;
+#[path = "../../empty_runtime_directory.rs"]
+pub(crate) mod empty_runtime_directory;
 pub(crate) mod entrypoint;
 #[cfg(feature = "private-tcp")]
 pub mod envelope;

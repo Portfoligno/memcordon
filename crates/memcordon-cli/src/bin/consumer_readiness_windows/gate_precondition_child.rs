@@ -1,0 +1,204 @@
+//! A read-only named-open comparison using the retained caller token input.
+//! This observation never grants target admission or proves event identity.
+use super::descriptor::gate_precondition::{Input, Observation, RECORD_BYTES, TokenObservation};
+use memcordon_core::WindowsCallerTokenEnvelopeV1;
+use std::io::{self, Write};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::path::Path;
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+fn check(input: &Input) -> io::Result<()> {
+    let mut frequency = 0_i64;
+    let mut now = 0_i64;
+    // SAFETY: both clock functions receive writable scalar output locations.
+    if unsafe { QueryPerformanceFrequency(&mut frequency) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: now is a writable scalar output location.
+    if unsafe { QueryPerformanceCounter(&mut now) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if frequency <= 0
+        || frequency as u64 != input.qpc_frequency
+        || now < 0
+        || now as u64 >= input.work_cutoff_qpc
+    {
+        return Err(io::Error::other(
+            "gate control original cutoff expired or clock differs",
+        ));
+    }
+    Ok(())
+}
+
+fn observed_token(
+    input: &Input,
+    expected_envelope: &WindowsCallerTokenEnvelopeV1,
+) -> io::Result<(TokenObservation, WindowsCallerTokenEnvelopeV1)> {
+    let token: TokenObservation =
+        serde_json::from_slice(&super::native::token_observation()?).map_err(io::Error::other)?;
+    check(input)?;
+    let current_token = -4_isize as windows_sys::Win32::Foundation::HANDLE;
+    let envelope =
+        memcordon_windows_launch_core::query_token_envelope_bounded(current_token, &mut || {
+            check(input).map_err(|error| error.to_string())
+        })
+        .map_err(io::Error::other)?;
+    if token != input.expected_token || envelope != *expected_envelope {
+        return Err(io::Error::other(
+            "gate control actual caller token differs from retained input",
+        ));
+    }
+    Ok((token, envelope))
+}
+
+pub fn run(path: &Path, expected_envelope: &WindowsCallerTokenEnvelopeV1) -> io::Result<i32> {
+    let descriptor = super::read_descriptor(path)?;
+    let input = descriptor
+        .gate_precondition
+        .as_ref()
+        .ok_or_else(|| io::Error::other("gate control input missing"))?;
+    input.validate().map_err(io::Error::other)?;
+    check(input)?;
+    let name = descriptor
+        .start_gate
+        .as_ref()
+        .ok_or_else(|| io::Error::other("gate control original name missing"))?;
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    if wide.is_empty() || wide.len() > 32767 || wide.contains(&0) {
+        return Err(io::Error::other(
+            "gate control original name exceeds native bound",
+        ));
+    }
+    let name_bytes: Vec<u8> = wide.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    wide.push(0);
+    let (token, envelope) = observed_token(input, expected_envelope)?;
+    let mut trace =
+        super::gate_call_trace::Prepared::new(input.work_cutoff_qpc, input.qpc_frequency);
+    observed_token(input, expected_envelope)?;
+    check(input)?;
+    let call = trace.call(&wide)?;
+    let handle = call.handle;
+    let native_error = if handle.is_null() {
+        Some(call.native_error as i32)
+    } else {
+        // SAFETY: successful OpenEventW transfers this owned reference once.
+        // Close without waiting, resetting or signaling the original event.
+        drop(unsafe { OwnedHandle::from_raw_handle(handle) });
+        None
+    };
+    check(input)?;
+    let readback = observed_token(input, expected_envelope);
+    let mut original_call_trace = trace.diagnostic();
+    original_call_trace["retained_directories"] = trace.directory_references();
+    original_call_trace["source_before_setup_validated"] = true.into();
+    original_call_trace["source_after_setup_validated"] = true.into();
+    original_call_trace["source_after_call_validated"] = readback.is_ok().into();
+    original_call_trace["source_after_call_error"] =
+        serde_json::json!(readback.as_ref().err().and_then(io::Error::raw_os_error));
+    original_call_trace["detours_revision"] = "9764cebcb1a75940e68fa83d6730ffaf0f669401".into();
+    original_call_trace["ntdll_version_hash"] =
+        "not-collected; already-loaded system module".into();
+    original_call_trace["thread_policy"] = "validated OpenEventW route-owner normal IAT data slots are atomically published without suspending peers or rewriting executable instructions; only the original caller TLS records".into();
+    original_call_trace["detours_use"] =
+        "bounded normal import enumeration only; no inline transaction or trampoline".into();
+    let original_call_trace =
+        super::gate_call_trace_record::bounded_diagnostic(original_call_trace);
+    let mut observation = Observation {
+        format: "memcordon.fixture-gate-precondition".into(),
+        revision: 1,
+        diagnostic_only: true,
+        case: serde_json::to_value(descriptor.case).map_err(io::Error::other)?,
+        challenge_sha256: super::descriptor::gate_precondition::sha256(&descriptor.challenge),
+        gate_name_utf16_sha256: super::descriptor::gate_precondition::sha256(&name_bytes),
+        operation: "OpenEventW-pre-handoff-control".into(),
+        desired_access: 0x0010_0000,
+        attempted: true,
+        opened: native_error.is_none(),
+        native_error,
+        original_call_trace: Some(original_call_trace),
+        token,
+        token_envelope: envelope,
+        same_original_event_identity_proved: false,
+        acceptance_authority: false,
+    };
+    observation
+        .validate(
+            input,
+            &observation.case,
+            &observation.challenge_sha256,
+            &observation.gate_name_utf16_sha256,
+            expected_envelope,
+        )
+        .map_err(io::Error::other)?;
+    let mut bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    if bytes.len() > RECORD_BYTES {
+        // Optional telemetry must never displace the original operation/error
+        // or token fields within the unchanged outer publication bound.
+        observation.original_call_trace = Some(serde_json::json!({
+            "context":"pre-handoff-control-child","diagnostic_only":true,
+            "acceptance_authority":false,"target_identity_proved":false,
+            "unavailable":"outer control record budget","coverage_inconclusive":true,
+            "called":1,"outer_opened":u32::from(observation.opened),"outer_error":call.native_error
+        }));
+        bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    }
+    if bytes.len() > RECORD_BYTES {
+        observation.original_call_trace = None;
+        bytes = serde_json::to_vec(&observation).map_err(io::Error::other)?;
+    }
+    observation
+        .validate(
+            input,
+            &observation.case,
+            &observation.challenge_sha256,
+            &observation.gate_name_utf16_sha256,
+            expected_envelope,
+        )
+        .map_err(io::Error::other)?;
+    if bytes.len() > RECORD_BYTES {
+        return Err(io::Error::other("gate control observation exceeds bound"));
+    }
+    check(input)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(descriptor.output_root.join("gate-precondition-child.json"))?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(descriptor.output_root.join("gate-directory-ready"))?
+        .sync_all()?;
+    // Keep the same-access diagnostic references alive until the controller
+    // duplicates them from this original process or releases the handoff.
+    // This is bounded by the existing original work cutoff, never a new budget.
+    let acknowledgement = descriptor.output_root.join("gate-directory-ack");
+    loop {
+        check(input)?;
+        use std::io::Read;
+        let acknowledgement_bytes = (|| {
+            let file = std::fs::File::open(&acknowledgement)?;
+            let mut bytes = Vec::new();
+            file.take((descriptor.challenge.len() + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        })();
+        match acknowledgement_bytes {
+            Ok(bytes) if bytes == descriptor.challenge => break,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "gate directory acknowledgement binding differs",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    check(input)?;
+    readback?;
+    // Access denial is a retained diagnostic, never a passing target result.
+    Ok(0)
+}

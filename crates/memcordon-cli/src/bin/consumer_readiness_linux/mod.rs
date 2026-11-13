@@ -1,8 +1,11 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+mod binary_streams;
 mod images;
 mod isolation;
+mod path_alias;
+mod relay_streams;
 mod snapshot;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -305,11 +308,7 @@ pub fn run() -> Result<()> {
             std::process::exit(status);
         }
         "raw-byte-streams" => {
-            let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
-            io::stdout().write_all(&bytes)?;
-            io::stdout().flush()?;
-            io::stderr().write_all(&bytes)?;
-            io::stderr().flush()?;
+            binary_streams::raw(&mut io::stdout(), &mut io::stderr())?;
             Ok(())
         }
         "binary-file" => {
@@ -446,14 +445,10 @@ pub fn run() -> Result<()> {
                     serde_json::json!({"bytes_per_stream":2097152}),
                 )?;
                 wait_release()?;
+                relay_streams::emit()?;
+            } else {
+                binary_streams::large(&mut io::stdout(), &mut io::stderr())?;
             }
-            let vector: Vec<u8> = (u8::MIN..=u8::MAX).collect();
-            for _ in 0..8192 {
-                io::stdout().write_all(&vector)?;
-                io::stderr().write_all(&vector)?;
-            }
-            io::stdout().flush()?;
-            io::stderr().flush()?;
             Ok(())
         }
         "authority-denial" => {

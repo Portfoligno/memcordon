@@ -6,21 +6,60 @@ mod controller_gate_error;
 mod controller_gate_resolution;
 mod controller_gate_thread_control;
 mod controller_gate_token;
+mod controller_start_input;
 pub mod descriptor;
 mod fixture_default_dacl;
 mod fixture_environment;
+mod gate_call_trace;
+mod gate_call_trace_record;
+mod gate_call_trace_self_check;
+mod gate_directory_readback;
+mod gate_directory_record;
+mod gate_entry_route;
+mod gate_precondition_child;
+mod listener_trace;
+mod listener_trace_record;
+mod loader_security;
+mod loader_security_record;
+mod matched_control_application;
+mod matched_control_broker;
+mod matched_control_input_record;
+mod matched_control_io;
+mod matched_control_process;
+mod matched_control_readback;
+mod matched_control_report;
 mod namespace_primary_root;
 mod namespace_primary_worker;
 mod native;
+mod native_file_trace_record;
 mod native_fixture_default_dacl;
+mod native_gate_precondition;
+mod operation_context;
+mod original_listener_result;
+mod own_thread_deadline_self_check;
+mod peer_retirement;
+mod peer_stdout;
+mod provider_input_probes;
+mod provider_input_target_record;
+mod provider_loader_context;
+mod provider_loader_context_native;
+mod provider_loader_policy;
+mod provider_loader_policy_native;
+mod spawn_trace;
+mod spawn_trace_record;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
+mod winsock_registry;
+mod winsock_startup;
+mod winsock_trace;
+mod winsock_trace_path;
+mod winsock_trace_record;
 
 use descriptor::{Case, Descriptor};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
@@ -72,6 +111,18 @@ impl Transcript {
 }
 
 fn read_descriptor(path: &Path) -> io::Result<Descriptor> {
+    read_descriptor_with_digest(path).map(|(descriptor, _)| descriptor)
+}
+
+fn read_descriptor_with_digest(path: &Path) -> io::Result<(Descriptor, [u8; 32])> {
+    let bytes = read_descriptor_bytes(path)?;
+    let digest = descriptor::controller_start::descriptor_digest(&bytes);
+    Descriptor::parse(&bytes)
+        .map(|descriptor| (descriptor, digest))
+        .map_err(io::Error::other)
+}
+
+fn read_descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -93,11 +144,14 @@ fn read_descriptor(path: &Path) -> io::Result<Descriptor> {
     Read::by_ref(&mut file)
         .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    Descriptor::parse(&bytes).map_err(io::Error::other)
+    Ok(bytes)
 }
 
 fn child_command() -> io::Result<Command> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(operation_context::context(
+        operation_context::Operation::CurrentExecutable,
+        std::env::current_exe(),
+    )?);
     command.arg("consumer-readiness-windows");
     Ok(command)
 }
@@ -137,10 +191,35 @@ fn read_http_header(stream: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn tcp_peer(port: u16, challenge: &[u8], output_root: &std::path::Path) -> io::Result<()> {
+fn tcp_peer(
+    port: u16,
+    challenge: &[u8],
+    output_root: &std::path::Path,
+    deadline: Option<std::time::Instant>,
+    trace: Option<&winsock_trace::Context<'_>>,
+) -> io::Result<()> {
+    let check = || {
+        if deadline.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original registry TCP peer work cutoff exhausted",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let _winsock = native::winsock_startup(trace.copied())?;
+    check()?;
     let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
-    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
-        .map_err(|error| context("connect", error))?;
+    let mut stream = match trace {
+        Some(trace) => listener_trace::connect(
+            trace,
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port),
+        ),
+        None => TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    }
+    .map_err(|error| context("connect", error))?;
     // The retained peer awaits server half-close through compiler/churn work;
     // the independently owned public deadline bounds that whole operation.
     stream
@@ -182,44 +261,660 @@ fn tcp_peer(port: u16, challenge: &[u8], output_root: &std::path::Path) -> io::R
 }
 
 fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
-    let directory = descriptor.output_root.join("nested");
-    fs::create_dir(&directory)?;
-    fs::write(directory.join("empty.bin"), [])?;
-    let bytes: Vec<u8> = (0..=255).collect();
-    let temporary = directory.join("unrenamed.bin");
-    fs::write(&temporary, &bytes)?;
-    let renamed = directory.join("all-bytes.bin");
-    fs::rename(temporary, &renamed)?;
-    if fs::read(renamed)? != bytes {
-        return Err(io::Error::other("binary file readback differs"));
-    }
-    fs::write(directory.join("challenge.bin"), &descriptor.challenge)?;
-    transcript.event("binary-files", None, &descriptor.challenge)
+    matched_control_application::binary_files(descriptor, transcript, None)
 }
 
-fn joint(descriptor: &Descriptor, transcript: &mut Transcript, churn: bool) -> io::Result<()> {
-    let listener =
-        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(native::tcp_bind_failure)?;
-    let address = listener.local_addr()?;
-    // The original socket stays held until every IPC/churn/descendant stage completes.
-    let conflicting_bind = match TcpListener::bind(address) {
-        Ok(_) => return Err(io::Error::other("competing bind acquired live endpoint")),
-        Err(error) => error,
-    };
-    let conflicting_code = conflicting_bind.raw_os_error();
-    if conflicting_code != Some(10048) {
-        return Err(io::Error::other(format!(
-            "competing bind did not report WSAEADDRINUSE: {conflicting_bind}"
-        )));
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerRegistryInput {
+    descriptor_path: std::path::PathBuf,
+    descriptor_sha256: [u8; 32],
+    clock: descriptor::ControlClock,
+}
+
+fn read_peer_descriptor(
+    input: &PeerRegistryInput,
+    challenge: &[u8],
+    output: &Path,
+) -> io::Result<(Descriptor, [u8; 32])> {
+    if !input.descriptor_path.is_absolute()
+        || input.descriptor_path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(io::Error::other(
+            "peer original descriptor path is not absolute ordinary input",
+        ));
     }
-    transcript.event(
-        "tcp-conflicting-bind",
-        None,
-        &conflicting_code
-            .expect("validated native bind code")
-            .to_le_bytes(),
+    let deadline = controller_start_input::deadline_from_clock(&input.clock)?;
+    let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(deadline)
+        .map_err(io::Error::other)?;
+    let read = (|| {
+        listener_trace::live(&input.clock)?;
+        let bytes = read_descriptor_bytes(&input.descriptor_path)?;
+        listener_trace::live(&input.clock)?;
+        let parsed = Descriptor::parse_authenticated_peer(
+            &bytes,
+            input.descriptor_sha256,
+            challenge,
+            output,
+            &input.clock,
+        )
+        .map_err(io::Error::other)?;
+        listener_trace::live(&input.clock)?;
+        Ok(parsed)
+    })();
+    let stopped = timer.finish().map_err(io::Error::other);
+    match (read, stopped) {
+        (Err(primary), Err(secondary)) => Err(peer_failures(primary, secondary)),
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(secondary)) => Err(secondary),
+        (Ok(parsed), Ok(())) => {
+            listener_trace::live(&input.clock)?;
+            Ok(parsed)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RegistryPeerFailure {
+    primary: io::Error,
+    secondary: io::Error,
+}
+impl std::fmt::Display for RegistryPeerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; independent registry peer cleanup: {}",
+            self.primary, self.secondary
+        )
+    }
+}
+impl std::error::Error for RegistryPeerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+fn peer_failures(primary: io::Error, secondary: io::Error) -> io::Error {
+    io::Error::new(primary.kind(), RegistryPeerFailure { primary, secondary })
+}
+
+struct FailedPeerOwner {
+    child: std::process::Child,
+    _forwarding: Vec<File>,
+    stdout: Option<peer_stdout::Owned>,
+}
+struct UnsettledPeer {
+    error: io::Error,
+    // Quarantine for this root's remaining lifetime only. Controller holds an
+    // independent admitted process owner, or conservatively keeps uncertainty.
+    _owner: &'static FailedPeerOwner,
+}
+impl std::fmt::Debug for UnsettledPeer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("UnsettledPeer")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for UnsettledPeer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{}; original peer owner retained for root lifetime; retirement unproved",
+            self.error
+        )
+    }
+}
+impl std::error::Error for UnsettledPeer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+fn settle_peer_failure(
+    peer: std::process::Child,
+    forwarding: Vec<File>,
+    primary: io::Error,
+    cutoff: std::time::Instant,
+) -> io::Error {
+    settle_peer_failure_with_stdout(peer, forwarding, None, primary, cutoff)
+}
+
+fn settle_peer_failure_with_stdout(
+    peer: std::process::Child,
+    forwarding: Vec<File>,
+    stdout: Option<peer_stdout::Owned>,
+    primary: io::Error,
+    cutoff: std::time::Instant,
+) -> io::Error {
+    use memcordon_platform::windows_registry_error::at;
+    let mut owner = FailedPeerOwner {
+        child: peer,
+        _forwarding: forwarding,
+        stdout,
+    };
+    owner.child.stdin.take();
+    let mut stdout_result = Ok(());
+    match peer_retirement::settle(
+        owner,
+        primary,
+        cutoff,
+        |owner| {
+            at(
+                owner.child.kill(),
+                "peer/cleanup-kill",
+                "Child::kill",
+                "Win32",
+                None,
+            )
+        },
+        |owner| {
+            at(
+                owner.child.try_wait(),
+                "peer/cleanup-wait",
+                "Child::try_wait",
+                "Win32",
+                None,
+            )
+            .map(|status| {
+                if status.is_some() {
+                    if let Some(stdout) = owner.stdout.take() {
+                        stdout_result = stdout.finish();
+                    }
+                    true
+                } else {
+                    false
+                }
+            })
+        },
+    ) {
+        peer_retirement::Outcome::Retired(error) => peer_stdout::preserve(error, stdout_result),
+        peer_retirement::Outcome::Unsettled { owner, error } => {
+            let error = match &owner.stdout {
+                Some(stdout) => peer_stdout::preserve(error, stdout.unresolved()),
+                None => error,
+            };
+            io::Error::new(
+                error.kind(),
+                UnsettledPeer {
+                    error,
+                    _owner: Box::leak(Box::new(owner)),
+                },
+            )
+        }
+    }
+}
+
+fn send_peer_registry(
+    peer: &mut std::process::Child,
+    registry: &winsock_registry::Mapping,
+    descriptor: &Descriptor,
+    session: &controller_start_input::Session,
+    permit: Option<controller_start_input::PeerHandoffPermit>,
+) -> io::Result<()> {
+    use memcordon_platform::windows_registry_error::at;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::DuplicateHandle,
+        System::{Registry::KEY_READ, Threading::GetCurrentProcess},
+    };
+    let deadline = session.original_deadline();
+    let check = || {
+        if std::time::Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original registry peer handoff cutoff exhausted",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    // One watcher covers source metadata queries, every duplicate and START;
+    // it is settled before later application I/O, never renewed per reference.
+    let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(deadline)
+        .map_err(io::Error::other)?;
+    let mut duplicated = 0u32;
+    let mut registry_duplicated = false;
+    let written = (|| -> io::Result<()> {
+        if descriptor.provider_input_experiment != permit.is_some() {
+            return Err(io::Error::other(
+                "provider peer requires the exact admitted recipient permit",
+            ));
+        }
+        if descriptor.provider_input_experiment {
+            session.private_directories()?.ok_or_else(|| {
+                io::Error::other("original private session is not admitted for forwarding")
+            })?;
+        }
+        let identity = at(
+            match &permit {
+                Some(permit) => permit.validate(peer, session.original_binding()),
+                None => native::child_identity(peer),
+            },
+            "peer/original-identity",
+            "child_identity",
+            "boundary",
+            None,
+        )?;
+        check()?;
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: source is the admitted read-only key; target is this exact owned
+        // Child, never a reopened PID. Its numeric result is target-local only.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                registry.raw(),
+                peer.as_raw_handle(),
+                &mut handle,
+                KEY_READ,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return at(
+                Err(io::Error::last_os_error()),
+                "peer/readonly-key-duplicate",
+                "DuplicateHandle",
+                "Win32",
+                Some(KEY_READ),
+            );
+        }
+        // A successful duplicate is already recipient debt before any cutoff check.
+        registry_duplicated = true;
+        check()?;
+        let binding = descriptor::controller_start::Binding {
+            challenge: descriptor.challenge.clone(),
+            descriptor_sha256: session.original_binding().descriptor_sha256,
+            pid: identity.process_id,
+            birth: identity.creation_time_100ns,
+        };
+        let capability = descriptor::controller_start::Capability {
+            version: 1,
+            handle: handle as usize as u64,
+            manifest_sha256: descriptor
+                .winsock_registry
+                .as_ref()
+                .ok_or_else(|| io::Error::other("peer registry declaration absent"))?
+                .sha256,
+        };
+        let mut sender = descriptor::controller_start::Sender::with_registry(capability, false);
+        if descriptor.provider_input_experiment {
+            let expected = descriptor
+                .provider_input_binding
+                .as_ref()
+                .ok_or_else(|| io::Error::other("peer private binding absent"))?
+                .directory_expectation()
+                .map_err(io::Error::other)?;
+            let directories = session
+                .private_directories()?
+                .ok_or_else(|| io::Error::other("root forwarding references absent"))?;
+            let files = directories
+                .input
+                .iter()
+                .chain(std::iter::once(directories.local))
+                .chain(directories.output.iter())
+                .collect::<Vec<_>>();
+            let roles = expected.roles().map_err(io::Error::other)?;
+            if roles.len() != files.len() {
+                return Err(io::Error::other("root forwarding role extent differs"));
+            }
+            let mut references = Vec::with_capacity(roles.len());
+            for ((role, index), file) in roles.into_iter().zip(files) {
+                let handle = if role == descriptor::controller_start::DirectoryRole::LocalMarkerFile
+                {
+                    memcordon_platform::test_support::duplicate_marker_metadata_into_child(
+                        peer,
+                        file,
+                        deadline,
+                        &mut duplicated,
+                    )?
+                } else {
+                    memcordon_platform::test_support::duplicate_directory_metadata_into_child(
+                        peer,
+                        file,
+                        deadline,
+                        &mut duplicated,
+                    )?
+                };
+                references.push(descriptor::controller_start::DirectoryReference {
+                    role,
+                    index,
+                    handle,
+                    access_mask: 128,
+                });
+            }
+            let transfer = descriptor::controller_start::DirectoryTransfer {
+                version: expected.transfer_version(),
+                manifest_sha256: expected.manifest_sha256,
+                references,
+            };
+            sender = sender.with_directories(transfer, expected)?;
+        }
+        match peer.stdin.take() {
+            Some(mut writer) => sender.send(
+                &mut writer,
+                &binding,
+                descriptor::controller_start::Phase::Start,
+                check,
+            ),
+            None => Err(io::Error::other("original registry peer stdin unavailable")),
+        }
+    })();
+    let stopped = timer.finish().map_err(io::Error::other);
+    let result = match (written, stopped) {
+        (Err(primary), Err(secondary)) => Err(peer_failures(primary, secondary)),
+        (Err(primary), _) => Err(primary),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => check(),
+    };
+    result.map_err(|primary| {
+        io::Error::new(
+            primary.kind(),
+            PeerTransferFailure {
+                primary,
+                duplicated: duplicated.saturating_add(u32::from(registry_duplicated)),
+                controller_recipient_admitted: permit.is_some(),
+            },
+        )
+    })
+}
+
+#[derive(Debug)]
+struct PeerTransferFailure {
+    primary: io::Error,
+    duplicated: u32,
+    controller_recipient_admitted: bool,
+}
+impl std::fmt::Display for PeerTransferFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{}; peer transferred references={}; controller-recipient-admitted={}; native recipient retirement remains required",
+            self.primary, self.duplicated, self.controller_recipient_admitted
+        )
+    }
+}
+impl std::error::Error for PeerTransferFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+fn joint(
+    descriptor: &Descriptor,
+    transcript: &mut Transcript,
+    churn: bool,
+    control: Option<&mut controller_start_input::Session>,
+    token_envelope: &[u8],
+    descriptor_path: &Path,
+    prefix_record: Option<&mut matched_control_application::Recorder>,
+) -> io::Result<()> {
+    let registry = match (&descriptor.winsock_registry, control.as_deref()) {
+        (Some(declaration), Some(session)) => {
+            let capability = session.registry_capability().ok_or_else(|| {
+                io::Error::other(
+                    "declared registry input capability was not admitted by original START",
+                )
+            })?;
+            if capability.manifest_sha256 != declaration.sha256 {
+                return Err(io::Error::other(
+                    "registry input capability and descriptor differ",
+                ));
+            }
+            // The completed authenticated frame transfers this one reference;
+            // native type/access/noninheritance and complete data are checked.
+            let key = unsafe {
+                winsock_registry::OwnedKey::from_transferred(
+                    capability.handle,
+                    session.original_deadline(),
+                )
+            }?;
+            Some(winsock_registry::Mapping::install(
+                key,
+                declaration,
+                session.original_deadline(),
+            )?)
+        }
+        (None, _) => None,
+        _ => {
+            return Err(io::Error::other(
+                "declared registry input lacks original control session",
+            ));
+        }
+    };
+    match registry {
+        Some(mapping) => mapping.run(|mapping| {
+            joint_mapped(
+                descriptor,
+                transcript,
+                churn,
+                control,
+                token_envelope,
+                Some(mapping),
+                descriptor_path,
+                prefix_record,
+            )
+        }),
+        None => joint_mapped(
+            descriptor,
+            transcript,
+            churn,
+            control,
+            token_envelope,
+            None,
+            descriptor_path,
+            prefix_record,
+        ),
+    }
+}
+
+struct ListenerPrefix {
+    listener: TcpListener,
+    _winsock: winsock_startup::Startup<fn()>,
+    address: std::net::SocketAddr,
+}
+
+fn prefix_operation<T>(
+    record: &mut Option<&mut matched_control_application::Recorder>,
+    op: descriptor::matched::Operation,
+    arguments: serde_json::Value,
+    call: impl FnOnce() -> io::Result<T>,
+    outcome: impl FnOnce(&io::Result<T>) -> descriptor::matched::Outcome,
+) -> io::Result<T> {
+    match record.as_deref_mut() {
+        Some(record) => record.prefix(op, arguments, call, outcome),
+        None => call(),
+    }
+}
+
+/// The original startup-through-competing-bind sequence, invoked exactly once.
+/// The caller retains both native Winsock and listener owners for its full scope.
+fn listener_prefix(
+    transcript: &mut Transcript,
+    trace: Option<winsock_trace::Context<'_>>,
+    mut record: Option<&mut matched_control_application::Recorder>,
+) -> io::Result<ListenerPrefix> {
+    use descriptor::matched::{NativeBoundary, NativeStatusDomain, Operation as Op, Outcome};
+    let winsock = prefix_operation(
+        &mut record,
+        Op::WinsockStartup,
+        serde_json::json!([514]),
+        || native::winsock_startup(trace),
+        |result| match result {
+            Ok(_) => Outcome::Completed { data_sha256: None },
+            Err(error) => match winsock_trace::native_refusal(error) {
+                Some(code) => Outcome::NativeCallFailure {
+                    boundary: NativeBoundary::WsaStartup,
+                    domain: NativeStatusDomain::Winsock,
+                    code,
+                    calls: 1,
+                },
+                None => Outcome::NonNativeFailure,
+            },
+        },
     )?;
-    transcript.event("tcp-listener-owned", None, &address.port().to_le_bytes())?;
+    let listener = prefix_operation(
+        &mut record,
+        Op::ListenerConstruct,
+        serde_json::json!(["ipv4-loopback", "ephemeral"]),
+        || listener_trace::bind(trace.as_ref()),
+        |result| match result {
+            Ok(_) => Outcome::Completed { data_sha256: None },
+            Err(error) => match listener_trace::original_application_failure(error) {
+                Some(failure)
+                    if failure.api() == original_listener_result::Operation::TcpListenerBind =>
+                {
+                    Outcome::OriginalApplicationIoFailure {
+                        api: descriptor::matched::ApplicationIoApi::TcpListenerBind,
+                        domain: descriptor::matched::ApplicationIoDomain::RustIoRawOsErrorOnWindows,
+                        raw_os_error: failure.raw_os_error(),
+                    }
+                }
+                _ => Outcome::NonNativeFailure,
+            },
+        },
+    )?;
+    use operation_context::{Operation, context};
+    let address = prefix_operation(
+        &mut record,
+        Op::ListenerLocalAddress,
+        serde_json::json!(["held-listener"]),
+        || context(Operation::ListenerLocalAddress, listener.local_addr()),
+        |result| match result {
+            Ok(std::net::SocketAddr::V4(value)) => Outcome::LocalEndpoint {
+                ipv4: value.ip().octets(),
+                port: value.port(),
+            },
+            _ => Outcome::NonNativeFailure,
+        },
+    )?;
+    let conflicting_code = prefix_operation(
+        &mut record,
+        Op::CompetingBind,
+        serde_json::json!(["held-local-endpoint"]),
+        || {
+            let error = match TcpListener::bind(address) {
+                Ok(_) => return Err(io::Error::other("competing bind acquired live endpoint")),
+                Err(error) => error,
+            };
+            if error.raw_os_error() != Some(10048) {
+                return Err(error);
+            }
+            Ok(10048i32)
+        },
+        |result| match (result, address) {
+            (Ok(code), std::net::SocketAddr::V4(value)) => Outcome::HeldEndpointRefusal {
+                ipv4: value.ip().octets(),
+                port: value.port(),
+                code: *code,
+                calls: 1,
+            },
+            (Err(error), _) => match error.raw_os_error() {
+                Some(code) => Outcome::NativeCallFailure {
+                    boundary: NativeBoundary::Bind,
+                    domain: NativeStatusDomain::Winsock,
+                    code,
+                    calls: 1,
+                },
+                None => Outcome::NonNativeFailure,
+            },
+            _ => Outcome::NonNativeFailure,
+        },
+    )
+    .map_err(|error| {
+        context::<i32>(Operation::CompetingBind, Err(error))
+            .expect_err("original competing bind failed")
+    })?;
+    context(
+        Operation::TranscriptConflictingBind,
+        transcript.event(
+            "tcp-conflicting-bind",
+            None,
+            &conflicting_code.to_le_bytes(),
+        ),
+    )?;
+    context(
+        Operation::TranscriptListenerOwned,
+        transcript.event("tcp-listener-owned", None, &address.port().to_le_bytes()),
+    )?;
+    Ok(ListenerPrefix {
+        _winsock: winsock,
+        listener,
+        address,
+    })
+}
+
+fn joint_mapped(
+    descriptor: &Descriptor,
+    transcript: &mut Transcript,
+    churn: bool,
+    mut control: Option<&mut controller_start_input::Session>,
+    token_envelope: &[u8],
+    registry: Option<&winsock_registry::Mapping>,
+    descriptor_path: &Path,
+    prefix_record: Option<&mut matched_control_application::Recorder>,
+) -> io::Result<()> {
+    let trace_binding = control
+        .as_deref()
+        .map(|session| session.original_binding().clone());
+    let trace = match (descriptor.control_clock.as_ref(), trace_binding.as_ref()) {
+        (Some(clock), Some(binding)) => Some(winsock_trace::Context {
+            clock,
+            output_root: &descriptor.output_root,
+            binding,
+            token_envelope,
+            provider_input_experiment: descriptor.provider_input_experiment,
+            peer: false,
+        }),
+        _ => None,
+    };
+    if descriptor.provider_input_experiment {
+        if registry.is_none() || trace.is_none() {
+            return Err(io::Error::other(
+                "provider experiment requires authenticated controller START and installed registry mapping",
+            ));
+        }
+        let prepared = provider_input_probes::prepare(
+            descriptor,
+            false,
+            control
+                .as_deref()
+                .expect("checked private session")
+                .private_directories()?,
+        )?;
+        provider_input_probes::run(descriptor, false, prepared)?;
+        if descriptor.matched_control.as_ref().is_some_and(|binding| {
+            binding.scope == descriptor::matched::Scope::ProviderListenerSelection
+        }) {
+            let binding = control
+                .as_deref()
+                .expect("checked private session")
+                .original_binding();
+            let receipt = serde_json::to_vec(&serde_json::json!({
+                "pid":binding.pid,"birth":binding.birth,
+                "descriptor_sha256":binding.descriptor_sha256,
+                "challenge_sha256":descriptor::controller_start::descriptor_digest(&binding.challenge),
+            })).map_err(io::Error::other)?;
+            transcript.event("provider-root-prelude-complete", None, &receipt)?;
+            control
+                .as_deref_mut()
+                .expect("checked private session")
+                .receive(descriptor::controller_start::Phase::ProviderPreludeRelease)?;
+        }
+    }
+    let prefix_only = prefix_record.is_some();
+    let prefix = listener_prefix(transcript, trace, prefix_record)?;
+    if prefix_only {
+        return Ok(());
+    }
+    let listener = &prefix.listener;
+    let address = prefix.address;
+    use operation_context::{Operation, context};
     if descriptor.case == Case::EndpointMismatch {
         let policy_endpoint = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         let allowed = policy_endpoint.local_addr()?.port();
@@ -242,87 +937,238 @@ fn joint(descriptor: &Descriptor, transcript: &mut Transcript, churn: bool) -> i
         return Ok(());
     }
     let challenge_path = descriptor.output_root.join("tcp-challenge.bin");
-    fs::write(&challenge_path, &descriptor.challenge)?;
-    let mut peer = child_command()?
+    context(
+        Operation::ChallengeWrite,
+        fs::write(&challenge_path, &descriptor.challenge),
+    )?;
+    let cutoff = control
+        .as_deref()
+        .map(|session| session.original_deadline());
+    let mut peer_stdout = Some(context(
+        Operation::PeerStdoutCreate,
+        peer_stdout::Owned::create(&descriptor.output_root, cutoff),
+    )?);
+    let mut peer_command = child_command()?;
+    peer_command
         .arg("tcp-peer")
         .arg(address.port().to_string())
         .arg(challenge_path)
         .arg(&descriptor.output_root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    transcript.event(
-        "tcp-peer-created",
-        None,
-        &serde_json::to_vec(&native::child_identity(&peer)?).map_err(io::Error::other)?,
-    )?;
-    let (mut stream, _) = listener.accept()?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let header = read_http_header(&mut stream)?;
-    if header != b"GET /readiness HTTP/1.1\r\nHost: localhost\r\n\r\n" {
-        return Err(io::Error::other("HTTP request differs"));
-    }
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
-    let mut received = Vec::new();
-    frame_write(&mut received, &header)?;
-    for payload in [
-        Vec::new(),
-        vec![0, 255, 128, 10],
-        descriptor.challenge.clone(),
-    ] {
-        let actual = frame_read(&mut stream)?;
-        if actual != payload {
-            return Err(io::Error::other("TCP application frame differs"));
+        .stdout(context(
+            Operation::PeerStdoutDuplicate,
+            peer_stdout.as_ref().expect("owned stdout").stdio(),
+        )?)
+        .stderr(Stdio::inherit());
+    if registry.is_some() {
+        let session = control
+            .as_deref()
+            .ok_or_else(|| io::Error::other("original registry session absent"))?;
+        let peer_input = PeerRegistryInput {
+            descriptor_path: descriptor_path.to_owned(),
+            descriptor_sha256: session.original_binding().descriptor_sha256,
+            clock: descriptor
+                .control_clock
+                .clone()
+                .ok_or_else(|| io::Error::other("original registry clock absent"))?,
+        };
+        let peer_input = serde_json::to_string(&peer_input).map_err(io::Error::other)?;
+        if peer_input.len() > 4096 {
+            return Err(io::Error::other(
+                "peer original descriptor envelope exceeds argv bound",
+            ));
         }
-        frame_write(&mut received, &actual)?;
-        frame_write(&mut stream, &payload)?;
+        peer_command.arg(peer_input).stdin(Stdio::piped());
     }
-    fs::write(
-        descriptor.output_root.join("tcp-server-received.bin"),
-        &received,
-    )?;
-    let pipe = native::named_pipe_exchange(&descriptor.challenge)?;
-    fs::write(
-        descriptor
-            .output_root
-            .join("named-pipe-server-received.bin"),
-        &pipe.server_received,
-    )?;
-    fs::write(
-        descriptor
-            .output_root
-            .join("named-pipe-client-received.bin"),
-        &pipe.client_received,
-    )?;
-    transcript.event("named-pipe-while-tcp-owned", None, &descriptor.challenge)?;
-    binary_files(descriptor, transcript)?;
-    toolchain::execute(descriptor, transcript)?;
-    protected_write_probes(descriptor, transcript)?;
-    if churn {
-        process_churn(descriptor, transcript)?;
-    } else {
-        generation_chain(3, &descriptor.challenge)?;
-        transcript.event("descendants-complete", None, &descriptor.challenge)?;
-    }
-    if let Some(gate) = &descriptor.completion_gate {
-        native::wait_controller_gate(std::ffi::OsStr::new(gate), || {
+    if descriptor.provider_input_experiment {
+        let binding = control
+            .as_deref()
+            .expect("checked private session")
+            .peer_admission_binding();
+        context(
+            Operation::TranscriptSpawnIntent,
             transcript.event(
-                "capacity-live-before-natural-completion",
+                "tcp-peer-spawn-intent",
                 None,
-                &descriptor.challenge,
-            )
-        })?;
+                &serde_json::to_vec(&binding).map_err(io::Error::other)?,
+            ),
+        )?;
     }
-    let mut byte = [0];
-    if stream.read(&mut byte)? != 0 {
-        return Err(io::Error::other("TCP peer did not half-close"));
+    let mut peer = match context(
+        Operation::PeerCommandSpawn,
+        spawn_trace::spawn(&mut peer_command, trace.as_ref()),
+    ) {
+        Ok(peer) => peer,
+        Err(primary) => {
+            let stdout = peer_stdout.take().expect("owned stdout");
+            let error = peer_stdout::preserve(primary, stdout.unresolved());
+            // No returned Child cannot prove that a partially created recipient
+            // retired. Controller spawn uncertainty keeps namespace custody too.
+            std::mem::forget(stdout);
+            return Err(error);
+        }
+    };
+    // Command retains its configured stdio; close that local duplicate while
+    // keeping the original held file and the child's actual inherited handle.
+    drop(peer_command);
+    // Every error after spawn retains/settles this original Child. In a private
+    // experiment the controller independently owns the peer before transfer,
+    // or keeps the unresolved spawn interval quarantined.
+    let worked = (|| -> io::Result<()> {
+        let permit = if descriptor.provider_input_experiment {
+            let session = control.as_deref_mut().expect("checked private session");
+            let pending = context(Operation::PendingPeerIdentity, session.pending_peer(&peer))?;
+            context(
+                Operation::TranscriptPendingAdmission,
+                transcript.event(
+                    "tcp-peer-pending-admission",
+                    None,
+                    &serde_json::to_vec(&pending).map_err(io::Error::other)?,
+                ),
+            )?;
+            Some(context(
+                Operation::PeerRecipientAdmission,
+                session.receive_peer_recipient(&pending),
+            )?)
+        } else {
+            None
+        };
+        if let Some(registry) = registry {
+            context(
+                Operation::RegistryMetadataHandoff,
+                send_peer_registry(
+                    &mut peer,
+                    registry,
+                    descriptor,
+                    control.as_deref().expect("checked registry control"),
+                    permit,
+                ),
+            )?;
+            control
+                .as_deref_mut()
+                .expect("checked registry control")
+                .close_private_directories();
+        }
+        context(
+            Operation::TranscriptPeerCreated,
+            transcript.event(
+                "tcp-peer-created",
+                None,
+                &serde_json::to_vec(&context(
+                    Operation::PeerIdentity,
+                    native::child_identity(&peer),
+                )?)
+                .map_err(io::Error::other)?,
+            ),
+        )?;
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let header = read_http_header(&mut stream)?;
+        if header != b"GET /readiness HTTP/1.1\r\nHost: localhost\r\n\r\n" {
+            return Err(io::Error::other("HTTP request differs"));
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+        let mut received = Vec::new();
+        frame_write(&mut received, &header)?;
+        for payload in [
+            Vec::new(),
+            vec![0, 255, 128, 10],
+            descriptor.challenge.clone(),
+        ] {
+            let actual = frame_read(&mut stream)?;
+            if actual != payload {
+                return Err(io::Error::other("TCP application frame differs"));
+            }
+            frame_write(&mut received, &actual)?;
+            frame_write(&mut stream, &payload)?;
+        }
+        fs::write(
+            descriptor.output_root.join("tcp-server-received.bin"),
+            &received,
+        )?;
+        let pipe = native::named_pipe_exchange(&descriptor.challenge)?;
+        fs::write(
+            descriptor
+                .output_root
+                .join("named-pipe-server-received.bin"),
+            &pipe.server_received,
+        )?;
+        fs::write(
+            descriptor
+                .output_root
+                .join("named-pipe-client-received.bin"),
+            &pipe.client_received,
+        )?;
+        transcript.event("named-pipe-while-tcp-owned", None, &descriptor.challenge)?;
+        binary_files(descriptor, transcript)?;
+        toolchain::execute(descriptor, transcript, control.as_deref_mut())?;
+        protected_write_probes(descriptor, transcript)?;
+        if churn {
+            process_churn(descriptor, transcript)?;
+        } else {
+            generation_chain(3, &descriptor.challenge)?;
+            transcript.event("descendants-complete", None, &descriptor.challenge)?;
+        }
+        if let Some(gate) = &descriptor.completion_gate {
+            native::wait_controller_gate(std::ffi::OsStr::new(gate), || {
+                transcript.event(
+                    "capacity-live-before-natural-completion",
+                    None,
+                    &descriptor.challenge,
+                )
+            })?;
+        }
+        let mut byte = [0];
+        if stream.read(&mut byte)? != 0 {
+            return Err(io::Error::other("TCP peer did not half-close"));
+        }
+        stream.shutdown(Shutdown::Write)?;
+        let status = peer.wait()?;
+        context(
+            Operation::PeerStdoutValidate,
+            peer_stdout.take().expect("owned stdout").finish(),
+        )?;
+        if !status.success() {
+            return Err(io::Error::other("TCP child failed"));
+        }
+        transcript.event("tcp-peer-complete", None, &descriptor.challenge)
+    })();
+    match worked {
+        Ok(()) => Ok(()),
+        Err(primary) => match control.as_deref_mut() {
+            Some(session) => {
+                let cutoff = session.original_deadline();
+                let forwarding = session.take_private_directory_files();
+                Err(settle_peer_failure_with_stdout(
+                    peer,
+                    forwarding,
+                    peer_stdout.take(),
+                    primary,
+                    cutoff,
+                ))
+            }
+            None => {
+                // Without an original deadline/settlement session, no new
+                // timeout or claimed retirement can justify releasing this file.
+                let owner = FailedPeerOwner {
+                    child: peer,
+                    _forwarding: Vec::new(),
+                    stdout: peer_stdout.take(),
+                };
+                let error = match &owner.stdout {
+                    Some(stdout) => peer_stdout::preserve(primary, stdout.unresolved()),
+                    None => primary,
+                };
+                Err(io::Error::new(
+                    error.kind(),
+                    UnsettledPeer {
+                        error,
+                        _owner: Box::leak(Box::new(owner)),
+                    },
+                ))
+            }
+        },
     }
-    stream.shutdown(Shutdown::Write)?;
-    if !peer.wait()?.success() {
-        return Err(io::Error::other("TCP child failed"));
-    }
-    transcript.event("tcp-peer-complete", None, &descriptor.challenge)
 }
 
 fn protected_write_probes(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
@@ -396,6 +1242,71 @@ fn generation_chain(depth: u32, challenge: &[u8]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn capacity_completion(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
+    let mut child = child_command()?
+        .arg("cohort-leaf")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let worked = (|| -> io::Result<()> {
+        let mut ready = [0];
+        child
+            .stdout
+            .as_mut()
+            .ok_or_else(|| io::Error::other("capacity child readiness absent"))?
+            .read_exact(&mut ready)?;
+        if ready != [0xA5] {
+            return Err(io::Error::other("capacity child readiness differs"));
+        }
+        transcript.event(
+            "capacity-child-created",
+            Some(0),
+            &serde_json::to_vec(&native::child_identity(&child)?).map_err(io::Error::other)?,
+        )?;
+        native::wait_controller_gate_reset(std::ffi::OsStr::new(
+            descriptor
+                .cohort_gate
+                .as_ref()
+                .expect("validated capacity child gate"),
+        ))?;
+        if let Some(gate) = &descriptor.completion_gate {
+            native::wait_controller_gate(std::ffi::OsStr::new(gate), || {
+                transcript.event(
+                    "capacity-live-before-natural-completion",
+                    None,
+                    &descriptor.challenge,
+                )
+            })?;
+        }
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("capacity child release absent"))?
+            .write_all(&[0x5A])?;
+        Ok(())
+    })();
+    if let Err(primary) = worked {
+        // Keep the original returned Child through actual cleanup; job containment
+        // remains the independent outer authority if local cleanup fails.
+        let cleanup = child.kill().and_then(|()| child.wait().map(|_| ()));
+        return Err(match cleanup {
+            Ok(()) => primary,
+            Err(secondary) => {
+                std::mem::forget(child);
+                io::Error::other(format!("{primary}; capacity child cleanup: {secondary}"))
+            }
+        });
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(io::Error::other(
+            "capacity child natural status or remaining streams differ",
+        ));
+    }
+    transcript.event("capacity-child-completed", Some(0), &[])
 }
 
 fn process_churn(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Result<()> {
@@ -576,6 +1487,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             if !matches!(
                 request,
                 memcordon_core::WindowsProviderRequestV4::RecoverAttempt { .. }
+                    | memcordon_core::WindowsProviderRequestV4::ObserveAttemptDiagnostics { .. }
                     | memcordon_core::WindowsProviderRequestV4::ReplayTerminal { .. }
                     | memcordon_core::WindowsProviderRequestV4::Cancel { .. }
             ) {
@@ -594,6 +1506,76 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         Some("restricted-frontend") => return native::restricted_frontend(args),
         Some("system-frontend") => return native::system_frontend(args),
         Some("system-restricted-frontend") => return native::system_restricted_frontend(args),
+        Some("system-restricted-gate-control-frontend") => {
+            return native::system_restricted_gate_control_frontend(args);
+        }
+        Some("gate-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other("trace self-check takes no operands"));
+            }
+            return gate_call_trace_self_check::run();
+        }
+        Some("winsock-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "Winsock forwarding self-check takes no operands",
+                ));
+            }
+            winsock_trace::mock()?;
+            return Ok(0);
+        }
+        Some("listener-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "listener trace self-check takes no operands",
+                ));
+            }
+            return listener_trace::self_check();
+        }
+        Some("matched-control-frontend") => return matched_control_broker::run(args),
+        Some("peer-spawn-call-trace-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "peer spawn trace self-check takes no operands",
+                ));
+            }
+            return spawn_trace::standalone_self_check();
+        }
+        Some("listener-peer-spawn-composition-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "listener-peer-spawn composition self-check takes no operands",
+                ));
+            }
+            return spawn_trace::composition_self_check();
+        }
+        Some("own-thread-deadline-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "own-thread deadline self-check takes no operands",
+                ));
+            }
+            return own_thread_deadline_self_check::run();
+        }
+        Some("gate-precondition-child") => {
+            let path = args
+                .next()
+                .ok_or_else(|| io::Error::other("gate control descriptor missing"))?;
+            let envelope = args
+                .next()
+                .ok_or_else(|| io::Error::other("gate control envelope missing"))?;
+            if args.next().is_some() || envelope.len() > descriptor::gate_precondition::RECORD_BYTES
+            {
+                return Err(io::Error::other("gate control operands exceed bound"));
+            }
+            let envelope = serde_json::from_str(
+                envelope
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("gate control envelope is not JSON"))?,
+            )
+            .map_err(io::Error::other)?;
+            return gate_precondition_child::run(Path::new(&path), &envelope);
+        }
         Some("system-sentinel-frontend") => return native::system_sentinel_frontend(args),
         Some("sentinel-frontend") => return native::sentinel_frontend(args),
         Some("tcp-peer") => {
@@ -607,11 +1589,136 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             let output_root = args
                 .next()
                 .ok_or_else(|| io::Error::other("missing peer output root"))?;
+            let registry = args.next();
             if args.next().is_some() {
                 return Err(io::Error::other("extra peer arguments"));
             }
-            tcp_peer(port, &fs::read(path)?, std::path::Path::new(&output_root))?;
+            let challenge = fs::read(path)?;
+            let _registry = match registry {
+                Some(input) => {
+                    let input = input
+                        .to_str()
+                        .filter(|text| text.len() <= 4096)
+                        .ok_or_else(|| {
+                            io::Error::other("peer registry input is not bounded UTF8")
+                        })?;
+                    let input: PeerRegistryInput =
+                        serde_json::from_str(input).map_err(io::Error::other)?;
+                    let (parsed, fresh_digest) =
+                        read_peer_descriptor(&input, &challenge, Path::new(&output_root))?;
+                    let declaration = parsed.winsock_registry.as_ref().ok_or_else(|| {
+                        io::Error::other("authenticated peer registry declaration absent")
+                    })?;
+                    let identity = native::current_identity()?;
+                    let binding = descriptor::controller_start::Binding {
+                        challenge: challenge.clone(),
+                        descriptor_sha256: fresh_digest,
+                        pid: identity.process_id,
+                        birth: identity.creation_time_100ns,
+                    };
+                    let mut session =
+                        controller_start_input::Session::peer(&input.clock, binding, &parsed)?;
+                    let peer_token = if parsed.provider_input_experiment {
+                        listener_trace::live(&input.clock)?;
+                        let token = native::token_observation()?;
+                        listener_trace::live(&input.clock)?;
+                        Some(token)
+                    } else {
+                        None
+                    };
+                    // The root sender uses the digest admitted by its original
+                    // controller START. Fresh local bytes alone grant nothing:
+                    // this frame must match that digest and this exact peer.
+                    session.receive(descriptor::controller_start::Phase::Start)?;
+                    let capability = session
+                        .registry_capability()
+                        .ok_or_else(|| io::Error::other("peer registry capability absent"))?;
+                    let key = unsafe {
+                        winsock_registry::OwnedKey::from_transferred(
+                            capability.handle,
+                            session.original_deadline(),
+                        )
+                    }?;
+                    Some((
+                        winsock_registry::Mapping::install(
+                            key,
+                            declaration,
+                            session.original_deadline(),
+                        )?,
+                        session.original_deadline(),
+                        parsed,
+                        session.original_binding().clone(),
+                        peer_token,
+                        session,
+                    ))
+                }
+                None => None,
+            };
+            match _registry {
+                Some((mapping, deadline, parsed, binding, token, mut session)) => {
+                    mapping.run(|_| {
+                        let clock = parsed
+                            .control_clock
+                            .as_ref()
+                            .expect("authenticated peer clock checked");
+                        let trace = token.as_ref().map(|token| winsock_trace::Context {
+                            clock,
+                            binding: &binding,
+                            token_envelope: token,
+                            output_root: &parsed.output_root,
+                            provider_input_experiment: true,
+                            peer: true,
+                        });
+                        if token.is_some() {
+                            let prepared = provider_input_probes::prepare(
+                                &parsed,
+                                true,
+                                session.private_directories()?,
+                            )?;
+                            session.close_private_directories();
+                            provider_input_probes::run(&parsed, true, prepared)?;
+                        }
+                        tcp_peer(
+                            port,
+                            &parsed.challenge,
+                            &parsed.output_root,
+                            Some(deadline),
+                            trace.as_ref(),
+                        )
+                    })?
+                }
+                None => tcp_peer(
+                    port,
+                    &challenge,
+                    std::path::Path::new(&output_root),
+                    None,
+                    None,
+                )?,
+            }
             return Ok(0);
+        }
+        Some("winsock-registry-self-check") => {
+            if args.next().is_some() {
+                return Err(io::Error::other("extra registry selfcheck arguments"));
+            }
+            return winsock_registry::self_check();
+        }
+        Some("winsock-registry-uninherited-self-check") => {
+            let clock = args
+                .next()
+                .ok_or_else(|| io::Error::other("registry selfcheck child lacks original clock"))?;
+            let clock = clock
+                .to_str()
+                .filter(|value| value.len() <= 4096)
+                .ok_or_else(|| io::Error::other("registry selfcheck clock is not bounded UTF8"))?;
+            let clock: descriptor::ControlClock =
+                serde_json::from_str(clock).map_err(io::Error::other)?;
+            if args.next().is_some() {
+                return Err(io::Error::other("extra registry child selfcheck arguments"));
+            }
+            return winsock_registry::uninherited_self_check(
+                controller_start_input::deadline_from_clock(&clock)?,
+            );
         }
         Some("generation") => {
             let depth = args
@@ -799,7 +1906,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         }
         _ => {}
     }
-    let descriptor = read_descriptor(Path::new(&first))?;
+    let (descriptor, descriptor_digest) = read_descriptor_with_digest(Path::new(&first))?;
     let actual_arguments: Vec<OsString> = args.collect();
     if actual_arguments
         != descriptor
@@ -839,12 +1946,62 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
     )?;
     let envelope = native::token_observation()?;
     transcript.event("token-envelope", None, &envelope)?;
-    if let Some(gate) = &descriptor.start_gate {
-        native::wait_controller_gate_for_fixture(
-            std::ffi::OsStr::new(gate),
+    if descriptor.case == Case::Envelope && descriptor.matched_control.is_none() {
+        let clock = descriptor
+            .control_clock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("actual invocation original clock absent"))?;
+        let observation = matched_control_readback::capture_invocation(
             &descriptor,
-            transcript.sequence,
+            descriptor_digest,
+            &envelope,
+            controller_start_input::deadline_from_clock(clock)?,
         )?;
+        transcript.event(
+            "invocation-readback",
+            None,
+            &descriptor::controller_start::descriptor_digest(&observation),
+        )?;
+    }
+    let mut control = match descriptor.start_transport {
+        descriptor::StartTransport::ControllerStdin { .. } => Some(
+            controller_start_input::Session::new(&descriptor, descriptor_digest)?,
+        ),
+        descriptor::StartTransport::NamedEvent => None,
+    };
+    if descriptor.matched_control.is_some() {
+        matched_control_readback::capture(
+            &descriptor,
+            descriptor_digest,
+            &envelope,
+            control
+                .as_ref()
+                .ok_or_else(|| io::Error::other("matched START session absent"))?
+                .original_deadline(),
+        )?;
+    }
+    let released = match descriptor.start_transport {
+        descriptor::StartTransport::ControllerStdin { .. } => {
+            control
+                .as_mut()
+                .expect("selected stdin session")
+                .receive(descriptor::controller_start::Phase::Start)?;
+            true
+        }
+        descriptor::StartTransport::NamedEvent => {
+            if let Some(gate) = &descriptor.start_gate {
+                native::wait_controller_gate_for_fixture(
+                    std::ffi::OsStr::new(gate),
+                    &descriptor,
+                    transcript.sequence,
+                )?;
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if released {
         transcript
             .event("controller-released", None, &descriptor.challenge)
             .map_err(|error| {
@@ -855,188 +2012,225 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 )
             })?;
     }
-    match descriptor.case {
-        Case::Joint | Case::EndpointMismatch => joint(&descriptor, &mut transcript, false)?,
-        Case::Churn => joint(&descriptor, &mut transcript, true)?,
-        Case::Toolchain => toolchain::execute(&descriptor, &mut transcript)?,
-        Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
-        Case::EmptyInput => {
-            let mut actual = Vec::new();
-            io::stdin().take(1).read_to_end(&mut actual)?;
-            if !actual.is_empty() {
-                return Err(io::Error::other(
-                    "empty-input fixture received unexpected stdin bytes",
-                ));
-            }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(descriptor.output_root.join("stdin.bin"))?;
-            file.write_all(&actual)?;
-            file.sync_all()?;
-            transcript.event("stdin-read-to-eof", None, &actual)?;
-        }
-        Case::BinaryStreams => {
-            let stdout = descriptor.stdout.clone();
-            let stderr = descriptor.stderr.clone();
-            let out = thread::spawn(move || -> io::Result<()> {
-                for _ in 0..128 {
-                    io::stdout().write_all(&stdout)?;
+    if descriptor.matched_control.is_some() {
+        matched_control_application::execute(
+            &descriptor,
+            descriptor_digest,
+            &mut transcript,
+            control.as_mut(),
+            &envelope,
+        )?;
+    } else {
+        match descriptor.case {
+            Case::Joint | Case::EndpointMismatch => joint(
+                &descriptor,
+                &mut transcript,
+                false,
+                control.as_mut(),
+                &envelope,
+                Path::new(&first),
+                None,
+            )?,
+            Case::Churn => joint(
+                &descriptor,
+                &mut transcript,
+                true,
+                control.as_mut(),
+                &envelope,
+                Path::new(&first),
+                None,
+            )?,
+            Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
+            Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
+            Case::EmptyInput => {
+                let mut actual = Vec::new();
+                io::stdin().take(1).read_to_end(&mut actual)?;
+                if !actual.is_empty() {
+                    return Err(io::Error::other(
+                        "empty-input fixture received unexpected stdin bytes",
+                    ));
                 }
-                io::stdout().flush()
-            });
-            for _ in 0..128 {
-                io::stderr().write_all(&stderr)?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(descriptor.output_root.join("stdin.bin"))?;
+                file.write_all(&actual)?;
+                file.sync_all()?;
+                transcript.event("stdin-read-to-eof", None, &actual)?;
             }
-            io::stderr().flush()?;
-            out.join()
-                .map_err(|_| io::Error::other("stdout writer panicked"))??;
-        }
-        Case::Envelope => {
-            if !descriptor.denied_write_paths.is_empty() {
-                binary_files(&descriptor, &mut transcript)?;
-                protected_write_probes(&descriptor, &mut transcript)?;
-            }
-        }
-        Case::EmptyStreams | Case::NativeArgv | Case::ApplicationExit => {}
-        Case::DeadlineDemand | Case::HeldDemand => {
-            let mut child = child_command()?
-                .arg("cohort-leaf")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            let mut ready = [0u8];
-            child
-                .stdout
-                .as_mut()
-                .ok_or_else(|| io::Error::other("demand child readiness pipe absent"))?
-                .read_exact(&mut ready)?;
-            if ready != [0xA5] {
-                return Err(io::Error::other(
-                    "demand child did not enter native held barrier",
-                ));
-            }
-            transcript.event(
-                "child-created",
-                Some(0),
-                &serde_json::to_vec(&native::child_identity(&child)?).map_err(io::Error::other)?,
-            )?;
-            transcript.event("policy-demand-started", None, &descriptor.challenge)?;
-            loop {
-                std::hint::black_box(&child);
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        Case::MemoryDemand => {
-            transcript.event("policy-demand-started", None, &descriptor.challenge)?;
-            let mut committed = Vec::<Vec<u8>>::new();
-            loop {
-                let mut allocation = Vec::new();
-                if allocation.try_reserve_exact(8 * 1024 * 1024).is_err() {
-                    loop {
-                        thread::sleep(Duration::from_millis(5));
+            Case::BinaryStreams => {
+                let stdout = descriptor.stdout.clone();
+                let stderr = descriptor.stderr.clone();
+                let out = thread::spawn(move || -> io::Result<()> {
+                    for _ in 0..128 {
+                        io::stdout().write_all(&stdout)?;
                     }
+                    io::stdout().flush()
+                });
+                for _ in 0..128 {
+                    io::stderr().write_all(&stderr)?;
                 }
-                allocation.resize(8 * 1024 * 1024, 0xA5);
-                std::hint::black_box(&allocation);
-                committed.push(allocation);
-                std::hint::black_box(&committed);
+                io::stderr().flush()?;
+                out.join()
+                    .map_err(|_| io::Error::other("stdout writer panicked"))??;
             }
-        }
-        Case::NestedJob => native::nested_job()?,
-        Case::BreakawayDenied => native::breakaway_denied()?,
-        Case::AllowedTokenChange => {
-            let executable = std::env::current_exe()?;
-            let output = child_command()?
-                .arg("restricted-frontend")
-                .arg(&executable)
-                .arg("consumer-readiness-windows")
-                .arg("token-change-child")
-                .arg(descriptor.output_root.join("token-change-output.bin"))
-                .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()?;
-            if !output.status.success() || !output.stderr.is_empty() {
-                return Err(io::Error::other("allowed token-change descendant failed"));
+            Case::Envelope => {
+                if !descriptor.denied_write_paths.is_empty() {
+                    binary_files(&descriptor, &mut transcript)?;
+                    protected_write_probes(&descriptor, &mut transcript)?;
+                }
             }
-            transcript.event("allowed-token-change-retained-job", None, &output.stdout)?;
-        }
-        Case::RootFirst | Case::IntermediateFirst => {
-            let gate = descriptor
-                .descendant_gate
-                .as_ref()
-                .expect("validated descendant gate");
-            let owned_gate = native::create_controller_gate(gate)?;
-            if descriptor.case == Case::IntermediateFirst {
-                let intermediate_gate = format!("{gate}-intermediate-live");
-                let intermediate_owner = native::create_controller_gate(&intermediate_gate)?;
-                let mut intermediate = child_command()?
-                    .arg("intermediate-exit")
-                    .arg(gate)
-                    .arg(descriptor.output_root.join("descendant-output.bin"))
-                    .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
+            Case::EmptyStreams | Case::NativeArgv | Case::ApplicationExit => {}
+            Case::CapacityCompletion => capacity_completion(&descriptor, &mut transcript)?,
+            Case::DeadlineDemand | Case::HeldDemand => {
+                let mut child = child_command()?
+                    .arg("cohort-leaf")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
+                    .stderr(Stdio::piped())
                     .spawn()?;
-                let identity: memcordon_core::WindowsProcessIdentityV1 = serde_json::from_slice(
-                    &frame_read(intermediate.stdout.as_mut().expect("piped intermediate"))?,
-                )
-                .map_err(io::Error::other)?;
-                let parent = native::child_identity(&intermediate)?;
-                transcript.event(
-                    "intermediate-live-with-descendant",
-                    None,
-                    &serde_json::to_vec(&serde_json::json!({"parent":parent,"child":identity}))
-                        .map_err(io::Error::other)?,
-                )?;
-                native::wait_controller_gate(std::ffi::OsStr::new(&intermediate_gate), || Ok(()))?;
-                intermediate
-                    .stdin
-                    .take()
-                    .expect("piped intermediate release")
-                    .write_all(&[0xA5])?;
-                if !intermediate.wait()?.success() {
-                    return Err(io::Error::other("intermediate did not exit naturally"));
-                }
-                drop(intermediate_owner);
-                transcript.event(
-                    "intermediate-exits-with-live-descendant",
-                    None,
-                    &serde_json::to_vec(&identity).map_err(io::Error::other)?,
-                )?;
-                native::wait_controller_gate(std::ffi::OsStr::new(gate), || Ok(()))?;
-                drop(owned_gate);
-            } else {
-                let mut child = child_command()?
-                    .arg("descendant-hold")
-                    .arg(gate)
-                    .arg(descriptor.output_root.join("descendant-output.bin"))
-                    .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .spawn()?;
-                let mut ready = [0];
+                let mut ready = [0u8];
                 child
                     .stdout
                     .as_mut()
-                    .expect("piped stdout")
+                    .ok_or_else(|| io::Error::other("demand child readiness pipe absent"))?
                     .read_exact(&mut ready)?;
-                if ready != [0xA5] || child.try_wait()?.is_some() {
-                    return Err(io::Error::other("descendant was not held live"));
+                if ready != [0xA5] {
+                    return Err(io::Error::other(
+                        "demand child did not enter native held barrier",
+                    ));
                 }
-                let identity = native::child_identity(&child)?;
                 transcript.event(
-                    "root-exits-with-live-descendant",
-                    None,
-                    &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+                    "child-created",
+                    Some(0),
+                    &serde_json::to_vec(&native::child_identity(&child)?)
+                        .map_err(io::Error::other)?,
                 )?;
-                drop(owned_gate);
+                transcript.event("policy-demand-started", None, &descriptor.challenge)?;
+                loop {
+                    std::hint::black_box(&child);
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
-            // Intentionally relinquish only the root's wait; Job ownership must
-            // continue after this process exits. Collection drains descendant I/O.
+            Case::MemoryDemand => {
+                transcript.event("policy-demand-started", None, &descriptor.challenge)?;
+                let mut committed = Vec::<Vec<u8>>::new();
+                loop {
+                    let mut allocation = Vec::new();
+                    if allocation.try_reserve_exact(8 * 1024 * 1024).is_err() {
+                        loop {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    allocation.resize(8 * 1024 * 1024, 0xA5);
+                    std::hint::black_box(&allocation);
+                    committed.push(allocation);
+                    std::hint::black_box(&committed);
+                }
+            }
+            Case::NestedJob => native::nested_job()?,
+            Case::BreakawayDenied => native::breakaway_denied()?,
+            Case::AllowedTokenChange => {
+                let executable = std::env::current_exe()?;
+                let output = child_command()?
+                    .arg("restricted-frontend")
+                    .arg(&executable)
+                    .arg("consumer-readiness-windows")
+                    .arg("token-change-child")
+                    .arg(descriptor.output_root.join("token-change-output.bin"))
+                    .arg(serde_json::to_string(&descriptor.challenge).map_err(io::Error::other)?)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()?;
+                if !output.status.success() || !output.stderr.is_empty() {
+                    return Err(io::Error::other("allowed token-change descendant failed"));
+                }
+                transcript.event("allowed-token-change-retained-job", None, &output.stdout)?;
+            }
+            Case::RootFirst | Case::IntermediateFirst => {
+                let gate = descriptor
+                    .descendant_gate
+                    .as_ref()
+                    .expect("validated descendant gate");
+                let owned_gate = native::create_controller_gate(gate)?;
+                if descriptor.case == Case::IntermediateFirst {
+                    let intermediate_gate = format!("{gate}-intermediate-live");
+                    let intermediate_owner = native::create_controller_gate(&intermediate_gate)?;
+                    let mut intermediate = child_command()?
+                        .arg("intermediate-exit")
+                        .arg(gate)
+                        .arg(descriptor.output_root.join("descendant-output.bin"))
+                        .arg(
+                            serde_json::to_string(&descriptor.challenge)
+                                .map_err(io::Error::other)?,
+                        )
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let identity: memcordon_core::WindowsProcessIdentityV1 =
+                        serde_json::from_slice(&frame_read(
+                            intermediate.stdout.as_mut().expect("piped intermediate"),
+                        )?)
+                        .map_err(io::Error::other)?;
+                    let parent = native::child_identity(&intermediate)?;
+                    transcript.event(
+                        "intermediate-live-with-descendant",
+                        None,
+                        &serde_json::to_vec(&serde_json::json!({"parent":parent,"child":identity}))
+                            .map_err(io::Error::other)?,
+                    )?;
+                    native::wait_controller_gate(std::ffi::OsStr::new(&intermediate_gate), || {
+                        Ok(())
+                    })?;
+                    intermediate
+                        .stdin
+                        .take()
+                        .expect("piped intermediate release")
+                        .write_all(&[0xA5])?;
+                    if !intermediate.wait()?.success() {
+                        return Err(io::Error::other("intermediate did not exit naturally"));
+                    }
+                    drop(intermediate_owner);
+                    transcript.event(
+                        "intermediate-exits-with-live-descendant",
+                        None,
+                        &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+                    )?;
+                    native::wait_controller_gate(std::ffi::OsStr::new(gate), || Ok(()))?;
+                    drop(owned_gate);
+                } else {
+                    let mut child = child_command()?
+                        .arg("descendant-hold")
+                        .arg(gate)
+                        .arg(descriptor.output_root.join("descendant-output.bin"))
+                        .arg(
+                            serde_json::to_string(&descriptor.challenge)
+                                .map_err(io::Error::other)?,
+                        )
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let mut ready = [0];
+                    child
+                        .stdout
+                        .as_mut()
+                        .expect("piped stdout")
+                        .read_exact(&mut ready)?;
+                    if ready != [0xA5] || child.try_wait()?.is_some() {
+                        return Err(io::Error::other("descendant was not held live"));
+                    }
+                    let identity = native::child_identity(&child)?;
+                    transcript.event(
+                        "root-exits-with-live-descendant",
+                        None,
+                        &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+                    )?;
+                    drop(owned_gate);
+                }
+                // Intentionally relinquish only the root's wait; Job ownership must
+                // continue after this process exits. Collection drains descendant I/O.
+            }
         }
     }
     transcript.event("finished", None, &descriptor.challenge)?;

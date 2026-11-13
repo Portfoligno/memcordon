@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -76,101 +76,7 @@ fn copy_snapshot(
     super::linux_test_execution::caller_tree(destination, caller, cutoff, &mut remaining)
 }
 fn rpath_probe(original: &[u8], target: &str) -> Result<(Vec<u8>, Value)> {
-    let file = |offset: usize, count: usize| {
-        original
-            .get(
-                offset
-                    ..offset
-                        .checked_add(count)
-                        .ok_or_else(|| fail("ELF mutation extent overflow"))?,
-            )
-            .ok_or_else(|| fail("ELF mutation extent invalid"))
-    };
-    let scalar = |offset: usize| -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            file(offset, 8)?
-                .try_into()
-                .map_err(|_| fail("ELF mutation scalar absent"))?,
-        ))
-    };
-    if file(0, 6)? != b"\x7fELF\x02\x01" {
-        return Err(fail("current RPATH fixture is not native ELF64LE"));
-    }
-    let offset = usize::try_from(scalar(32)?).map_err(|error| fail(error.to_string()))?;
-    let count = usize::from(u16::from_le_bytes(
-        file(56, 2)?
-            .try_into()
-            .map_err(|_| fail("ELF program count absent"))?,
-    ));
-    if count == 0 || count > 512 {
-        return Err(fail("ELF mutation program inventory invalid"));
-    }
-    let mut dynamic = None;
-    for index in 0..count {
-        let at = offset
-            .checked_add(index * 56)
-            .ok_or_else(|| fail("ELF header mutation overflow"))?;
-        if u32::from_le_bytes(
-            file(at, 4)?
-                .try_into()
-                .map_err(|_| fail("ELF program kind absent"))?,
-        ) == 2
-        {
-            dynamic = Some((
-                usize::try_from(scalar(at + 8)?).map_err(|error| fail(error.to_string()))?,
-                usize::try_from(scalar(at + 32)?).map_err(|error| fail(error.to_string()))?,
-            ));
-        }
-    }
-    let (dynamic, length) = dynamic.ok_or_else(|| fail("actual fixture has no dynamic table"))?;
-    file(dynamic, length)?;
-    let mut needed = None;
-    let mut end = None;
-    for at in (dynamic..dynamic + length).step_by(16) {
-        match scalar(at)? {
-            1 if needed.is_none() => needed = Some(scalar(at + 8)?),
-            0 => {
-                end = Some(at);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| fail("ELF dynamic terminator absent"))?;
-    if end.checked_add(32).is_none_or(|end| end > dynamic + length) || scalar(end + 16)? != 0 {
-        return Err(fail(
-            "actual ELF has no spare dynamic terminator for RPATH probe",
-        ));
-    }
-    let mut probe = original.to_vec();
-    probe[end..end + 8].copy_from_slice(&29_u64.to_le_bytes());
-    probe[end + 8..end + 16].copy_from_slice(
-        &needed
-            .ok_or_else(|| fail("actual ELF has no needed dependency string"))?
-            .to_le_bytes(),
-    );
-    let held = std::io::Cursor::new(&probe);
-    let elf = memcordon_core::elf_closure::inspect(
-        |offset, buffer| {
-            use std::io::Read;
-            let mut held = held.clone();
-            held.set_position(offset);
-            held.read_exact(buffer).map_err(|error| error.to_string())
-        },
-        probe.len() as u64,
-        target,
-    )
-    .map_err(fail)?
-    .ok_or_else(|| fail("RPATH probe stopped being native ELF"))?;
-    if elf.search_paths.len() != 1 || elf.search_paths[0].starts_with('/') {
-        return Err(fail(
-            "RPATH probe did not select actual relative dynamic search",
-        ));
-    }
-    Ok((
-        probe,
-        json!({"offset":end,"old_tag":0,"new_tag":29,"string_offset":needed,"search":elf.search_paths[0]}),
-    ))
+    crate::linux_elf_rpath::mutate(original, target).map_err(fail)
 }
 #[expect(
     clippy::too_many_arguments,
@@ -219,7 +125,6 @@ fn negative(
     let mut runtime_root = images.runtime_source.clone();
     let mut input_root = images.input_source.clone();
     let mut mutation = Value::Null;
-    let mut probe = Vec::new();
     if scenario == "rpath-injection" {
         runtime_root = directory.join("runtime-source");
         copy_snapshot(
@@ -229,8 +134,7 @@ fn negative(
             caller,
             work,
         )?;
-        let (changed, details) = rpath_probe(&original_fixture, &images.runtime.target)?;
-        probe = changed;
+        let (probe, details) = rpath_probe(&original_fixture, &images.runtime.target)?;
         mutation = details;
         fs::write(runtime_root.join("bin/owned-readiness"), &probe)?;
         let mut value = serde_json::to_value(&runtime)?;
@@ -343,16 +247,32 @@ fn negative(
     } else {
         RequestLaunch::start(launch_input)?
     };
+    let mut failure_context = None;
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let frontend = launch.retain_frontend(work)?;
+        let original = (frontend.process_id, frontend.birth);
         let frontend_identity = json!({"pid":frontend.process_id,"birth":frontend.birth});
         let output = launch.capture_until(work)?;
         use std::os::unix::process::ExitStatusExt;
+        let original_wait = output.status;
         let stdout = output.stdout.clone();
         let stderr = output.stderr.clone();
         let wait = json!({"process":frontend_identity,"status":output.status.code(),"raw_wait_status":output.status.into_raw()});
+        failure_context = Some(format!(
+            "loader scenario={scenario}; original-frontend={original:?}; observed-status={:?}; raw-wait-status={}; stderr={}",
+            original_wait.code(),
+            original_wait.into_raw(),
+            crate::linux_result_publication::stderr_detail(&stderr)
+        ));
         let result_bytes = artifacts::read_file(&directory.join("workload-result.json"))?;
         let result = memcordon_core::result_v3::ResultV3::parse(&result_bytes).map_err(fail)?;
+        crate::linux_result_publication::publication_writer(result.delivery, original)
+            .map_err(fail)?;
+        crate::linux_result_publication::wrapper_status(
+            original_wait.code(),
+            result.outcome.wrapper_status,
+        )
+        .map_err(fail)?;
         let association = if scenario == "ld-injection" {
             None
         } else {
@@ -367,6 +287,17 @@ fn negative(
         );
         let start_bytes = artifacts::read_file(&start_path)?;
         let recovery = association.as_ref().map(|_| launch.recover()).transpose()?;
+        if let Some(recovery) = &recovery {
+            crate::command::require_successful_output(
+                "original rejected loader recovery",
+                &recovery.process,
+            )
+            .map_err(|error| {
+                error.context(format!(
+                    "loader scenario={scenario}; original recovery process"
+                ))
+            })?;
+        }
         let journal = association
             .as_ref()
             .map(|association| -> Result<Vec<u8>> {
@@ -378,24 +309,29 @@ fn negative(
         let raw = serde_json::to_value(&result)?;
         let request_bytes = fs::read(&fixture.request)?;
         let request = memcordon_core::workload_request::WorkloadRequestV1::parse(&request_bytes)
-            .map_err(fail)?;
+            .map_err(|error| fail(error.to_string()))?;
         if raw["release"] != "not-released"
             || raw["runtime"]["kind"] != "preparation-failed"
             || raw["outcome"]["kind"] != "launch-failure"
             || raw["outcome"]["wrapper_status"] != 125
-            || raw["delivery"] != "complete"
-            || raw["cleanup"]["state"] != "complete"
             || raw["request"]["request_sha256"]
-                != serde_json::to_value(request.digest().map_err(fail)?)?
+                != serde_json::to_value(request.digest().map_err(|error| fail(error.to_string()))?)?
             || wait["status"] != 125
             || wait["raw_wait_status"] != 125 * 256
             || !stdout.is_empty()
         {
             return Err(fail(
-                "loader mutation did not produce its actual prelaunch refusal and complete cleanup",
+                "loader mutation did not produce its actual prelaunch refusal and original status/request",
             ));
         }
         if scenario == "ld-injection" {
+            crate::linux_result_publication::preallocation_report(
+                &result,
+                &request.digest().map_err(|error| fail(error.to_string()))?,
+                original,
+                original_wait.code(),
+            )
+            .map_err(fail)?;
             if association.is_some()
                 || raw["request_rejection"]["code"] != "unsupported-requirement"
                 || !raw["request_rejection"]["detail"]
@@ -414,6 +350,26 @@ fn negative(
             let recovery = recovery
                 .as_ref()
                 .ok_or_else(|| fail("actual rejected loader recovery absent"))?;
+            crate::linux_result_publication::intake_report(
+                &result,
+                &recovery.terminal,
+                association,
+                &request.digest().map_err(|error| fail(error.to_string()))?,
+                original,
+                original_wait.code(),
+            )
+            .map_err(fail)?;
+            if scenario == "rpath-injection"
+                && !recovery.terminal.failures.as_slice().iter().any(|failure| {
+                    failure
+                        .as_str()
+                        .contains("ELF loader search contains unsupported or relative authority")
+                })
+            {
+                return Err(fail(
+                    "RPATH mutation did not reach its original relative loader-authority refusal",
+                ));
+            }
             let terminal: Value = serde_json::from_slice(&recovery.raw_terminal)?;
             if raw["workload_attempt"] != serde_json::to_value(association)?
                 || raw["provider"] != serde_json::to_value(provider)?
@@ -449,7 +405,7 @@ fn negative(
         }
         if let (Some(association), Some(ack)) = (&association, ack) {
             let response = memcordon_core::workload_request::WorkloadAcknowledgmentV1::parse(&ack)
-                .map_err(fail)?;
+                .map_err(|error| fail(error.to_string()))?;
             if response.association != *association {
                 return Err(fail(
                     "loader refusal acknowledgment names another actual attempt",
@@ -465,21 +421,41 @@ fn negative(
             match launch.cancel_and_settle(cleanup) {
                 Ok(_) => {
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                        eprintln!("loader input retirement after unwind: {error}");
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "loader input retirement after unwind: {error}"
+                        );
                     }
                 }
-                Err(error) => eprintln!("loader native settlement after unwind: {error}"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "loader native settlement after unwind: {error}"
+                    );
+                }
             }
             std::panic::resume_unwind(panic)
         }
     };
     if let Err(primary) = execution {
-        let settled = launch.cancel_and_settle(cleanup);
-        let mut detail = primary.to_string();
-        if let Err(secondary) = settled {
-            detail = format!("{detail}; loader native settlement: {secondary}");
-        }
-        return Err(fail(detail));
+        let primary = primary.context(failure_context.unwrap_or_else(|| {
+            format!("loader scenario={scenario}; original capture unavailable")
+        }));
+        let retirement =
+            match launch.cancel_and_settle(cleanup) {
+                Ok(_) => launch.retire_bundle_exact(&fixture).map_err(|error| {
+                    error.context("loader exact bundle retirement after original settlement")
+                }),
+                Err(error) => Err(error
+                    .context("loader original native settlement; bundle retirement not admitted")),
+            };
+        return Err(match retirement {
+            Ok(()) => primary,
+            Err(secondary) => CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            },
+        });
     }
     Ok(())
 }
@@ -632,7 +608,7 @@ pub fn run_installed(
     cleanup: Instant,
 ) -> Result<()> {
     let images = images.minimal();
-    let operation = (|| -> Result<()> {
+    (|| -> Result<()> {
         for scenario in [
             "first-image",
             "interpreter",
@@ -933,6 +909,5 @@ pub fn run_installed(
             )?;
         }
         Ok(())
-    })();
-    operation
+    })()
 }

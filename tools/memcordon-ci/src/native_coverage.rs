@@ -33,10 +33,10 @@ pub fn select(targets: &[Target], index: usize, count: usize) -> Result<Selectio
         if target.package.is_empty() {
             return Err("native target package is empty".into());
         }
-        if let Selector::Bin(name) = &target.selector {
-            if !binaries.insert(name.to_ascii_lowercase()) {
-                return Err("native ordinary binary output names collide".into());
-            }
+        if let Selector::Bin(name) = &target.selector
+            && !binaries.insert(name.to_ascii_lowercase())
+        {
+            return Err("native ordinary binary output names collide".into());
         }
         if !groups
             .entry(target.selector.clone())

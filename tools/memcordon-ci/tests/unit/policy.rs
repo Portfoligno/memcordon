@@ -88,6 +88,32 @@ fn authored_workflow_tokens_require_only_trusted_publishing_bindings() {
 fn ordinary_workflows_do_not_restore_retired_self_hosted_runner_exceptions() {
     let root = repository_root();
     let policy = config::policy(&root).unwrap();
+    let generated: Value =
+        serde_yaml::from_slice(include_bytes!("../../../../.github/workflows/ci.yml")).unwrap();
+    let checkout = generated["jobs"]
+        .as_mapping()
+        .unwrap()
+        .values()
+        .flat_map(|job| job["steps"].as_sequence().unwrap())
+        .find_map(|step| {
+            step["uses"]
+                .as_str()
+                .filter(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("generated workflow pins checkout");
+    let mut ordinary: Value = serde_yaml::from_str(
+        "name: Policy fixture\non: [push]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    steps:\n      - uses: checkout\n        with:\n          persist-credentials: false\n",
+    )
+    .unwrap();
+    ordinary["jobs"]["check"]["steps"][0]["uses"] = Value::String(checkout.into());
+    let ordinary_path = Path::new(".github/workflows/policy-fixture.yml");
+    validate_workflow_bytes(
+        &root,
+        ordinary_path,
+        serde_yaml::to_string(&ordinary).unwrap().as_bytes(),
+        &policy,
+    )
+    .expect("ordinary policy baseline must pass");
     for (job_name, runner) in [
         ("linux-private-q-x64", "[self-hosted, linux]"),
         (
@@ -98,8 +124,7 @@ fn ordinary_workflows_do_not_restore_retired_self_hosted_runner_exceptions() {
         let mut document: Value =
             serde_yaml::from_slice(include_bytes!("../../../../.github/workflows/ci.yml"))
                 .expect("actual ordinary workflow parses");
-        // Preserve a real job's step and budget invariants so the mutation
-        // reaches the runner policy rather than failing unrelated validation.
+        // Generated workflows reject any drift before generic runner checks.
         let mut job = document["jobs"]
             .as_mapping()
             .unwrap()
@@ -120,8 +145,29 @@ fn ordinary_workflows_do_not_restore_retired_self_hosted_runner_exceptions() {
         assert!(
             error
                 .to_string()
-                .contains("workflow may not select self-hosted runners"),
+                .contains("workflow differs from current Rust authoring graph"),
             "unexpected rejection for {job_name}: {error}"
+        );
+        let mut changed = ordinary.clone();
+        let mut job = changed["jobs"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(Value::String("check".into()))
+            .unwrap();
+        job["runs-on"] = serde_yaml::from_str(runner).unwrap();
+        changed["jobs"][job_name] = job;
+        let error = validate_workflow_bytes(
+            &root,
+            ordinary_path,
+            serde_yaml::to_string(&changed).unwrap().as_bytes(),
+            &policy,
+        )
+        .expect_err("ordinary workflows must reject retired self-hosted runners");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow may not select self-hosted runners"),
+            "unexpected ordinary rejection for {job_name}: {error}"
         );
     }
 }

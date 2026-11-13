@@ -2,11 +2,13 @@ mod attempt_store;
 pub(crate) mod bootstrap_image_capability;
 pub mod control_service;
 mod diagnostics;
+mod frame_write;
 pub mod guardian;
 pub mod guardian_service;
 pub mod job;
 mod job_diagnostics;
 pub mod launcher_service;
+mod launcher_startup_progress;
 pub(crate) mod loader_access;
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_native_process.rs"]
@@ -18,9 +20,11 @@ mod process_impl;
 pub mod qualification;
 pub mod random;
 pub mod record;
+mod runtime_state_presence;
 pub mod security;
 pub mod service;
 pub mod service_manager;
+mod service_startup_render;
 pub mod session_broker;
 mod settlement;
 mod startup_diagnostics;
@@ -28,6 +32,8 @@ mod startup_diagnostics;
 mod support_loader_diagnostic;
 pub mod token;
 pub mod user_api;
+mod writer_lifecycle;
+mod writer_observation;
 
 pub fn control() -> Result<(), String> {
     control_service::run()

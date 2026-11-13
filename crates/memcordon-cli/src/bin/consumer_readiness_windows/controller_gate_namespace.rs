@@ -257,6 +257,10 @@ pub fn probe(proof: &Proof, check: impl Fn() -> io::Result<()>) -> Value {
         "interpretation":"fixture native-path observation only; original event identity and Win32 mapping unproved"});
     observation["unprefixed_win32_comparison"] =
         unprefixed_observation("native-reference-unavailable");
+    observation["parent_query_traverse"] = json!({"diagnostic_only":true,"acceptance_authority":false,
+        "same_original_event_identity_proved":false,"desired_access":3,"attempted":false,
+        "ntstatus":null,"native_status_success":null,"owned_reference_returned":false,"work_confirmed":false,
+        "completion":{"state":"unavailable","reason":"traverse-prefixes-not-complete"}});
     let mut run = || -> Result<(), Failure> {
         let api = Api::load(&check)?;
         let path = super::rooted_path(&proof.components)
@@ -290,34 +294,73 @@ pub fn probe(proof: &Proof, check: impl Fn() -> io::Result<()>) -> Value {
                     unprefixed_observation("native-reference-not-opened");
                 observation["native_event_status"] = json!(error.status);
                 observation["native_event_opened"] = json!(false);
-                let mut prefixes = Vec::new();
-                for count in 1..proof.components.len() {
-                    let prefix = super::rooted_path(&proof.components[..count])
-                        .map_err(|_| refused("fixture-prefix", "invalid-proof"))?;
-                    let mut prefix_status = None;
-                    match api.open_recorded(
-                        false,
-                        ptr::null_mut(),
-                        &prefix,
-                        2,
-                        &check,
-                        &mut prefix_status,
-                    ) {
-                        Ok(owner) => {
-                            drop(owner);
-                            prefixes.push(json!({"component_count":count,"ntstatus":0,"traverse_opened":true}));
-                        }
-                        Err(error) => {
-                            prefixes.push(json!({"component_count":count,"ntstatus":prefix_status,"attempted":prefix_status.is_some(),"traverse_opened":prefix_status.map(|status|status==0),"reason":error.reason}));
-                            observation["prefixes"] = json!(prefixes);
-                            return Err(error);
-                        }
-                    }
-                }
-                observation["prefixes"] = json!(prefixes);
             }
             Err(error) => return Err(error),
         }
+        // A completed event open (success or denial) says nothing about the
+        // separately requested directory traversal handles. Preserve both.
+        let mut prefixes = Vec::new();
+        for count in 1..proof.components.len() {
+            let prefix = super::rooted_path(&proof.components[..count])
+                .map_err(|_| refused("fixture-prefix", "invalid-proof"))?;
+            let mut prefix_status = None;
+            match api.open_recorded(
+                false,
+                ptr::null_mut(),
+                &prefix,
+                2,
+                &check,
+                &mut prefix_status,
+            ) {
+                Ok(owner) => {
+                    drop(owner);
+                    prefixes
+                        .push(json!({"component_count":count,"ntstatus":0,"traverse_opened":true}));
+                }
+                Err(error) => {
+                    prefixes.push(json!({"component_count":count,"ntstatus":prefix_status,"attempted":prefix_status.is_some(),"traverse_opened":prefix_status.map(|status|status==0),"reason":error.reason}));
+                    observation["prefixes"] = json!(prefixes);
+                    return Err(error);
+                }
+            }
+        }
+        observation["prefixes"] = json!(prefixes);
+        // Compare one additional documented directory request on the final
+        // prefix only, after all traverse-only opens succeeded. It is never
+        // used to open the event, enumerate, mutate security or grant access.
+        observation["parent_query_traverse"]["completion"] =
+            json!({"state":"unavailable","reason":"parent-path-unavailable"});
+        let parent = proof
+            .event_parent()
+            .map_err(|_| refused("event-parent-query", "invalid-proof"))?;
+        let parent_path = super::rooted_path(parent)
+            .map_err(|_| refused("event-parent-query", "invalid-prefix"))?;
+        let parent_hash = super::path_sha256(parent)
+            .map_err(|_| refused("event-parent-query", "invalid-prefix"))?;
+        let mut status = None;
+        let opened =
+            api.open_recorded(false, ptr::null_mut(), &parent_path, 3, &check, &mut status);
+        let mut query = json!({"diagnostic_only":true,"acceptance_authority":false,
+            "same_original_event_identity_proved":false,"component_count":parent.len(),"path_sha256":parent_hash,
+            "desired_access":3,"attempted":status.is_some(),"ntstatus":status,
+            "native_status_success":status.map(|value| value==0),"owned_reference_returned":false,"work_confirmed":false});
+        let completed = match opened {
+            Ok(owner) => {
+                query["owned_reference_returned"] = json!(true);
+                drop(owner);
+                live(&check)
+            }
+            Err(error) => Err(error),
+        };
+        query["completion"] = match completed {
+            Ok(()) => {
+                query["work_confirmed"] = json!(true);
+                json!({"state":"observed"})
+            }
+            Err(error) => failure_value(error),
+        };
+        observation["parent_query_traverse"] = query;
+        completed?;
         live(&check)?;
         Ok(())
     };

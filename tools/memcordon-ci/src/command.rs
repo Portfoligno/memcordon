@@ -9,20 +9,33 @@ use crate::{CiError, Result};
 
 #[cfg(target_os = "linux")]
 pub(crate) type AfterReleaseObserver = Box<dyn FnOnce(&std::process::Child) -> Result<()> + Send>;
+#[cfg(target_os = "linux")]
+type ReleasedAt<'a> = Box<dyn FnOnce(&std::process::Child, Instant) -> Result<()> + 'a>;
 
 /// Reject native command failure before decoding its successful-response schema.
 pub fn require_successful_output(operation: &str, output: &ObservedOutput) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    let end = output.stderr.len().min(2048);
+    let limit = 2048;
+    let (head, tail, omitted) = if output.stderr.len() <= limit {
+        (output.stderr.as_slice(), &[][..], 0)
+    } else {
+        let section = limit / 2;
+        (
+            &output.stderr[..section],
+            &output.stderr[output.stderr.len() - section..],
+            output.stderr.len() - limit,
+        )
+    };
     Err(CiError::Message(format!(
-        "{operation}: native command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr={:?}",
+        "{operation}: native command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr-omitted-bytes={omitted}; stderr-head={:?}; stderr-tail={:?}",
         output.status,
         output.stdout.len(),
         output.stderr.len(),
-        end != output.stderr.len(),
-        String::from_utf8_lossy(&output.stderr[..end])
+        omitted != 0,
+        String::from_utf8_lossy(head),
+        String::from_utf8_lossy(tail),
     )))
 }
 
@@ -200,8 +213,9 @@ impl CommandSpec {
         self
     }
 
-    /// Optional cache version probes can reject an image and rebuild it.
-    /// Their caller still propagates unknown native settlement as a failure.
+    /// Defer exit classification to a caller that immediately validates the
+    /// semantic result and propagates failures through its enclosing operation.
+    /// Native capture errors and unknown settlement remain failures.
     pub fn defer_group_failure(mut self) -> Self {
         self.defer_group_failure = true;
         self
@@ -584,7 +598,7 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, false, None, None)
+        self.output_quiet_with_creation_mode(|child, _| observe_creation(child), false, None, None)
     }
 
     /// Keep the sole child wait owner and bounded capture while an installed
@@ -660,6 +674,76 @@ impl CommandSpec {
         crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
     }
 
+    /// Launch the installed administrative helper without an exec trace, so
+    /// its setuid elevation remains available. The original child still has
+    /// one bounded wait owner, capture and live cancellation input.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_for_installed_helper_with_creation_and_io(
+        &self,
+        diagnostics: &Path,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        io: impl FnOnce(
+            u32,
+            Option<std::process::ChildStdin>,
+            memcordon_testkit::OutputSnapshot,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> Result<ObservedOutput> {
+        let mut command = self.materialize()?;
+        command.stdin(std::process::Stdio::piped());
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
+            command,
+            self.available_budget()?,
+            self.output_limit,
+            |mut command| {
+                let child = command.spawn()?;
+                if let Err(error) = observe_creation(&child) {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            io,
+        );
+        let writers = crate::work_outcome::native_settlement(&output);
+        let retention = match &output {
+            Ok(output) => crate::current_command_evidence::retain_output(
+                diagnostics,
+                output,
+                self.output_limit,
+            ),
+            Err(error) => crate::current_command_evidence::retain_failure(
+                diagnostics,
+                error,
+                self.output_limit,
+            ),
+        }
+        .map_err(|error| {
+            let message = error.to_string();
+            let bytes = message.as_bytes();
+            let end = bytes.len().min(2048);
+            CiError::Message(format!(
+                "installed helper diagnostic retention failed; error-bytes={}; error-truncated={}; error={:?}",
+                bytes.len(),
+                end != bytes.len(),
+                String::from_utf8_lossy(&bytes[..end]),
+            ))
+        });
+        let result = match (output, observation_error) {
+            (Ok(output), None) => {
+                require_successful_output("direct installed Linux helper", &output).map(|()| output)
+            }
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "installed helper creation observation={original:?}; native settlement={error}"
+            ))),
+        };
+        crate::work_outcome::WorkOutcome::observed(result, writers)
+            .postcondition(retention)
+            .into_result()
+    }
+
     /// Observe the genuine executed image while the original child is stopped
     /// at its kernel exec event, then release it under the same cutoff.
     #[cfg(target_os = "linux")]
@@ -667,7 +751,17 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true, None, None)
+        self.output_quiet_with_creation_mode(|child, _| observe_creation(child), true, None, None)
+    }
+    /// Capture original custody while exec-stopped, then perform dependent work
+    /// only after release, sharing the command-selected absolute cutoff.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_quiet_with_exec_observers<'a>(
+        &self,
+        held: impl FnOnce(&std::process::Child, Instant) -> Result<()>,
+        released: impl FnOnce(&std::process::Child, Instant) -> Result<()> + 'a,
+    ) -> Result<ObservedOutput> {
+        self.output_quiet_with_creation_mode(held, true, Some(Box::new(released)), None)
     }
     /// Retain bounded original streams/status in this invocation's owned output.
     #[cfg(target_os = "linux")]
@@ -677,27 +771,37 @@ impl CommandSpec {
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
         after_release: Option<AfterReleaseObserver>,
     ) -> Result<ObservedOutput> {
-        self.output_quiet_with_creation_mode(observe_creation, true, after_release, Some(directory))
+        let released = after_release.map(|observer| {
+            Box::new(move |child: &std::process::Child, _| observer(child)) as ReleasedAt<'_>
+        });
+        self.output_quiet_with_creation_mode(
+            |child, _| observe_creation(child),
+            true,
+            released,
+            Some(directory),
+        )
     }
 
     #[cfg(target_os = "linux")]
-    fn output_quiet_with_creation_mode(
+    fn output_quiet_with_creation_mode<'a>(
         &self,
-        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        observe_creation: impl FnOnce(&std::process::Child, Instant) -> Result<()>,
         hold_exec: bool,
-        after_release: Option<AfterReleaseObserver>,
+        after_release: Option<ReleasedAt<'a>>,
         evidence_directory: Option<&std::path::Path>,
     ) -> Result<ObservedOutput> {
         let command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
-        let deadline = self
-            .operation_deadline
-            .unwrap_or(Instant::now() + budget)
-            .min(Instant::now() + budget);
-        let mut observation_error = None;
-        let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
-            command,
+        let started = Instant::now();
+        let deadline = crate::exec_observation::cutoff(
+            started,
             budget,
+            self.operation_deadline.unwrap_or(started + budget),
+        )?;
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_until_owned_spawn_after_output_limit(
+            command,
+            deadline,
             self.output_limit,
             |mut command| {
                 if hold_exec {
@@ -712,19 +816,12 @@ impl CommandSpec {
                     } else {
                         None
                     };
-                    observe_creation(&child)?;
-                    if let Some(stop) = stop {
-                        if Instant::now() >= deadline {
-                            return Err(CiError::Message(
-                                "original exec observation cutoff exhausted before release".into(),
-                            ));
-                        }
-                        stop.release()?;
-                    }
-                    if let Some(after_release) = after_release {
-                        after_release(&child)?;
-                    }
-                    Ok(())
+                    crate::exec_observation::observe(
+                        deadline,
+                        || observe_creation(&child, deadline),
+                        || stop.map_or(Ok(()), |stop| stop.release().map_err(CiError::from)),
+                        || after_release.map_or(Ok(()), |observer| observer(&child, deadline)),
+                    )
                 })();
                 if let Err(error) = observed {
                     observation_error = Some(error);
@@ -757,9 +854,11 @@ impl CommandSpec {
         let result = match (output, observation_error) {
             (Ok(output), None) => Ok(output),
             (Ok(_), Some(error)) => Err(error),
-            (Err(error), original) => Err(CiError::Message(format!(
-                "native creation observation={original:?}; native settlement={error}"
-            ))),
+            (Err(error), None) => Err(CiError::Process(error)),
+            (Err(error), Some(original)) => Err(CiError::LaneFailures {
+                primary: Box::new(original),
+                secondary: Box::new(CiError::Process(error)),
+            }),
         };
         crate::work_outcome::WorkOutcome::observed(result, writers)
             .postcondition(custody)
@@ -903,18 +1002,41 @@ impl CommandSpec {
         }
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
         let started = Instant::now();
+        let observe_storage = cfg!(target_os = "linux")
+            && matches!(
+                self.phase,
+                Some(CiPhase::NativeCompile | CiPhase::NativeExecute)
+            );
         let diagnostic_directory = if self.phase.is_some() {
-            let directory = self.current_dir.join("target/ci/reports/execution");
-            std::fs::create_dir_all(&directory)?;
-            Some(
-                tempfile::Builder::new()
+            let allocate = || -> std::io::Result<PathBuf> {
+                let directory = self.current_dir.join("target/ci/reports/execution");
+                std::fs::create_dir_all(&directory)?;
+                Ok(tempfile::Builder::new()
                     .prefix("operation-")
                     .tempdir_in(directory)?
-                    .keep(),
-            )
+                    .keep())
+            };
+            match allocate() {
+                Ok(directory) => Some(directory),
+                Err(error) if observe_storage => {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "passive native storage retention unavailable: {error}"
+                    );
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             None
         };
+        let storage_target = self
+            .arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--target-dir")
+            .map(|pair| PathBuf::from(&pair[1]));
+        let storage_cutoff = started + budget;
         let report = |state: &str,
                       observed_budget: Duration,
                       result: Option<
@@ -927,6 +1049,20 @@ impl CommandSpec {
             };
             let mut value = serde_json::json!({"phase": phase.name(), "state": state, "program": self.program.to_string_lossy(), "arguments": self.arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>(), "toolchain": format!("{:?}", self.toolchain), "original-budget-ms": self.deadline.as_millis(), "available-budget-ms": observed_budget.as_millis(), "elapsed-ms": started.elapsed().as_millis()});
             value["selection"] = self.selection.clone().unwrap_or(serde_json::Value::Null);
+            if observe_storage {
+                let storage = crate::storage_observation::snapshot(
+                    &self.current_dir,
+                    storage_target.as_deref(),
+                    true,
+                    storage_cutoff,
+                );
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[ci native storage {state}] {storage}"
+                );
+                value["storage-observation"] = storage;
+            }
             #[cfg(unix)]
             if let Some(owner) = &self.compiler_owner {
                 value["compiler-pool"] = owner.diagnostic();
@@ -1032,9 +1168,9 @@ impl CommandSpec {
                     }
                 }
             }
-            let directory = diagnostic_directory
-                .as_ref()
-                .expect("phase diagnostics allocated");
+            let Some(directory) = diagnostic_directory.as_ref() else {
+                return Ok(());
+            };
             let temporary = directory.join(phase.name()).with_extension("tmp");
             let path = directory.join(phase.name()).with_extension("json");
             crate::release::source::write_diagnostic_json(&temporary, &value)?;
@@ -1042,9 +1178,26 @@ impl CommandSpec {
             Ok(())
         };
         if let Err(error) = report("in-progress", budget, None, None) {
-            eprintln!("diagnostic retention incomplete: {error}");
+            if observe_storage {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "diagnostic retention incomplete: {error}"
+                );
+            } else {
+                eprintln!("diagnostic retention incomplete: {error}");
+            }
         }
         let budget = self.available_budget()?;
+        let budget = if observe_storage {
+            remaining_budget(
+                budget,
+                storage_cutoff.saturating_duration_since(Instant::now()),
+                Duration::ZERO,
+            )?
+        } else {
+            budget
+        };
         let ordinary = (matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
             && self.arguments.first().is_some_and(|argument| {
                 matches!(
@@ -1071,34 +1224,35 @@ impl CommandSpec {
         let observe_cargo_progress = cfg!(target_os = "macos")
             && matches!(self.phase, Some(CiPhase::NativeCompile))
             && matches!(self.toolchain, Some(ToolchainInvocation::Cargo { .. }));
-        let (result, logger_settled, cargo_progress) =
-            std::thread::scope(|scope| {
-                let lane = match std::thread::current().name() {
-                    Some("ci-source-lane") => "first",
-                    Some("ci-auxiliary-lane") => "second",
-                    _ => "owner",
-                };
-                let phase = self.phase.map_or("command", CiPhase::name);
-                let (sender, receiver) =
-                    std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
-                let (admitted_sender, admitted_receiver) = std::sync::mpsc::sync_channel::<
-                    std::result::Result<memcordon_platform::test_support::ProcessIdentity, String>,
-                >(1);
-                let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let logger_done = done.clone();
-                let secrets: Vec<String> = [
-                    "GH_TOKEN",
-                    "GITHUB_TOKEN",
-                    "CARGO_REGISTRY_TOKEN",
-                    "CARGO_REGISTRIES_CRATES_IO_TOKEN",
-                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-                ]
-                .into_iter()
-                .filter_map(|key| std::env::var(key).ok())
-                .filter(|value| !value.is_empty())
-                .collect();
-                let logger = scope.spawn(move || {
+        let (result, logger_settled, cargo_progress) = std::thread::scope(|scope| {
+            let lane = match std::thread::current().name() {
+                Some("ci-source-lane") => "first",
+                Some("ci-auxiliary-lane") => "second",
+                _ => "owner",
+            };
+            let phase = self.phase.map_or("command", CiPhase::name);
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
+            let (admitted_sender, admitted_receiver) = std::sync::mpsc::sync_channel::<
+                std::result::Result<memcordon_platform::test_support::ProcessIdentity, String>,
+            >(1);
+            let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let logger_done = done.clone();
+            let secrets: Vec<String> = [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "CARGO_REGISTRY_TOKEN",
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            ]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+            .collect();
+            let storage_root = self.current_dir.clone();
+            let storage_target = storage_target.clone();
+            let logger = scope.spawn(move || {
                 let mut cargo_progress = observe_cargo_progress
                     .then(|| crate::cargo_progress::CargoProgress::new(budget));
                 let mut pending = [Vec::new(), Vec::new()];
@@ -1106,11 +1260,34 @@ impl CommandSpec {
                 let mut remaining: usize = 1024 * 1024;
                 let mut omitted_lines = 0_u64;
                 let mut final_chunks = 0;
+                let mut next_storage_sample = Duration::from_secs(60);
+                let mut storage_samples = 0;
                 #[cfg(target_os = "macos")]
                 let mut admitted = None;
                 #[cfg(target_os = "macos")]
                 let mut next_native_sample = Duration::ZERO;
                 loop {
+                    if observe_storage
+                        && storage_samples < 32
+                        && !logger_done.load(std::sync::atomic::Ordering::Acquire)
+                        && Instant::now() < storage_cutoff
+                        && started.elapsed() >= next_storage_sample
+                    {
+                        let storage = crate::storage_observation::snapshot(
+                            &storage_root,
+                            storage_target.as_deref(),
+                            false,
+                            storage_cutoff,
+                        );
+                        use std::io::Write;
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "[ci native storage during elapsed-ms={}] {storage}",
+                            started.elapsed().as_millis()
+                        );
+                        storage_samples += 1;
+                        next_storage_sample = started.elapsed() + Duration::from_secs(60);
+                    }
                     #[cfg(target_os = "macos")]
                     if observe_cargo_progress
                         && !logger_done.load(std::sync::atomic::Ordering::Acquire)
@@ -1155,11 +1332,17 @@ impl CommandSpec {
                     };
                     for byte in chunk.bytes {
                         if byte == b'\n' {
-                            if !discarding[stream] && let Some(safe) =
-                                crate::command_progress_line::observe_complete_line(
-                                    &pending[stream], &secrets, &mut remaining,
-                                    cargo_progress.as_mut(), started.elapsed(), chunk.stream,
-                                ) {
+                            if !discarding[stream]
+                                && let Some(safe) =
+                                    crate::command_progress_line::observe_complete_line(
+                                        &pending[stream],
+                                        &secrets,
+                                        &mut remaining,
+                                        cargo_progress.as_mut(),
+                                        started.elapsed(),
+                                        chunk.stream,
+                                    )
+                            {
                                 eprintln!("[ci {lane} {phase} {:?}] {safe}", chunk.stream);
                             } else if !discarding[stream] {
                                 omitted_lines = omitted_lines.saturating_add(1);
@@ -1188,57 +1371,69 @@ impl CommandSpec {
                 }
                 (cargo_progress, omitted_lines)
             });
-                let progress = (progress || observe_cargo_progress).then(|| {
-                    memcordon_testkit::ProgressOutput {
-                        sender,
-                        omitted: omitted.clone(),
-                        admitted: observe_cargo_progress.then_some(admitted_sender),
-                    }
+            let progress =
+                (progress || observe_cargo_progress).then(|| memcordon_testkit::ProgressOutput {
+                    sender,
+                    omitted: omitted.clone(),
+                    admitted: observe_cargo_progress.then_some(admitted_sender),
                 });
-                let failure = if self.defer_group_failure {
-                    None
-                } else {
-                    group.clone().map(|group| {
-                        let operation = self.phase.map_or("command", CiPhase::name);
-                        std::sync::Arc::new(move |notice| {
-                            group.request_command_failure_notice(operation, notice)
-                        })
-                            as std::sync::Arc<
-                                dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
-                            >
+            let failure = if self.defer_group_failure {
+                None
+            } else {
+                group.clone().map(|group| {
+                    let operation = self.phase.map_or("command", CiPhase::name);
+                    std::sync::Arc::new(move |notice| {
+                        group.request_command_failure_notice(operation, notice)
                     })
-                };
-                let external_stop = (cancel_safe
-                    && crate::cancellation::retirement_deadline().is_none())
-                .then(|| {
+                        as std::sync::Arc<
+                            dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
+                        >
+                })
+            };
+            let external_stop =
+                (cancel_safe && crate::cancellation::retirement_deadline().is_none()).then(|| {
                     std::sync::Arc::new(|| crate::cancellation::observed().is_some())
                         as std::sync::Arc<dyn Fn() -> bool + Send + Sync>
                 });
-                let result = memcordon_testkit::run_with_deadline_external_stop_output_limit(
+            let execution_budget = if observe_storage {
+                budget.min(storage_cutoff.saturating_duration_since(Instant::now()))
+            } else {
+                budget
+            };
+            let result = if execution_budget.is_zero() {
+                Err(memcordon_testkit::ProcessTestError::Spawn(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "original native cutoff exhausted before spawn",
+                    ),
+                ))
+            } else {
+                memcordon_testkit::run_with_deadline_external_stop_output_limit(
                     command,
-                    budget,
+                    execution_budget,
                     self.output_limit,
                     cancellation,
                     progress,
                     failure,
                     external_stop,
-                );
-                done.store(true, std::sync::atomic::Ordering::Release);
-                // Incomplete reader settlement cannot keep the logger waiting for
-                // a sender forever. The native result remains authoritative.
-                let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
-                    Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
-                    Err(_) => (false, None, 0),
-                };
-                let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
-                if let Some(observed) = &mut cargo_progress {
-                    observed.finish(omitted_lines, omitted);
-                }
-                if omitted != 0 {
-                    eprintln!("[ci child] omitted {omitted} progress chunks");
-                }
-                (result, logger_settled, cargo_progress)
-            });
+                )
+            };
+            done.store(true, std::sync::atomic::Ordering::Release);
+            // Incomplete reader settlement cannot keep the logger waiting for
+            // a sender forever. The native result remains authoritative.
+            let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
+                Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
+                Err(_) => (false, None, 0),
+            };
+            let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
+            if let Some(observed) = &mut cargo_progress {
+                observed.finish(omitted_lines, omitted);
+            }
+            if omitted != 0 {
+                eprintln!("[ci child] omitted {omitted} progress chunks");
+            }
+            (result, logger_settled, cargo_progress)
+        });
         if !self.defer_group_failure
             && (result.as_ref().is_err()
                 || result.as_ref().is_ok_and(|output| !output.status.success()))
@@ -1252,6 +1447,10 @@ impl CommandSpec {
         if let (Err(error), Some(group)) = (&result, &group) {
             use memcordon_testkit::ProcessTestError;
             let unsettled = match error {
+                ProcessTestError::ApplicationEnded { .. } => {
+                    crate::work_outcome::native_error_settlement(error)
+                        == crate::work_outcome::WriterSettlement::Unknown
+                }
                 ProcessTestError::Wait(_) | ProcessTestError::Output(_) => true,
                 ProcessTestError::Callback {
                     cleanup,
@@ -1286,7 +1485,15 @@ impl CommandSpec {
             "failed"
         };
         if let Err(error) = report(state, budget, Some(&result), cargo_progress.as_ref()) {
-            eprintln!("diagnostic retention incomplete: {error}");
+            if observe_storage {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "diagnostic retention incomplete: {error}"
+                );
+            } else {
+                eprintln!("diagnostic retention incomplete: {error}");
+            }
         }
         finish_native_observation(result, logger_settled).into_result()
     }

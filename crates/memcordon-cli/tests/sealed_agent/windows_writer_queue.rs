@@ -25,6 +25,7 @@ fn frozen_lane() -> (Lane, mpsc::Receiver<Snapshot>) {
     let (sender, receiver) = mpsc::sync_channel(PENDING_SNAPSHOTS);
     (
         Lane {
+            observation: None,
             publisher_error: Arc::new(OnceLock::new()),
             sender,
             quarantined: Arc::new(AtomicBool::new(false)),

@@ -330,6 +330,88 @@ pub fn control_service_loss_observation(
         })
 }
 
+pub const CONTROL_RECOVERY_CHECKS: &[&str] = &[
+    "response-reject-variant",
+    "authority-serialization",
+    "response-schema",
+    "delivery-consistency",
+    "delivery-attempt",
+    "delivery-nonce",
+    "delivery-request",
+    "delivery-terminal-digest",
+    "live-nonce",
+    "selected-fault",
+    "live-nonce-present",
+    "live-target-present",
+    "selected-site-binding",
+    "observed-selected-fault",
+    "rejection-consistency",
+    "provider-failure-present",
+    "guardian-receipt-present",
+    "terminal-receipt-present",
+    "failure-consistency",
+    "failure-provider",
+    "failure-attempt",
+    "failure-request",
+    "live-consistency",
+    "live-provider",
+    "live-attempt",
+    "live-request",
+    "guardian-identity",
+    "worker-identity",
+    "terminal-attempt",
+    "terminal-request",
+    "terminal-validation",
+    "terminal-root",
+    "terminal-nonce",
+    "frontend-trigger",
+    "monitor-failed-outcome",
+    "original-event-present",
+    "original-event-shape",
+    "secondary-selected-event",
+    "live-association-present",
+    "delivery-present",
+];
+
+#[derive(Default)]
+pub struct ControlServiceRecoveryAssessment {
+    pub accepted: bool,
+    checks: Vec<(&'static str, bool)>,
+    first_failed_check: Option<&'static str>,
+    missing_prerequisite: bool,
+    authority_bytes: Option<usize>,
+    authority_sha256: Option<String>,
+    delivery_terminal_bytes: Option<usize>,
+    delivery_terminal_sha256: Option<String>,
+}
+impl ControlServiceRecoveryAssessment {
+    fn check(&mut self, name: &'static str, passed: bool) -> bool {
+        self.checks.push((name, passed));
+        if !passed && self.first_failed_check.is_none() {
+            self.first_failed_check = Some(name);
+        }
+        passed
+    }
+    fn present(&mut self, name: &'static str, present: bool) -> bool {
+        if !present {
+            self.missing_prerequisite = true;
+        }
+        self.check(name, present)
+    }
+    pub fn diagnostic(&self) -> serde_json::Value {
+        let checks = self
+            .checks
+            .iter()
+            .map(|(name, passed)| ((*name).to_owned(), serde_json::json!(passed)))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::json!({"diagnostic_only":true,"acceptance_authority":false,"accepted":self.accepted,
+            "first_failed_check":self.first_failed_check,"first_failed_check_state":self.first_failed_check.map(|_|if self.missing_prerequisite {"missing-prerequisite"}else{"evaluated-false"}),
+            "evaluated_checks":self.checks.len(),"remaining_checks_not_evaluated":!self.accepted,
+            "checks":checks,"authority_bytes":self.authority_bytes,"authority_sha256":self.authority_sha256,
+            "delivery_terminal_bytes":self.delivery_terminal_bytes,"delivery_terminal_sha256":self.delivery_terminal_sha256})
+    }
+}
+
 pub fn control_service_guardian_injection_authority(
     rejection: &memcordon_core::WindowsProviderRejectionV3,
     selected: memcordon_core::WindowsSealedFault,
@@ -339,22 +421,55 @@ pub fn control_service_guardian_injection_authority(
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedControlServiceLoss,
 ) -> bool {
-    selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
-        && live.live_nonce.as_deref().is_some_and(|nonce| {
-            live.live_target_identity.as_ref().is_some_and(|target| {
-                observed
-                    .site
-                    .binds(attempt, nonce, request, selected, target.process_id)
-            })
-        })
-        && guardian_frontend_chain_authority(
+    evaluate_control_service_guardian(
+        rejection,
+        selected,
+        provider,
+        attempt,
+        request,
+        live,
+        (observed, &mut ControlServiceRecoveryAssessment::default()),
+    )
+}
+fn evaluate_control_service_guardian(
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observation: (
+        &ObservedControlServiceLoss,
+        &mut ControlServiceRecoveryAssessment,
+    ),
+) -> bool {
+    let (observed, assessment) = observation;
+    assessment.check(
+        "selected-fault",
+        selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization,
+    ) && assessment.present("live-nonce-present", live.live_nonce.is_some())
+        && assessment.present("live-target-present", live.live_target_identity.is_some())
+        && assessment.check(
+            "selected-site-binding",
+            observed.site.binds(
+                attempt,
+                live.live_nonce.as_deref().expect("checked nonce"),
+                request,
+                selected,
+                live.live_target_identity
+                    .as_ref()
+                    .expect("checked target")
+                    .process_id,
+            ),
+        )
+        && evaluate_guardian_frontend_chain(
             rejection,
             selected,
             provider,
             attempt,
             request,
             live,
-            &observed.frontend,
+            (&observed.frontend, assessment),
         )
 }
 
@@ -364,7 +479,17 @@ pub fn control_service_recovery_authority(
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedControlServiceLoss,
 ) -> bool {
+    control_service_recovery_assessment(response, delivery, live, observed).accepted
+}
+
+pub fn control_service_recovery_assessment(
+    response: &memcordon_core::WindowsProviderResponseV4,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observed: &ObservedControlServiceLoss,
+) -> ControlServiceRecoveryAssessment {
     use memcordon_core::*;
+    let mut assessment = ControlServiceRecoveryAssessment::default();
     let WindowsProviderResponseV4::Reject {
         schema_version,
         attempt_id,
@@ -373,28 +498,51 @@ pub fn control_service_recovery_authority(
         rejection,
     } = response
     else {
-        return false;
+        assessment.present("response-reject-variant", false);
+        return assessment;
     };
+    assessment.check("response-reject-variant", true);
     let Ok(authority) = response.terminal_authority_json() else {
-        return false;
+        assessment.check("authority-serialization", false);
+        return assessment;
     };
-    *schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION
-        && delivery.is_consistent()
-        && delivery.attempt_id == *attempt_id
-        && delivery.nonce == *nonce
-        && delivery.request_sha256 == *request_sha256
-        && delivery.terminal_sha256
-            == crate::windows_causal_acceptance::sha256(authority.as_bytes())
-        && live.live_nonce.as_ref() == Some(nonce)
-        && control_service_guardian_injection_authority(
+    assessment.check("authority-serialization", true);
+    assessment.authority_bytes = Some(authority.len());
+    assessment.authority_sha256 = Some(crate::windows_causal_acceptance::sha256(
+        authority.as_bytes(),
+    ));
+    assessment.delivery_terminal_bytes = Some(delivery.terminal_sha256.len());
+    assessment.delivery_terminal_sha256 = (delivery.terminal_sha256.len() == 64
+        && delivery
+            .terminal_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| delivery.terminal_sha256.clone());
+    assessment.accepted = assessment.check(
+        "response-schema",
+        *schema_version == WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+    ) && assessment.check("delivery-consistency", delivery.is_consistent())
+        && assessment.check("delivery-attempt", delivery.attempt_id == *attempt_id)
+        && assessment.check("delivery-nonce", delivery.nonce == *nonce)
+        && assessment.check(
+            "delivery-request",
+            delivery.request_sha256 == *request_sha256,
+        )
+        && assessment.check(
+            "delivery-terminal-digest",
+            Some(&delivery.terminal_sha256) == assessment.authority_sha256.as_ref(),
+        )
+        && assessment.check("live-nonce", live.live_nonce.as_ref() == Some(nonce))
+        && evaluate_control_service_guardian(
             rejection,
             WindowsSealedFault::ControlServiceKilledAfterAuthorization,
             &live.association.provider,
             attempt_id,
             request_sha256,
             live,
-            observed,
-        )
+            (observed, &mut assessment),
+        );
+    assessment
 }
 
 fn guardian_frontend_chain_authority(
@@ -406,68 +554,104 @@ fn guardian_frontend_chain_authority(
     live: &memcordon_core::WindowsGuardianAttemptObservation,
     observed: &ObservedFrontendLoss,
 ) -> bool {
+    evaluate_guardian_frontend_chain(
+        rejection,
+        selected,
+        provider,
+        attempt,
+        request,
+        live,
+        (observed, &mut ControlServiceRecoveryAssessment::default()),
+    )
+}
+fn evaluate_guardian_frontend_chain(
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observation: (&ObservedFrontendLoss, &mut ControlServiceRecoveryAssessment),
+) -> bool {
     use memcordon_core::*;
-    if observed.selected != selected || !rejection.is_consistent() {
+    let (observed, assessment) = observation;
+    if !assessment.check("observed-selected-fault", observed.selected == selected)
+        || !assessment.check("rejection-consistency", rejection.is_consistent())
+    {
         return false;
     }
-    let (Some(failure), Some(guardian), Some(terminal)) = (
+    let prerequisites = (
         rejection.provider_failure.as_ref(),
         rejection.guardian_causal_receipt.as_ref(),
         rejection.terminal_receipt(),
-    ) else {
+    );
+    if !assessment.present("provider-failure-present", prerequisites.0.is_some())
+        || !assessment.present("guardian-receipt-present", prerequisites.1.is_some())
+        || !assessment.present("terminal-receipt-present", prerequisites.2.is_some())
+    {
         return false;
+    }
+    let (Some(failure), Some(guardian), Some(terminal)) = prerequisites else {
+        unreachable!("checked causal prerequisites")
     };
-    if !failure.is_consistent()
-        || &failure.provider_binding != provider
-        || String::from(failure.attempt_id.clone()) != attempt
-        || String::from(failure.request_sha256.clone()) != request
-        || !live.is_consistent()
-        || &live.association.provider != provider
-        || String::from(live.association.attempt_id.clone()) != attempt
-        || String::from(live.association.request_sha256.clone()) != request
-        || live.guardian_identity != guardian.guardian_identity
-        || live.worker_process_identity.as_ref() != Some(&guardian.worker_identity)
-        || terminal.attempt_id != attempt
-        || terminal.request_sha256 != request
-        || terminal.validate_for_attempt().is_err()
-        || terminal.process_observation.root_identity != live.live_target_identity
-        || live.live_nonce.as_ref() != Some(&terminal.nonce)
-        || !matches!(&guardian.cleanup_trigger, Some(WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, native_exit_status })
-            if frontend == &observed.identity && *native_exit_status == observed.native_status)
-        || !terminal
+    if !assessment.check("failure-consistency",failure.is_consistent())
+        || !assessment.check("failure-provider",&failure.provider_binding == provider)
+        || !assessment.check("failure-attempt",String::from(failure.attempt_id.clone()) == attempt)
+        || !assessment.check("failure-request",String::from(failure.request_sha256.clone()) == request)
+        || !assessment.check("live-consistency",live.is_consistent())
+        || !assessment.check("live-provider",&live.association.provider == provider)
+        || !assessment.check("live-attempt",String::from(live.association.attempt_id.clone()) == attempt)
+        || !assessment.check("live-request",String::from(live.association.request_sha256.clone()) == request)
+        || !assessment.check("guardian-identity",live.guardian_identity == guardian.guardian_identity)
+        || !assessment.check("worker-identity",live.worker_process_identity.as_ref() == Some(&guardian.worker_identity))
+        || !assessment.check("terminal-attempt",terminal.attempt_id == attempt)
+        || !assessment.check("terminal-request",terminal.request_sha256 == request)
+        || !assessment.check("terminal-validation",terminal.validate_for_attempt().is_ok())
+        || !assessment.check("terminal-root",terminal.process_observation.root_identity == live.live_target_identity)
+        || !assessment.check("terminal-nonce",live.live_nonce.as_ref() == Some(&terminal.nonce))
+        || !assessment.check("frontend-trigger",matches!(&guardian.cleanup_trigger, Some(WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, native_exit_status })
+            if frontend == &observed.identity && *native_exit_status == observed.native_status))
+        || !assessment.check("monitor-failed-outcome",terminal
             .execution()
-            .is_some_and(|(_, outcome, _)| matches!(outcome, RunOutcome::MonitorFailed { .. }))
+            .is_some_and(|(_, outcome, _)| matches!(outcome, RunOutcome::MonitorFailed { .. })))
     {
         return false;
     }
     let OriginalFailureV1::Observed { event: original } = &failure.original else {
+        assessment.present("original-event-present", false);
         return false;
     };
-    if original.sequence == 0
-        || original.origin != DiagnosticOriginV1::Launcher
-        || original.category != FailureCategoryV1::Monitor
-        || original.operation != FailureOperationV1::CheckGuardian
-        || original.code != FailureCodeV1::GuardianLoss
-        || original.observed_phase != AttemptObservationPhaseV1::Monitoring
-        || original.native_code.is_some()
-        || original.safe_detail != SafeDiagnosticDetailV1::NoAdditionalDetail
-    {
+    assessment.check("original-event-present", true);
+    if !assessment.check(
+        "original-event-shape",
+        !(original.sequence == 0
+            || original.origin != DiagnosticOriginV1::Launcher
+            || original.category != FailureCategoryV1::Monitor
+            || original.operation != FailureOperationV1::CheckGuardian
+            || original.code != FailureCodeV1::GuardianLoss
+            || original.observed_phase != AttemptObservationPhaseV1::Monitoring
+            || original.native_code.is_some()
+            || original.safe_detail != SafeDiagnosticDetailV1::NoAdditionalDetail),
+    ) {
         return false;
     }
-    failure.secondary.as_slice().iter().any(|event| {
-        event.sequence > original.sequence
-            && event.origin == DiagnosticOriginV1::Launcher
-            && event.category == FailureCategoryV1::Transport
-            && event.operation == FailureOperationV1::DeliverResponse
-            && event.code == FailureCodeV1::ControlTransport
-            && event.observed_phase == AttemptObservationPhaseV1::Cleaning
-            && matches!(
-                event.native_code,
-                Some(NativeFailureCodeV1::Win32(109 | 232 | 233))
-            )
-            && event.safe_detail
-                == (SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected })
-    })
+    assessment.check(
+        "secondary-selected-event",
+        failure.secondary.as_slice().iter().any(|event| {
+            event.sequence > original.sequence
+                && event.origin == DiagnosticOriginV1::Launcher
+                && event.category == FailureCategoryV1::Transport
+                && event.operation == FailureOperationV1::DeliverResponse
+                && event.code == FailureCodeV1::ControlTransport
+                && event.observed_phase == AttemptObservationPhaseV1::Cleaning
+                && matches!(
+                    event.native_code,
+                    Some(NativeFailureCodeV1::Win32(109 | 232 | 233))
+                )
+                && event.safe_detail
+                    == (SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected })
+        }),
+    )
 }
 
 pub fn fault_selectors() -> Vec<memcordon_core::WindowsSealedFault> {
@@ -907,6 +1091,37 @@ mod native {
         Ok(())
     }
 
+    fn retain_case_result(
+        result: Result<()>,
+        directory: &std::path::Path,
+        selector: &serde_json::Value,
+        record: &mut ComponentAssessment,
+        cutoff: Instant,
+    ) -> Result<()> {
+        let marker = serde_json::json!({
+            "format":"memcordon.windows-component-case-assessment","revision":1,
+            "diagnostic_only":true,"acceptance_authority":false,
+            "selected_fault":selector.get("fault"),"selected_mutant":selector.get("mutant"),
+            "collection_ok":record.collection.is_ok(),"retirement_ok":record.retirement.is_ok(),
+            "error_sha256":result.as_ref().err().map(|error|crate::windows_causal_acceptance::sha256(error.to_string().as_bytes()))
+        });
+        crate::windows_component_retention::after(
+            || result,
+            || {
+                if Instant::now() >= cutoff {
+                    return Err(CiError::Message(
+                        "component case marker original cleanup cutoff exhausted".into(),
+                    ));
+                }
+                retain(
+                    &directory.join("component-case-assessment.json"),
+                    &serde_json::to_vec(&marker)?,
+                    record,
+                )
+            },
+        )
+    }
+
     pub fn run(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &ComponentInput,
@@ -965,7 +1180,9 @@ mod native {
                 record,
                 deadlines,
             );
-            if let Err(error) = result {
+            if let Err(error) =
+                retain_case_result(result, &directory, &selector, record, deadlines.cleanup)
+            {
                 return Err(error);
             }
             if record.retirement.is_err() {
@@ -989,7 +1206,7 @@ mod native {
                 .join("native-components")
                 .join(format!("mutant-{ordinal}"));
             fs::create_dir_all(&directory)?;
-            if let Err(error) = exercise(
+            let result = exercise(
                 config,
                 input,
                 base,
@@ -999,7 +1216,10 @@ mod native {
                 &directory,
                 record,
                 deadlines,
-            ) {
+            );
+            if let Err(error) =
+                retain_case_result(result, &directory, &selector, record, deadlines.cleanup)
+            {
                 return Err(error);
             }
             if record.retirement.is_err() {
@@ -1887,6 +2107,15 @@ mod native {
             Ok(())
         })();
         drop(frontend_gate_owner);
+        let mut control_assessment = (fault
+            == Some(memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization))
+        .then(|| {
+            serde_json::json!({
+                "format":"memcordon.windows-control-service-assessment","revision":1,
+                "diagnostic_only":true,"acceptance_authority":false,"selected_fault":fault,
+                "loss":{"state":"not-observed"},"recovery":{"state":"not-observed"}
+            })
+        });
         let collection = (|| -> Result<()> {
             if let Err(retention) = post_spawn_retention {
                 return Err(match &output {
@@ -1980,6 +2209,10 @@ mod native {
                 .pointer("/launch/nonce")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| CiError::Message("component launch nonce absent".into()))?;
+            if let Some(assessment) = &mut control_assessment {
+                assessment["attempt_id"] = serde_json::json!(attempt);
+                assessment["request_sha256"] = serde_json::json!(request);
+            }
             let mut observed_frontend_loss = None;
             let mut observed_control_service_loss = None;
             if fault.is_some_and(|fault| {
@@ -2357,25 +2590,126 @@ mod native {
                     let association = association.as_ref().ok_or_else(|| {
                         CiError::Message("original held association absent".into())
                     })?;
-                    if control.process.has_exited()? && frontend.has_exited()? {
-                        observed_control_service_loss = control_service_loss_observation(
-                            site,
-                            &ControlServiceRetirement {
-                                process: identity(&control.process)?,
-                                thread: control.identity,
-                                process_status: control.process.native_exit_status()?,
-                                thread_status: worker_exit(control)?,
-                                frontend: identity(frontend)?,
-                                frontend_status: frontend.native_exit_status()?.ok_or_else(
-                                    || {
-                                        CiError::Message(
-                                            "original frontend native exit absent".into(),
-                                        )
-                                    },
-                                )?,
-                            },
-                            association,
+                    if let Some(assessment) = &mut control_assessment {
+                        assessment["loss"] = serde_json::json!({
+                            "state":"assessment-started",
+                            "site_sha256":serde_json::to_vec(site).ok().map(|bytes|crate::windows_causal_acceptance::sha256(&bytes)),
+                            "association_sha256":serde_json::to_vec(association).ok().map(|bytes|crate::windows_causal_acceptance::sha256(&bytes)),
+                            "process":{"process_id":control.process.identity.pid,"creation_time_100ns":control.process.identity.birth},"thread":control.identity,
+                            "frontend":{"process_id":frontend.identity.pid,"creation_time_100ns":frontend.identity.birth},"loss_observation_present":null,
+                            "frontend_retired":null,"process_status":null,"thread_status":null,"frontend_status":null
+                        });
+                    }
+                    let process_retired = control.process.has_exited();
+                    if let Some(assessment) = &mut control_assessment {
+                        assessment["loss"]["query_phase"] = serde_json::json!("process-retired");
+                        assessment["loss"]["query_failed"] =
+                            serde_json::json!(process_retired.is_err());
+                        assessment["loss"]["process_retired"] =
+                            serde_json::json!(process_retired.as_ref().ok());
+                        assessment["loss"]["query_error_code"] = serde_json::json!(
+                            process_retired
+                                .as_ref()
+                                .err()
+                                .and_then(io::Error::raw_os_error)
                         );
+                    }
+                    if process_retired? {
+                        let frontend_retired = frontend.has_exited();
+                        if let Some(assessment) = &mut control_assessment {
+                            assessment["loss"]["query_phase"] =
+                                serde_json::json!("frontend-retired");
+                            assessment["loss"]["query_failed"] =
+                                serde_json::json!(frontend_retired.is_err());
+                            assessment["loss"]["frontend_retired"] =
+                                serde_json::json!(frontend_retired.as_ref().ok());
+                            assessment["loss"]["query_error_code"] = serde_json::json!(
+                                frontend_retired
+                                    .as_ref()
+                                    .err()
+                                    .and_then(io::Error::raw_os_error)
+                            );
+                        }
+                        if frontend_retired? {
+                            let process = identity(&control.process)?;
+                            let process_status = control.process.native_exit_status();
+                            if let Some(assessment) = &mut control_assessment {
+                                assessment["loss"]["query_phase"] =
+                                    serde_json::json!("process-status");
+                                assessment["loss"]["query_failed"] =
+                                    serde_json::json!(process_status.is_err());
+                                assessment["loss"]["process_status"] =
+                                    serde_json::json!(process_status.as_ref().ok());
+                                assessment["loss"]["query_error_code"] = serde_json::json!(
+                                    process_status
+                                        .as_ref()
+                                        .err()
+                                        .and_then(io::Error::raw_os_error)
+                                );
+                            }
+                            let process_status = process_status?;
+                            let thread_status = worker_exit(control);
+                            if let Some(assessment) = &mut control_assessment {
+                                assessment["loss"]["query_phase"] =
+                                    serde_json::json!("thread-status");
+                                assessment["loss"]["query_failed"] =
+                                    serde_json::json!(thread_status.is_err());
+                                assessment["loss"]["thread_status"] =
+                                    serde_json::json!(thread_status.as_ref().ok());
+                                assessment["loss"]["query_error_code"] = serde_json::json!(
+                                    thread_status
+                                        .as_ref()
+                                        .err()
+                                        .and_then(io::Error::raw_os_error)
+                                );
+                            }
+                            let thread_status = thread_status?;
+                            let frontend_identity = identity(frontend)?;
+                            let frontend_status = frontend.native_exit_status();
+                            if let Some(assessment) = &mut control_assessment {
+                                assessment["loss"]["query_phase"] =
+                                    serde_json::json!("frontend-status");
+                                assessment["loss"]["query_failed"] =
+                                    serde_json::json!(frontend_status.is_err());
+                                assessment["loss"]["frontend_status"] =
+                                    serde_json::json!(frontend_status.as_ref().ok());
+                                assessment["loss"]["query_error_code"] = serde_json::json!(
+                                    frontend_status
+                                        .as_ref()
+                                        .err()
+                                        .and_then(io::Error::raw_os_error)
+                                );
+                            }
+                            let retirement = ControlServiceRetirement {
+                                process,
+                                thread: control.identity,
+                                process_status,
+                                thread_status,
+                                frontend: frontend_identity,
+                                frontend_status: frontend_status?.ok_or_else(|| {
+                                    CiError::Message("original frontend native exit absent".into())
+                                })?,
+                            };
+                            observed_control_service_loss =
+                                control_service_loss_observation(site, &retirement, association);
+                            if let Some(assessment) = &mut control_assessment {
+                                assessment["loss"]["state"] = serde_json::json!("assessed");
+                                assessment["loss"]["process_status"] =
+                                    serde_json::json!(retirement.process_status);
+                                assessment["loss"]["thread_status"] =
+                                    serde_json::json!(retirement.thread_status);
+                                assessment["loss"]["frontend_status"] =
+                                    serde_json::json!(retirement.frontend_status);
+                                assessment["loss"]["loss_observation_present"] =
+                                    serde_json::json!(observed_control_service_loss.is_some());
+                            }
+                        } else if let Some(assessment) = &mut control_assessment {
+                            assessment["loss"]["skipped_reason"] =
+                                serde_json::json!("frontend-not-retired");
+                        }
+                    } else if let Some(assessment) = &mut control_assessment {
+                        assessment["loss"]["skipped_reason"] =
+                            serde_json::json!("process-not-retired");
                     }
                 }
                 let recovery_budget = recovery_cutoff
@@ -2407,12 +2741,25 @@ mod native {
                 let remaining = recovery_cutoff.checked_duration_since(Instant::now())
                     .filter(|budget| !budget.is_zero())
                     .ok_or_else(|| CiError::Message("original terminal recovery cutoff exhausted during command preparation".into()))?;
+                if let Some(assessment) = &mut control_assessment {
+                    assessment["recovery"]["state"] = serde_json::json!("command-started");
+                    assessment["recovery"]["command_attempted"] = serde_json::json!(true);
+                }
                 let output = memcordon_testkit::run_with_deadline_output_limit(
                     &mut recovery,
                     remaining,
                     2 * 1024 * 1024,
                 )
                 .map_err(|error| CiError::Message(error.to_string()))?;
+                if let Some(assessment) = &mut control_assessment {
+                    assessment["recovery"] = serde_json::json!({
+                        "state":"command-returned","command_attempted":true,
+                        "native_status":output.status.code(),"command_success":output.status.success(),
+                        "stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),
+                        "stdout_bytes":output.stdout.len(),"stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr),
+                        "stderr_bytes":output.stderr.len(),"loss_observation_present":observed_control_service_loss.is_some()
+                    });
+                }
                 retain(
                     &directory.join("terminal-recovery.json"),
                     &output.stdout,
@@ -2480,12 +2827,43 @@ mod native {
                     } else { false };
                     let selected_control_guardian_original = if let (Some(selected), Some(observed)) = (fault, observed_control_service_loss.as_ref()) {
                         let association = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
-                        let delivery = recovered.get("frontend_delivery").cloned().and_then(|value|
-                            serde_json::from_value::<memcordon_core::WindowsFrontendDeliveryV3>(value).ok());
-                        selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
-                            && association.as_ref().zip(delivery.as_ref()).is_some_and(|(association, delivery)|
-                                control_service_recovery_authority(&response, delivery, association, observed))
+                        let delivery_parse = recovered.get("frontend_delivery").cloned().map(
+                            serde_json::from_value::<memcordon_core::WindowsFrontendDeliveryV3>);
+                        if let Some(assessment) = &mut control_assessment {
+                            assessment["recovery"]["delivery_present"] = serde_json::json!(delivery_parse.is_some());
+                            assessment["recovery"]["delivery_parsed"] = serde_json::json!(delivery_parse.as_ref().is_some_and(|value|value.is_ok()));
+                            assessment["recovery"]["delivery_parse_error"] = serde_json::json!(delivery_parse.as_ref().and_then(|value|value.as_ref().err()).map(|error|format!("{:?}",error.classify())));
+                        }
+                        let delivery = delivery_parse.and_then(std::result::Result::ok);
+                        let evaluated = if selected != memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization {
+                            let mut value=ControlServiceRecoveryAssessment::default();
+                            value.check("selected-fault",false);value
+                        } else if let Some((association,delivery))=association.as_ref().zip(delivery.as_ref()) {
+                            control_service_recovery_assessment(&response,delivery,association,observed)
+                        } else {
+                            let mut value=ControlServiceRecoveryAssessment::default();
+                            if value.present("live-association-present",association.is_some()) {
+                                value.present("delivery-present",delivery.is_some());
+                            }
+                            value
+                        };
+                        if let Some(assessment)=&mut control_assessment {
+                            assessment["recovery"]["authority_assessment"]=evaluated.diagnostic();
+                        }
+                        evaluated.accepted
                     } else { false };
+                    if let Some(assessment) = &mut control_assessment {
+                        if observed_control_service_loss.is_none() {
+                            assessment["recovery"]["skipped_reason"] = serde_json::json!("loss-observation-unavailable");
+                        }
+                        assessment["recovery"]["response_variant"] = serde_json::json!(match &response {
+                            memcordon_core::WindowsProviderResponseV4::Terminal(_) => "terminal",
+                            memcordon_core::WindowsProviderResponseV4::Reject{..} => "reject",
+                            _ => "other"
+                        });
+                        assessment["recovery"]["receipt_present"] = serde_json::json!(receipt.is_some());
+                        assessment["recovery"]["selected_control_guardian_original"] = serde_json::json!(selected_control_guardian_original);
+                    }
                     if let Some(receipt) = receipt {
                         receipt.validate_for_attempt().map_err(|error| CiError::Message(error.into()))?;
                         if receipt.attempt_id == attempt && receipt.nonce == nonce && receipt.request_sha256 == request
@@ -2522,6 +2900,9 @@ mod native {
                         }
                     }
                 }
+            }
+            if let Some(assessment) = &mut control_assessment {
+                assessment["final_rejected"] = serde_json::json!(rejected);
             }
             if !rejected {
                 return Err(CiError::Message(format!(
@@ -3000,7 +3381,41 @@ mod native {
             record.behavior = Err(error.to_string());
             record.collection = Err(error.to_string());
         }
-        collection?;
-        retirement
+        let assessment_retention = if let Some(mut assessment) = control_assessment {
+            assessment["collection_succeeded"] = serde_json::json!(collection.is_ok());
+            assessment["settlement_succeeded"] = serde_json::json!(retirement.is_ok());
+            (|| -> Result<()> {
+                if Instant::now() >= deadlines.cleanup {
+                    return Err(CiError::Message(
+                        "control assessment retention original cleanup cutoff exhausted".into(),
+                    ));
+                }
+                let bytes = serde_json::to_vec(&assessment)?;
+                if bytes.len() > 8192 {
+                    return Err(CiError::Message("control assessment exceeds 8 KiB".into()));
+                }
+                retain(
+                    &directory.join("control-service-assessment.json"),
+                    &bytes,
+                    record,
+                )
+            })()
+        } else {
+            Ok(())
+        };
+        match (collection.and(retirement), assessment_retention) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            }),
+            (result, Ok(())) => result,
+            (Ok(()), Err(error)) => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "control assessment diagnostic retention incomplete: {error}"
+                );
+                Ok(())
+            }
+        }
     }
 }

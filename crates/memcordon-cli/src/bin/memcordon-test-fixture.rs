@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use memcordon_core::{ByteSize, NativeArgument};
 
+mod fixture_identity_snapshot;
+
 #[cfg(windows)]
 #[path = "consumer_readiness_windows/mod.rs"]
 mod consumer_readiness_windows;
@@ -597,6 +599,7 @@ fn fork_continually(mut args: impl Iterator<Item = OsString>) {
     }
     let path = pid_file.unwrap_or_else(|| fail("fork-continually requires --pid-file"));
     let executable = std::env::current_exe().unwrap_or_else(|error| fail(error.to_string()));
+    let mut identities = Vec::new();
     loop {
         let child = Command::new(&executable)
             .args(["hold", "--duration", "30s"])
@@ -606,13 +609,9 @@ fn fork_continually(mut args: impl Iterator<Item = OsString>) {
             .unwrap_or_else(|error| fail(format!("continual child failed to spawn: {error}")));
         let identity = memcordon_platform::test_support::ProcessIdentity::for_pid(child.id())
             .unwrap_or_else(|error| fail(format!("cannot observe child identity: {error}")));
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap_or_else(|error| fail(format!("cannot append child identity: {error}")));
-        writeln!(file, "{} {}", identity.pid, identity.birth)
-            .unwrap_or_else(|error| fail(format!("cannot record child identity: {error}")));
+        identities.push((identity.pid, identity.birth));
+        fixture_identity_snapshot::publish_snapshot(&path, &identities)
+            .unwrap_or_else(|error| fail(format!("cannot publish child identities: {error}")));
         thread::sleep(Duration::from_millis(5));
     }
 }

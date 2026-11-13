@@ -163,26 +163,73 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
             .arg(&output)
             .arg(&marker);
         let started = Instant::now();
-        assert_eq!(bounded(command, phase).code(), Some(125), "{phase}");
-        let evidence: serde_json::Value = serde_json::from_str(&evidence.finish()).unwrap();
-        assert_eq!(evidence["schema"], 1);
-        assert_eq!(evidence["stage"], "writer_deadline");
-        let phases = evidence["writer"]["phases"].as_array().unwrap();
-        assert_eq!(phases.first().unwrap(), "entered");
+        let status = bounded(command, phase);
+        let observed_elapsed = started.elapsed();
+        let raw_evidence = evidence.finish();
+        let marker_observed = (|| -> Result<(u32, memcordon_core::ReportWritePhase), String> {
+            use std::io::Read;
+            let file = std::fs::File::open(&marker).map_err(|error| error.to_string())?;
+            let mut bytes = Vec::new();
+            file.take(1025)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > 1024 {
+                return Err("marker exceeds bounded observation".into());
+            }
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+        })();
+        let context = format!(
+            "phase={phase}; elapsed={observed_elapsed:?}; evidence={raw_evidence}; marker={marker_observed:?}"
+        );
+        assert_eq!(status.code(), Some(125), "{context}");
+        let evidence: serde_json::Value = serde_json::from_str(&raw_evidence)
+            .unwrap_or_else(|error| panic!("evidence parse: {error}; {context}"));
+        assert_eq!(evidence["schema"], 1, "{context}");
+        assert_eq!(evidence["stage"], "writer_deadline", "{context}");
+        let phases = evidence["writer"]["phases"]
+            .as_array()
+            .unwrap_or_else(|| panic!("phase array unavailable; {context}"));
         assert_eq!(
-            phases.last().unwrap().as_str(),
-            Some(phase.replace('-', "_").as_str())
+            phases.first().and_then(serde_json::Value::as_str),
+            Some("entered"),
+            "{context}"
+        );
+        assert_eq!(
+            phases.last().and_then(serde_json::Value::as_str),
+            Some(phase.replace('-', "_").as_str()),
+            "{context}"
         );
         assert_eq!(evidence["writer"]["malformed"], false);
         assert_eq!(evidence["writer"]["truncated"], false);
         assert!(evidence["writer"]["os_error"].is_null());
         // Save the original observation before checking cleanup; a late return
         // must still expose its actual native reaping and output-state proof.
-        let observed_elapsed = started.elapsed();
-        let marker: (u32, memcordon_core::ReportWritePhase) = serde_json::from_slice(
-            &std::fs::read(marker).expect("actual native persistence barrier reached"),
-        )
-        .expect("typed barrier marker");
+        let marker = marker_observed.unwrap_or_else(|error| {
+            panic!("actual typed persistence barrier unavailable: {error}; {context}")
+        });
+        assert_eq!(
+            evidence["writer"]["provenance"], "owner_result",
+            "{context}"
+        );
+        assert_eq!(
+            evidence["writer"]["cleanup_outstanding"], false,
+            "{context}"
+        );
+        assert_eq!(evidence["writer"]["frame_transferred"], true, "{context}");
+        assert_eq!(evidence["writer"]["writer_pid"], marker.0, "{context}");
+        assert!(
+            matches!(evidence["outcome"].as_str(), Some("failed" | "uncertain")),
+            "{context}"
+        );
+        assert_eq!(
+            marker.1,
+            match phase {
+                "before-write" => memcordon_core::ReportWritePhase::BeforeWrite,
+                "before-rename" => memcordon_core::ReportWritePhase::BeforeRename,
+                _ => memcordon_core::ReportWritePhase::BeforeAck,
+            },
+            "{context}"
+        );
         // A surviving or unreaped child retains its PID. The parent must reap
         // before the fixture completes; ESRCH corroborates that observation.
         assert_eq!(

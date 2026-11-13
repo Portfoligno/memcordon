@@ -1,10 +1,11 @@
+#[path = "../../memcordon-core/tests/support/windows_current_frontend_guardian.rs"]
+mod frontend_support;
 #[path = "../src/sealed/windows_rejection_retirement.rs"]
 mod retirement;
-#[path = "../../memcordon-core/tests/support/windows_current_postauthorization.rs"]
-mod support;
+use frontend_support::postauthorization as support;
 
 use memcordon_core::*;
-use retirement::{RejectionContext, complete_rejection_ack};
+use retirement::{RejectionContext, complete_rejection_ack, complete_terminal_ack};
 use sha2::{Digest, Sha256};
 
 fn digest(bytes: &[u8]) -> String {
@@ -67,14 +68,17 @@ fn context<'a>(
     provider: &'a PublicProviderBindingV1,
     response: &'a WindowsProviderResponseV4,
 ) -> RejectionContext<'a> {
-    let WindowsProviderResponseV4::Reject {
-        attempt_id,
-        nonce,
-        request_sha256,
-        ..
-    } = response
-    else {
-        unreachable!()
+    let (attempt_id, nonce, request_sha256) = match response {
+        WindowsProviderResponseV4::Reject {
+            attempt_id,
+            nonce,
+            request_sha256,
+            ..
+        } => (attempt_id, nonce, request_sha256),
+        WindowsProviderResponseV4::Terminal(receipt) => {
+            (&receipt.attempt_id, &receipt.nonce, &receipt.request_sha256)
+        }
+        _ => unreachable!(),
     };
     RejectionContext {
         attempt_id,
@@ -154,6 +158,180 @@ fn retired(context: &RejectionContext<'_>, authority: &str) -> Vec<u8> {
         authority
     ));
     serde_json::to_vec(&WindowsProviderResponseV4::TerminalRetiredV2(confirmation)).unwrap()
+}
+
+fn postauthorization_response() -> (PublicProviderBindingV1, WindowsProviderResponseV4) {
+    let (rejection, held, _, _) = frontend_support::fixture();
+    let receipt = rejection.terminal_receipt().unwrap();
+    let response = WindowsProviderResponseV4::Reject {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+        attempt_id: receipt.attempt_id.clone(),
+        nonce: receipt.nonce.clone(),
+        request_sha256: receipt.request_sha256.clone(),
+        rejection,
+    };
+    (held.association.provider, response)
+}
+
+fn posttarget_retired(response: &WindowsProviderResponseV4, authority: &str) -> Vec<u8> {
+    let receipt = match response {
+        WindowsProviderResponseV4::Reject { rejection, .. } => {
+            rejection.terminal_receipt().unwrap()
+        }
+        WindowsProviderResponseV4::Terminal(receipt) => receipt,
+        _ => unreachable!(),
+    };
+    let proof = &receipt.retirement_proof;
+    let confirmation = WindowsTerminalRetiredV2 {
+        schema_version: 2,
+        attempt_id: receipt.attempt_id.clone(),
+        nonce: receipt.nonce.clone(),
+        request_sha256: receipt.request_sha256.clone(),
+        terminal_response_sha256: authority.into(),
+        disposition: WindowsAttemptTerminalDispositionV1::Posttarget,
+        provider_generation: proof.provider_generation.clone(),
+        original_boot_id: proof.original_boot_id.clone(),
+        launch_incarnation: proof.launch_incarnation.clone(),
+        job_identity: proof.job_identity.clone(),
+        owner_manifest_sha256: proof.owner_manifest_sha256.clone(),
+        retirement_proof_sha256: digest(&serde_json::to_vec(proof).unwrap()),
+        preauthorization_retirement_proof: None,
+        ledger_generation: "2".repeat(64),
+        completion: WindowsRetirementLedgerCompletionV1::RetirementComplete,
+    };
+    assert!(confirmation.is_consistent_for(
+        &receipt.attempt_id,
+        &receipt.nonce,
+        &receipt.request_sha256,
+        authority
+    ));
+    // Preserve retirement's actual received representation, which is separately
+    // hashed and must not be replaced by authority serialization.
+    serde_json::to_vec_pretty(&WindowsProviderResponseV4::TerminalRetiredV2(confirmation)).unwrap()
+}
+
+#[test]
+fn recovery_completion_uses_one_canonical_authority_for_ack_and_delivery_without_expiring_response()
+{
+    let (provider, response) = postauthorization_response();
+    let immutable = response.terminal_authority_json().unwrap();
+    let WindowsProviderResponseV4::Reject { rejection, .. } = &response else {
+        unreachable!()
+    };
+    assert!(rejection.provider_failure.is_some());
+    assert!(rejection.guardian_causal_receipt.is_some());
+    let mut expired = response.clone();
+    let WindowsProviderResponseV4::Reject { rejection, .. } = &mut expired else {
+        unreachable!()
+    };
+    rejection.provider_failure = None;
+    rejection.guardian_causal_receipt = None;
+    assert!(rejection.is_consistent());
+    assert_eq!(expired.terminal_authority_json().unwrap(), immutable);
+    let WindowsProviderResponseV4::Reject { rejection, .. } = &response else {
+        unreachable!()
+    };
+    let terminal =
+        WindowsProviderResponseV4::Terminal(rejection.terminal_receipt().unwrap().clone());
+    for response in [&response, &expired, &terminal] {
+        let binding = context(&provider, response);
+        let raw = serde_json::to_vec_pretty(response).unwrap();
+        let before = serde_json::to_vec(response).unwrap();
+        let canonical_digest = digest(response.terminal_authority_json().unwrap().as_bytes());
+        assert_ne!(digest(&raw), canonical_digest);
+        let retired_raw = posttarget_retired(response, &canonical_digest);
+        let mut calls = 0;
+        let delivery = complete_terminal_ack(response, &binding, |ack_digest| {
+            calls += 1;
+            assert_eq!(ack_digest, canonical_digest);
+            assert_ne!(ack_digest, digest(&raw));
+            Ok(retired_raw.clone())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(delivery.terminal_sha256, canonical_digest);
+        assert_eq!(delivery.retired_sha256, digest(&retired_raw));
+        assert!(delivery.terminal_validated && delivery.acknowledgement_observed);
+        assert_eq!(serde_json::to_vec(response).unwrap(), before);
+    }
+}
+
+#[test]
+fn recovery_completion_rejects_foreign_response_and_retirement_before_marking_delivery() {
+    let (provider, response) = postauthorization_response();
+    let binding = context(&provider, &response);
+    for field in ["attempt_id", "nonce", "request_sha256", "schema_version"] {
+        let mut foreign = response.clone();
+        let WindowsProviderResponseV4::Reject {
+            attempt_id,
+            nonce,
+            request_sha256,
+            schema_version,
+            ..
+        } = &mut foreign
+        else {
+            unreachable!()
+        };
+        match field {
+            "attempt_id" => *attempt_id = "9".repeat(64),
+            "nonce" => *nonce = "9".repeat(32),
+            "request_sha256" => *request_sha256 = "9".repeat(64),
+            "schema_version" => *schema_version += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            complete_terminal_ack(&foreign, &binding, |_| panic!(
+                "foreign recovery must not ACK"
+            ))
+            .is_err(),
+            "{field}"
+        );
+    }
+    let mut foreign_provider = provider.clone();
+    foreign_provider.generation = BoundedText::new("foreign-generation").unwrap();
+    let foreign_binding = RejectionContext {
+        provider: &foreign_provider,
+        ..binding
+    };
+    assert!(
+        complete_terminal_ack(&response, &foreign_binding, |_| panic!(
+            "foreign generation must not ACK"
+        ))
+        .is_err()
+    );
+    for field in [
+        "attempt_id",
+        "nonce",
+        "request_sha256",
+        "provider_generation",
+        "terminal_response_sha256",
+        "retirement_proof_sha256",
+        "ledger_generation",
+        "completion",
+    ] {
+        let result = complete_terminal_ack(&response, &binding, |authority| {
+            let mut foreign: serde_json::Value =
+                serde_json::from_slice(&posttarget_retired(&response, authority)).unwrap();
+            foreign[field] = serde_json::json!(if field == "retirement_proof_sha256"
+                || field == "ledger_generation"
+            {
+                String::new()
+            } else {
+                "9".repeat(64)
+            });
+            Ok(serde_json::to_vec(&foreign).unwrap())
+        });
+        assert!(result.is_err(), "{field}");
+    }
+    assert!(complete_terminal_ack(&response, &binding, |_| Ok(b"{".to_vec())).is_err());
+    assert!(
+        complete_terminal_ack(&response, &binding, |_| Err(Box::new(Error::new(
+            ErrorCategory::Setup,
+            "ACK-FAILED",
+            "pipe closed"
+        ))))
+        .is_err()
+    );
 }
 
 #[test]

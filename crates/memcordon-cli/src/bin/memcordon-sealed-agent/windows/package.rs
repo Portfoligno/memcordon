@@ -1335,6 +1335,8 @@ fn recover_interrupted_upgrade() -> Result<(), String> {
             if current.digests == rollback.replacement_artifact_digests
                 && captured_installed_manifest(&current)?.as_deref()
                     == Some(rollback.replacement_manifest.as_slice())
+                && super::runtime_state_presence::inspect(&state_root(), reject_reparse_components)?
+                    == super::runtime_state_presence::RuntimeStatePresence::Present
             {
                 validate_current_runtime_snapshot(&replacement, &current)?;
                 reconcile_services_from_installed()?;
@@ -2403,16 +2405,20 @@ fn uninstall_transaction_services(ownership: &ServiceOwnership) -> Result<(), St
 
 fn reconcile_services_from_installed() -> Result<(), String> {
     let _installed_artifacts = validate_existing_installed_artifacts()?;
-    let services = configure_services(&installed_binary(), ServiceConfiguration::Reconcile)?;
     reconcile_runtime_state_security()?;
+    let services = configure_services(&installed_binary(), ServiceConfiguration::Reconcile)?;
     start_services(&services)
 }
 
 fn reconcile_runtime_state_security() -> Result<(), String> {
     let root = state_root();
-    reject_reparse_components(&root)?;
-    if path_absent_no_follow(&root, "reconcile-runtime-state")? {
-        return Ok(());
+    if super::runtime_state_presence::inspect(&root, reject_reparse_components)?
+        == super::runtime_state_presence::RuntimeStatePresence::Absent
+    {
+        return Err(format!(
+            "MCSEALED-WINDOWS-RUNTIME-STATE: installed runtime root is absent: {}",
+            root.display()
+        ));
     }
     SecurityDescriptor::from_sddl(&state_parent_sddl()?)?.verify_path(
         root.parent()

@@ -69,10 +69,9 @@ pub fn run(root: &Path, diagnostics: &Path) -> Result<()> {
             if record["reason"] == "compiler-artifact"
                 && record["target"]["name"] == "sealed_agent"
                 && record["profile"]["test"] == true
+                && let Some(path) = record["executable"].as_str()
             {
-                if let Some(path) = record["executable"].as_str() {
-                    executables.push(PathBuf::from(path));
-                }
+                executables.push(PathBuf::from(path));
             }
         }
         executables.sort();
@@ -118,7 +117,12 @@ pub fn run(root: &Path, diagnostics: &Path) -> Result<()> {
             assert_one_test(&bytes)?;
         }
         #[cfg(windows)]
-        super::windows_component_tests::run(root, cutoff - Duration::from_secs(15 * 60), cutoff)?;
+        super::windows_component_tests::run(
+            root,
+            diagnostics,
+            cutoff - Duration::from_secs(15 * 60),
+            cutoff,
+        )?;
         #[cfg(target_os = "linux")]
         super::linux_installed_tests::run_components(
             root,
@@ -126,7 +130,7 @@ pub fn run(root: &Path, diagnostics: &Path) -> Result<()> {
             cutoff - Duration::from_secs(15 * 60),
             cutoff,
         )?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         let _ = diagnostics;
         Ok(())
     })

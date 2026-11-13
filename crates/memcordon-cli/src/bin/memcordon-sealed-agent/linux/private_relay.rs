@@ -8,11 +8,15 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 
 use super::descriptor_custody::ProviderPipeStdio;
+#[path = "private_relay_state.rs"]
+mod state;
+use state::{Endpoint, Lane, PollAction, WriteFailure};
 
 const RELAY_BUFFER_BYTES: usize = 8192;
 
 struct Channel {
-    source: File,
+    lane: Lane,
+    source: Option<File>,
     destination: Option<File>,
     pending: [u8; RELAY_BUFFER_BYTES],
     offset: usize,
@@ -23,9 +27,10 @@ struct Channel {
 }
 
 impl Channel {
-    fn new(source: File, destination: File) -> Self {
+    fn new(lane: Lane, source: File, destination: File) -> Self {
         Self {
-            source,
+            lane,
+            source: Some(source),
             destination: Some(destination),
             pending: [0; RELAY_BUFFER_BYTES],
             offset: 0,
@@ -40,13 +45,29 @@ impl Channel {
         self.source_eof && self.length == 0
     }
 
+    fn close_input(&mut self) {
+        assert_eq!(
+            self.lane,
+            Lane::Stdin,
+            "only undeliverable input may be discarded"
+        );
+        self.source_eof = true;
+        self.offset = 0;
+        self.length = 0;
+        self.destination.take();
+        self.source.take();
+    }
+
     fn pump(&mut self) -> Result<(), String> {
         if !self.source_eof && self.length == 0 {
             // SAFETY: read writes at most the fixed pending capacity to a live
             // descriptor verified nonblocking before this loop.
             let count = unsafe {
                 libc::read(
-                    self.source.as_raw_fd(),
+                    self.source
+                        .as_ref()
+                        .ok_or("MCSEALED-PRIVATE-RELAY: source absent before EOF")?
+                        .as_raw_fd(),
                     self.pending.as_mut_ptr().cast(),
                     self.pending.len(),
                 )
@@ -67,11 +88,14 @@ impl Channel {
                 self.length = count as usize;
             } else if count == 0 {
                 self.source_eof = true;
-            } else if !would_retry() {
-                return Err(format!(
-                    "MCSEALED-PRIVATE-RELAY: read: {}",
-                    std::io::Error::last_os_error()
-                ));
+            } else {
+                let error = std::io::Error::last_os_error();
+                if !state::retryable(error.raw_os_error()) {
+                    return Err(format!(
+                        "MCSEALED-PRIVATE-RELAY: lane={} operation=read: {error}",
+                        self.lane.label()
+                    ));
+                }
             }
         }
         if self.length > 0 {
@@ -94,12 +118,22 @@ impl Channel {
                 self.offset += count as usize;
                 self.length -= count as usize;
             } else if count == 0 {
-                return Err("MCSEALED-PRIVATE-RELAY: zero-length write".into());
-            } else if !would_retry() {
                 return Err(format!(
-                    "MCSEALED-PRIVATE-RELAY: write: {}",
-                    std::io::Error::last_os_error()
+                    "MCSEALED-PRIVATE-RELAY: lane={} operation=write: zero-length write",
+                    self.lane.label()
                 ));
+            } else {
+                let error = std::io::Error::last_os_error();
+                match state::write_failure(self.lane, error.raw_os_error()) {
+                    WriteFailure::Retry => (),
+                    WriteFailure::CloseInput => self.close_input(),
+                    WriteFailure::Fatal => {
+                        return Err(format!(
+                            "MCSEALED-PRIVATE-RELAY: lane={} operation=write: {error}",
+                            self.lane.label()
+                        ));
+                    }
+                }
             }
         }
         if self.completed() {
@@ -108,13 +142,18 @@ impl Channel {
         Ok(())
     }
 
-    fn poll_descriptors(&self, output: &mut Vec<libc::pollfd>) {
+    fn poll_descriptors(&self, output: &mut Vec<libc::pollfd>, roles: &mut Vec<(Lane, Endpoint)>) {
         if !self.source_eof && self.length == 0 {
             output.push(libc::pollfd {
-                fd: self.source.as_raw_fd(),
+                fd: self
+                    .source
+                    .as_ref()
+                    .expect("live source before EOF")
+                    .as_raw_fd(),
                 events: libc::POLLIN | libc::POLLHUP,
                 revents: 0,
             });
+            roles.push((self.lane, Endpoint::Source));
         }
         if self.length > 0 {
             if let Some(destination) = &self.destination {
@@ -123,6 +162,7 @@ impl Channel {
                     events: libc::POLLOUT | libc::POLLHUP,
                     revents: 0,
                 });
+                roles.push((self.lane, Endpoint::Destination));
             }
         }
     }
@@ -187,9 +227,9 @@ impl PrivateRelay {
         }
         let [stdin, stdout, stderr] = frontend;
         Ok(Self {
-            stdin: Channel::new(stdin.into(), stdin_writer),
-            stdout: Channel::new(streams.stdout_reader, stdout.into()),
-            stderr: Channel::new(streams.stderr_reader, stderr.into()),
+            stdin: Channel::new(Lane::Stdin, stdin.into(), stdin_writer),
+            stdout: Channel::new(Lane::Stdout, streams.stdout_reader, stdout.into()),
+            stderr: Channel::new(Lane::Stderr, streams.stderr_reader, stderr.into()),
         })
     }
 
@@ -198,9 +238,7 @@ impl PrivateRelay {
     }
 
     pub fn close_stdin_after_target_exit(&mut self) {
-        self.stdin.source_eof = true;
-        self.stdin.length = 0;
-        self.stdin.destination.take();
+        self.stdin.close_input();
     }
 
     /// One bounded readiness interval. A supervisor checks frontend loss,
@@ -214,9 +252,10 @@ impl PrivateRelay {
             return Ok(());
         }
         let mut descriptors = Vec::with_capacity(6);
-        self.stdin.poll_descriptors(&mut descriptors);
-        self.stdout.poll_descriptors(&mut descriptors);
-        self.stderr.poll_descriptors(&mut descriptors);
+        let mut roles = Vec::with_capacity(6);
+        self.stdin.poll_descriptors(&mut descriptors, &mut roles);
+        self.stdout.poll_descriptors(&mut descriptors, &mut roles);
+        self.stderr.poll_descriptors(&mut descriptors, &mut roles);
         let timeout = interval.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: poll synchronously borrows the initialized descriptor list.
         let result = unsafe {
@@ -226,28 +265,47 @@ impl PrivateRelay {
                 timeout,
             )
         };
-        if result == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-        {
-            return Err(format!(
-                "MCSEALED-PRIVATE-RELAY: poll: {}",
-                std::io::Error::last_os_error()
-            ));
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(format!("MCSEALED-PRIVATE-RELAY: operation=poll: {error}"));
+            }
+            return Ok(());
         }
         if descriptors
             .iter()
-            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+            .any(|fd| fd.revents & libc::POLLNVAL != 0)
         {
-            return Err("MCSEALED-PRIVATE-RELAY: endpoint error".into());
+            let index = descriptors
+                .iter()
+                .position(|fd| fd.revents & libc::POLLNVAL != 0)
+                .expect("invalid descriptor observed");
+            let (lane, endpoint) = roles[index];
+            return Err(format!(
+                "MCSEALED-PRIVATE-RELAY: lane={} endpoint={} operation=poll: invalid descriptor; fd={}; revents={}",
+                lane.label(),
+                endpoint.label(),
+                descriptors[index].fd,
+                descriptors[index].revents
+            ));
+        }
+        for (fd, (lane, endpoint)) in descriptors.iter().zip(roles) {
+            match state::poll_action(lane, endpoint, fd.revents) {
+                PollAction::Continue => (),
+                PollAction::CloseInput => self.stdin.close_input(),
+                PollAction::InvalidDescriptor | PollAction::FatalEndpoint => {
+                    return Err(format!(
+                        "MCSEALED-PRIVATE-RELAY: lane={} endpoint={} operation=poll: endpoint error; fd={}; revents={}",
+                        lane.label(),
+                        endpoint.label(),
+                        fd.fd,
+                        fd.revents
+                    ));
+                }
+            }
         }
         Ok(())
     }
-}
-
-fn would_retry() -> bool {
-    matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EAGAIN | libc::EINTR)
-    )
 }
 
 fn require_nonblocking_stream(fd: i32, readable: bool) -> Result<(), String> {

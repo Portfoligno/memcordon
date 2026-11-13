@@ -113,8 +113,87 @@ fn packages_until(
                     "incomplete",
                     serde_json::json!({"package": package, "phase": if ordinal == 0 { "compile" } else { "execute" }, "budget_seconds": deadline.as_secs()}),
                 )?;
-                rustup_cargo(root, stable, arguments, deadline)
-                    .bounded_until(operation_deadline)
+                // The serial diagnostic and original parallel execution share
+                // the existing runtime cutoff. Compilation is unchanged.
+                let phase_deadline = if ordinal == 1 {
+                    (Instant::now() + deadline).min(operation_deadline)
+                } else {
+                    operation_deadline
+                };
+                if ordinal == 1
+                    && let Some((diagnostic, _)) = stress_package_plan::original_listener_diagnostic(
+                        package,
+                        target,
+                        cfg!(windows),
+                    )
+                {
+                    state(
+                        root,
+                        target,
+                        "packages",
+                        attempted,
+                        completed,
+                        (0, 0, None),
+                        started,
+                        "incomplete",
+                        serde_json::json!({
+                            "package":package,"phase":"original-listener-result-serial-release",
+                            "toolchain":stable,"profile":"release",
+                            "arguments":diagnostic.iter().map(|value| value.to_string_lossy()).collect::<Vec<_>>(),
+                            "shared_runtime_budget_seconds":deadline.as_secs(),"full_parallel_execution":"not-run"
+                        }),
+                    )?;
+                    let observed = rustup_cargo(
+                        root,
+                        stable,
+                        diagnostic,
+                        phase_deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .bounded_until(phase_deadline)
+                    .output_owned();
+                    let writers = observed.writers();
+                    let output = observed.into_result().map_err(|error| error.context(
+                        "serial original-listener result diagnostic failed; required full parallel execution not run"))?;
+                    let summary = format!(
+                        "serial original-listener result diagnostic: toolchain={stable}; status={}; writers={writers:?}; stdout={:?}; stderr={:?}",
+                        output.status,
+                        crate::command::bounded_excerpt(&output.stdout),
+                        crate::command::bounded_excerpt(&output.stderr)
+                    );
+                    // Best-effort diagnostics cannot replace the owned result.
+                    let _ = writeln!(std::io::stderr().lock(), "{summary}");
+                    if writers != crate::work_outcome::WriterSettlement::Settled {
+                        return Err(CiError::Message(format!(
+                            "{summary}; required full parallel execution not run: serial writer settlement unproved"
+                        )));
+                    }
+                    if !output.status.success() {
+                        return Err(CiError::SettledCommandFailure(format!(
+                            "{summary}; required full parallel execution not run"
+                        )));
+                    }
+                    state(
+                        root,
+                        target,
+                        "packages",
+                        attempted,
+                        completed,
+                        (0, 0, None),
+                        started,
+                        "incomplete",
+                        serde_json::json!({"package":package,"phase":"execute",
+                            "serial_original_listener_result":"passed-with-settled-writers",
+                            "toolchain":stable,"profile":"release",
+                            "shared_runtime_budget_seconds":deadline.as_secs(),"full_parallel_execution":"required"}),
+                    )?;
+                }
+                let remaining = if ordinal == 1 {
+                    phase_deadline.saturating_duration_since(Instant::now())
+                } else {
+                    deadline
+                };
+                rustup_cargo(root, stable, arguments, remaining)
+                    .bounded_until(phase_deadline)
                     .run()
                     .map_err(|error| {
                         CiError::Message(format!(

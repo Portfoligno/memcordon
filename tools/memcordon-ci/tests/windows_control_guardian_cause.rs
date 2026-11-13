@@ -2,7 +2,7 @@
 mod support;
 use memcordon_ci::windows_readiness_components::{
     ControlServiceRetirement, control_retirement_matches, control_service_loss_observation,
-    control_service_recovery_authority,
+    control_service_recovery_assessment, control_service_recovery_authority,
 };
 use memcordon_core::*;
 
@@ -22,6 +22,7 @@ fn fixture() -> (
     journal.observe(event.clone()).unwrap();
     let mut secondary = failure.secondary.as_slice()[0].clone();
     secondary.sequence = 0;
+    secondary.native_code = Some(NativeFailureCodeV1::Win32(232));
     secondary.safe_detail = SafeDiagnosticDetailV1::InjectedWindowsFault {
         fault: WindowsSealedFault::ControlServiceKilledAfterAuthorization,
     };
@@ -84,6 +85,74 @@ fn fixture() -> (
     };
     let delivery = delivery(&response);
     (response, delivery, live, site, facts)
+}
+
+#[test]
+fn same_evaluation_names_strict_binding_failures_without_private_values() {
+    let (response, ack, live, site, facts) = fixture();
+    let witness = control_service_loss_observation(&site, &facts, &live).unwrap();
+    let good = control_service_recovery_assessment(&response, &ack, &live, &witness);
+    assert!(good.accepted);
+    let detail = good.diagnostic();
+    assert!(detail["first_failed_check"].is_null());
+    assert_eq!(detail["checks"]["secondary-selected-event"], true);
+    assert_eq!(detail["authority_sha256"], ack.terminal_sha256);
+    assert!(serde_json::to_vec(&detail).unwrap().len() <= 8192);
+    for (field, expected) in [
+        ("nonce", "delivery-nonce"),
+        ("attempt", "delivery-attempt"),
+        ("request", "delivery-request"),
+        ("digest", "delivery-terminal-digest"),
+        ("ack", "delivery-consistency"),
+    ] {
+        let mut changed = ack.clone();
+        match field {
+            "nonce" => changed.nonce = "99".repeat(32),
+            "attempt" => changed.attempt_id = "99".repeat(32),
+            "request" => changed.request_sha256 = "99".repeat(32),
+            "digest" => changed.terminal_sha256 = "99".repeat(32),
+            "ack" => changed.acknowledgement_observed = false,
+            _ => unreachable!(),
+        }
+        let assessment = control_service_recovery_assessment(&response, &changed, &live, &witness);
+        assert!(!assessment.accepted);
+        assert!(!control_service_recovery_authority(
+            &response, &changed, &live, &witness
+        ));
+        let value = assessment.diagnostic();
+        assert_eq!(value["first_failed_check"], expected);
+        assert_eq!(value["first_failed_check_state"], "evaluated-false");
+        assert!(value["checks"].get("secondary-selected-event").is_none());
+        let projected=memcordon_ci::windows_component_diagnostics::project("control-service-assessment.json",&serde_json::to_vec(&serde_json::json!({"recovery":{"authority_assessment":value},"nonce":"private-nonce-must-never-be-copied"})).unwrap()).unwrap();
+        assert_eq!(
+            projected["fields"]["/recovery/authority_assessment/first_failed_check"]["value"],
+            expected
+        );
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-nonce-must-never-be-copied")
+        );
+    }
+    let mut mismatched_live = live.clone();
+    mismatched_live
+        .live_target_identity
+        .as_mut()
+        .unwrap()
+        .process_id += 1;
+    let detail = control_service_recovery_assessment(&response, &ack, &mismatched_live, &witness)
+        .diagnostic();
+    assert_eq!(detail["first_failed_check"], "selected-site-binding");
+    let pending = WindowsProviderResponseV4::RecoveryAttemptUnavailable {
+        schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+        attempt_id: site.attempt_id,
+        challenge: "private".into(),
+        detail: "private".into(),
+    };
+    let missing = control_service_recovery_assessment(&pending, &ack, &live, &witness).diagnostic();
+    assert_eq!(missing["first_failed_check"], "response-reject-variant");
+    assert_eq!(missing["first_failed_check_state"], "missing-prerequisite");
+    assert!(missing["authority_sha256"].is_null());
 }
 
 fn delivery(response: &WindowsProviderResponseV4) -> WindowsFrontendDeliveryV3 {

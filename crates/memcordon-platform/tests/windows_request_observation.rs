@@ -3,6 +3,27 @@
 use memcordon_platform::WindowsTerminalObservationScope;
 
 #[test]
+fn prepared_directory_allows_atomic_child_publication_while_remaining_pinned() {
+    let parent = tempfile::tempdir().unwrap();
+    let observations = parent.path().join("observations");
+    let renamed = parent.path().join("renamed");
+    std::fs::create_dir(&observations).unwrap();
+    let scope = memcordon_platform::WindowsPreparedObservationScope::begin(&observations).unwrap();
+    let bytes = [0, 255, 128, 9, 10];
+    memcordon_core::write_report_bytes_atomic(&observations.join("request.json"), &bytes).unwrap();
+    assert_eq!(
+        std::fs::read(observations.join("request.json")).unwrap(),
+        bytes
+    );
+    assert!(std::fs::rename(&observations, &renamed).is_err());
+    assert!(observations.is_dir());
+    assert!(!renamed.exists());
+    drop(scope);
+    std::fs::rename(&observations, &renamed).unwrap();
+    assert_eq!(std::fs::read(renamed.join("request.json")).unwrap(), bytes);
+}
+
+#[test]
 fn request_capture_reservation_blocks_named_mutation_and_absence_is_not_success() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("request.bin");

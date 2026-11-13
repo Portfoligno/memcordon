@@ -1,10 +1,36 @@
-//! Closed native fixture selection and proof of actual one-test execution.
+//! Closed native fixture selection and proof of every distinct native execution.
 use std::io;
 use std::time::Duration;
+#[path = "../../../crates/memcordon-platform/tests/private/windows_pipe_sqos_record.rs"]
+pub mod sqos;
 
 pub const TARGET_DIR: &str = "target/ci/windows-fixture-native";
 pub const TEST_SELECTOR: &str =
     "fresh_restricted_primary_namespace_access_is_observed_without_inherited_gate_capabilities";
+pub const TRACE_TEST_SELECTOR: &str =
+    "isolated_native_mock_and_owned_event_calls_preserve_original_results";
+pub const DEADLINE_TEST_SELECTOR: &str =
+    "restricted_initial_thread_deadline_cancels_only_original_io_and_joins";
+pub const WINSOCK_TEST_SELECTOR: &str =
+    "restricted_owned_winsock_forwarding_preserves_arguments_results_and_tls_scope";
+pub const REGISTRY_TEST_SELECTOR: &str =
+    "owned_registry_projection_preserves_restricted_reads_and_refuses_mutation";
+pub const PRIVATE_FIXTURE_TEST_SELECTOR: &str =
+    "actual_main_image_requires_exact_object_content_ancestry_and_separate_output";
+pub const PRIVATE_PROCESS_TEST_SELECTOR: &str =
+    "held_child_admission_and_metadata_references_preserve_exact_owners_and_rights";
+pub const SQOS_TEST_SELECTOR: &str =
+    "owned_pipe_sqos_rows_measure_authenticated_inventory_without_policy_changes";
+pub const TEST_SELECTORS: [&str; 8] = [
+    TEST_SELECTOR,
+    TRACE_TEST_SELECTOR,
+    DEADLINE_TEST_SELECTOR,
+    WINSOCK_TEST_SELECTOR,
+    REGISTRY_TEST_SELECTOR,
+    PRIVATE_FIXTURE_TEST_SELECTOR,
+    PRIVATE_PROCESS_TEST_SELECTOR,
+    SQOS_TEST_SELECTOR,
+];
 
 pub struct Command {
     pub arguments: Vec<&'static str>,
@@ -18,14 +44,31 @@ pub fn commands(compile: Duration, execute: Duration) -> [Command; 2] {
         TARGET_DIR,
         "--package",
         "memcordon",
+        "--package",
+        "memcordon-platform",
         "--test",
         "windows_namespace_primary",
+        "--test",
+        "windows_gate_call_trace",
+        "--test",
+        "windows_own_thread_deadline",
+        "--test",
+        "windows_winsock_call_trace",
+        "--test",
+        "windows_winsock_registry",
+        "--test",
+        "windows_private_fixture_native",
+        "--test",
+        "windows_private_process_native",
+        "--test",
+        "windows_pipe_sqos",
         "--all-features",
     ];
     let mut compilation = base.clone();
     compilation.push("--no-run");
     let mut execution = base;
-    execution.extend([TEST_SELECTOR, "--", "--exact", "--nocapture"]);
+    execution.extend(["--", "--exact", "--nocapture"]);
+    execution.extend(TEST_SELECTORS);
     [
         Command {
             arguments: compilation,
@@ -38,39 +81,74 @@ pub fn commands(compile: Duration, execute: Duration) -> [Command; 2] {
     ]
 }
 
-pub fn verify_one_test(stdout: &[u8]) -> io::Result<()> {
+pub fn verify_selected_tests(stdout: &[u8]) -> io::Result<()> {
     let reject = || {
         io::Error::other(
-            "native fixture requires exactly one executed selected test with one pass and no failure or ignored result",
+            "native fixture requires all distinct selected tests, each executed once with one pass and no failure or ignored result",
         )
     };
     if stdout.len() > 1024 * 1024 {
         return Err(reject());
     }
     let text = std::str::from_utf8(stdout).map_err(|_| reject())?;
-    let mut running = 0;
-    let mut selected = 0;
-    let mut summaries = 0;
+    let mut phase = 0;
+    let mut seen = [false; TEST_SELECTORS.len()];
+    let mut summaries = 0usize;
+    let mut pending_sqos = false;
     for line in text.lines().map(str::trim) {
-        if line.starts_with("running ") && (line.ends_with(" test") || line.ends_with(" tests")) {
-            if line != "running 1 test" || (running, selected, summaries) != (0, 0, 0) {
+        if line.starts_with("running ") {
+            if pending_sqos {
                 return Err(reject());
             }
-            running += 1;
+            if line != "running 1 test" || phase != 0 || summaries >= TEST_SELECTORS.len() {
+                return Err(reject());
+            }
+            phase = 1;
         }
         if let Some(record) = line
             .strip_prefix("test ")
             .filter(|_| !line.starts_with("test result:"))
         {
-            if record.strip_suffix(" ... ok") != Some(TEST_SELECTOR)
-                || (running, selected, summaries) != (1, 0, 0)
-            {
+            if pending_sqos {
                 return Err(reject());
             }
-            selected += 1;
+            if record
+                .strip_suffix(" ...")
+                .is_some_and(|name| name == SQOS_TEST_SELECTOR)
+                || record.split_once(" ... ").is_some_and(|(name, rest)| {
+                    name == SQOS_TEST_SELECTOR && rest.starts_with(sqos::MARKER)
+                })
+            {
+                let index = TEST_SELECTORS.len() - 1;
+                if phase != 1 || seen[index] || pending_sqos {
+                    return Err(reject());
+                }
+                pending_sqos = true;
+                continue;
+            }
+            let name = record.strip_suffix(" ... ok").ok_or_else(reject)?;
+            let index = TEST_SELECTORS
+                .iter()
+                .position(|expected| *expected == name)
+                .ok_or_else(reject)?;
+            if phase != 1 || seen[index] {
+                return Err(reject());
+            }
+            seen[index] = true;
+            phase = 2;
+        }
+        if line == "ok" && pending_sqos {
+            seen[TEST_SELECTORS.len() - 1] = true;
+            pending_sqos = false;
+            phase = 2;
+        } else if line == "ok" {
+            return Err(reject());
         }
         if line.starts_with("test result:") {
-            if (running, selected, summaries) != (1, 1, 0) {
+            if pending_sqos {
+                return Err(reject());
+            }
+            if phase != 2 {
                 return Err(reject());
             }
             let summary = line.strip_prefix("test result: ok. ").ok_or_else(reject)?;
@@ -84,21 +162,33 @@ pub fn verify_one_test(stdout: &[u8]) -> io::Result<()> {
                 .next()
                 .and_then(|field| field.strip_suffix(" filtered out"))
                 .ok_or_else(reject)?;
+            let elapsed = fields
+                .next()
+                .and_then(|field| field.strip_prefix("finished in "))
+                .and_then(|field| field.strip_suffix('s'))
+                .and_then(|field| field.parse::<f64>().ok());
             if filtered.parse::<u64>().is_err()
-                || fields
-                    .next()
-                    .and_then(|field| field.strip_prefix("finished in "))
-                    .is_none_or(str::is_empty)
+                || elapsed.is_none_or(|value| !value.is_finite() || value < 0.0)
                 || fields.next().is_some()
             {
                 return Err(reject());
             }
             summaries += 1;
+            phase = 0;
         }
     }
-    if (running, selected, summaries) == (1, 1, 1) {
+    if !pending_sqos
+        && phase == 0
+        && summaries == TEST_SELECTORS.len()
+        && seen.into_iter().all(|seen| seen)
+    {
         Ok(())
     } else {
         Err(reject())
     }
+}
+
+pub fn verify_measurements(inventory: &[String], tracking: &[String]) -> io::Result<()> {
+    sqos::verify_rows(inventory)?;
+    sqos::verify_tracking_rows(tracking)
 }

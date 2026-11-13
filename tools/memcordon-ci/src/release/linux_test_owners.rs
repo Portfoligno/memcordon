@@ -246,20 +246,39 @@ fn owner_probe(
                 );
                 Ok(())
             })?;
-    let child = child
-        .into_inner()
-        .expect("original peer query holder")
-        .ok_or_else(|| CiError::Message("actual peer child was not held before input".into()))?;
-    if !child.exited().map_err(CiError::Message)? {
-        return Err(CiError::Message(
-            "original peer child not retired after its direct wait".into(),
-        ));
-    }
-    let after: Vec<_> = held
-        .iter()
-        .map(|process| process.live_snapshot())
-        .collect::<std::result::Result<_, _>>()
-        .map_err(CiError::Message)?;
+    let native_result = crate::command::require_successful_output(
+        &format!("owner probe scenario={scenario}; image={probe:?}; arguments={args:?}"),
+        &observed,
+    );
+    let custody = (|| {
+        let child = child
+            .into_inner()
+            .expect("original peer query holder")
+            .ok_or_else(|| {
+                CiError::Message("actual peer child was not held before input".into())
+            })?;
+        if !child.exited().map_err(CiError::Message)? {
+            return Err(CiError::Message(
+                "original peer child not retired after its direct wait".into(),
+            ));
+        }
+        let after: Vec<_> = held
+            .iter()
+            .map(|process| process.live_snapshot())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(CiError::Message)?;
+        Ok((child, after))
+    })();
+    let (child, after) = match (native_result, custody) {
+        (Ok(()), Ok(custody)) => custody,
+        (Err(primary), Err(secondary)) => {
+            return Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+            });
+        }
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => return Err(error),
+    };
     let image = artifacts::read_file(probe)?;
     let metadata = fs::symlink_metadata(probe)?;
     use std::os::unix::ffi::OsStrExt;
@@ -271,7 +290,19 @@ fn owner_probe(
             serde_json::to_vec(&observation)?,
         ),
         ("owner-input.json".into(), input_bytes),
-        ("owner-response.json".into(), artifacts::read_file(&output)?),
+        (
+            "owner-response.json".into(),
+            artifacts::read_file(&output).map_err(|error| {
+                error.context(format!(
+                    "owner probe scenario={scenario}: read response {output:?}; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-prefix={:?}; stderr-truncated={}",
+                    observed.status,
+                    observed.stdout.len(),
+                    observed.stderr.len(),
+                    String::from_utf8_lossy(&observed.stderr[..observed.stderr.len().min(2048)]),
+                    observed.stderr.len() > 2048,
+                ))
+            })?,
+        ),
         ("owner-stdout.bin".into(), observed.stdout),
         ("owner-stderr.bin".into(), observed.stderr),
     ]))
@@ -305,19 +336,28 @@ fn before_preparation_experiment(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&fixture.bundle)?;
     let identity = bundle.metadata()?;
-    let watcher = NativeNamespaceWatch::new(&[
-        ("journal", Path::new("/var/lib/memcordon/workload-attempts")),
-        (
-            "input-staging",
-            Path::new("/var/lib/memcordon/workload-inputs"),
-        ),
-        (
-            "footprint",
-            Path::new("/var/lib/memcordon/workload-resources"),
-        ),
-        ("root-staging", Path::new("/run/memcordon")),
-        ("cgroup", Path::new("/sys/fs/cgroup/memcordon-sealed")),
-    ])?;
+    let watcher = NativeNamespaceWatch::new(
+        &[
+            ("journal", Path::new("/var/lib/memcordon/workload-attempts")),
+            (
+                "input-staging",
+                Path::new("/var/lib/memcordon/workload-inputs"),
+            ),
+            (
+                "footprint",
+                Path::new("/var/lib/memcordon/workload-resources"),
+            ),
+            ("root-staging", Path::new("/run/memcordon")),
+            ("cgroup", Path::new("/sys/fs/cgroup/memcordon-sealed")),
+        ],
+        work,
+    )
+    .map_err(|error| {
+        error.context(format!(
+            "before-preparation namespace watch root={}",
+            directory.display()
+        ))
+    })?;
     let namespace_before = watcher.snapshot()?;
     let gate = NativeReadGate::on_file(&bundle, caller.uid, work)?;
     let observations = directory.join("observations");
@@ -340,7 +380,7 @@ fn before_preparation_experiment(
         challenge.into(),
     ];
     use std::os::unix::ffi::OsStrExt;
-    let invocation = json!({"format":"memcordon.current-preparation-invocation","revision":1,"installed_cli":caller.installed_cli,"caller_uid":caller.uid,"caller_gid":caller.gid,"memory_token":memory.as_bytes(),"memory_bytes":memory_bytes,"deadline_token":"+30s","lifetime":"command","request_path":fixture.request,"input_path":fixture.bundle,"entrypoint":"owned-readiness","arguments":NativeArguments::UnixBytes(arguments.iter().map(|value|value.as_bytes().to_vec()).collect()),"report_format":"result-v3","request_sha256":fixture.request_sha256,"provider":provider});
+    let invocation = json!({"format":"memcordon.current-preparation-invocation","revision":1,"installed_cli":caller.installed_cli,"caller_uid":caller.uid,"caller_gid":caller.gid,"memory_token":memory.as_bytes(),"memory_bytes":memory_bytes,"deadline_token":"+30s","lifetime":"command","request_path":fixture.request,"input_path":fixture.bundle,"entrypoint":"owned-readiness","arguments":arguments.iter().map(|value|value.as_bytes().to_vec()).collect::<Vec<_>>(),"report_format":"result-v3","request_sha256":fixture.request_sha256,"provider":provider});
     let mut launch = RequestLaunch::start(LaunchInput {
         extra_descriptor: None,
         lifetime: memcordon_core::Lifetime::Command,
@@ -486,12 +526,24 @@ fn before_preparation_experiment(
         Ok(result) => result,
         Err(panic) => {
             match launch.cancel_and_settle(cleanup) {
-                Ok(_) => {
+                Ok(settled) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "owner phase=before-preparation unwind; original frontend settlement: {settled}"
+                    );
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                        eprintln!("native input retirement after unwind: {error}");
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "native input retirement after unwind: {error}"
+                        );
                     }
                 }
-                Err(error) => eprintln!("native request settlement after unwind: {error}"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "native request settlement after unwind: {error}"
+                    );
+                }
             }
             std::panic::resume_unwind(panic)
         }
@@ -502,10 +554,15 @@ fn before_preparation_experiment(
             Ok(observed)
         }
         Err(primary) => match launch.cancel_and_settle(cleanup) {
-            Ok(_) => Err(primary),
-            Err(settlement) => Err(CiError::Message(format!(
-                "{primary}; original pre-input child settlement incomplete: {settlement}"
+            Ok(settled) => Err(primary.context(format!(
+                "owner phase=before-preparation; original frontend settlement: {settled}"
             ))),
+            Err(settlement) => Err(CiError::LaneFailures {
+                primary: Box::new(primary.context("owner phase=before-preparation")),
+                secondary: Box::new(
+                    settlement.context("original before-preparation frontend settlement"),
+                ),
+            }),
         },
     }
 }
@@ -678,15 +735,7 @@ fn allocation_experiment(
         work,
         move |pid, bytes| {
             serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|record| {
-                record["format"] == "memcordon.private-workload-journal"
-                    && record["revision"] == 1
-                    && record["request_sha256"] == expected
-                    && record["caller_uid"] == uid
-                    && record["worker"]["pid"] == pid
-                    && record["phase"] == "guardian-ready"
-                    && record["intents"]["namespace_init"] == false
-                    && record["intents"]["target"] == false
-                    && record["native"].is_null()
+                crate::linux_allocation_checkpoint::matches_gate(&record, pid, &expected, uid)
             })
         },
     )?;
@@ -747,11 +796,11 @@ fn allocation_experiment(
                 || record["boot_id"]
                     != fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()
                 || record["release"] != "not-released"
-                || !record["namespace_init"].is_null()
-                || !record["target"].is_null()
+                || !crate::linux_allocation_checkpoint::acquired_guardian_ready(&record)
+                || record["cgroup"].is_null()
             {
                 return Err(CiError::Message(
-                    "kernel allocation readback does not belong to the original pre-target attempt"
+                    "kernel allocation readback does not belong to the original pre-TargetGated-publication attempt"
                         .into(),
                 ));
             }
@@ -774,11 +823,29 @@ fn allocation_experiment(
             let mut guardian = HeldLinuxProcess::acquire(guardian_pid, guardian_birth)
                 .map_err(CiError::Message)?;
             guardian.verify_parent(&worker).map_err(CiError::Message)?;
+            let acquire = |role: &str| -> Result<HeldLinuxProcess> {
+                let pid = u32::try_from(
+                    record[role]["pid"]
+                        .as_u64()
+                        .ok_or_else(|| CiError::Message(format!("original {role} PID absent")))?,
+                )
+                .map_err(|error| CiError::Message(error.to_string()))?;
+                let birth = record[role]["start_time"]
+                    .as_u64()
+                    .ok_or_else(|| CiError::Message(format!("original {role} birth absent")))?;
+                HeldLinuxProcess::acquire(pid, birth).map_err(CiError::Message)
+            };
+            let mut init = acquire("namespace_init")?;
+            init.verify_parent(&worker).map_err(CiError::Message)?;
+            let mut target = acquire("target")?;
+            target.verify_parent(&init).map_err(CiError::Message)?;
             let mut held = vec![
                 ("frontend", frontend),
                 ("worker", worker),
                 ("control", control),
                 ("guardian", guardian),
+                ("namespace_init", init),
+                ("target", target),
             ];
             let manifest_bytes = fs::read("/usr/libexec/memcordon-runtime-manifest.json")?;
             let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
@@ -841,6 +908,44 @@ fn allocation_experiment(
                             .into(),
                     ));
                 }
+                if role == "cgroup" {
+                    use std::io::Read;
+                    let members = fs::File::from(
+                        rustix::fs::openat(
+                            &file,
+                            "cgroup.procs",
+                            rustix::fs::OFlags::RDONLY
+                                | rustix::fs::OFlags::NOFOLLOW
+                                | rustix::fs::OFlags::CLOEXEC,
+                            rustix::fs::Mode::empty(),
+                        )
+                        .map_err(std::io::Error::from)?,
+                    );
+                    let mut bytes = String::new();
+                    members.take(65537).read_to_string(&mut bytes)?;
+                    if bytes.len() > 65536 {
+                        return Err(CiError::Message(
+                            "original allocation cgroup membership exceeds bound".into(),
+                        ));
+                    }
+                    let members = bytes
+                        .lines()
+                        .map(|line| {
+                            line.parse::<u32>().map_err(|error| {
+                                CiError::Message(format!("original cgroup member invalid: {error}"))
+                            })
+                        })
+                        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+                    for (role, process) in &held {
+                        if matches!(*role, "namespace_init" | "target")
+                            && !members.contains(&process.process_id)
+                        {
+                            return Err(CiError::Message(format!(
+                                "held original {role} is outside the pinned attempt cgroup"
+                            )));
+                        }
+                    }
+                }
                 resources.push(
                     json!({"role":role,"path":path,"device":identity.dev(),"inode":identity.ino()}),
                 );
@@ -880,7 +985,7 @@ fn allocation_experiment(
                 ("provider-manifest.json".into(), manifest_bytes),
             ]);
             use std::os::unix::ffi::OsStrExt;
-            files.insert("operands.json".into(),serde_json::to_vec(&json!({"working_directory":null,"memory_bytes":memory_bytes,"deadline_millis":30000,"lifetime":"command","target_argv":NativeArguments::UnixBytes(arguments.iter().map(|argument|argument.as_bytes().to_vec()).collect())}))?);
+            files.insert("operands.json".into(),serde_json::to_vec(&json!({"working_directory":null,"memory_bytes":memory_bytes,"deadline_millis":30000,"lifetime":"command","target_argv":arguments.iter().map(|argument|argument.as_bytes().to_vec()).collect::<Vec<_>>()}))?);
             let blocked = permission.observation();
             super::source::write_json(
                 &controller.join(format!("current-attempt-{attempt}.json")),
@@ -928,7 +1033,7 @@ fn allocation_experiment(
                 Err(error) => return Err(error.into()),
             }
             for (role, process) in &held {
-                if *role == "guardian" {
+                if matches!(*role, "guardian" | "namespace_init" | "target") {
                     continue;
                 }
                 while !process.exited().map_err(CiError::Message)? {
@@ -941,11 +1046,12 @@ fn allocation_experiment(
                 }
             }
             let recovery = launch.recover()?;
-            files.insert(
-                "recovery.json".into(),
-                fs::read(directory.join("workload-recovery.json"))?,
-            );
-            files.insert("recovery-process.json".into(),serde_json::to_vec(&json!({"status":recovery.process.status.code(),"stdout":recovery.process.stdout,"stderr":recovery.process.stderr}))?);
+            files.insert("recovery.json".into(), recovery.raw_terminal.clone());
+            files.insert("recovery-process.json".into(),serde_json::to_vec(&json!({"status":recovery.process.status.code(),"stdout":&recovery.process.stdout,"stderr":&recovery.process.stderr}))?);
+            crate::command::require_successful_output(
+                &format!("allocation scenario={scenario}: original public recovery"),
+                &recovery.process,
+            )?;
             files.insert(
                 "journal-after.json".into(),
                 fs::read(Path::new("/var/lib/memcordon/workload-attempts").join(&attempt))?,
@@ -963,16 +1069,20 @@ fn allocation_experiment(
             let retired:Vec<_>=held.iter().map(|(role,process)|json!({"role":role,"pid":process.process_id,"birth":process.birth,"pidfd_readable":true})).collect();
             files.insert("held-after.json".into(), serde_json::to_vec(&retired)?);
             let mut absent = Vec::new();
-            for (path, _) in &directories {
+            for (path, original) in &directories {
                 match fs::symlink_metadata(path) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         absent.push(json!({"path":path,"absent":true}))
                     }
                     Err(error) => return Err(error.into()),
                     Ok(_) => {
-                        return Err(CiError::Message(
-                            "original partial native directory remains".into(),
-                        ));
+                        let identity = original.metadata()?;
+                        return Err(CiError::Message(format!(
+                            "original partial native directory remains; path={}; original-device={}; original-inode={}",
+                            path.display(),
+                            identity.dev(),
+                            identity.ino()
+                        )));
                     }
                 }
             }
@@ -1041,12 +1151,24 @@ fn allocation_experiment(
         Ok(result) => result,
         Err(panic) => {
             match launch.cancel_and_settle(cleanup) {
-                Ok(_) => {
+                Ok(settled) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "allocation scenario={scenario} unwind; expected-checkpoint=before TargetGated publication; original frontend settlement: {settled}"
+                    );
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
-                        eprintln!("native input retirement after unwind: {error}");
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "native input retirement after unwind: {error}"
+                        );
                     }
                 }
-                Err(error) => eprintln!("native request settlement after unwind: {error}"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "native request settlement after unwind: {error}"
+                    );
+                }
             }
             std::panic::resume_unwind(panic)
         }
@@ -1057,10 +1179,13 @@ fn allocation_experiment(
             Ok(observed)
         }
         Err(primary) => match launch.cancel_and_settle(cleanup) {
-            Ok(_) => Err(primary),
-            Err(settlement) => Err(CiError::Message(format!(
-                "{primary}; original allocation frontend settlement incomplete: {settlement}"
+            Ok(settled) => Err(primary.context(format!(
+                "allocation scenario={scenario}; expected-phase=guardian-ready before TargetGated publication; original frontend settlement: {settled}"
             ))),
+            Err(settlement) => Err(CiError::LaneFailures {
+                primary: Box::new(primary.context(format!("allocation scenario={scenario}; expected-phase=guardian-ready before TargetGated publication"))),
+                secondary: Box::new(settlement.context("original allocation frontend settlement")),
+            }),
         },
     }
 }

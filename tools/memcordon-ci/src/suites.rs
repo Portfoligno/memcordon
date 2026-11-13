@@ -422,7 +422,23 @@ fn native(
 ) -> Result<()> {
     for command in memcordon_ci::native_test_plan::commands_with_failure(release_mode, mode) {
         memcordon_ci::workflow_output::revoke_compilation("compiled-native-complete")?;
-        cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
+        let phase = if command.arguments.contains(&"--no-run") {
+            crate::command::CiPhase::NativeCompile
+        } else {
+            crate::command::CiPhase::NativeExecute
+        };
+        let command = rustup_cargo(
+            root,
+            stable,
+            std::iter::once("test").chain(command.arguments),
+            command.deadline,
+        );
+        let command = if cfg!(target_os = "linux") {
+            command.phase(phase)
+        } else {
+            command
+        };
+        command.run()?;
         memcordon_ci::workflow_output::compilation_complete("compiled-native-complete")?;
     }
     Ok(())
@@ -439,7 +455,22 @@ fn native_phase(
         .nth(if compile { 0 } else { 1 })
         .expect("native compile/execute plan");
     memcordon_ci::workflow_output::revoke_compilation("compiled-native-complete")?;
-    cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
+    let command = rustup_cargo(
+        root,
+        stable,
+        std::iter::once("test").chain(command.arguments),
+        command.deadline,
+    );
+    let command = if cfg!(target_os = "linux") {
+        command.phase(if compile {
+            crate::command::CiPhase::NativeCompile
+        } else {
+            crate::command::CiPhase::NativeExecute
+        })
+    } else {
+        command
+    };
+    command.run()?;
     memcordon_ci::workflow_output::compilation_complete("compiled-native-complete")?;
     Ok(())
 }
@@ -459,13 +490,37 @@ fn windows_fixture_native(root: &Path, stable: &str) -> Result<()> {
     memcordon_ci::workflow_output::compilation_complete("compiled-recipe-complete")?;
     let execute = commands.next().expect("fixture execute plan");
     let output = cargo_with_deadline(root, stable, "test", execute.arguments, execute.deadline)?;
-    settled_validation(|| {
-        memcordon_ci::windows_fixture_native::verify_one_test(&output).map_err(Into::into)
+    let measurements = settled_validation(|| {
+        memcordon_ci::windows_fixture_native::sqos::extract(&output).map_err(Into::into)
     })?;
-    eprintln!(
-        "[ci windows-fixture-native] verified selected-test={}; executed=1; passed=1; failed=0; ignored=0",
-        memcordon_ci::windows_fixture_native::TEST_SELECTOR
-    );
+    let tracking = settled_validation(|| {
+        memcordon_ci::windows_fixture_native::sqos::extract_tracking(&output).map_err(Into::into)
+    })?;
+    for measurement in &measurements {
+        eprintln!(
+            "{}{measurement}",
+            memcordon_ci::windows_fixture_native::sqos::MARKER
+        );
+    }
+    for measurement in &tracking {
+        eprintln!(
+            "{}{measurement}",
+            memcordon_ci::windows_fixture_native::sqos::TRACKING_MARKER
+        );
+    }
+    settled_validation(|| {
+        memcordon_ci::windows_fixture_native::verify_measurements(&measurements, &tracking)
+            .map_err(Into::into)
+    })?;
+    settled_validation(|| {
+        memcordon_ci::windows_fixture_native::verify_selected_tests(&output).map_err(Into::into)
+    })?;
+    for selector in memcordon_ci::windows_fixture_native::TEST_SELECTORS {
+        eprintln!(
+            "[ci windows-fixture-native] verified selected-test={}; executed=1; passed=1; failed=0; ignored=0",
+            selector
+        );
+    }
     Ok(())
 }
 

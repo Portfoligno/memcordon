@@ -27,8 +27,9 @@ fn workload_request_selection_is_absolute_exclusive_and_shared_by_both_frontends
     assert_eq!(std::fs::read(&selected).unwrap(), bytes);
     let root = owned.path().to_path_buf();
     let descriptor = descriptor::Descriptor {
+        matched_control: None,
         format: "memcordon.fixture-workload".into(),
-        revision: 1,
+        revision: descriptor::DESCRIPTOR_REVISION,
         case: descriptor::Case::Envelope,
         transcript: root.join("events.bin"),
         output_root: root.clone(),
@@ -43,7 +44,14 @@ fn workload_request_selection_is_absolute_exclusive_and_shared_by_both_frontends
         sentinel_handles: vec![],
         descendant_gate: None,
         start_gate: None,
+        start_transport: descriptor::StartTransport::NamedEvent,
+        control_clock: None,
+        winsock_registry: None,
+        provider_input_experiment: false,
+        provider_input_paths: Vec::new(),
+        provider_input_binding: None,
         gate_access_diagnostic: None,
+        gate_precondition: None,
         completion_gate: None,
         cohort_gate: None,
         generation_gate: None,

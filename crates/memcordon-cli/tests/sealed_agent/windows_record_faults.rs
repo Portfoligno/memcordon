@@ -156,6 +156,16 @@ fn snapshot_classifier_distinguishes_every_ordered_invariant_without_values() {
         };
         event.native_code = Some(memcordon_core::NativeFailureCodeV1::Win32(4321));
     });
+    case!(NativeInputReplacement, |p, c| {
+        let observation = memcordon_core::WindowsNativeInputObservationV1::new(
+            [1; 32],
+            [2; 32],
+            p.caller_process_identity.clone(),
+            memcordon_core::NativeInputCaptureV1::default(),
+        );
+        p.causal_diagnostics.set_native_inputs(observation).unwrap();
+        c.causal_diagnostics.native_inputs = None;
+    });
     case!(TerminalOutbox, |p, c| {
         p.terminal_response_json = Some(std::sync::Arc::from(
             serde_json::to_string(&serde_json::json!({"fixture":"retained-terminal-outbox"}))
@@ -168,6 +178,15 @@ fn snapshot_classifier_distinguishes_every_ordered_invariant_without_values() {
 fn snapshot_retention_expiry_exception_remains_narrow() {
     let mut previous = observed_record();
     previous.boot_identity = "original-boot-no-longer-current".into();
+    previous
+        .causal_diagnostics
+        .set_native_inputs(memcordon_core::WindowsNativeInputObservationV1::new(
+            [1; 32],
+            [2; 32],
+            previous.caller_process_identity.clone(),
+            memcordon_core::NativeInputCaptureV1::default(),
+        ))
+        .unwrap();
     let mut expired = previous.clone();
     expired.causal_diagnostics = memcordon_core::WindowsCausalDiagnosticsV1::default();
     expired.causal_diagnostics.original = memcordon_core::OriginalFailureV1::Unavailable {
@@ -178,6 +197,13 @@ fn snapshot_retention_expiry_exception_remains_narrow() {
     assert_eq!(
         expired.snapshot_violation(&previous, previous.record_revision),
         None
+    );
+    let mut retained_observation = expired.clone();
+    retained_observation.causal_diagnostics.native_inputs =
+        previous.causal_diagnostics.native_inputs.clone();
+    assert_eq!(
+        retained_observation.snapshot_violation(&previous, previous.record_revision),
+        Some(SnapshotInvariant::RetentionTombstone)
     );
     let eligible = observed_record();
     assert!(diagnostic_export_eligible(&eligible));
@@ -665,6 +691,129 @@ fn observed_record() -> WindowsAttemptRecordV1 {
         })
         .unwrap();
     record
+}
+
+#[test]
+fn diagnostic_snapshot_authenticates_owner_without_changing_lifecycle_files() {
+    use memcordon_core::{
+        WindowsRecoveryAccessFloorV1, WindowsRecoveryAuthorizationV1,
+        WindowsRecoveryCallerEvidenceV1, WindowsRecoveryPolicyV1,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attempt.json");
+    let mut record = observed_record();
+    record.nonce = "diagnostic-fixture-nonce".into();
+    let floor = WindowsRecoveryAccessFloorV1 {
+        integrity_level: "S-1-16-8192".into(),
+        elevated: false,
+        restricted: false,
+        restricted_sids_sha256: None,
+        appcontainer: false,
+        appcontainer_binding_sha256: None,
+    };
+    let caller = WindowsRecoveryCallerEvidenceV1 {
+        schema_version: 1,
+        current_boot_identity: record.boot_identity.clone(),
+        process_identity: record.caller_process_identity.clone(),
+        user_sid: "S-1-5-21-1".into(),
+        logon_identity: 1,
+        token_binding_sha256: digest(b"diagnostic owner fixture"),
+        access_floor: floor.clone(),
+    };
+    record.recovery_authorization = Some(WindowsRecoveryAuthorizationV1 {
+        schema_version: 1,
+        user_sid: caller.user_sid.clone(),
+        launch_logon_identity: caller.logon_identity,
+        launch_token_binding_sha256: caller.token_binding_sha256.clone(),
+        recovery_access_floor: floor,
+        policy: WindowsRecoveryPolicyV1::SameOwnerBootSensitive,
+    });
+    record.publish_at(&path, 0, |_| Ok(())).unwrap();
+    let binding = memcordon_core::PublicProviderBindingV1 {
+        generation: memcordon_core::BoundedText::new(record.provider_generation.as_str()).unwrap(),
+        source_commit: memcordon_core::BoundedText::new(&"12".repeat(20)).unwrap(),
+        runtime_manifest_sha256: memcordon_core::hash_bytes(b"diagnostic fixture manifest"),
+    };
+    let protected = [
+        "admission.reader.json",
+        "guardian.json",
+        "tombstone.json",
+        "target.live",
+    ];
+    for leaf in protected {
+        std::fs::write(directory.path().join(leaf), b"must remain untouched").unwrap();
+    }
+    let original = std::fs::read(&path).unwrap();
+    let observe = |nonce: &str, request: &str, caller: &WindowsRecoveryCallerEvidenceV1| {
+        read_attempt_diagnostics_snapshot(&path, &record.attempt_id, nonce, request, caller, || {
+            Ok(binding.clone())
+        })
+    };
+    let observed = observe(&record.nonce, &record.request_sha256, &caller).unwrap();
+    assert_eq!(
+        observed.diagnostic_availability,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::Available
+    );
+    assert!(observed.provider_failure.is_some());
+    assert!(observe("wrong nonce", &record.request_sha256, &caller).is_err());
+    assert!(observe(&record.nonce, &digest(b"wrong request"), &caller).is_err());
+    for field in ["user", "logon", "token", "floor"] {
+        let mut other = caller.clone();
+        match field {
+            "user" => other.user_sid = "S-1-5-21-2".into(),
+            "logon" => other.logon_identity += 1,
+            "token" => other.token_binding_sha256 = digest(b"other token"),
+            "floor" => other.access_floor.integrity_level = "S-1-16-4096".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            observe(&record.nonce, &record.request_sha256, &other).is_err(),
+            "{field}"
+        );
+    }
+    assert!(
+        read_attempt_diagnostics_snapshot(
+            &directory.path().join("missing.json"),
+            &record.attempt_id,
+            &record.nonce,
+            &record.request_sha256,
+            &caller,
+            || panic!("missing snapshot must not resolve provider"),
+        )
+        .is_err()
+    );
+    let expired_directory = tempfile::tempdir().unwrap();
+    let expired_path = expired_directory.path().join("attempt.json");
+    let mut expired = record.clone();
+    expired.boot_identity = "original boot no longer current".into();
+    expired.publish_at(&expired_path, 0, |_| Ok(())).unwrap();
+    let expired_bytes = std::fs::read(&expired_path).unwrap();
+    let unavailable = read_attempt_diagnostics_snapshot(
+        &expired_path,
+        &expired.attempt_id,
+        &expired.nonce,
+        &expired.request_sha256,
+        &caller,
+        || panic!("expired diagnostics must not resolve provider"),
+    )
+    .unwrap();
+    assert_eq!(
+        unavailable.diagnostic_availability,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::RetentionExpired
+    );
+    assert!(unavailable.provider_failure.is_none());
+    assert_eq!(std::fs::read(&expired_path).unwrap(), expired_bytes);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    for leaf in protected {
+        assert_eq!(
+            std::fs::read(directory.path().join(leaf)).unwrap(),
+            b"must remain untouched"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        protected.len() + 1
+    );
 }
 
 #[test]
@@ -1217,6 +1366,17 @@ fn native_durable_record_rejects_provider_generation_substitution() {
 #[ignore = "runs current native provider projection and recovery vectors"]
 fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     let mut record = observed_record();
+    assert!(record.guardian_identity.is_none());
+    // The temporary record uses its real compiled generation. The remaining
+    // binding fields are explicit fixture inputs, not an installed package.
+    let binding = memcordon_core::PublicProviderBindingV1 {
+        generation: memcordon_core::BoundedText::new(record.provider_generation.as_str()).unwrap(),
+        source_commit: memcordon_core::BoundedText::new(&"12".repeat(20)).unwrap(),
+        runtime_manifest_sha256: memcordon_core::hash_bytes(
+            b"native provider projection fixture manifest",
+        ),
+    };
+    assert!(binding.is_consistent());
     let original = record.causal_diagnostics.original.clone();
     let memcordon_core::OriginalFailureV1::Observed { event } = &original else {
         panic!("fixture must have original cause");
@@ -1239,7 +1399,8 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     record.publish_at(&path, 0, |_| Ok(())).unwrap();
     let bytes = read_record_bounded(&path).unwrap();
     authenticate(&record, &record.attempt_id).unwrap();
-    let (projection, availability) = provider_projection(Some(&record));
+    let (projection, availability) =
+        provider_projection_with_binding(Some(&record), || Ok(binding.clone()));
     let stored: WindowsAttemptRecordV1 = serde_json::from_slice(&bytes).unwrap();
     authenticate(&stored, &stored.attempt_id).unwrap();
     assert_eq!(
@@ -1255,6 +1416,45 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     assert_eq!(projection.loss.secondary_events_omitted, 17);
     let projection_bytes = serde_json::to_vec(&projection).unwrap();
     assert!(projection_bytes.len() <= memcordon_core::MAX_DIAGNOSTIC_PROJECTION_BYTES);
+    let (unavailable, reason) = provider_projection_with_binding(Some(&record), || {
+        Err("fixture binding intentionally unavailable".into())
+    });
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::ProviderBindingUnavailable
+    );
+    let mut foreign_binding = binding.clone();
+    foreign_binding.generation =
+        memcordon_core::BoundedText::new("foreign-fixture-generation").unwrap();
+    assert!(foreign_binding.is_consistent());
+    assert_ne!(foreign_binding.generation, binding.generation);
+    let (unavailable, reason) =
+        provider_projection_with_binding(Some(&record), || Ok(foreign_binding.clone()));
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::ProviderBindingUnavailable
+    );
+    let (unavailable, reason) = provider_projection_with_binding(None, || {
+        panic!("absent record must not resolve installed state")
+    });
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::RecordUnavailable
+    );
+    let mut expired_record = record.clone();
+    expired_record.diagnostic_retention.tombstone =
+        Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
+    let (unavailable, reason) = provider_projection_with_binding(Some(&expired_record), || {
+        panic!("expired record must not resolve installed state")
+    });
+    assert!(unavailable.is_none());
+    assert_eq!(
+        reason,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::RetentionExpired
+    );
     let mut recovered_record = record.clone();
     let rejection = terminal_fixture::postauthorization_failure(
         &mut recovered_record,
@@ -1265,6 +1465,11 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
         true,
         "MCSEALED-WINDOWS-AUTHORITY-LOSS",
         memcordon_core::BoundarySetupPhase::Retirement,
+    );
+    assert!(recovered_record.guardian_identity.is_none());
+    assert_eq!(
+        binding.generation.as_str(),
+        recovered_record.provider_generation
     );
     recovered_record.terminal_disposition =
         Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
@@ -1307,19 +1512,47 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
         rejection, ..
     } if rejection.provider_failure.is_none())
     );
-    let recovered = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
+    let recovered =
+        bound_recovery_terminal_response_with_binding(&recovered_record, &authority, || {
+            Ok(binding.clone())
+        })
+        .unwrap();
     assert!(
         matches!(&recovered, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..
     } if rejection.provider_failure.as_ref() == Some(&transport_projection))
     );
     assert_eq!(recovered.terminal_authority_json().unwrap(), authority);
+    for unavailable_binding in [false, true] {
+        let unavailable =
+            bound_recovery_terminal_response_with_binding(&recovered_record, &authority, || {
+                if unavailable_binding {
+                    Err("fixture binding intentionally unavailable".into())
+                } else {
+                    Ok(foreign_binding.clone())
+                }
+            })
+            .unwrap();
+        assert!(
+            matches!(&unavailable, memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. } if rejection.provider_failure.is_none())
+        );
+        assert_eq!(unavailable.terminal_authority_json().unwrap(), authority);
+    }
     let mut foreign = recovered_record.clone();
     foreign.request_sha256 = "ab".repeat(32);
-    assert!(bound_recovery_terminal_response(&foreign, &authority).is_err());
+    assert!(
+        bound_recovery_terminal_response_with_binding(&foreign, &authority, || {
+            panic!("foreign recovery outbox must fail before resolving installed state")
+        })
+        .is_err()
+    );
     recovered_record.diagnostic_retention.tombstone =
         Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
-    let expired = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
+    let expired =
+        bound_recovery_terminal_response_with_binding(&recovered_record, &authority, || {
+            panic!("expired recovery diagnostics must not resolve installed state")
+        })
+        .unwrap();
     assert!(
         matches!(&expired, memcordon_core::WindowsLauncherResponseV4::Reject {
         rejection, ..

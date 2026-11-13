@@ -14,6 +14,8 @@ fn failed_native_command_is_rejected_before_empty_json_is_decoded() {
     assert!(error.contains("native command failed"));
     assert!(error.contains("publication phase=Flush"));
     assert!(error.contains("stdout-bytes=0"));
+    assert!(error.contains("stderr-omitted-bytes=0"));
+    assert!(error.contains("stderr-tail=\"\""));
     assert!(!error.contains("EOF"));
     output.status = std::process::ExitStatus::from_raw(0);
     memcordon_ci::command::require_successful_output("native recovery", &output).unwrap();
@@ -28,6 +30,43 @@ fn failed_native_command_is_rejected_before_empty_json_is_decoded() {
         .to_string();
     assert!(error.contains("stderr-truncated=true"));
     assert!(error.len() < 6500);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_native_command_retains_terminal_stderr_with_exact_bounded_omission() {
+    let mut output = retained_output(false);
+    let prefix = b"installed-provider-inspection: ";
+    let terminal = b"\nterminal-helper-error: distinct-native-refusal";
+    output.stderr = [prefix.as_slice(), &vec![b'x'; 4096], terminal.as_slice()].concat();
+    let error = memcordon_ci::command::require_successful_output("installed helper", &output)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("stderr-head=\"installed-provider-inspection: "));
+    assert!(error.contains("stderr-tail="));
+    assert!(error.contains("terminal-helper-error: distinct-native-refusal"));
+    assert!(error.contains(&format!("stderr-bytes={}", output.stderr.len())));
+    assert!(error.contains(&format!(
+        "stderr-omitted-bytes={}",
+        output.stderr.len() - 2048
+    )));
+    assert!(!error.contains('\n'));
+    assert!(error.len() < 6500);
+
+    for length in [0, 1, 2047, 2048] {
+        output.stderr = vec![b's'; length];
+        let error = memcordon_ci::command::require_successful_output("installed helper", &output)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stderr-truncated=false"));
+        assert!(error.contains("stderr-omitted-bytes=0"));
+        assert!(error.contains("stderr-tail=\"\""));
+    }
+    output.stderr = b"unique short failure".to_vec();
+    let error = memcordon_ci::command::require_successful_output("installed helper", &output)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error.matches("unique short failure").count(), 1);
 }
 
 #[cfg(unix)]

@@ -15,26 +15,28 @@ use memcordon_core::{
 };
 
 const LAUNCHER_FILE_NAME: &str = "launcher-startup-failure.json";
-static LAUNCHER_PROGRESS: std::sync::LazyLock<std::sync::Mutex<(Stage, Option<(Stage, Reason)>)>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new((Stage::ProcessProtection, None)));
+static LAUNCHER_PROGRESS: std::sync::LazyLock<
+    std::sync::Mutex<super::launcher_startup_progress::LauncherStartupProgress>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(super::launcher_startup_progress::LauncherStartupProgress::new())
+});
 
 pub(super) fn launcher_stage(stage: Stage) {
     let mut progress = LAUNCHER_PROGRESS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    progress.0 = stage;
-    if stage == Stage::ServiceLoop {
-        progress.1 = None;
-    }
+    progress.stage(stage);
 }
 
 pub(super) fn launcher_blocker(reason: Reason) {
+    launcher_failure(reason, None);
+}
+
+pub(super) fn launcher_failure(reason: Reason, native_code: Option<u32>) {
     let mut progress = LAUNCHER_PROGRESS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if progress.1.is_none() {
-        progress.1 = Some((progress.0, reason));
-    }
+    progress.failure(reason, native_code);
 }
 
 fn launcher_path() -> Result<std::path::PathBuf, String> {
@@ -42,9 +44,10 @@ fn launcher_path() -> Result<std::path::PathBuf, String> {
 }
 
 pub(super) fn clear_launcher() -> Result<(), String> {
-    *LAUNCHER_PROGRESS
+    LAUNCHER_PROGRESS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = (Stage::ProcessProtection, None);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reset();
     let destination = launcher_path()?;
     match std::fs::remove_file(destination.with_extension("json.new")) {
         Ok(()) => (),
@@ -62,7 +65,7 @@ pub(super) fn record_launcher(service_exit: u32) -> Result<(), String> {
     let progress = LAUNCHER_PROGRESS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (stage, reason) = progress.1.unwrap_or((progress.0, Reason::OperationFailed));
+    let (stage, reason, native_code) = progress.observation();
     let failure = memcordon_core::WindowsLauncherStartupDiagnosticV1 {
         schema_version: 1,
         provider: super::package::installed_public_provider_binding()?,
@@ -76,7 +79,7 @@ pub(super) fn record_launcher(service_exit: u32) -> Result<(), String> {
         service_exit,
         stage,
         reason,
-        native_code: None,
+        native_code,
     };
     drop(progress);
     let bytes = failure.to_bounded_json().map_err(str::to_owned)?;

@@ -5,6 +5,213 @@ use serde_yaml::Value;
 pub(super) fn definition() -> Value {
     node_0()
 }
+
+/// A sibling experiment keeps original mandatory consumers independent and
+/// reuses the same owned driver/payload preparation without new cache cases.
+fn provider_input_experiment_job(mut job: Value, dot_local_file: bool) -> Value {
+    let directory = if dot_local_file {
+        "provider-file-input-experiment"
+    } else {
+        "provider-input-experiment"
+    };
+    job["strategy"]["matrix"]["include"]
+        .as_sequence_mut()
+        .expect("installed matrix")
+        .retain(|entry| entry["channel"].as_str() == Some("native"));
+    let steps = job["steps"].as_sequence_mut().expect("installed steps");
+    steps.retain(|step| {
+        !step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("working-windows-consumer --channel cargo"))
+            && !step["with"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("windows-installed"))
+    });
+    let selected = steps
+        .iter_mut()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("working-windows-consumer --channel native"))
+        })
+        .expect("native consumer step");
+    selected["id"] = text("provider-input-experiment");
+    selected["run"] = text(if dot_local_file {
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-file-input-experiment --dot-local-file"
+    } else {
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-provider-experiment --destination target/ci/provider-input-experiment"
+    });
+    let mut with = serde_yaml::Mapping::new();
+    with.insert(
+        text("name"),
+        text(&format!("{directory}-${{{{ matrix.id }}}}")),
+    );
+    let mut paths = format!(
+        "target/ci/{directory}/cases/provider-input-experiment.json\ntarget/ci/{directory}/cases/provider-input-experiment/*/declaration.json\ntarget/ci/{directory}/cases/provider-input-experiment/*/result.json\ntarget/ci/{directory}/cases/provider-input-experiment/*/facts/*.json",
+    );
+    for leaf in [
+        "result.stdout.bin",
+        "result.stderr.bin",
+        "result.guardian-query.stdout.bin",
+        "result.guardian-query.stderr.bin",
+        "tcp-peer-stdout.bin",
+    ] {
+        paths.push('\n');
+        paths.push_str(&format!(
+            "target/ci/{directory}/cases/provider-input-experiment/*/facts/{leaf}"
+        ));
+    }
+    paths.push('\n');
+    paths.push_str(&crate::installed_failure_carriers::package_cleanup_paths(
+        &format!("target/ci/{directory}/cases"),
+    ));
+    with.insert(text("path"), text(&paths));
+    with.insert(text("if-no-files-found"), text("warn"));
+    let mut artifact = serde_yaml::Mapping::new();
+    artifact.insert(
+        text("name"),
+        text("Retain finite declared provider experiment facts"),
+    );
+    artifact.insert(text("if"), text("!cancelled()"));
+    artifact.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    artifact.insert(text("timeout-minutes"), Value::Number(2.into()));
+    artifact.insert(text("with"), Value::Mapping(with));
+    steps.push(Value::Mapping(artifact));
+    job
+}
+
+fn matched_owned_job(mut job: Value) -> Value {
+    job["strategy"]["matrix"]["include"]
+        .as_sequence_mut()
+        .expect("installed matrix")
+        .retain(|entry| entry["channel"].as_str() == Some("native"));
+    let steps = job["steps"].as_sequence_mut().expect("installed steps");
+    steps.retain(|step| {
+        !step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("working-windows-consumer --channel cargo"))
+            && !step["with"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("windows-installed"))
+    });
+    let command = steps
+        .iter_mut()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("working-windows-consumer --channel native"))
+        })
+        .expect("native consumer step");
+    command["id"] = text("matched-owned");
+    command["run"] = text(
+        "./target/ci-runtime/current/memcordon-ci.exe release working-windows-matched-owned --destination target/ci/matched-owned",
+    );
+    let base = "target/ci/matched-owned/cases";
+    let mut paths = vec![
+        format!("{base}/matched-owned-execution.json"),
+        format!("{base}/matched-owned-controls.json"),
+    ];
+    for leaf in [
+        "broker.json",
+        "broker.input-expected.json",
+        "broker.input-failure.json",
+        "broker.authenticated-input-observation.json",
+        "broker.authenticated-input-observation-started.json",
+        "broker.direct-stdout.bin",
+        "broker.direct-stderr.bin",
+        "plan.json",
+        "plan.direct-input.json",
+        "installed-input.json",
+        "windows-ordinary-token.json",
+        "windows-restricted-token.json",
+    ] {
+        paths.push(format!("{base}/matched-owned-controls/*/*/{leaf}"));
+    }
+    for leaf in [
+        "result.json",
+        "result.stdout.bin",
+        "result.stderr.bin",
+        "result.terminal-observation.json",
+        "result.callback-failure.json",
+        "result.failed-frontend.json",
+        "result.failed-terminal-observation.json",
+        "result.guardian-query.json",
+        "result.guardian-query.stdout.bin",
+        "result.guardian-query.stderr.bin",
+        "native-exit.json",
+        "native-retirement.json",
+    ] {
+        paths.push(format!(
+            "{base}/matched-owned-controls/*/*/W-MATCHED-OWNED/*/{leaf}"
+        ));
+    }
+    for lane in ["direct", "installed"] {
+        for leaf in [
+            "application-terminal.json",
+            "matched-input-readback.json",
+            "matched-stream-security-components.json",
+            "fixture-events.bin",
+            "native-argv.json",
+            "nested/empty.bin",
+            "nested/all-bytes.bin",
+            "nested/challenge.bin",
+        ] {
+            paths.push(format!("{base}/candidate-outputs/*/*/{lane}/{leaf}"));
+        }
+    }
+    for leaf in [
+        "frontend-result.json",
+        "frontend-result.terminal-observation.json",
+        "frontend-result.terminal-observation.accepted-observation.json",
+        "frontend-result.terminal-observation.client-input-observation.json",
+    ] {
+        paths.push(format!("{base}/candidate-outputs/*/*/installed/{leaf}"));
+    }
+    paths.push(crate::installed_failure_carriers::package_cleanup_paths(
+        base,
+    ));
+    let mut with = serde_yaml::Mapping::new();
+    with.insert(text("name"), text("matched-owned-${{ matrix.id }}"));
+    with.insert(text("path"), text(&paths.join("\n")));
+    with.insert(text("if-no-files-found"), text("warn"));
+    let mut artifact = serde_yaml::Mapping::new();
+    artifact.insert(
+        text("name"),
+        text("Retain finite matched owned measurements"),
+    );
+    artifact.insert(text("if"), text("!cancelled()"));
+    artifact.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    artifact.insert(text("timeout-minutes"), Value::Number(2.into()));
+    artifact.insert(text("with"), Value::Mapping(with));
+    steps.push(Value::Mapping(artifact));
+    job
+}
+
+fn installed_failure_carriers() -> Value {
+    let mut inputs = serde_yaml::Mapping::new();
+    inputs.insert(
+        text("name"),
+        text("windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}"),
+    );
+    inputs.insert(
+        text("path"),
+        text(&crate::installed_failure_carriers::paths(
+            "target/ci/windows-installed/${{ matrix.channel }}/cases",
+        )),
+    );
+    inputs.insert(text("if-no-files-found"), text("ignore"));
+    let mut step = serde_yaml::Mapping::new();
+    step.insert(
+        text("name"),
+        text("Retain original Winsock failure carriers"),
+    );
+    step.insert(text("if"), text("!cancelled() && failure()"));
+    step.insert(text("uses"), text("./.github/actions/upload-artifact"));
+    step.insert(text("continue-on-error"), Value::Bool(true));
+    step.insert(text("timeout-minutes"), Value::Number(2.into()));
+    step.insert(text("with"), Value::Mapping(inputs));
+    Value::Mapping(step)
+}
 fn node_0() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Native backend tests"));
@@ -25,6 +232,14 @@ fn node_4() -> Value {
     values.insert(text("windows-payload-arm64"), node_488());
     values.insert(text("windows-installed-x64"), node_602());
     values.insert(text("windows-installed-arm64"), node_701());
+    values.insert(
+        text("windows-matched-owned-x64"),
+        matched_owned_job(node_602()),
+    );
+    values.insert(
+        text("windows-matched-owned-arm64"),
+        matched_owned_job(node_701()),
+    );
     values.insert(text("private-linux"), node_800());
     values.insert(text("standard-linux"), node_845());
     values.insert(text("standard-windows"), node_941());
@@ -38,6 +253,22 @@ fn node_4() -> Value {
     values.insert(text("current-contracts"), node_1504());
     values.insert(text("tooling-contracts"), node_1526());
     values.insert(text("macos-administrative-contracts"), node_1543());
+    values.insert(
+        text("windows-provider-input-experiment-x64"),
+        provider_input_experiment_job(node_602(), false),
+    );
+    values.insert(
+        text("windows-provider-input-experiment-arm64"),
+        provider_input_experiment_job(node_701(), false),
+    );
+    values.insert(
+        text("windows-provider-file-input-experiment-x64"),
+        provider_input_experiment_job(node_602(), true),
+    );
+    values.insert(
+        text("windows-provider-file-input-experiment-arm64"),
+        provider_input_experiment_job(node_701(), true),
+    );
     Value::Mapping(values)
 }
 
@@ -66,7 +297,7 @@ fn node_1545() -> Value {
     let mut values = Vec::new();
     values.push(node_1546());
     values.push(node_1547());
-    values.push(node_1549());
+    values.extend(node_1549());
     values.push(node_1550());
     values.push(node_1552());
     values.push(node_1554());
@@ -173,7 +404,7 @@ fn node_1551() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1549() -> Value {
+fn node_1549() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -181,7 +412,7 @@ fn node_1549() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1549", Value::Mapping(values))
 }
 
 fn node_1547() -> Value {
@@ -240,7 +471,7 @@ fn node_1528() -> Value {
     let mut values = Vec::new();
     values.push(node_1529());
     values.push(node_1530());
-    values.push(node_1532());
+    values.extend(node_1532());
     values.push(node_1533());
     values.push(node_1535());
     values.push(node_1537());
@@ -297,7 +528,7 @@ fn node_1539() -> Value {
 fn node_1537() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Current external consumer contracts"));
-    values.insert(text("run"), text("rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy"));
+    values.insert(text("run"), text("rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow --test suite_failure_policy --test windows_consumer_readiness --test launch_event_wait"));
     values.insert(text("timeout-minutes"), Value::Number(10.into()));
     Value::Mapping(values)
 }
@@ -347,7 +578,7 @@ fn node_1534() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1532() -> Value {
+fn node_1532() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -355,7 +586,7 @@ fn node_1532() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1532", Value::Mapping(values))
 }
 
 fn node_1530() -> Value {
@@ -414,7 +645,7 @@ fn node_1506() -> Value {
     let mut values = Vec::new();
     values.push(node_1507());
     values.push(node_1508());
-    values.push(node_1510());
+    values.extend(node_1510());
     values.push(node_1511());
     values.push(node_1513());
     values.push(node_1515());
@@ -569,7 +800,7 @@ fn node_1512() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1510() -> Value {
+fn node_1510() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -577,7 +808,7 @@ fn node_1510() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1510", Value::Mapping(values))
 }
 
 fn node_1508() -> Value {
@@ -632,7 +863,7 @@ fn node_1492() -> Value {
     let mut values = Vec::new();
     values.push(node_1493());
     values.push(node_1494());
-    values.push(node_1496());
+    values.extend(node_1496());
     values.push(node_1497());
     values.push(node_1499());
     values.push(node_1500());
@@ -719,7 +950,7 @@ fn node_1498() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1496() -> Value {
+fn node_1496() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("name"), text("Install pinned Cargo toolchain"));
     values.insert(
@@ -727,7 +958,7 @@ fn node_1496() -> Value {
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1496", Value::Mapping(values))
 }
 
 fn node_1494() -> Value {
@@ -806,7 +1037,7 @@ fn node_1441() -> Value {
 fn node_1446() -> Value {
     let mut values = Vec::new();
     values.push(node_1447());
-    values.push(node_1449());
+    values.extend(node_1449());
     values.push(node_1450());
     values.push(node_1452());
     values.push(node_1453());
@@ -846,7 +1077,7 @@ fn node_1485() -> Value {
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
     values.insert(
         text("path"),
-        text("target/ci/private-installed-diagnostics"),
+        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json\ntarget/ci/private-installed/installed/linux/helper-command/stdout.bin\ntarget/ci/private-installed/installed/linux/helper-command/stderr.bin\ntarget/ci/private-installed/installed/linux/helper-command/command-output.json\ntarget/ci/private-installed/installed/linux/helper-command/command-failure.json"),
     );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
@@ -1355,14 +1586,14 @@ fn node_1451() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1449() -> Value {
+fn node_1449() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1449", Value::Mapping(values))
 }
 
 fn node_1447() -> Value {
@@ -1447,7 +1678,7 @@ fn node_1386() -> Value {
     let mut values = Vec::new();
     values.push(node_1387());
     values.push(node_1388());
-    values.push(node_1390());
+    values.extend(node_1390());
     values.push(node_1391());
     values.push(node_1393());
     values.push(node_1394());
@@ -1503,7 +1734,7 @@ fn node_1438() -> Value {
 
 fn node_1436() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json"));
+    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
     Value::Mapping(values)
 }
@@ -2175,14 +2406,14 @@ fn node_1392() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1390() -> Value {
+fn node_1390() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1390", Value::Mapping(values))
 }
 
 fn node_1388() -> Value {
@@ -2274,7 +2505,7 @@ fn node_1294() -> Value {
     let mut values = Vec::new();
     values.push(node_1295());
     values.push(node_1296());
-    values.push(node_1298());
+    values.extend(node_1298());
     values.push(node_1299());
     values.push(node_1301());
     values.push(node_1303());
@@ -3497,14 +3728,14 @@ fn node_1300() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1298() -> Value {
+fn node_1298() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1298", Value::Mapping(values))
 }
 
 fn node_1296() -> Value {
@@ -3594,7 +3825,7 @@ fn node_1234() -> Value {
     let mut values = Vec::new();
     values.push(node_1235());
     values.push(node_1236());
-    values.push(node_1238());
+    values.extend(node_1238());
     values.push(node_1239());
     values.push(node_1241());
     values.push(node_1242());
@@ -3650,7 +3881,7 @@ fn node_1286() -> Value {
 
 fn node_1284() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json"));
+    values.insert(text("run"), text("tar -cf target/ci/private-prepared.tar target/ci/private-prepared target/ci-runtime/current target/ci-preparation/private.json target/ci/native/release/memcordon-linux-readiness-fixture"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
     Value::Mapping(values)
 }
@@ -4322,14 +4553,14 @@ fn node_1240() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1238() -> Value {
+fn node_1238() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1238", Value::Mapping(values))
 }
 
 fn node_1236() -> Value {
@@ -4418,7 +4649,7 @@ fn node_1142() -> Value {
     let mut values = Vec::new();
     values.push(node_1143());
     values.push(node_1144());
-    values.push(node_1146());
+    values.extend(node_1146());
     values.push(node_1147());
     values.push(node_1149());
     values.push(node_1151());
@@ -5641,14 +5872,14 @@ fn node_1148() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1146() -> Value {
+fn node_1146() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1146", Value::Mapping(values))
 }
 
 fn node_1144() -> Value {
@@ -5730,7 +5961,7 @@ fn node_1040() -> Value {
     let mut values = Vec::new();
     values.push(node_1041());
     values.push(node_1042());
-    values.push(node_1044());
+    values.extend(node_1044());
     values.push(node_1045());
     values.push(node_1047());
     values.push(node_1049());
@@ -7161,14 +7392,14 @@ fn node_1046() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1044() -> Value {
+fn node_1044() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_1044", Value::Mapping(values))
 }
 
 fn node_1042() -> Value {
@@ -7225,7 +7456,7 @@ fn node_942() -> Value {
     let mut values = Vec::new();
     values.push(node_943());
     values.push(node_944());
-    values.push(node_946());
+    values.extend(node_946());
     values.push(node_947());
     values.push(node_949());
     values.push(node_951());
@@ -8656,14 +8887,14 @@ fn node_948() -> Value {
     Value::Mapping(values)
 }
 
-fn node_946() -> Value {
+fn node_946() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_946", Value::Mapping(values))
 }
 
 fn node_944() -> Value {
@@ -8720,7 +8951,7 @@ fn node_846() -> Value {
     let mut values = Vec::new();
     values.push(node_847());
     values.push(node_848());
-    values.push(node_850());
+    values.extend(node_850());
     values.push(node_851());
     values.push(node_853());
     values.push(node_855());
@@ -10111,14 +10342,14 @@ fn node_852() -> Value {
     Value::Mapping(values)
 }
 
-fn node_850() -> Value {
+fn node_850() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_850", Value::Mapping(values))
 }
 
 fn node_848() -> Value {
@@ -10162,7 +10393,7 @@ fn node_800() -> Value {
 fn node_805() -> Value {
     let mut values = Vec::new();
     values.push(node_806());
-    values.push(node_808());
+    values.extend(node_808());
     values.push(node_809());
     values.push(node_811());
     values.push(node_812());
@@ -10202,7 +10433,7 @@ fn node_844() -> Value {
     values.insert(text("name"), text("private-installed-${{ matrix.id }}"));
     values.insert(
         text("path"),
-        text("target/ci/private-installed-diagnostics"),
+        text("target/ci/private-installed/installed/public-success.json\ntarget/ci/private-installed/installed/public-success.stdout.bin\ntarget/ci/private-installed/installed/public-success.stderr.bin\ntarget/ci/private-installed/installed/public-deadline.json\ntarget/ci/private-installed/installed/public-deadline.stdout.bin\ntarget/ci/private-installed/installed/public-deadline.stderr.bin\ntarget/ci/private-installed/installed/linux/inputs.json\ntarget/ci/private-installed/installed/linux/helper-command/stdout.bin\ntarget/ci/private-installed/installed/linux/helper-command/stderr.bin\ntarget/ci/private-installed/installed/linux/helper-command/command-output.json\ntarget/ci/private-installed/installed/linux/helper-command/command-failure.json"),
     );
     values.insert(text("if-no-files-found"), text("error"));
     values.insert(text("include-hidden-files"), Value::Bool(true));
@@ -10711,14 +10942,14 @@ fn node_810() -> Value {
     Value::Mapping(values)
 }
 
-fn node_808() -> Value {
+fn node_808() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_808", Value::Mapping(values))
 }
 
 fn node_806() -> Value {
@@ -10790,7 +11021,7 @@ fn node_707() -> Value {
     values.push(node_708());
     values.push(node_709());
     values.push(node_711());
-    values.push(node_713());
+    values.extend(node_713());
     values.push(node_714());
     values.push(node_716());
     values.push(node_718());
@@ -10838,8 +11069,7 @@ fn node_707() -> Value {
     values.push(node_790());
     values.push(node_791());
     values.push(node_792());
-    values.push(node_793());
-    values.push(node_794());
+    values.push(installed_failure_carriers());
     values.push(node_795());
     values.push(node_797());
     Value::Sequence(values)
@@ -10885,30 +11115,6 @@ fn node_796() -> Value {
     Value::Mapping(values)
 }
 
-fn node_794() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-cargo"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'cargo' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
-fn node_793() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-native"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'native' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
 fn node_792() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("cargo"));
@@ -10940,7 +11146,7 @@ fn node_790() -> Value {
         text("if"),
         text("(matrix.channel == 'cargo') && runner.os == 'Windows'"),
     );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness"));
+    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime"));
     values.insert(text("timeout-minutes"), Value::Number(20.into()));
     Value::Mapping(values)
 }
@@ -12100,14 +12306,14 @@ fn node_715() -> Value {
     Value::Mapping(values)
 }
 
-fn node_713() -> Value {
+fn node_713() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_713", Value::Mapping(values))
 }
 
 fn node_711() -> Value {
@@ -12214,7 +12420,7 @@ fn node_608() -> Value {
     values.push(node_609());
     values.push(node_610());
     values.push(node_612());
-    values.push(node_614());
+    values.extend(node_614());
     values.push(node_615());
     values.push(node_617());
     values.push(node_619());
@@ -12262,8 +12468,7 @@ fn node_608() -> Value {
     values.push(node_691());
     values.push(node_692());
     values.push(node_693());
-    values.push(node_694());
-    values.push(node_695());
+    values.push(installed_failure_carriers());
     values.push(node_696());
     values.push(node_698());
     Value::Sequence(values)
@@ -12309,30 +12514,6 @@ fn node_697() -> Value {
     Value::Mapping(values)
 }
 
-fn node_695() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-cargo"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'cargo' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
-fn node_694() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(text("id"), text("loader-cleanup-native"));
-    values.insert(
-        text("if"),
-        text("always() && matrix.channel == 'native' && runner.os == 'Windows'"),
-    );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native"));
-    values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
-}
-
 fn node_693() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("cargo"));
@@ -12364,7 +12545,7 @@ fn node_691() -> Value {
         text("if"),
         text("(matrix.channel == 'cargo') && runner.os == 'Windows'"),
     );
-    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness"));
+    values.insert(text("run"), text("./target/ci-runtime/current/memcordon-ci.exe release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile runtime"));
     values.insert(text("timeout-minutes"), Value::Number(20.into()));
     Value::Mapping(values)
 }
@@ -13524,14 +13705,14 @@ fn node_616() -> Value {
     Value::Mapping(values)
 }
 
-fn node_614() -> Value {
+fn node_614() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_614", Value::Mapping(values))
 }
 
 fn node_612() -> Value {
@@ -13636,7 +13817,7 @@ fn node_493() -> Value {
     let mut values = Vec::new();
     values.push(node_494());
     values.push(node_495());
-    values.push(node_497());
+    values.extend(node_497());
     values.push(node_498());
     values.push(node_500());
     values.push(node_502());
@@ -15240,14 +15421,14 @@ fn node_499() -> Value {
     Value::Mapping(values)
 }
 
-fn node_497() -> Value {
+fn node_497() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_497", Value::Mapping(values))
 }
 
 fn node_495() -> Value {
@@ -15324,7 +15505,7 @@ fn node_379() -> Value {
     let mut values = Vec::new();
     values.push(node_380());
     values.push(node_381());
-    values.push(node_383());
+    values.extend(node_383());
     values.push(node_384());
     values.push(node_386());
     values.push(node_388());
@@ -16928,14 +17109,14 @@ fn node_385() -> Value {
     Value::Mapping(values)
 }
 
-fn node_383() -> Value {
+fn node_383() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_383", Value::Mapping(values))
 }
 
 fn node_381() -> Value {
@@ -17013,7 +17194,7 @@ fn node_279() -> Value {
     let mut values = Vec::new();
     values.push(node_280());
     values.push(node_281());
-    values.push(node_283());
+    values.extend(node_283());
     values.push(node_284());
     values.push(node_286());
     values.push(node_288());
@@ -18400,14 +18581,14 @@ fn node_285() -> Value {
     Value::Mapping(values)
 }
 
-fn node_283() -> Value {
+fn node_283() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_283", Value::Mapping(values))
 }
 
 fn node_281() -> Value {
@@ -18494,7 +18675,7 @@ fn node_178() -> Value {
     let mut values = Vec::new();
     values.push(node_179());
     values.push(node_180());
-    values.push(node_182());
+    values.extend(node_182());
     values.push(node_183());
     values.push(node_185());
     values.push(node_187());
@@ -19884,14 +20065,14 @@ fn node_184() -> Value {
     Value::Mapping(values)
 }
 
-fn node_182() -> Value {
+fn node_182() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_182", Value::Mapping(values))
 }
 
 fn node_180() -> Value {
@@ -19978,7 +20159,7 @@ fn node_77() -> Value {
     let mut values = Vec::new();
     values.push(node_78());
     values.push(node_79());
-    values.push(node_81());
+    values.extend(node_81());
     values.push(node_82());
     values.push(node_84());
     values.push(node_86());
@@ -21370,14 +21551,14 @@ fn node_83() -> Value {
     Value::Mapping(values)
 }
 
-fn node_81() -> Value {
+fn node_81() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_81", Value::Mapping(values))
 }
 
 fn node_79() -> Value {
@@ -21463,7 +21644,7 @@ fn node_7() -> Value {
     let mut values = Vec::new();
     values.push(node_8());
     values.push(node_9());
-    values.push(node_11());
+    values.extend(node_11());
     values.push(node_12());
     values.push(node_14());
     values.push(node_16());
@@ -22360,14 +22541,14 @@ fn node_13() -> Value {
     Value::Mapping(values)
 }
 
-fn node_11() -> Value {
+fn node_11() -> [Value; 3] {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("run"),
         text("rustup toolchain install 1.97.1 --profile minimal"),
     );
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    Value::Mapping(values)
+    super::toolchain_acquisition::steps("acquire_node_11", Value::Mapping(values))
 }
 
 fn node_9() -> Value {

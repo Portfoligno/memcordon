@@ -200,12 +200,13 @@ pub fn workflow_breakdown(file: &str) -> Result<Vec<(String, BudgetEvaluation)>>
         .iter()
         .filter(|(_, job)| job["steps"].is_sequence())
         .map(|(name, job)| {
-            Ok((
-                name.as_str()
-                    .ok_or_else(|| CiError::Message("job id is not text".into()))?
-                    .to_owned(),
-                super::workflow_budget::job_budget_definition(job)?.breakdown()?,
-            ))
+            let name = name
+                .as_str()
+                .ok_or_else(|| CiError::Message("job id is not text".into()))?;
+            let budget = super::workflow_budget::job_budget_definition(job)
+                .and_then(|definition| definition.breakdown())
+                .map_err(|error| CiError::Message(format!("{file} job {name}: {error}")))?;
+            Ok((name.to_owned(), budget))
         })
         .collect()
 }

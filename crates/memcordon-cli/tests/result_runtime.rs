@@ -97,6 +97,10 @@ fn distinct_destinations_use_two_lanes_same_destination_is_busy_and_bytes_are_fi
         panic!("distinct path rejected: {second:?}")
     };
     assert!(!observation.cleanup_outstanding);
+    assert_eq!(
+        observation.provenance,
+        memcordon_platform::ObservationProvenance::OwnerResult
+    );
     assert!(observation.frame_transferred);
     let mut expected = report;
     expected.prepare_writer(
@@ -156,7 +160,7 @@ fn delayed_native_publication_keeps_capacity_and_independent_runtime_usable() {
         "caller return budget renewed while creation was delayed"
     );
     assert!(
-        matches!(outcome, DeliveryOutcome::Failed { observation, .. } if !observation.frame_transferred)
+        matches!(outcome, DeliveryOutcome::Failed { observation, .. } if !observation.frame_transferred && observation.provenance==memcordon_platform::ObservationProvenance::CallerDeadlineSnapshot)
     );
     assert_eq!(
         runtime.outstanding(),

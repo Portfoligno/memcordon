@@ -4674,9 +4674,50 @@ pub fn rejects_protocol(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "test-support")]
 pub fn inspector_stall(image: &Path) -> Result<(), String> {
+    inspector_stall_observations(image, InspectorStallFault::None)?.into_result()
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy)]
+pub enum InspectorStallFault {
+    None,
+    RejectCleanupWitness,
+    RejectWorkerReadiness,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct InspectorStallObservations {
+    pub measurement: Result<(), String>,
+    pub child_retirement: Result<(), String>,
+    pub guardian_retirement: Result<(), String>,
+    pub recovery: Result<(), String>,
+}
+
+#[cfg(feature = "test-support")]
+impl InspectorStallObservations {
+    pub fn into_result(self) -> Result<(), String> {
+        inspector_stall_results([
+            self.measurement,
+            self.child_retirement,
+            self.guardian_retirement,
+            self.recovery,
+        ])
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn inspector_stall_observations(
+    image: &Path,
+    fault: InspectorStallFault,
+) -> Result<InspectorStallObservations, String> {
     process_inspector_stall(image)?;
     use crate::macos_watchdog::{
         InspectionAdmission, inspect_until_admitted, inspect_with_admission,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -4690,30 +4731,40 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
     let (entered_send, entered) = std::sync::mpsc::sync_channel(1);
     let (release, blocked) = std::sync::mpsc::sync_channel(1);
     let (done_send, done) = std::sync::mpsc::sync_channel(1);
+    let worker_entered = Arc::new(AtomicBool::new(false));
+    let worker_exited = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let entered_flag = Arc::clone(&worker_entered);
+    let exited_flag = Arc::clone(&worker_exited);
     std::thread::spawn(move || {
         let result = crate::macos_watchdog::inspect_until(
             Instant::now() + Duration::from_millis(100),
             move || {
+                entered_flag.store(true, Ordering::SeqCst);
                 entered_send
                     .send(())
                     .map_err(|error| format!("stalled inspection worker entry: {error}"))?;
                 blocked
                     .recv()
                     .map_err(|error| format!("stalled inspection worker release: {error}"))?;
+                exited_flag.store(true, Ordering::SeqCst);
                 Ok(())
             },
         );
         let _ = done_send.send(result);
     });
-    entered
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|error| format!("stalled inspection worker readiness: {error}"))?;
-    if crate::macos_watchdog::inspection_obligations() == 0 {
-        return Err("stalled native inspection lost its runtime obligation".into());
-    }
-    let queued_executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let queued_executed = Arc::new(AtomicBool::new(false));
     let queued_operation = queued_executed.clone();
-    let result = (|| {
+    let measurement = (|| {
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| format!("stalled inspection worker readiness: {error}"))?;
+        if matches!(fault, InspectorStallFault::RejectWorkerReadiness) {
+            return Err("fixture rejected stalled inspection worker readiness".into());
+        }
+        if crate::macos_watchdog::inspection_obligations() == 0 {
+            return Err("stalled native inspection lost its runtime obligation".into());
+        }
         let started = Instant::now();
         let expired: Result<(), String> = crate::macos_watchdog::inspect_until(started, || {
             panic!("expired monitoring inspection must not execute")
@@ -4722,20 +4773,44 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
             return Err("expired monitoring inspection was admitted".into());
         }
         let mut full = None;
+        let mut cleanup_witness = None;
+        let admission_deadline = Instant::now() + Duration::from_secs(1);
         let queued = inspect_until_admitted(
             // Admission is a readiness precondition, using the same bounded
             // budget as the worker-entry handshake above.
-            Instant::now() + Duration::from_secs(1),
+            admission_deadline,
             move || {
                 queued_operation.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             },
             || {
                 // Successful admission proves the slot is occupied. Check capacity
-                // before waiting for this queued request's deadline, with a fresh budget.
+                // and complete Cleanup under this same already sampled cutoff.
                 full = Some(crate::macos_watchdog::inspect_until(
-                    Instant::now() + Duration::from_secs(1),
+                    admission_deadline,
                     || Ok(()),
+                ));
+                let entered = Arc::clone(&worker_entered);
+                let exited = Arc::clone(&worker_exited);
+                let released = Arc::clone(&released);
+                cleanup_witness = Some(inspect_with_admission(
+                    admission_deadline,
+                    InspectionAdmission::Cleanup,
+                    move || {
+                        if !entered.load(Ordering::SeqCst)
+                            || exited.load(Ordering::SeqCst)
+                            || released.load(Ordering::SeqCst)
+                            || crate::macos_watchdog::inspection_obligations() == 0
+                        {
+                            return Err(
+                                "cleanup witness did not observe the held normal gate".into()
+                            );
+                        }
+                        if matches!(fault, InspectorStallFault::RejectCleanupWitness) {
+                            return Err("fixture rejected cleanup-lane witness".into());
+                        }
+                        Ok(())
+                    },
                 ));
             },
         );
@@ -4764,52 +4839,45 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
                 "stalled inspection caller did not time out: {stalled:?}"
             ));
         }
-        let emergency: Result<(), String> = inspect_with_admission(
-            Instant::now() + Duration::from_millis(20),
-            InspectionAdmission::Cleanup,
-            || Ok(()),
-        );
-        if let Err(error) = emergency {
-            return Err(format!(
-                "emergency inspection was blocked by the stalled normal lane: {error}"
-            ));
-        }
-        launch
-            .child
-            .retire(Instant::now() + Duration::from_millis(500))
-            .map_err(|error| format!("stalled inspector execution child retirement: {error}"))?;
-        launch
-            .guardian
-            .disarm(Instant::now() + Duration::from_millis(500))
-            .map_err(|error| format!("stalled inspector execution guardian disarm: {error}"))?;
+        cleanup_witness
+            .ok_or_else(|| "cleanup witness was not attempted after queued admission".to_owned())?
+            .map_err(|error| {
+                format!("cleanup witness did not complete before the admission cutoff: {error}")
+            })?;
         Ok(())
     })();
-    let release_worker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        let _ = release.send(());
-    });
-    // Both normal slots remain occupied; the independent cleanup lane still works.
-    let recovered = inspect_with_admission(
+    // These are independent native obligations, including after a failed
+    // measurement. Neither Drop cancellation nor thread recovery proves them.
+    let child_deadline = Instant::now() + Duration::from_millis(500);
+    let child_retirement = launch
+        .child
+        .retire(child_deadline)
+        .map_err(|error| format!("stalled inspector execution child retirement: {error}"));
+    let guardian_deadline = Instant::now() + Duration::from_millis(500);
+    let guardian_retirement = launch
+        .guardian
+        .disarm(guardian_deadline)
+        .map_err(|error| format!("stalled inspector execution guardian disarm: {error}"));
+    let gate_retained = if released.load(Ordering::SeqCst) || worker_exited.load(Ordering::SeqCst) {
+        Err("normal inspection gate opened before native retirement checks completed".into())
+    } else {
+        Ok(())
+    };
+    released.store(true, Ordering::SeqCst);
+    let release_result = release
+        .send(())
+        .map_err(|error| format!("stalled inspection worker release: {error}"));
+    let native_error = inspect_with_admission(
         Instant::now() + Duration::from_secs(1),
         InspectionAdmission::Cleanup,
-        || Ok(()),
+        || Err::<(), _>("fixture native inspection failure".into()),
     );
+    let native_error = if native_error == Err("fixture native inspection failure".into()) {
+        Ok(())
+    } else {
+        Err("cleanup admission did not preserve native inspection failure".into())
+    };
     let recovery = (|| {
-        release_worker
-            .join()
-            .map_err(|_| "inspector release fixture panicked".to_owned())?;
-        recovered.map_err(|error| format!("stalled inspector cleanup-lane recovery: {error}"))?;
-        if queued_executed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err("expired queued inspection executed after worker release".into());
-        }
-        let native_error = inspect_with_admission(
-            Instant::now() + Duration::from_secs(1),
-            InspectionAdmission::Cleanup,
-            || Err::<(), _>("fixture native inspection failure".into()),
-        );
-        if native_error != Err("fixture native inspection failure".into()) {
-            return Err("cleanup admission did not preserve native inspection failure".into());
-        }
         let settled_by = Instant::now() + Duration::from_secs(1);
         while crate::macos_watchdog::inspection_obligations() != 0 {
             if Instant::now() >= settled_by {
@@ -4817,9 +4885,20 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        if queued_executed.load(Ordering::SeqCst) {
+            return Err("expired queued inspection executed after worker release".into());
+        }
+        if worker_entered.load(Ordering::SeqCst) && !worker_exited.load(Ordering::SeqCst) {
+            return Err("released normal inspection worker did not report exit".into());
+        }
         Ok(())
     })();
-    inspector_stall_results([result, recovery])
+    Ok(InspectorStallObservations {
+        measurement,
+        child_retirement,
+        guardian_retirement,
+        recovery: inspector_stall_results([gate_retained, release_result, native_error, recovery]),
+    })
 }
 
 #[cfg(feature = "test-support")]

@@ -62,6 +62,10 @@ mod linux_startup;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/linux_transport_deadline.rs"]
 mod linux_transport_deadline;
+
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/linux_private_relay.rs"]
+mod linux_private_relay;
 #[path = "sealed_agent/namespace_startup.rs"]
 mod namespace_startup;
 #[cfg(target_os = "linux")]

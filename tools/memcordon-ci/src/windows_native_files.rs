@@ -10,6 +10,324 @@ pub struct HeldWindowsArtifact {
     _ancestors: Vec<std::fs::File>,
 }
 
+/// A borrowed catalog-selected source. Positive links are observations, not
+/// exclusive ownership; only an independent strict destination is launched.
+#[cfg(windows)]
+pub struct HeldProviderSource {
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub metadata: crate::windows_provider_source_record::Metadata,
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    _ancestors: Vec<std::fs::File>,
+}
+
+#[cfg(windows)]
+fn provider_live(work: std::time::Instant) -> crate::Result<()> {
+    if std::time::Instant::now() >= work {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "borrowed provider original cutoff exhausted",
+        )
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_provider(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Query-only metadata of the already held borrowed provider.
+fn provider_metadata(
+    file: &std::fs::File,
+) -> crate::Result<crate::windows_provider_source_record::Metadata> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: File owns this live handle and info is a correctly sized output.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let metadata = crate::windows_provider_source_record::Metadata {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        attributes: info.dwFileAttributes,
+        links: info.nNumberOfLinks,
+        bytes: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+    };
+    metadata.validate().map_err(crate::CiError::Message)?;
+    Ok(metadata)
+}
+
+#[cfg(windows)]
+fn read_provider(file: &std::fs::File, work: std::time::Instant) -> crate::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    provider_live(work)?;
+    let mut reader = file;
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        provider_live(work)?;
+        let remaining = (crate::windows_provider_source_record::SOURCE_BYTES - bytes.len() as u64
+            + 1)
+        .min(chunk.len() as u64) as usize;
+        let read = reader.read(&mut chunk[..remaining])?;
+        provider_live(work)?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().checked_add(read).is_none_or(|length| {
+            length as u64 > crate::windows_provider_source_record::SOURCE_BYTES
+        }) {
+            return Err(crate::CiError::Message(
+                "borrowed provider byte bound exceeded".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+impl HeldProviderSource {
+    pub fn hold(path: &Path, work: std::time::Instant) -> crate::Result<Self> {
+        provider_live(work)?;
+        if !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Err(crate::CiError::Message(
+                "borrowed provider requires exact absolute source".into(),
+            ));
+        }
+        let ancestors =
+            hold_ancestors(path.parent().ok_or_else(|| {
+                crate::CiError::Message("borrowed provider parent absent".into())
+            })?)?;
+        provider_live(work)?;
+        let file = open_provider(path)?;
+        provider_live(work)?;
+        let metadata = provider_metadata(&file)?;
+        let bytes = read_provider(&file, work)?;
+        provider_live(work)?;
+        let sha256 = crate::windows_causal_acceptance::sha256(&bytes);
+        provider_live(work)?;
+        let held = Self {
+            bytes,
+            sha256,
+            metadata,
+            path: path.to_path_buf(),
+            file,
+            _ancestors: ancestors,
+        };
+        held.verify(work)?;
+        Ok(held)
+    }
+
+    pub fn verify(&self, work: std::time::Instant) -> crate::Result<()> {
+        provider_live(work)?;
+        let named = open_provider(&self.path)?;
+        provider_live(work)?;
+        let named_metadata = provider_metadata(&named)?;
+        let named_bytes = read_provider(&named, work)?;
+        provider_live(work)?;
+        self.metadata
+            .verify(&named_metadata, &named_bytes, &self.sha256)
+            .map_err(crate::CiError::Message)?;
+        provider_live(work)?;
+        let original_metadata = provider_metadata(&self.file)?;
+        let original_bytes = read_provider(&self.file, work)?;
+        provider_live(work)?;
+        self.metadata
+            .verify(&original_metadata, &original_bytes, &self.sha256)
+            .map_err(crate::CiError::Message)?;
+        if named_bytes != self.bytes || original_bytes != self.bytes {
+            return Err(crate::CiError::Message(
+                "borrowed provider exact held bytes differ".into(),
+            ));
+        }
+        provider_live(work)?;
+        if provider_metadata(&self.file)? != self.metadata {
+            return Err(crate::CiError::Message(
+                "borrowed provider held metadata changed after readback".into(),
+            ));
+        }
+        provider_live(work)?;
+        if provider_metadata(&named)? != self.metadata {
+            return Err(crate::CiError::Message(
+                "borrowed provider named metadata changed after readback".into(),
+            ));
+        }
+        provider_live(work)
+    }
+
+    pub fn publish(
+        &self,
+        destination: &Path,
+        work: std::time::Instant,
+    ) -> crate::Result<HeldWindowsArtifact> {
+        self.verify(work)?;
+        let _parents = hold_ancestors(destination.parent().ok_or_else(|| {
+            crate::CiError::Message("private provider destination parent absent".into())
+        })?)?;
+        provider_live(work)?;
+        let _published = publish_owned_file(destination, &self.bytes)?;
+        provider_live(work)?;
+        let copied = hold_artifact(
+            destination,
+            Some(&self.sha256),
+            crate::windows_provider_source_record::SOURCE_BYTES,
+        )?;
+        provider_live(work)?;
+        let destination_identity = copied.identity(destination)?;
+        if destination_identity == (self.metadata.volume_serial, self.metadata.file_index)
+            || copied.bytes != self.bytes
+        {
+            return Err(crate::CiError::Message(
+                "private provider is not an independent exact owned copy".into(),
+            ));
+        }
+        self.verify(work)?;
+        provider_live(work)?;
+        verify_named_artifact(&copied, destination)?;
+        provider_live(work)?;
+        Ok(copied)
+    }
+}
+
+#[cfg(windows)]
+impl HeldWindowsArtifact {
+    /// Declaration from the original live file and directory guards, never a
+    /// later named-file snapshot. The caller keeps this owner through execution.
+    pub fn private_fixture_binding(
+        &self,
+        path: &Path,
+        local_input: memcordon_platform::windows_private_fixture_binding::DotLocalInput,
+        output_ancestors: Vec<
+            memcordon_platform::windows_private_fixture_binding::PrivateFixtureAncestor,
+        >,
+        work: std::time::Instant,
+    ) -> crate::Result<memcordon_platform::windows_private_fixture_binding::PrivateFixtureBinding>
+    {
+        use memcordon_platform::{
+            test_support::windows_held_file_metadata,
+            windows_private_fixture_binding::{PrivateFixtureAncestor, PrivateFixtureBinding},
+        };
+        provider_live(work)?;
+        let metadata = windows_held_file_metadata(&self._file)?;
+        native_file_identity(&self._file, false, path)?;
+        if metadata.length != self.bytes.len() as u64
+            || crate::windows_causal_acceptance::sha256(&self.bytes) != self.sha256
+        {
+            return Err(crate::CiError::Message("held fixture bytes differ".into()));
+        }
+        let paths = path
+            .parent()
+            .ok_or_else(|| crate::CiError::Message("held fixture parent absent".into()))?
+            .ancestors()
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect::<Vec<_>>();
+        if paths.len() != self._ancestors.len() || paths.len() > 64 {
+            return Err(crate::CiError::Message(
+                "held fixture ancestry extent differs".into(),
+            ));
+        }
+        let mut ancestors = Vec::new();
+        for (path, file) in paths.into_iter().rev().zip(&self._ancestors) {
+            provider_live(work)?;
+            let identity = native_file_identity(file, true, path)?;
+            let metadata = windows_held_file_metadata(file)?;
+            ancestors.push(PrivateFixtureAncestor {
+                path: path.to_owned(),
+                volume_serial: identity.0,
+                file_index: identity.1,
+                attributes: metadata.attributes,
+            });
+        }
+        provider_live(work)?;
+        let binding = PrivateFixtureBinding {
+            revision: if matches!(
+                local_input,
+                memcordon_platform::windows_private_fixture_binding::DotLocalInput::File(_)
+            ) {
+                3
+            } else {
+                2
+            },
+            fixture: path.to_owned(),
+            volume_serial: metadata.volume_serial,
+            file_index: metadata.file_index,
+            attributes: metadata.attributes,
+            links: metadata.links,
+            bytes: metadata.length,
+            sha256: self.sha256.clone(),
+            native_path_utf16: self.native_path()?,
+            ancestors,
+            local_input,
+            output_ancestors,
+        };
+        provider_live(work)?;
+        Ok(binding)
+    }
+
+    pub(crate) fn private_ancestor_files(&self) -> &[std::fs::File] {
+        &self._ancestors
+    }
+    pub(crate) fn private_file(&self) -> &std::fs::File {
+        &self._file
+    }
+
+    /// Query the same continuously held regular file, not a fresh path identity.
+    pub fn identity(&self, path: &Path) -> std::io::Result<(u32, u64)> {
+        native_file_identity(&self._file, false, path)
+    }
+
+    #[allow(unsafe_code)] // Bounded backing filename from this exact retained file handle.
+    pub fn native_path(&self) -> std::io::Result<Vec<u16>> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_NT};
+        let mut path = [0u16; 2048];
+        // SAFETY: owned live handle, fixed writable buffer with exact capacity.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                self._file.as_raw_handle().cast(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                VOLUME_NAME_NT,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if length as usize >= path.len()
+            || path[length as usize] != 0
+            || path[..length as usize].contains(&0)
+        {
+            return Err(std::io::Error::other(
+                "held private native backing path is truncated or malformed",
+            ));
+        }
+        Ok(path[..length as usize].to_vec())
+    }
+}
+
 /// Compare the named leaf and every retained directory to the original native
 /// handles; equal bytes alone do not authorize replacement of a custody record.
 #[cfg(windows)]
@@ -111,6 +429,18 @@ pub fn hold_artifact(
         _file: file,
         _ancestors: ancestors,
     })
+}
+
+/// Keep source file/ancestry custody live through synchronous publication.
+#[cfg(windows)]
+pub fn retain_captured_artifact(
+    source: &Path,
+    destination: &Path,
+    maximum: u64,
+) -> crate::Result<Vec<u8>> {
+    let held = hold_artifact(source, None, maximum)?;
+    drop(publish_owned_file(destination, &held.bytes)?);
+    Ok(held.bytes)
 }
 
 #[cfg(windows)]
@@ -272,7 +602,7 @@ pub(crate) fn native_file_identity(
 }
 
 #[cfg(windows)]
-fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
+pub(crate) fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,

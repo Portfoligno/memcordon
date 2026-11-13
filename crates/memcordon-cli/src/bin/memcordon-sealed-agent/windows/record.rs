@@ -31,6 +31,11 @@ use windows_sys::Win32::System::Threading::{
 
 use super::package;
 use super::pipe::OwnedHandle;
+use super::writer_lifecycle::DriverPhase;
+use super::writer_observation::driver;
+
+#[path = "live_guardian_diagnostics.rs"]
+mod live_guardian_diagnostics;
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
@@ -195,6 +200,7 @@ enum SnapshotInvariant {
     StateTransition,
     CausalSequenceRegression,
     OriginalFailureReplacement,
+    NativeInputReplacement,
     TerminalOutbox,
 }
 
@@ -312,6 +318,7 @@ impl WindowsAttemptRecordV1 {
                 == Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired)
             && !diagnostic_export_eligible(previous)
             && self.causal_diagnostics.sequence == 0
+            && self.causal_diagnostics.native_inputs.is_none()
             && self.causal_diagnostics.secondary.as_slice().is_empty()
             && self.causal_diagnostics.original
                 == memcordon_core::OriginalFailureV1::Unavailable {
@@ -468,6 +475,20 @@ impl WindowsAttemptRecordV1 {
         );
         refuse!(
             !expiry
+                && previous
+                    .causal_diagnostics
+                    .native_inputs
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        self.causal_diagnostics
+                            .native_inputs
+                            .as_ref()
+                            .is_none_or(|next| !next.is_monotonic_extension_of(previous))
+                    }),
+            NativeInputReplacement
+        );
+        refuse!(
+            !expiry
                 && matches!(
                     previous.causal_diagnostics.original,
                     memcordon_core::OriginalFailureV1::Observed { .. }
@@ -621,23 +642,62 @@ impl WindowsAttemptRecordV1 {
     }
 
     pub fn retire(&mut self) -> Result<(), String> {
-        self.transition(WindowsAttemptStateV1::Empty)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::RecordRetire,
+        )
+        .run(|| self.transition(WindowsAttemptStateV1::Empty))?;
         self.cleanup_state.termination_requested = true;
         self.cleanup_state.active_processes_zero = true;
         self.cleanup_state.guardian_reaped = true;
         self.cleanup_state.final_handles_closed = true;
-        self.store()?;
-        super::attempt_store::retire(&self.attempt_id)?;
-        let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::CleanupCompletion,
+        )
+        .run(|| self.store())?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::WriterRetire,
+        )
+        .run(|| super::attempt_store::retire(&self.attempt_id))?;
+        let _owner = driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::PublicationGuardAcquire,
+        )
+        .run(|| super::attempt_store::PublicationGuard::acquire(&self.attempt_id))?;
 
-        fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
-        remove_guardian_receipt(&self.attempt_id)
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AttemptRecordRemove,
+        )
+        .run(|| {
+            fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())
+        })?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::GuardianReceiptRemove,
+        )
+        .run(|| remove_guardian_receipt(&self.attempt_id))
     }
 
     pub fn complete_retirement(&mut self) -> Result<(), String> {
-        self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)?;
-        self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
-        self.store()
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::CleanupCompletion,
+        )
+        .run(|| {
+            self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)?;
+            self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
+            self.store()
+        })
     }
 
     pub fn stage_terminal_proof(
@@ -994,10 +1054,17 @@ impl WindowsAttemptRecordV1 {
         &mut self,
         response: &memcordon_core::WindowsLauncherResponseV4,
     ) -> Result<(), String> {
-        self.stage_terminal_response_with_store(response, &mut |record| record.store())?;
-        // The exact relay event remains queryable until the outbox and its
-        // completed proof are durable. It no longer needs a service owner then.
-        super::launcher_service::retire_relay_retirement_event(&self.attempt_id)
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::TerminalOutboxStage,
+        )
+        .run(|| {
+            self.stage_terminal_response_with_store(response, &mut |record| record.store())?;
+            // The exact relay event remains queryable until the outbox and its
+            // completed proof are durable. It no longer needs a service owner then.
+            super::launcher_service::retire_relay_retirement_event(&self.attempt_id)
+        })
     }
 
     fn stage_terminal_response_with_store<F>(
@@ -1315,26 +1382,75 @@ impl WindowsAttemptRecordV1 {
     }
 
     pub fn acknowledge_terminal_response(&mut self) -> Result<(), String> {
-        if self.terminal_response_json.is_none() {
-            return Err("attempt has no durable terminal outbox to acknowledge".to_owned());
-        }
-        let retired = self.terminal_retired_receipt(&self.nonce)?;
-        // Validate the exact disposition's checked authority before committing ACK.
-        let tombstone = ack_tombstone_for(self, &retired)?;
+        let tombstone = driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AckValidation,
+        )
+        .run(|| {
+            if self.terminal_response_json.is_none() {
+                return Err("attempt has no durable terminal outbox to acknowledge".to_owned());
+            }
+            let retired = self.terminal_retired_receipt(&self.nonce)?;
+            // Validate the exact disposition's checked authority before committing ACK.
+            ack_tombstone_for(self, &retired)
+        })?;
         if self.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::AckCommitted {
             self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::AckCommitted;
-            self.store()?;
+            driver(
+                &self.attempt_id,
+                &self.request_sha256,
+                DriverPhase::AckCommit,
+            )
+            .run(|| self.store())?;
         }
-        stage_ack_tombstone(self, tombstone)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AckTombstoneStage,
+        )
+        .run(|| stage_ack_tombstone(self, tombstone))?;
         if self.job_closure_contract.is_some() {
-            retire_admission(&self.attempt_id)?;
+            driver(
+                &self.attempt_id,
+                &self.request_sha256,
+                DriverPhase::JobAdmissionRetire,
+            )
+            .run(|| retire_admission(&self.attempt_id))?;
         }
-        remove_guardian_receipt(&self.attempt_id)?;
-        super::attempt_store::retire(&self.attempt_id)?;
-        let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::GuardianReceiptRemove,
+        )
+        .run(|| remove_guardian_receipt(&self.attempt_id))?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::WriterRetire,
+        )
+        .run(|| super::attempt_store::retire(&self.attempt_id))?;
+        let _owner = driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::PublicationGuardAcquire,
+        )
+        .run(|| super::attempt_store::PublicationGuard::acquire(&self.attempt_id))?;
 
-        fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
-        complete_ack_tombstone(&self.attempt_id, &self.request_sha256)?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AttemptRecordRemove,
+        )
+        .run(|| {
+            fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())
+        })?;
+        driver(
+            &self.attempt_id,
+            &self.request_sha256,
+            DriverPhase::AckTombstoneComplete,
+        )
+        .run(|| complete_ack_tombstone(&self.attempt_id, &self.request_sha256))?;
         Ok(())
     }
 
@@ -1713,23 +1829,51 @@ fn reconcile_until(
             super::startup_diagnostics::launcher_blocker(reason);
         }
     };
-    stage(Stage::WriterQuarantine);
-    super::attempt_store::ensure_no_quarantined_writer()?;
+    let io_failure = |error: std::io::Error| {
+        if startup {
+            let native_code = error
+                .raw_os_error()
+                .map(|code| u32::from_ne_bytes(code.to_ne_bytes()));
+            super::startup_diagnostics::launcher_failure(Reason::OperationFailed, native_code);
+        }
+        error.to_string()
+    };
+    stage(Stage::WriterRegistry);
+    super::attempt_store::ensure_no_quarantined_writer().map_err(|error| {
+        if startup {
+            let (reason, native_code) = match &error {
+                super::attempt_store::WriterRegistryCheckError::Unavailable => {
+                    (Reason::WriterRegistryUnavailable, None)
+                }
+                super::attempt_store::WriterRegistryCheckError::Unconfirmed {
+                    native_code, ..
+                } => (Reason::UnconfirmedWriter, *native_code),
+            };
+            super::startup_diagnostics::launcher_failure(reason, native_code);
+        }
+        error.to_string()
+    })?;
     let attempts = attempts_root();
-    fs::create_dir_all(&attempts).map_err(|error| error.to_string())?;
-    fs::create_dir_all(quarantine_root()).map_err(|error| error.to_string())?;
-    fs::create_dir_all(replay_root()).map_err(|error| error.to_string())?;
+    stage(Stage::AttemptsDirectory);
+    fs::create_dir_all(&attempts).map_err(io_failure)?;
+    stage(Stage::QuarantineDirectory);
+    fs::create_dir_all(quarantine_root()).map_err(io_failure)?;
+    stage(Stage::ReplayDirectory);
+    fs::create_dir_all(replay_root()).map_err(io_failure)?;
     stage(Stage::StagedAck);
     recover_staged_ack_tombstones().map_err(PackageCleanupError::Ambiguous)?;
-    fs::create_dir_all(admissions_root()).map_err(|error| error.to_string())?;
-    fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
-    stage(Stage::WriterQuarantine);
+    stage(Stage::AdmissionDirectory);
+    fs::create_dir_all(admissions_root()).map_err(io_failure)?;
+    stage(Stage::GuardianReceiptDirectory);
+    fs::create_dir_all(guardian_receipts_root()).map_err(io_failure)?;
+    stage(Stage::QuarantineOpen);
     let mut ambiguous = fs::read_dir(quarantine_root())
-        .map_err(|error| error.to_string())?
+        .map_err(io_failure)?
         .map(|entry| {
+            stage(Stage::QuarantineEntry);
             entry
                 .map(|entry| format!("{} (durable quarantine)", entry.path().to_string_lossy()))
-                .map_err(|error| error.to_string())
+                .map_err(io_failure)
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !ambiguous.is_empty() {
@@ -2088,6 +2232,42 @@ pub fn attempts_empty() -> Result<bool, String> {
 
 pub fn admissions_empty() -> Result<bool, String> {
     directory_empty(&admissions_root())
+}
+
+#[path = "admission_blockers.rs"]
+mod admission_blockers;
+pub(super) use admission_blockers::Observation as AdmissionBlockerObservation;
+
+/// Observation only: this never changes the authoritative quiescence result.
+pub(super) fn admission_blocker_observation(cutoff: Instant) -> AdmissionBlockerObservation {
+    use std::os::windows::fs::MetadataExt;
+    if Instant::now() >= cutoff {
+        return AdmissionBlockerObservation::unavailable(
+            admission_blockers::Unavailable::OriginalCutoff,
+        );
+    }
+    let root = admissions_root();
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) => return AdmissionBlockerObservation::unavailable(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return AdmissionBlockerObservation::unavailable(
+            admission_blockers::Unavailable::UnsafeRoot,
+        );
+    }
+    if Instant::now() >= cutoff {
+        return AdmissionBlockerObservation::unavailable(
+            admission_blockers::Unavailable::OriginalCutoff,
+        );
+    }
+    match fs::read_dir(root) {
+        Ok(entries) => admission_blockers::observe_names(
+            entries.map(|entry| entry.map(|entry| entry.file_name())),
+            cutoff,
+        ),
+        Err(error) => AdmissionBlockerObservation::unavailable(error.into()),
+    }
 }
 
 pub fn recovery_clear() -> Result<bool, String> {
@@ -2582,6 +2762,18 @@ fn enforce_storage_reservation(
     reserving_attempt_id: Option<&str>,
     reserving_reader: bool,
 ) -> Result<(), String> {
+    enforce_storage_reservation_with_writer_observation(
+        reserving_attempt_id,
+        reserving_reader,
+        true,
+    )
+}
+
+fn enforce_storage_reservation_with_writer_observation(
+    reserving_attempt_id: Option<&str>,
+    reserving_reader: bool,
+    observe_writer: bool,
+) -> Result<(), String> {
     const RECORD_STATE_BUDGET: u64 = 128 * 1024 * 1024;
     const IMAGES_PER_ACTIVE_ATTEMPT: u64 = 5;
     let record_bound = memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64;
@@ -2632,6 +2824,15 @@ fn enforce_storage_reservation(
         }
         for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
+            if !observe_writer
+                && root == attempts_root()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".json.new"))
+            {
+                return Err("read-only diagnostic quota observation has a staged writer".into());
+            }
             if root == attempts_root() && reserved_writer_stage(&entry.path(), &admissions_root())?
             {
                 let path = entry.path();
@@ -3201,6 +3402,86 @@ pub(crate) fn complete_owned_component_ack_for_test(
     )
 }
 
+fn authenticate_recovery_owner(
+    record: &WindowsAttemptRecordV1,
+    nonce: &str,
+    request_sha256: &str,
+    caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
+) -> Result<bool, String> {
+    if record.request_sha256 != request_sha256 || record.nonce != nonce {
+        return Err("recovery request differs from durable attempt binding".to_owned());
+    }
+    let authorization = record
+        .recovery_authorization
+        .as_ref()
+        .ok_or_else(|| "current attempt has no original recovery authorization".to_owned())?;
+    let same_boot = record.boot_identity == caller.current_boot_identity;
+    if !authorization.admits_recovery(
+        &caller.user_sid,
+        caller.logon_identity,
+        &caller.access_floor,
+        same_boot,
+    ) || (same_boot && authorization.launch_token_binding_sha256 != caller.token_binding_sha256)
+    {
+        return Err("recovery caller does not meet admitted owner access floor".to_owned());
+    }
+    Ok(same_boot)
+}
+
+pub(super) struct AuthorizedAttemptDiagnostics {
+    pub provider_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+    pub diagnostic_availability: memcordon_core::DiagnosticProjectionAvailabilityV1,
+}
+
+/// Owner-authenticated snapshot only: no recovery, reader-file publication,
+/// guardian handling, tombstone transition or terminal acknowledgement.
+pub(super) fn observe_attempt_diagnostics_for_caller(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
+) -> Result<AuthorizedAttemptDiagnostics, String> {
+    if !caller.is_consistent() || caller.current_boot_identity != boot_identity()? {
+        return Err("recovery caller does not match the trusted current boot".to_owned());
+    }
+    let _reader = super::attempt_store::PublicationGuard::acquire(&digest(
+        b"installation-retained-reader-v1",
+    ))?;
+    let _budget = super::attempt_store::PublicationGuard::acquire(&digest(
+        b"installation-attempt-storage-budget-v1",
+    ))?;
+    enforce_storage_reservation_with_writer_observation(None, true, false)?;
+    read_attempt_diagnostics_snapshot(
+        &record_path(attempt_id)?,
+        attempt_id,
+        nonce,
+        request_sha256,
+        caller,
+        super::package::installed_public_provider_binding,
+    )
+}
+
+fn read_attempt_diagnostics_snapshot(
+    path: &Path,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
+    resolve: impl FnOnce() -> Result<memcordon_core::PublicProviderBindingV1, String>,
+) -> Result<AuthorizedAttemptDiagnostics, String> {
+    let bytes = read_record_bounded(path).map_err(|error| error.to_string())?;
+    let record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    authenticate(&record, attempt_id)?;
+    authenticate_recovery_owner(&record, nonce, request_sha256, caller)?;
+    let (provider_failure, diagnostic_availability) =
+        provider_projection_with_binding(Some(&record), resolve);
+    Ok(AuthorizedAttemptDiagnostics {
+        provider_failure,
+        diagnostic_availability,
+    })
+}
+
 pub fn recover_attempt_for_caller(
     attempt_id: &str,
     nonce: &str,
@@ -3217,23 +3498,7 @@ pub fn recover_attempt_for_caller(
             let mut record: WindowsAttemptRecordV1 =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             authenticate(&record, attempt_id)?;
-            if record.request_sha256 != request_sha256 || record.nonce != nonce {
-                return Err("recovery request differs from durable attempt binding".to_owned());
-            }
-            let authorization = record.recovery_authorization.as_ref().ok_or_else(|| {
-                "current attempt has no original recovery authorization".to_owned()
-            })?;
-            let same_boot = record.boot_identity == caller.current_boot_identity;
-            if !authorization.admits_recovery(
-                &caller.user_sid,
-                caller.logon_identity,
-                &caller.access_floor,
-                same_boot,
-            ) || (same_boot
-                && authorization.launch_token_binding_sha256 != caller.token_binding_sha256)
-            {
-                return Err("recovery caller does not meet admitted owner access floor".to_owned());
-            }
+            let same_boot = authenticate_recovery_owner(&record, nonce, request_sha256, caller)?;
             if record.terminal_response_json.is_none() && record.authorization_unix_millis.is_some()
             {
                 if !same_boot {
@@ -3317,6 +3582,18 @@ fn bound_recovery_terminal_response(
     record: &WindowsAttemptRecordV1,
     outbox: &str,
 ) -> Result<memcordon_core::WindowsLauncherResponseV4, String> {
+    bound_recovery_terminal_response_with_binding(
+        record,
+        outbox,
+        super::package::installed_public_provider_binding,
+    )
+}
+
+fn bound_recovery_terminal_response_with_binding(
+    record: &WindowsAttemptRecordV1,
+    outbox: &str,
+    resolve: impl FnOnce() -> Result<memcordon_core::PublicProviderBindingV1, String>,
+) -> Result<memcordon_core::WindowsLauncherResponseV4, String> {
     let mut response: memcordon_core::WindowsLauncherResponseV4 =
         serde_json::from_str(outbox).map_err(|error| error.to_string())?;
     if !memcordon_core::windows_terminal_outbox_is_bound_v4(&decoded_v4(record), &response) {
@@ -3326,7 +3603,7 @@ fn bound_recovery_terminal_response(
     // the authenticated record's current projection separately, as live replay
     // does, without changing terminal authority or its acknowledgement digest.
     if let memcordon_core::WindowsLauncherResponseV4::Reject { rejection, .. } = &mut response {
-        rejection.provider_failure = provider_projection(Some(record)).0;
+        rejection.provider_failure = provider_projection_with_binding(Some(record), resolve).0;
         rejection.guardian_causal_receipt = guardian_causal_projection(record)?;
     }
     Ok(response)
@@ -3791,44 +4068,99 @@ fn reserve_writer_admission_at(
 ) -> Result<(), String> {
     validate_attempt_id(attempt_id)?;
     validate_attempt_id(request_sha256)?;
-    let path = root.join(attempt_id).with_extension("writer.json");
-    if path.exists() {
-        let old: AdmissionRecordV1 =
-            serde_json::from_slice(&read_record_bounded(&path).map_err(|error| error.to_string())?)
+    super::writer_observation::begin(attempt_id, request_sha256);
+    let result = (|| {
+        let path = root.join(attempt_id).with_extension("writer.json");
+        if path.exists() {
+            let old: AdmissionRecordV1 =
+                serde_json::from_slice(&read_record_bounded(&path).map_err(|error| {
+                    super::writer_observation::stage(
+                        attempt_id,
+                        super::writer_lifecycle::Stage::ReservationFailed,
+                        error.raw_os_error().map(|code| code as u32),
+                    );
+                    error.to_string()
+                })?)
                 .map_err(|error| error.to_string())?;
-        if old.attempt_id != attempt_id || old.request_sha256 != request_sha256 {
-            return Err("writer reservation binding differs".to_owned());
-        }
-        for owner in old.owner_process_identities {
-            if process_identity_is_live(owner)? {
-                return Err("another live process owns the writer reservation".to_owned());
+            if old.attempt_id != attempt_id || old.request_sha256 != request_sha256 {
+                return Err("writer reservation binding differs".to_owned());
             }
+            for owner in old.owner_process_identities {
+                if process_identity_is_live(owner)? {
+                    return Err("another live process owns the writer reservation".to_owned());
+                }
+            }
+            fs::remove_file(&path).map_err(|error| {
+                super::writer_observation::stage(
+                    attempt_id,
+                    super::writer_lifecycle::Stage::ReservationFailed,
+                    error.raw_os_error().map(|code| code as u32),
+                );
+                error.to_string()
+            })?;
         }
-        fs::remove_file(&path).map_err(|error| error.to_string())?;
-    }
-    enforce_budget()?;
-    // SAFETY: the pseudo handle denotes this service process for identity capture.
-    let owner = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let record = AdmissionRecordV1 {
-        format: AdmissionRecordFormat::Native,
-        revision: Default::default(),
-        attempt_id: attempt_id.to_owned(),
-        request_sha256: request_sha256.to_owned(),
-        owner_process_identities: vec![owner],
-        workload_reservation: true,
-    };
-    let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())
+        enforce_budget()?;
+        // SAFETY: the pseudo handle denotes this service process for identity capture.
+        let owner = super::process::process_identity(unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentProcess()
+        })?;
+        super::writer_observation::bind_owner(
+            attempt_id,
+            super::writer_lifecycle::Owner {
+                pid: owner.process_id,
+                birth: owner.creation_time_100ns,
+            },
+        );
+        let record = AdmissionRecordV1 {
+            format: AdmissionRecordFormat::Native,
+            revision: Default::default(),
+            attempt_id: attempt_id.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            owner_process_identities: vec![owner],
+            workload_reservation: true,
+        };
+        let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                super::writer_observation::stage(
+                    attempt_id,
+                    super::writer_lifecycle::Stage::ReservationFailed,
+                    error.raw_os_error().map(|code| code as u32),
+                );
+                error.to_string()
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::ReservationFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            error.to_string()
+        })?;
+        file.sync_all().map_err(|error| {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::ReservationFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            error.to_string()
+        })
+    })();
+    super::writer_observation::stage(
+        attempt_id,
+        if result.is_ok() {
+            super::writer_lifecycle::Stage::ReservationPublished
+        } else {
+            super::writer_lifecycle::Stage::ReservationFailed
+        },
+        None,
+    );
+    result
 }
 
 pub(super) fn retire_writer_admission(
@@ -3852,7 +4184,14 @@ fn retire_writer_admission_at(
     let bytes = match read_record_bounded(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::AdmissionRetireFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            return Err(error.to_string());
+        }
     };
     let admission: AdmissionRecordV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -3877,7 +4216,14 @@ fn retire_writer_admission_at(
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            super::writer_observation::stage(
+                attempt_id,
+                super::writer_lifecycle::Stage::AdmissionRetireFailed,
+                error.raw_os_error().map(|code| code as u32),
+            );
+            Err(error.to_string())
+        }
     }
 }
 
@@ -4931,6 +5277,16 @@ fn provider_projection(
     Option<memcordon_core::ProviderFailureDiagnosticV1>,
     memcordon_core::DiagnosticProjectionAvailabilityV1,
 ) {
+    provider_projection_with_binding(record, super::package::installed_public_provider_binding)
+}
+
+fn provider_projection_with_binding(
+    record: Option<&WindowsAttemptRecordV1>,
+    resolve: impl FnOnce() -> Result<memcordon_core::PublicProviderBindingV1, String>,
+) -> (
+    Option<memcordon_core::ProviderFailureDiagnosticV1>,
+    memcordon_core::DiagnosticProjectionAvailabilityV1,
+) {
     use memcordon_core::DiagnosticProjectionAvailabilityV1 as Availability;
     let Some(record) = record else {
         return (None, Availability::RecordUnavailable);
@@ -4938,7 +5294,7 @@ fn provider_projection(
     if !diagnostic_export_eligible(record) {
         return (None, Availability::RetentionExpired);
     }
-    let binding = match super::package::installed_public_provider_binding() {
+    let binding = match resolve() {
         Ok(binding) if binding.generation.as_str() == record.provider_generation => binding,
         _ => return (None, Availability::ProviderBindingUnavailable),
     };
@@ -5049,8 +5405,10 @@ pub fn acknowledge_terminal_response(
     nonce: &str,
     request_sha256: &str,
 ) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
-    let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
-    acknowledge_terminal_response_reserved(attempt_id, nonce, request_sha256)
+    driver(attempt_id, request_sha256, DriverPhase::AckValidation).run(|| {
+        let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
+        acknowledge_terminal_response_reserved(attempt_id, nonce, request_sha256)
+    })
 }
 
 fn acknowledge_terminal_response_reserved(
@@ -5175,14 +5533,16 @@ pub fn observe_live_guardian_details(
         if record.guardian_identity.as_ref() != Some(expected) {
             continue;
         }
-        if selected.is_some()
-            || record.boot_identity != boot
-            || record.provider_generation != provider.generation.as_str()
-            || !record.target_released
-            || !record.resume_attempted
-            || record.authorization_unix_millis.is_none()
-        {
-            return Err("live guardian association is ambiguous or not released".into());
+        let predicates = live_guardian_diagnostics::AssociationRefusalPredicates {
+            duplicate_match: selected.is_some(),
+            boot_mismatch: record.boot_identity != boot,
+            provider_mismatch: record.provider_generation != provider.generation.as_str(),
+            target_not_released: !record.target_released,
+            resume_not_attempted: !record.resume_attempted,
+            authorization_missing: record.authorization_unix_millis.is_none(),
+        };
+        if let Some(refusal) = predicates.refusal(expected, record.record_revision) {
+            return Err(refusal.to_string());
         }
         selected = Some((
             memcordon_core::execution_facts::ProviderAttemptAssociationV1 {

@@ -74,6 +74,10 @@ Each installed job runs one direct `release test-installed` operation that owns
 installation, product assertions and cleanup. Native component jobs run
 `release test-components`; failures fail their actual jobs. Optional diagnostics
 are explanatory and are never consumed as a test-success certificate.
+Linux and Windows component jobs acquire their matching native payload and tools
+on the selected runner. Assembly and candidate consumers require both payload
+and component success. Separate job budgets preserve the original operation
+cutoffs within the 360-minute platform limit; macOS keeps its native validation.
 
 The macOS x64 product job builds the payload independently of four native test
 shards. Each shard derives its tests locally with `suite native-shard`; final

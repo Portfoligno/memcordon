@@ -41,7 +41,7 @@ impl OperationalAttemptFailure {
             workload_rejection: error.workload_rejection.clone(),
             workload_input_complete: error.workload_input_complete,
             windows_current_rejection: error.windows_provider_rejection_v3.as_deref().cloned(),
-            provider_failure: error.provider_failure.clone(),
+            provider_failure: error.provider_failure.as_deref().cloned(),
             provider_association: error.provider_association.as_deref().cloned(),
         })
     }
@@ -490,7 +490,7 @@ pub struct Error {
     pub provider_rejection: Option<Box<ProviderRejectionEvidence>>,
     /// Indirect for the same bounded-stack reason; report projection remains by value.
     pub windows_provider_rejection_v3: Option<Box<crate::WindowsProviderRejectionV3>>,
-    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
+    pub provider_failure: Option<Box<crate::ProviderFailureDiagnosticV1>>,
 }
 
 impl Error {
@@ -541,7 +541,7 @@ impl Error {
         mut self,
         failure: crate::ValidatedProviderFailureDiagnosticV1,
     ) -> Self {
-        self.provider_failure = Some(failure.into_projection());
+        self.provider_failure = Some(Box::new(failure.into_projection()));
         self
     }
 

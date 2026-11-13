@@ -75,6 +75,14 @@ fn every_startup_gate_keeps_its_native_service_failure_namespace() {
         (TokenPolicy, 0x4d43_0210),
         (GuardianSlots, 0x4d43_0202),
         (WriterQuarantine, 0x4d43_0202),
+        (WriterRegistry, 0x4d43_0202),
+        (AttemptsDirectory, 0x4d43_0202),
+        (QuarantineDirectory, 0x4d43_0202),
+        (ReplayDirectory, 0x4d43_0202),
+        (AdmissionDirectory, 0x4d43_0202),
+        (GuardianReceiptDirectory, 0x4d43_0202),
+        (QuarantineOpen, 0x4d43_0202),
+        (QuarantineEntry, 0x4d43_0202),
         (StagedAck, 0x4d43_0202),
         (GuardianDirectory, 0x4d43_0202),
         (ReaderAdmission, 0x4d43_0202),
@@ -94,9 +102,10 @@ fn every_startup_gate_keeps_its_native_service_failure_namespace() {
         let mut value = report();
         value.stage = stage;
         value.reason = WindowsLauncherStartupReasonV1::OperationFailed;
+        value.native_code = Some(32);
         value.service_exit = exit;
         let bytes = value.to_bounded_json().unwrap();
-        WindowsLauncherStartupDiagnosticV1::from_json_for(
+        let restored = WindowsLauncherStartupDiagnosticV1::from_json_for(
             &bytes,
             &value.provider,
             &value.boot_identity,
@@ -105,11 +114,37 @@ fn every_startup_gate_keeps_its_native_service_failure_namespace() {
             Some(&value.startup_process),
         )
         .unwrap();
+        assert_eq!(restored, value);
         value.service_exit = 1067;
         assert!(
             value.to_bounded_json().is_err(),
             "accepted generic SCM exit for {stage:?}"
         );
+    }
+}
+
+#[test]
+fn registry_failure_reasons_round_trip_without_a_native_code() {
+    for reason in [
+        WindowsLauncherStartupReasonV1::WriterRegistryUnavailable,
+        WindowsLauncherStartupReasonV1::UnconfirmedWriter,
+    ] {
+        let mut value = report();
+        value.stage = WindowsLauncherStartupStageV1::WriterRegistry;
+        value.reason = reason;
+        let bytes = value.to_bounded_json().unwrap();
+        assert!(bytes.len() <= WINDOWS_LAUNCHER_STARTUP_DIAGNOSTIC_BYTES);
+        let restored = WindowsLauncherStartupDiagnosticV1::from_json_for(
+            &bytes,
+            &value.provider,
+            &value.boot_identity,
+            1001,
+            value.service_exit,
+            Some(&value.startup_process),
+        )
+        .unwrap();
+        assert_eq!(restored, value);
+        assert_eq!(restored.native_code, None);
     }
 }
 

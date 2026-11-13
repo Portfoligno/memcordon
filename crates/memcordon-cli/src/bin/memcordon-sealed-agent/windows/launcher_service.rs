@@ -35,6 +35,11 @@ use super::job::{BoundedProcessSnapshot, Job, JobNotification};
 use super::pipe::{self, OwnedHandle, PipeListener, PipePreparationError};
 use super::process::{GuardianProcess, StreamSet, SuspendedTarget};
 use super::security::{SecurityDescriptor, private_pipe_sddl};
+use super::writer_lifecycle::{self, DriverPhase};
+use super::writer_observation::driver;
+
+#[path = "settlement_observation.rs"]
+mod settlement_observation;
 
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_job_diagnostic_conversion.rs"]
@@ -1119,6 +1124,51 @@ fn handle_control(
                 },
             )
         }
+        WindowsLauncherRequestV4::ObserveAttemptDiagnostics {
+            schema_version,
+            attempt_id,
+            nonce,
+            request_sha256,
+            challenge,
+            caller,
+        } => {
+            memcordon_core::validate_windows_attempt_diagnostics_request(
+                schema_version,
+                &attempt_id,
+                &nonce,
+                &request_sha256,
+                &challenge,
+            )?;
+            let mut observed = memcordon_core::WindowsAttemptDiagnosticsV1 {
+                schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+                challenge,
+                attempt_id: attempt_id.clone(),
+                request_sha256: request_sha256.clone(),
+                provider_binding: super::package::installed_public_provider_binding()?,
+                status: memcordon_core::WindowsAttemptDiagnosticsStatusV1::Denied,
+                diagnostic_availability: None,
+                provider_failure: None,
+            };
+            if let Ok(snapshot) = super::record::observe_attempt_diagnostics_for_caller(
+                &attempt_id,
+                &nonce,
+                &request_sha256,
+                &caller,
+            ) {
+                observed.status = if snapshot.provider_failure.is_some() {
+                    memcordon_core::WindowsAttemptDiagnosticsStatusV1::Observed
+                } else {
+                    memcordon_core::WindowsAttemptDiagnosticsStatusV1::Unavailable
+                };
+                observed.provider_failure = snapshot.provider_failure.map(Box::new);
+                observed.diagnostic_availability = Some(snapshot.diagnostic_availability);
+            }
+            // No settlement, recovery, terminal delivery or ACK read occurs.
+            pipe::write_frame(
+                connection,
+                &WindowsLauncherResponseV4::AttemptDiagnostics(observed),
+            )
+        }
         WindowsLauncherRequestV4::ObserveGuardianAttempt {
             schema_version,
             challenge,
@@ -1322,13 +1372,60 @@ fn handle_control(
             // The package lease excludes new public admissions. Existing admissions
             // may not have reached Membership yet, so wait for those as well as
             // workers whose Job handles have closed but terminal writes continue.
+            let mut admission_snapshot = None;
+            let mut admission_unavailable = None;
+            let mut writer_observation = settlement_observation::Observation::default();
             let settlement = SETTLEMENT.settle_until(deadline, || {
                 terminate_active_jobs(deadline)?;
-                super::record::admissions_empty()
+                let empty = super::record::admissions_empty()?;
+                let observed = if !empty {
+                    Some(super::record::admission_blocker_observation(deadline))
+                } else {
+                    None
+                };
+                let empty = writer_observation.observe(empty, deadline, || {
+                    let snapshot = super::attempt_store::lifecycle_snapshot(deadline);
+                    let names = observed.as_ref().map(|value|value.writer_tokens.as_slice()).unwrap_or_default();
+                    let diagnostic = super::writer_lifecycle::diagnostic(&snapshot, names);
+                    settlement_observation::WriterStatus::LocalSnapshot {
+                        detail:serde_json::to_string(&diagnostic).unwrap_or_else(|_| "{\"state\":\"serialization-unavailable\",\"retirement_proof\":false}".into()),
+                        snapshot: Box::new(snapshot),
+                    }
+                });
+                if let Some(observed) = observed {
+                    if observed.unavailable.is_none() {
+                        admission_snapshot = Some(observed);
+                        admission_unavailable = None;
+                    } else {
+                        admission_unavailable = Some(observed);
+                    }
+                }
+                Ok(empty)
             });
             let result = match &settlement {
                 Ok(_) => converge_package_cleanup(deadline),
-                Err(error) => Err(super::record::PackageCleanupError::Failed(error.clone())),
+                Err(error) => {
+                    let mut detail = error.clone();
+                    if let Some(observed) = writer_observation.detail() {
+                        detail.push_str("; ");
+                        detail.push_str(&observed);
+                    }
+                    if let Some(observed) = admission_snapshot.as_ref().and_then(|snapshot| {
+                        writer_observation.final_name_detail(&snapshot.writer_tokens)
+                    }) {
+                        detail.push_str("; ");
+                        detail.push_str(&observed);
+                    }
+                    if let Some(observed) = admission_snapshot {
+                        detail.push_str("; last-admission-name-snapshot-after-false-quiesce: ");
+                        detail.push_str(&observed.detail());
+                    }
+                    if let Some(observed) = admission_unavailable {
+                        detail.push_str("; admission-name-inspection-unavailable: ");
+                        detail.push_str(&observed.detail());
+                    }
+                    Err(super::record::PackageCleanupError::Failed(detail))
+                }
             };
             let (mut status, mut attempts_empty, mut detail) = match result {
                 Ok(()) => (
@@ -1848,7 +1945,10 @@ fn handle_control(
                             let terminal_transport = pipe::SynchronousIoDeadline::start(
                                 Instant::now() + Duration::from_secs(30),
                             )?;
-                            pipe::write_frame(connection, &response).map_err(|secondary| {
+                            let delivery =
+                                driver(&attempt_id, &request_sha256, DriverPhase::TerminalDelivery);
+                            let progress = delivery.transport();
+                            delivery.run(||pipe::write_frame_observed(connection,&response,terminal_transport.cutoff(),|update|progress.record(update))).map_err(|secondary| {
                                 format!(
                                     "{primary_detail}; secondary bound rejection delivery failure: {secondary}"
                                 )
@@ -1878,11 +1978,11 @@ fn handle_control(
                                         "{primary_detail}; secondary terminal retirement failure: {secondary}"
                                     )
                                 })?;
-                                pipe::write_frame_until(
+                                driver(&attempt_id, &request_sha256, DriverPhase::RetirementReceiptDelivery).run(|| pipe::write_frame_until(
                                     connection,
                                     &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
                                     terminal_cutoff,
-                                )
+                                ))
                                 .map_err(|secondary| {
                                     format!(
                                         "{primary_detail}; secondary terminal retirement receipt failure: {secondary}"
@@ -2457,7 +2557,45 @@ fn launch_attempt(
                 .into(),
         );
     }
-    let duplicated_primary_envelope = super::token::envelope(primary_token.raw())?;
+    let mut native_inputs = request.native_inputs.clone().filter(|observation| {
+        observation.is_bound_to(
+            &request.attempt_id,
+            &request.request_sha256,
+            &request.caller_process_identity,
+        ) && observation.target_identity.is_none()
+            && matches!(
+                observation.launcher_primary,
+                memcordon_core::NativeInputStageV1::NotReached
+            )
+            && matches!(
+                observation.suspended_target,
+                memcordon_core::NativeInputStageV1::NotReached
+            )
+    });
+    let native_input_loss = request.native_inputs.is_some() && native_inputs.is_none();
+    let primary_query = if native_inputs.is_some() {
+        super::token::envelope_input_observation(primary_token.raw())
+    } else {
+        super::token::envelope(primary_token.raw())
+            .map(|envelope| (envelope, memcordon_core::NativeInputStageV1::NotReached))
+    };
+    let (duplicated_primary_envelope, primary_stage) = match primary_query {
+        Ok(value) => value,
+        Err(primary) => {
+            if let Some(observation) = native_inputs.as_mut() {
+                observation.launcher_primary = memcordon_core::NativeInputStageV1::Unavailable {
+                    reason: memcordon_core::NativeInputUnavailableV1::QueryFailed,
+                    native_error: None,
+                };
+                super::diagnostics::observe_native_inputs(observation);
+            }
+            return Err(primary.into());
+        }
+    };
+    if let Some(observation) = native_inputs.as_mut() {
+        observation.launcher_primary = primary_stage;
+        super::diagnostics::observe_native_inputs(observation);
+    }
     if duplicated_primary_envelope != request.caller_token_envelope {
         let mismatch_fields = super::token::envelope_mismatch_fields(
             &request.caller_token_envelope,
@@ -2558,6 +2696,16 @@ fn launch_attempt(
         super::record::digest(&job_identity),
     )?;
     record.nonce = request.launch.nonce.clone();
+    if let Some(observation) = &native_inputs {
+        if record
+            .causal_diagnostics
+            .set_native_inputs(observation.clone())
+            .is_err()
+        {
+            record.causal_diagnostics.loss.writer_unavailable = true;
+        }
+    }
+    record.causal_diagnostics.loss.writer_unavailable |= native_input_loss;
     record.worker_identity = Some(super::process::process_identity(unsafe {
         GetCurrentProcess()
     })?);
@@ -2920,7 +3068,48 @@ fn launch_attempt(
         {
             None
         } else {
-            Some(super::token::envelope(target_token.raw())?)
+            let queried = if cleanup_guard
+                .record
+                .causal_diagnostics
+                .native_inputs
+                .is_some()
+            {
+                super::token::envelope_input_observation(target_token.raw())
+            } else {
+                super::token::envelope(target_token.raw())
+                    .map(|envelope| (envelope, memcordon_core::NativeInputStageV1::NotReached))
+            };
+            let stage = match &queried {
+                Ok((_, stage)) => stage.clone(),
+                Err(_) => memcordon_core::NativeInputStageV1::Unavailable {
+                    reason: memcordon_core::NativeInputUnavailableV1::QueryFailed,
+                    native_error: None,
+                },
+            };
+            if let Some(mut observation) = cleanup_guard
+                .record
+                .causal_diagnostics
+                .native_inputs
+                .clone()
+            {
+                observation.target_identity = cleanup_guard.record.target_identity.clone();
+                observation.suspended_target = stage;
+                if cleanup_guard
+                    .record
+                    .causal_diagnostics
+                    .set_native_inputs(observation.clone())
+                    .is_err()
+                {
+                    cleanup_guard
+                        .record
+                        .causal_diagnostics
+                        .loss
+                        .writer_unavailable = true;
+                } else {
+                    super::diagnostics::observe_native_inputs(&observation);
+                }
+            }
+            Some(queried?.0)
         };
         if request.certification_mutant
             != Some(memcordon_core::WindowsSealedMutant::SkipTargetTokenReadback)
@@ -4058,7 +4247,20 @@ fn launch_attempt(
             pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))
                 .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
         (|| -> Result<(), String> {
-            pipe::write_frame(connection, &response)?;
+            let delivery = driver(
+                &request.attempt_id,
+                &request.request_sha256,
+                DriverPhase::TerminalDelivery,
+            );
+            let progress = delivery.transport();
+            delivery.run(|| {
+                pipe::write_frame_observed(
+                    connection,
+                    &response,
+                    terminal_transport.cutoff(),
+                    |update| progress.record(update),
+                )
+            })?;
             Ok(())
         })()
         .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
@@ -4082,11 +4284,18 @@ fn launch_attempt(
         let retired = record
             .completed_terminal_retired_receipt()
             .map_err(|error| LaunchAttemptError::terminal_transport("retirement-receipt", error))?;
-        pipe::write_frame_until(
-            connection,
-            &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
-            terminal_cutoff,
+        driver(
+            &request.attempt_id,
+            &request.request_sha256,
+            DriverPhase::RetirementReceiptDelivery,
         )
+        .run(|| {
+            pipe::write_frame_until(
+                connection,
+                &WindowsLauncherResponseV4::TerminalRetiredV2(retired),
+                terminal_cutoff,
+            )
+        })
         .map_err(|error| LaunchAttemptError::terminal_transport("retirement-delivery", error))?;
     }
     Ok(())
@@ -4754,32 +4963,35 @@ fn wait_for_terminal_acknowledgment(
     request_sha256: &str,
     terminal_response_sha256: &str,
 ) -> Result<(), String> {
-    let transport = pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))?;
-    let result = (|| match pipe::read_frame::<WindowsLauncherRequestV4>(connection)? {
-        WindowsLauncherRequestV4::TerminalAcknowledged {
-            schema_version,
-            attempt_id: received_attempt_id,
-            nonce: received_nonce,
-            request_sha256: received_request_sha256,
-            terminal_response_sha256: received_response_sha256,
-        } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
-            && received_attempt_id == attempt_id
-            && received_nonce == nonce
-            && received_request_sha256 == request_sha256
-            && received_response_sha256 == terminal_response_sha256 =>
-        {
-            Ok(())
+    driver(attempt_id, request_sha256, DriverPhase::TerminalAckWait).run(|| {
+        let transport =
+            pipe::SynchronousIoDeadline::start(Instant::now() + Duration::from_secs(30))?;
+        let result = (|| match pipe::read_frame::<WindowsLauncherRequestV4>(connection)? {
+            WindowsLauncherRequestV4::TerminalAcknowledged {
+                schema_version,
+                attempt_id: received_attempt_id,
+                nonce: received_nonce,
+                request_sha256: received_request_sha256,
+                terminal_response_sha256: received_response_sha256,
+            } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
+                && received_attempt_id == attempt_id
+                && received_nonce == nonce
+                && received_request_sha256 == request_sha256
+                && received_response_sha256 == terminal_response_sha256 =>
+            {
+                Ok(())
+            }
+            _ => Err("control did not acknowledge the bound terminal response".to_owned()),
+        })();
+        let settlement = transport.finish();
+        match (result, settlement) {
+            (Err(primary), Err(secondary)) => {
+                Err(format!("{primary}; terminal transport: {secondary}"))
+            }
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
         }
-        _ => Err("control did not acknowledge the bound terminal response".to_owned()),
-    })();
-    let settlement = transport.finish();
-    match (result, settlement) {
-        (Err(primary), Err(secondary)) => {
-            Err(format!("{primary}; terminal transport: {secondary}"))
-        }
-        (Err(primary), _) => Err(primary),
-        (Ok(()), result) => result,
-    }
+    })
 }
 
 fn certify_cleanup_process_creation(

@@ -80,6 +80,22 @@ pub fn path_sha256(components: &[Vec<u16>]) -> io::Result<String> {
 }
 
 impl Proof {
+    /// The final observed directory prefix, excluding the selected event leaf.
+    /// This is diagnostic path metadata, never an event reference or authority.
+    pub fn event_parent(&self) -> io::Result<&[Vec<u16>]> {
+        if self.revision != 1
+            || !self.complete
+            || !self.controller_same_original
+            || !self.controller_absolute_same_original
+            || self.components.len() < 2
+            || self.path_sha256 != path_sha256(&self.components)?
+        {
+            return Err(invalid());
+        }
+        self.event_leaf()?;
+        Ok(&self.components[..self.components.len() - 1])
+    }
+
     pub fn event_leaf(&self) -> io::Result<&[u16]> {
         let leaf = self.components.last().ok_or_else(invalid)?.as_slice();
         component(leaf)?;

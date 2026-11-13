@@ -149,6 +149,15 @@ fn records(root: &Path, paths: &[PathBuf]) -> Result<Vec<FileRecord>> {
         })
         .collect()
 }
+fn private_members(kind: Kind, mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    if kind == Kind::Private {
+        paths.push(PathBuf::from(
+            "target/ci/native/release/memcordon-linux-readiness-fixture",
+        ));
+    }
+    paths
+}
+
 fn files(root: &Path, kind: Kind) -> Result<Vec<PathBuf>> {
     if kind == Kind::ReleaseFuzz {
         return Ok(vec![
@@ -156,7 +165,10 @@ fn files(root: &Path, kind: Kind) -> Result<Vec<PathBuf>> {
             PathBuf::from("target/ci-tools/bin/cargo-fuzz"),
         ]);
     }
-    crate::driver_cache::preparation_members(root)
+    Ok(private_members(
+        kind,
+        crate::driver_cache::preparation_members(root)?,
+    ))
 }
 fn transported_files(root: &Path, record: &Record) -> Result<Vec<PathBuf>> {
     if record.kind == Kind::ReleaseFuzz {
@@ -171,7 +183,10 @@ fn transported_files(root: &Path, record: &Record) -> Result<Vec<PathBuf>> {
     if member.executable || member.size == 0 || member.size > FILE_LIMIT {
         return Err(invalid("tool image member is invalid"));
     }
-    crate::driver_cache::transported_preparation_members(root, member.size, &member.sha256)
+    Ok(private_members(
+        record.kind,
+        crate::driver_cache::transported_preparation_members(root, member.size, &member.sha256)?,
+    ))
 }
 fn validate(root: &Path, record: &Record, kind: Kind) -> Result<()> {
     if record.kind != kind
@@ -201,7 +216,7 @@ pub fn run(root: &Path, operation: Operation, kind: Kind) -> Result<()> {
                 let bytes = read(root, Path::new(manifest(Kind::PrivateDriver)), RECORD_LIMIT)?;
                 let upstream: Record = serde_json::from_slice(&bytes)?;
                 validate(root, &upstream, Kind::PrivateDriver)?;
-                transported_files(root, &upstream)?
+                private_members(kind, transported_files(root, &upstream)?)
             } else {
                 files(root, kind)?
             };

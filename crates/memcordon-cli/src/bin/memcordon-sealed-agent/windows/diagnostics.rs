@@ -136,10 +136,46 @@ pub(super) fn merge_into(target: &mut WindowsCausalDiagnosticsV1) {
         if journal.sequence > target.sequence {
             let watermark = target.durable_through_sequence;
             let loss = target.loss.clone();
-            journal.copy_into_reserved(target);
+            // Causal publication must not erase separately advanced neutral
+            // snapshots when the attempt-local failure sequence catches up.
+            target.original.clone_from(&journal.original);
+            target.secondary.clone_from(&journal.secondary);
+            target.sequence = journal.sequence;
+            target.loss.clone_from(&journal.loss);
             target.durable_through_sequence = watermark;
             target.loss.writer_unavailable |= loss.writer_unavailable;
             target.loss.persistence_failure_observed |= loss.persistence_failure_observed;
+        }
+        if let Some(next) = &journal.native_inputs {
+            match &target.native_inputs {
+                Some(previous) if previous.is_monotonic_extension_of(next) => {}
+                _ => {
+                    if target.set_native_inputs(next.clone()).is_err() {
+                        target.loss.writer_unavailable = true;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// A neutral snapshot never creates an original or secondary failure event.
+pub(super) fn observe_native_inputs(next: &memcordon_core::WindowsNativeInputObservationV1) {
+    CURRENT.with(|current| {
+        let Ok(current) = current.try_borrow() else {
+            CAPTURE_LOST.set(true);
+            return;
+        };
+        let Some(slot) = current.as_ref() else {
+            CAPTURE_LOST.set(true);
+            return;
+        };
+        let Ok(mut journal) = slot.try_borrow_mut() else {
+            CAPTURE_LOST.set(true);
+            return;
+        };
+        if journal.set_native_inputs(next.clone()).is_err() {
+            CAPTURE_LOST.set(true);
         }
     });
 }

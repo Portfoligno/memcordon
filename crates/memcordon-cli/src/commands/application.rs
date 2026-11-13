@@ -480,7 +480,7 @@ fn finish_error(
             workload_may_be_alive: error.workload_may_be_alive,
             boundary_setup_failure: error.boundary_setup_failure.clone(),
             provider_rejection: error.provider_rejection.as_deref().cloned(),
-            provider_failure: error.provider_failure.clone(),
+            provider_failure: error.provider_failure.as_deref().cloned(),
         };
         match report(
             args,
@@ -655,7 +655,7 @@ fn finish_error(
             workload_may_be_alive: error.workload_may_be_alive,
             boundary_setup_failure: error.boundary_setup_failure.clone(),
             provider_rejection: error.provider_rejection.as_deref().cloned(),
-            provider_failure: error.provider_failure.clone(),
+            provider_failure: error.provider_failure.as_deref().cloned(),
         };
         match report(
             &args,

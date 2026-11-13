@@ -36,12 +36,44 @@ mod macos_result_frame;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod startup_cleanup_observation;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_access_failure_preparation;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_access_failure_record;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_fileio_record;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_private_fixture_binding;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_private_input_record;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_process_candidate;
+#[cfg(feature = "test-support")]
+pub mod windows_provider_catalog_protocol;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_registry_difference;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_registry_error;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_registry_manifest;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod windows_registry_seal;
 #[cfg(target_os = "macos")]
 pub use macos_launch::LaunchRuntime as MacosLaunchRuntime;
 #[cfg(target_os = "macos")]
 pub use macos_result_delivery::{
     DeliveryLimits, DeliveryObservation, DeliveryOutcome, DeliveryRequest, DeliveryStage,
-    MacosDeliveryRuntime, WriterImage,
+    MacosDeliveryRuntime, ObservationProvenance, WriterImage,
 };
 #[cfg(target_os = "macos")]
 #[doc(hidden)]

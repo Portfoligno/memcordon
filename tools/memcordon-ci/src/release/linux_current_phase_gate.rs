@@ -136,19 +136,7 @@ impl NativeReadGate {
     }
 
     pub fn on_current_executable(file: &File, cutoff: Instant) -> Result<Self> {
-        let identity = file.metadata()?;
-        let flags = rustix::fs::fcntl_getfl(file).map_err(std::io::Error::from)?;
-        if !identity.is_file()
-            || identity.uid() != 0
-            || identity.mode() & 0o777 != 0o555
-            || identity.nlink() != 1
-            || identity.len() == 0
-            || flags & rustix::fs::OFlags::ACCMODE != rustix::fs::OFlags::RDONLY
-        {
-            return Err(CiError::Message(
-                "current package gate lacks its exact protected readonly executable".into(),
-            ));
-        }
+        let identity = crate::linux_package_executable::inspect(file)?;
         let expected = (identity.dev(), identity.ino());
         Self::start(file.try_clone()?, false, cutoff, move |pid, _| {
             // Ignore the pre-exec open so Command can complete its exec
@@ -404,8 +392,12 @@ pub struct NativeTraceStop {
     cutoff: Instant,
     attached: bool,
     stopped: bool,
+    observations: crate::linux_transaction_trace::TraceWindow,
 }
 impl NativeTraceStop {
+    pub fn original_exited(&self) -> Result<bool> {
+        self.process.exited().map_err(CiError::Message)
+    }
     pub fn attach(
         process: crate::linux_consumer_readiness::HeldLinuxProcess,
         permission: &mut PermissionStop,
@@ -424,6 +416,7 @@ impl NativeTraceStop {
             cutoff,
             attached: false,
             stopped: false,
+            observations: crate::linux_transaction_trace::TraceWindow::default(),
         };
         trace.control(
             libc::PTRACE_SEIZE,
@@ -512,11 +505,24 @@ impl NativeTraceStop {
     fn next_syscall(&mut self) -> Result<Vec<u8>> {
         let mut signal = 0;
         loop {
+            self.observations
+                .check(Instant::now(), self.cutoff)
+                .map_err(CiError::Message)?;
             self.control(libc::PTRACE_SYSCALL, 0, signal)?;
             self.stopped = false;
             let status = self.wait_stop()?;
+            self.observations
+                .check(Instant::now(), self.cutoff)
+                .map_err(CiError::Message)?;
             if libc::WSTOPSIG(status) == libc::SIGTRAP | 0x80 {
-                return self.syscall_info();
+                let record = self.syscall_info()?;
+                self.observations
+                    .record(&record)
+                    .map_err(CiError::Message)?;
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                return Ok(record);
             }
             if status >> 16 != 0 {
                 return Err(CiError::Message(
@@ -525,6 +531,50 @@ impl NativeTraceStop {
             }
             signal = usize::try_from(libc::WSTOPSIG(status))
                 .map_err(|error| CiError::Message(error.to_string()))?;
+        }
+    }
+    fn trace_context(&self, error: CiError) -> CiError {
+        error.context(format!(
+            "original deadline-bounded native trace: {}",
+            self.observations.diagnostic()
+        ))
+    }
+
+    fn transaction_parent(&self, parent: &crate::linux_transaction_trace::Parent) -> Result<File> {
+        use crate::linux_transaction_trace::Parent;
+        use std::os::unix::ffi::OsStrExt;
+        self.observations
+            .check(Instant::now(), self.cutoff)
+            .map_err(CiError::Message)?;
+        match parent {
+            Parent::Absolute(path) => {
+                let root = File::open(format!("/proc/{}/root", self.process.process_id))?;
+                let relative = path
+                    .strip_prefix(b"/")
+                    .ok_or_else(|| CiError::Message("native absolute parent lacks root".into()))?;
+                let relative = if relative.is_empty() {
+                    std::ffi::OsStr::new(".")
+                } else {
+                    std::ffi::OsStr::from_bytes(relative)
+                };
+                Ok(File::from(
+                    rustix::fs::openat2(
+                        &root,
+                        relative,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                        rustix::fs::ResolveFlags::IN_ROOT | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+                    )
+                    .map_err(std::io::Error::from)?,
+                ))
+            }
+            Parent::Descriptor(fd) => Ok(File::open(if *fd == libc::AT_FDCWD {
+                format!("/proc/{}/cwd", self.process.process_id)
+            } else {
+                format!("/proc/{}/fd/{fd}", self.process.process_id)
+            })?),
         }
     }
     fn pathname(&self, address: u64) -> Result<Vec<u8>> {
@@ -564,7 +614,7 @@ impl NativeTraceStop {
         &mut self,
         source: &File,
         minimum: u64,
-        ready: impl Fn() -> bool,
+        ready: impl Fn() -> Result<bool>,
     ) -> Result<serde_json::Value> {
         use std::os::unix::fs::MetadataExt;
         let original = source.metadata()?;
@@ -573,67 +623,73 @@ impl NativeTraceStop {
                 "source read gate has no remaining original extent".into(),
             ));
         }
-        for _ in 0..65536 {
-            let entry = self.next_syscall()?;
-            if entry.first() != Some(&1) || entry.len() < 80 {
-                continue;
-            }
-            let architecture =
-                u32::from_ne_bytes(entry[4..8].try_into().expect("bounded syscall info"));
-            let number =
-                u64::from_ne_bytes(entry[24..32].try_into().expect("bounded syscall info"));
-            if !((architecture == 0xc000003e && number == 0)
-                || (architecture == 0xc00000b7 && number == 63))
-            {
-                continue;
-            }
-            let descriptor =
-                u64::from_ne_bytes(entry[32..40].try_into().expect("bounded source descriptor"));
-            let path = format!("/proc/{}/fd/{descriptor}", self.process.process_id);
-            let actual = match std::fs::metadata(&path) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if (actual.dev(), actual.ino()) != (original.dev(), original.ino()) {
-                continue;
-            }
-            let exit = self.next_syscall()?;
-            if exit.first() != Some(&2) || exit.len() < 33 || exit[32] != 0 {
-                return Err(CiError::Message(
-                    "original source read did not reach successful native exit".into(),
-                ));
-            }
-            let count =
-                i64::from_ne_bytes(exit[24..32].try_into().expect("bounded source read result"));
-            if count <= 0 {
-                continue;
-            }
-            let fdinfo = std::fs::read_to_string(format!(
-                "/proc/{}/fdinfo/{descriptor}",
-                self.process.process_id
-            ))?;
-            let positions = fdinfo
-                .lines()
-                .filter_map(|line| line.strip_prefix("pos:"))
-                .collect::<Vec<_>>();
-            if positions.len() != 1 {
-                return Err(CiError::Message(
-                    "original source cursor absent or duplicate".into(),
-                ));
-            }
-            let position = positions[0]
-                .trim()
-                .parse::<u64>()
-                .map_err(|error| CiError::Message(error.to_string()))?;
-            if position > minimum && position < original.len() && ready() {
-                return Ok(
-                    serde_json::json!({"format":"memcordon.current-source-read-stop","revision":1,"process":{"pid":self.process.process_id,"birth":self.process.birth},"source":{"device":original.dev(),"inode":original.ino(),"uid":original.uid(),"length":original.len()},"descriptor":descriptor,"syscall":number,"architecture":architecture,"read_bytes":count,"position":position,"fdinfo":fdinfo,"stopped_after_native_read":true}),
+        let observed = (|| {
+            loop {
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                let entry = self.next_syscall()?;
+                if entry.first() != Some(&1) || entry.len() < 80 {
+                    continue;
+                }
+                let architecture =
+                    u32::from_ne_bytes(entry[4..8].try_into().expect("bounded syscall info"));
+                let number =
+                    u64::from_ne_bytes(entry[24..32].try_into().expect("bounded syscall info"));
+                if !((architecture == 0xc000003e && number == 0)
+                    || (architecture == 0xc00000b7 && number == 63))
+                {
+                    continue;
+                }
+                let descriptor = u64::from_ne_bytes(
+                    entry[32..40].try_into().expect("bounded source descriptor"),
                 );
+                let path = format!("/proc/{}/fd/{descriptor}", self.process.process_id);
+                let actual = match std::fs::metadata(&path) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if (actual.dev(), actual.ino()) != (original.dev(), original.ino()) {
+                    self.observations.reject("read refers another source inode");
+                    continue;
+                }
+                self.observations.candidate();
+                let exit = self.next_syscall()?;
+                let count = crate::linux_transaction_trace::successful_exit(&exit, architecture)
+                    .map_err(CiError::Message)?;
+                if count <= 0 {
+                    continue;
+                }
+                let fdinfo = std::fs::read_to_string(format!(
+                    "/proc/{}/fdinfo/{descriptor}",
+                    self.process.process_id
+                ))?;
+                let positions = fdinfo
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("pos:"))
+                    .collect::<Vec<_>>();
+                if positions.len() != 1 {
+                    return Err(CiError::Message(
+                        "original source cursor absent or duplicate".into(),
+                    ));
+                }
+                let position = positions[0]
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|error| CiError::Message(error.to_string()))?;
+                if position > minimum && position < original.len() && ready()? {
+                    self.observations
+                        .check(Instant::now(), self.cutoff)
+                        .map_err(CiError::Message)?;
+                    return Ok(
+                        serde_json::json!({"format":"memcordon.current-source-read-stop","revision":1,"process":{"pid":self.process.process_id,"birth":self.process.birth},"source":{"device":original.dev(),"inode":original.ino(),"uid":original.uid(),"length":original.len()},"descriptor":descriptor,"syscall":number,"architecture":architecture,"read_bytes":count,"position":position,"fdinfo":fdinfo,"stopped_after_native_read":true}),
+                    );
+                }
+                self.observations
+                    .reject("original source position or readiness not selected");
             }
-        }
-        Err(CiError::Message(
-            "original source read boundary was not reached within syscall bound".into(),
-        ))
+        })();
+        observed.map_err(|error| self.trace_context(error))
     }
     pub fn after_rename(
         &mut self,
@@ -675,170 +731,138 @@ impl NativeTraceStop {
                 "syscall transaction directory custody differs".into(),
             ));
         }
-        for _ in 0..4096 {
-            let entry = self.next_syscall()?;
-            if entry[0] != 1 || entry.len() < 80 {
-                continue;
-            }
-            let architecture =
-                u32::from_ne_bytes(entry[4..8].try_into().expect("bounded syscall info"));
-            let number =
-                u64::from_ne_bytes(entry[24..32].try_into().expect("bounded syscall info"));
-            #[cfg(target_arch = "x86_64")]
-            let selected = architecture == 0xc000003e && [82, 264, 316].contains(&number);
-            #[cfg(target_arch = "aarch64")]
-            let selected = architecture == 0xc00000b7 && [38, 276].contains(&number);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let selected = false;
-            if !selected {
-                continue;
-            }
-            let arguments: Vec<u64> = entry[32..80]
-                .chunks_exact(8)
-                .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("fixed register width")))
-                .collect();
-            let (source_address, target_address, source_fd, target_fd) =
-                if architecture == 0xc000003e && number == 82 {
-                    (
-                        arguments[0],
-                        arguments[1],
-                        libc::AT_FDCWD as i64 as u64,
-                        libc::AT_FDCWD as i64 as u64,
-                    )
-                } else {
-                    (arguments[1], arguments[3], arguments[0], arguments[2])
+        let observed = (|| {
+            loop {
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                let entry = self.next_syscall()?;
+                #[cfg(target_arch = "x86_64")]
+                let expected_architecture = 0xc000003e;
+                #[cfg(target_arch = "aarch64")]
+                let expected_architecture = 0xc00000b7;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let expected_architecture = 0;
+                let Some(rename) =
+                    crate::linux_transaction_trace::rename_entry(&entry, expected_architecture)
+                        .map_err(CiError::Message)?
+                else {
+                    continue;
                 };
-            let source = self.pathname(source_address)?;
-            let temporary = std::str::from_utf8(&source)
-                .map_err(|error| CiError::Message(error.to_string()))?;
-            let selected_source = if prefix {
-                Path::new(temporary)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(selector) && name.len() > selector.len())
-            } else {
-                source == selector.as_bytes()
-            };
-            if !selected_source || self.pathname(target_address)? != final_name.as_bytes() {
-                continue;
-            }
-            for (path, descriptor) in [
-                (Path::new(temporary), source_fd),
-                (Path::new(final_name), target_fd),
-            ] {
-                if path.components().any(|part| {
-                    !matches!(
-                        part,
-                        std::path::Component::RootDir | std::path::Component::Normal(_)
-                    )
-                }) {
+                let source = self.pathname(rename.source_address)?;
+                let target = self.pathname(rename.target_address)?;
+                self.observations.operands(&source, &target);
+                let candidate = crate::linux_transaction_trace::select(
+                    &source,
+                    &target,
+                    selector.as_bytes(),
+                    final_name.as_bytes(),
+                    prefix,
+                    rename.source_fd,
+                    rename.target_fd,
+                )
+                .map_err(CiError::Message)?;
+                let Some(candidate) = candidate else {
+                    self.observations.reject("rename leaf selector mismatch");
+                    continue;
+                };
+                self.observations.candidate();
+                let source_parent = self.transaction_parent(&candidate.source.parent)?;
+                let target_parent = self.transaction_parent(&candidate.target.parent)?;
+                let source_identity = source_parent.metadata()?;
+                let target_identity = target_parent.metadata()?;
+                if !source_identity.is_dir() || !target_identity.is_dir() {
+                    self.observations.reject("native parent is not directory");
                     return Err(CiError::Message(
-                        "native transaction pathname is not normalized".into(),
+                        "native rename parent is not directory".into(),
                     ));
                 }
-                let held = if path.is_absolute() {
-                    File::open(path.parent().ok_or_else(|| {
-                        CiError::Message("absolute native transaction parent absent".into())
-                    })?)?
-                } else {
-                    if path.components().count() != 1 {
-                        return Err(CiError::Message(
-                            "relative native transaction must be a direct held-directory leaf"
-                                .into(),
-                        ));
-                    }
-                    let descriptor = i32::try_from(descriptor as i64)
-                        .map_err(|error| CiError::Message(error.to_string()))?;
-                    File::open(if descriptor == libc::AT_FDCWD {
-                        format!("/proc/{}/cwd", self.process.process_id)
-                    } else {
-                        format!("/proc/{}/fd/{descriptor}", self.process.process_id)
-                    })?
-                };
-                let identity = held.metadata()?;
-                if !identity.is_dir()
-                    || (identity.dev(), identity.ino()) != (parent.dev(), parent.ino())
+                if let Err(error) = crate::linux_transaction_trace::require_parents(
+                    (parent.dev(), parent.ino()),
+                    (source_identity.dev(), source_identity.ino()),
+                    (target_identity.dev(), target_identity.ino()),
+                ) {
+                    self.observations
+                        .reject("actual native parent identity mismatch");
+                    return Err(CiError::Message(error));
+                }
+                use std::os::unix::ffi::OsStrExt;
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                let pending = rustix::fs::openat(
+                    directory,
+                    std::ffi::OsStr::from_bytes(&candidate.source.leaf),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let mut pending = File::from(pending);
+                let identity = pending.metadata()?;
+                if !identity.is_file()
+                    || identity.uid() != 0
+                    || identity.nlink() != 1
+                    || identity.mode() & 0o777 != 0o600
+                    || identity.len() > 512 * 1024
                 {
                     return Err(CiError::Message(
-                        "native rename uses another held transaction directory".into(),
+                        "pending native transaction record custody differs".into(),
                     ));
                 }
+                let mut bytes = Vec::new();
+                (&mut pending)
+                    .take(512 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if !predicate(&bytes) {
+                    self.observations
+                        .reject("pending record content predicate refused");
+                    continue;
+                }
+                let exit = self.next_syscall()?;
+                if crate::linux_transaction_trace::successful_exit(&exit, rename.architecture)
+                    .map_err(CiError::Message)?
+                    != 0
+                {
+                    return Err(CiError::Message(
+                        "selected native rename did not succeed at its actual syscall exit".into(),
+                    ));
+                }
+                let published = rustix::fs::openat(
+                    directory,
+                    std::ffi::OsStr::from_bytes(&candidate.target.leaf),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let mut published = File::from(published);
+                let named = published.metadata()?;
+                let mut actual = Vec::new();
+                (&mut published)
+                    .take(512 * 1024 + 1)
+                    .read_to_end(&mut actual)?;
+                if (identity.dev(), identity.ino()) != (named.dev(), named.ino())
+                    || bytes != actual
+                    || named.nlink() != 1
+                    || named.uid() != 0
+                    || named.mode() & 0o777 != 0o600
+                {
+                    return Err(CiError::Message(
+                        "published native transaction differs from the exact pending inode/bytes"
+                            .into(),
+                    ));
+                }
+                let observation = serde_json::json!({"mechanism":"ptrace-native-rename-exit","pid":self.process.process_id,"birth":self.process.birth,"architecture":rename.architecture,"syscall":rename.number,"rename_flags":rename.flags,"source_bytes":source,"destination_bytes":target,"source_leaf":candidate.source.leaf,"destination_leaf":candidate.target.leaf,"directory_device":parent.dev(),"directory_inode":parent.ino(),"device":named.dev(),"inode":named.ino(),"record_bytes":actual,"return_value":0,"worker_stopped_before_userspace":true});
+                self.observations
+                    .check(Instant::now(), self.cutoff)
+                    .map_err(CiError::Message)?;
+                return Ok(observation);
             }
-            let pending = rustix::fs::openat(
-                directory,
-                Path::new(temporary).file_name().ok_or_else(|| {
-                    CiError::Message("native pending transaction leaf absent".into())
-                })?,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(std::io::Error::from)?;
-            let mut pending = File::from(pending);
-            let identity = pending.metadata()?;
-            if !identity.is_file()
-                || identity.uid() != 0
-                || identity.nlink() != 1
-                || identity.mode() & 0o777 != 0o600
-                || identity.len() > 512 * 1024
-            {
-                return Err(CiError::Message(
-                    "pending native transaction record custody differs".into(),
-                ));
-            }
-            let mut bytes = Vec::new();
-            (&mut pending)
-                .take(512 * 1024 + 1)
-                .read_to_end(&mut bytes)?;
-            if !predicate(&bytes) {
-                continue;
-            }
-            let exit = self.next_syscall()?;
-            if exit[0] != 2
-                || exit.len() < 33
-                || i64::from_ne_bytes(exit[24..32].try_into().expect("bounded syscall exit")) != 0
-                || exit[32] != 0
-            {
-                return Err(CiError::Message(
-                    "selected native rename did not succeed at its actual syscall exit".into(),
-                ));
-            }
-            let published = rustix::fs::openat(
-                directory,
-                Path::new(final_name).file_name().ok_or_else(|| {
-                    CiError::Message("native published transaction leaf absent".into())
-                })?,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(std::io::Error::from)?;
-            let mut published = File::from(published);
-            let named = published.metadata()?;
-            let mut actual = Vec::new();
-            (&mut published)
-                .take(512 * 1024 + 1)
-                .read_to_end(&mut actual)?;
-            if (identity.dev(), identity.ino()) != (named.dev(), named.ino())
-                || bytes != actual
-                || named.nlink() != 1
-                || named.uid() != 0
-                || named.mode() & 0o777 != 0o600
-            {
-                return Err(CiError::Message(
-                    "published native transaction differs from the exact pending inode/bytes"
-                        .into(),
-                ));
-            }
-            return Ok(
-                serde_json::json!({"mechanism":"ptrace-native-rename-exit","pid":self.process.process_id,"birth":self.process.birth,"architecture":architecture,"syscall":number,"source":temporary,"destination":final_name,"directory_device":parent.dev(),"directory_inode":parent.ino(),"device":named.dev(),"inode":named.ino(),"record_bytes":actual,"return_value":0,"worker_stopped_before_userspace":true}),
-            );
-        }
-        Err(CiError::Message(
-            "native transaction syscall inventory exceeds bound".into(),
-        ))
+        })();
+        observed.map_err(|error| self.trace_context(error))
     }
     pub fn detach(&mut self) -> Result<()> {
         if !self.attached {
@@ -925,70 +949,248 @@ impl Drop for NativeTraceStop {
 
 pub struct NativeNamespaceWatch {
     events: File,
-    roots: Vec<(String, std::path::PathBuf, File, i32)>,
+    roots: Vec<NamespaceRoot>,
+    subscriptions: Vec<crate::namespace_watch_model::Subscription>,
+    cutoff: Instant,
+}
+struct NamespaceRoot {
+    role: String,
+    path: std::path::PathBuf,
+    parent: File,
+    basename: std::ffi::OsString,
+    directory: Option<File>,
+}
+
+pub(super) fn namespace_identity(file: &File) -> Result<(u64, u64, u32, u32)> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(CiError::Message(
+            "native namespace observation directory is unprotected".into(),
+        ));
+    }
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+    ))
+}
+
+fn namespace_open(parent: &File, name: &std::ffi::OsStr) -> Result<Option<File>> {
+    match rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(file) => Ok(Some(File::from(file))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(std::io::Error::from(error).into()),
+    }
+}
+
+pub(super) fn namespace_parent(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(CiError::Message(
+            "native namespace path must be absolute".into(),
+        ));
+    }
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    namespace_identity(&directory)?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => (),
+            std::path::Component::Normal(name) => {
+                directory = namespace_open(&directory, name)?.ok_or_else(|| {
+                    CiError::Message(format!(
+                        "native namespace parent component absent: {}",
+                        path.display()
+                    ))
+                })?;
+                namespace_identity(&directory)?;
+            }
+            _ => {
+                return Err(CiError::Message(
+                    "native namespace parent is not normalized".into(),
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn namespace_add_watch(events: &File, directory: &File) -> Result<i32> {
+    let name = std::ffi::CString::new(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .expect("numeric held directory path");
+    // SAFETY: the held directory FD pins this path for this call.
+    let watch = unsafe {
+        libc::inotify_add_watch(
+            events.as_raw_fd(),
+            name.as_ptr(),
+            libc::IN_CREATE
+                | libc::IN_MOVED_TO
+                | libc::IN_DELETE
+                | libc::IN_MOVED_FROM
+                | libc::IN_DELETE_SELF
+                | libc::IN_MOVE_SELF
+                | libc::IN_UNMOUNT
+                | libc::IN_ONLYDIR,
+        )
+    };
+    if watch < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(watch)
 }
 impl NativeNamespaceWatch {
-    pub fn new(roots: &[(&str, &Path)]) -> Result<Self> {
+    pub fn new(roots: &[(&str, &Path)], cutoff: Instant) -> Result<Self> {
         // SAFETY: fixed flags request a new, nonblocking kernel event FD.
         let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if raw < 0 {
-            return Err(CiError::Message(format!(
-                "native namespace observation unavailable: {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(CiError::from(std::io::Error::last_os_error())
+                .context("native namespace inotify initialization"));
         }
         // SAFETY: inotify_init1 transferred this fresh descriptor exactly once.
         let events = unsafe { File::from_raw_fd(raw) };
         let mut held = Vec::new();
+        let mut subscriptions = Vec::new();
         for (role, path) in roots {
-            let directory = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(path)?;
-            let metadata = directory.metadata()?;
-            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            use std::os::unix::ffi::OsStrExt;
+            if Instant::now() >= cutoff {
                 return Err(CiError::Message(
-                    "native namespace observation directory is unprotected".into(),
+                    "native namespace original cutoff expired".into(),
                 ));
             }
-            let name = std::ffi::CString::new(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-                .expect("numeric held directory path");
-            // SAFETY: the held directory FD pins this path for the call.
-            let watch = unsafe {
-                libc::inotify_add_watch(
-                    events.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::IN_CREATE
-                        | libc::IN_MOVED_TO
-                        | libc::IN_DELETE
-                        | libc::IN_MOVED_FROM
-                        | libc::IN_DELETE_SELF
-                        | libc::IN_MOVE_SELF
-                        | libc::IN_ONLYDIR,
-                )
-            };
-            if watch < 0 {
-                return Err(CiError::Message(format!(
-                    "native namespace watch unavailable: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            held.push(((*role).into(), (*path).to_path_buf(), directory, watch));
+            let admitted = (|| -> Result<NamespaceRoot> {
+                let basename = path
+                    .file_name()
+                    .ok_or_else(|| {
+                        CiError::Message("native namespace root basename absent".into())
+                    })?
+                    .to_os_string();
+                if !matches!(
+                    path.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    return Err(CiError::Message(
+                        "native namespace root basename is not normal".into(),
+                    ));
+                }
+                let parent = namespace_parent(path.parent().ok_or_else(|| {
+                    CiError::Message("native namespace root parent absent".into())
+                })?)?;
+                let watch = namespace_add_watch(&events, &parent)?;
+                subscriptions.push(crate::namespace_watch_model::Subscription {
+                    watch,
+                    role: (*role).into(),
+                    basename: Some(basename.as_bytes().to_vec()),
+                });
+                let directory = namespace_open(&parent, &basename)?;
+                if let Some(directory) = &directory {
+                    namespace_identity(directory)?;
+                    let watch = namespace_add_watch(&events, directory)?;
+                    subscriptions.push(crate::namespace_watch_model::Subscription {
+                        watch,
+                        role: (*role).into(),
+                        basename: None,
+                    });
+                }
+                Ok(NamespaceRoot {
+                    role: (*role).into(),
+                    path: (*path).to_path_buf(),
+                    parent,
+                    basename,
+                    directory,
+                })
+            })()
+            .map_err(|error| {
+                error.context(format!(
+                    "native namespace admission role={role} path={}",
+                    path.display()
+                ))
+            })?;
+            held.push(admitted);
         }
-        Ok(Self {
+        let observer = Self {
             events,
             roots: held,
-        })
+            subscriptions,
+            cutoff,
+        };
+        // Revalidate the original admission without consuming queued setup events.
+        observer.snapshot()?;
+        Ok(observer)
     }
     pub fn snapshot(&self) -> Result<serde_json::Value> {
         use std::os::unix::ffi::OsStrExt;
         let mut observed = Vec::new();
-        for (role, path, directory, _) in &self.roots {
-            let metadata = directory.metadata()?;
+        for root in &self.roots {
+            if Instant::now() >= self.cutoff {
+                return Err(CiError::Message(
+                    "native namespace original cutoff expired".into(),
+                ));
+            }
+            let NamespaceRoot {
+                role,
+                path,
+                parent,
+                basename,
+                directory,
+            } = root;
+            let validation = (|| -> Result<()> {
+                let named_parent = namespace_parent(path.parent().expect("admitted parent"))?;
+                crate::namespace_watch_model::require_same_identity(
+                    Some(namespace_identity(parent)?),
+                    Some(namespace_identity(&named_parent)?),
+                )?;
+                let named = namespace_open(parent, basename)?;
+                crate::namespace_watch_model::require_same_identity(
+                    directory.as_ref().map(namespace_identity).transpose()?,
+                    named.as_ref().map(namespace_identity).transpose()?,
+                )
+            })();
+            validation.map_err(|error| {
+                error.context(format!(
+                    "native namespace snapshot role={role} path={}",
+                    path.display()
+                ))
+            })?;
+            let parent_identity = namespace_identity(parent)?;
+            let Some(directory) = directory else {
+                observed.push(serde_json::json!({"role":role,"path":path,"parent":parent_identity,"absent":true}));
+                continue;
+            };
+            let metadata = directory.metadata().map_err(|error| {
+                CiError::from(error).context(format!(
+                    "native namespace held metadata role={role} path={}",
+                    path.display()
+                ))
+            })?;
             let root = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
             let mut entries = Vec::new();
-            for entry in std::fs::read_dir(&root)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(&root).map_err(|error| {
+                CiError::from(error).context(format!(
+                    "native namespace entries role={role} path={}",
+                    path.display()
+                ))
+            })? {
+                if Instant::now() >= self.cutoff {
+                    return Err(CiError::Message(
+                        "native namespace original cutoff expired".into(),
+                    ));
+                }
+                let entry = entry.map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "native namespace entry read role={role} path={}",
+                        path.display()
+                    ))
+                })?;
                 let name = entry.file_name();
                 if role == "root-staging" && !name.as_bytes().starts_with(b"private-root-") {
                     continue;
@@ -998,18 +1200,45 @@ impl NativeNamespaceWatch {
                         "native namespace entry inventory exceeds bound".into(),
                     ));
                 }
-                let identity = std::fs::symlink_metadata(root.join(&name))?;
+                let identity = std::fs::symlink_metadata(root.join(&name)).map_err(|error| {
+                    CiError::from(error).context(format!(
+                        "native namespace entry metadata role={role} path={} name={name:?}",
+                        path.display()
+                    ))
+                })?;
                 entries.push(serde_json::json!({"name":name.as_bytes(),"device":identity.dev(),"inode":identity.ino(),"uid":identity.uid(),"mode":identity.mode(),"length":identity.len()}));
             }
             entries.sort_by(|left, right| left["name"].to_string().cmp(&right["name"].to_string()));
-            observed.push(serde_json::json!({"role":role,"path":path,"device":metadata.dev(),"inode":metadata.ino(),"uid":metadata.uid(),"mode":metadata.mode(),"entries":entries}));
+            let named_parent = namespace_parent(path.parent().expect("admitted parent"))?;
+            crate::namespace_watch_model::require_same_identity(
+                Some(parent_identity),
+                Some(namespace_identity(&named_parent)?),
+            )?;
+            let named = namespace_open(parent, basename)?;
+            crate::namespace_watch_model::require_same_identity(
+                Some(namespace_identity(directory)?),
+                named.as_ref().map(namespace_identity).transpose()?,
+            )
+            .map_err(|error| {
+                error.context(format!(
+                    "native namespace snapshot final readback role={role} path={}",
+                    path.display()
+                ))
+            })?;
+            observed.push(serde_json::json!({"role":role,"path":path,"parent":parent_identity,"absent":false,"device":metadata.dev(),"inode":metadata.ino(),"uid":metadata.uid(),"mode":metadata.mode(),"entries":entries}));
         }
         Ok(serde_json::Value::Array(observed))
     }
     pub fn drain(&self) -> Result<serde_json::Value> {
         let mut buffer = [0u8; 65536];
         let mut observed = Vec::new();
+        let mut raw_events = 0;
         loop {
+            if Instant::now() >= self.cutoff {
+                return Err(CiError::Message(
+                    "native namespace original cutoff expired".into(),
+                ));
+            }
             let mut source = &self.events;
             let count = match source.read(&mut buffer) {
                 Ok(0) => return Err(CiError::Message("native namespace observer closed".into())),
@@ -1019,6 +1248,11 @@ impl NativeNamespaceWatch {
             };
             let mut offset = 0;
             while offset < count {
+                if Instant::now() >= self.cutoff {
+                    return Err(CiError::Message(
+                        "native namespace original cutoff expired".into(),
+                    ));
+                }
                 if count - offset < 16 {
                     return Err(CiError::Message("native namespace event truncated".into()));
                 }
@@ -1048,25 +1282,17 @@ impl NativeNamespaceWatch {
                     .position(|byte| *byte == 0)
                     .unwrap_or(name.len())];
                 offset += 16 + length;
-                let (role, _, _, _) = self
-                    .roots
-                    .iter()
-                    .find(|(_, _, _, id)| *id == watch)
-                    .ok_or_else(|| {
-                        CiError::Message("native namespace event belongs to another watch".into())
-                    })?;
-                if role == "root-staging"
-                    && !name.starts_with(b"private-root-")
-                    && mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) == 0
+                raw_events += 1;
+                crate::namespace_watch_model::check_event_bounds(raw_events, observed.len())?;
+                for role in
+                    crate::namespace_watch_model::classify(&self.subscriptions, watch, mask, name)?
                 {
-                    continue;
+                    crate::namespace_watch_model::check_event_bounds(
+                        raw_events,
+                        observed.len() + 1,
+                    )?;
+                    observed.push(serde_json::json!({"role":role,"mask":mask,"name":name}));
                 }
-                if observed.len() >= 4096 {
-                    return Err(CiError::Message(
-                        "native namespace event inventory exceeds bound".into(),
-                    ));
-                }
-                observed.push(serde_json::json!({"role":role,"mask":mask,"name":name}));
             }
         }
         Ok(serde_json::Value::Array(observed))

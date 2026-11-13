@@ -744,6 +744,7 @@ fn projection_requires_exact_provider_attempt_request_and_digest() {
         original: journal.original,
         secondary: journal.secondary,
         loss: journal.loss,
+        native_inputs: None,
         projection_sha256: DiagnosticSha256::from_bytes([0; 32]),
     };
     projection.projection_sha256 = projection.canonical_digest();

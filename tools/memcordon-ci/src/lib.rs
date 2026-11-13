@@ -3,6 +3,37 @@
 // All other CI orchestration remains safe Rust.
 #![deny(unsafe_code)]
 
+pub mod exec_observation;
+pub mod installed_failure_carriers;
+pub mod linux_allocation_checkpoint;
+pub mod linux_elf_rpath;
+pub mod linux_execution_order;
+pub mod linux_export_outcome;
+pub mod linux_export_writer;
+pub mod linux_package_executable;
+pub mod linux_path_alias;
+pub mod linux_relay_sample;
+pub mod linux_result_publication;
+pub mod linux_snapshot_rejection;
+pub mod linux_source_substitution;
+pub mod linux_transaction_trace;
+pub mod snapshot_copy_contract;
+pub mod storage_observation;
+
+pub mod windows_access_failure_probe;
+pub mod windows_component_diagnostics;
+pub mod windows_component_retention;
+pub mod windows_fixture_inventory;
+pub mod windows_listener_wait;
+pub mod windows_loader_fileio;
+pub mod windows_original_gate_failure;
+pub mod windows_pe_manifest;
+pub mod windows_provider_catalog;
+pub mod windows_provider_projection;
+pub mod windows_provider_projection_record;
+pub mod windows_provider_source_record;
+pub mod windows_status_streams;
+
 pub mod bootstrap_profile;
 pub mod cache;
 pub mod cache_inputs;
@@ -29,6 +60,7 @@ pub mod linux_request_arguments;
 pub mod macos_probe_contract;
 pub mod miri_cache;
 pub mod miri_targets;
+pub mod namespace_watch_model;
 pub mod native_channel;
 pub mod native_coverage;
 pub mod native_paths;
@@ -69,6 +101,10 @@ pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
 #[cfg(windows)]
+mod windows_private_custody;
+#[cfg(windows)]
+mod windows_private_peer_debt;
+#[cfg(windows)]
 mod windows_readiness_acl;
 pub mod windows_readiness_capacity;
 pub mod windows_readiness_components;
@@ -87,6 +123,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CiError {
+    #[error("{context}: {source}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<CiError>,
+    },
     #[error("{0}")]
     CacheSafety(Box<CiError>),
     #[error("{source}")]
@@ -140,12 +182,71 @@ pub enum CiError {
     Zip(#[from] zip::result::ZipError),
 }
 
+impl CiError {
+    /// Add bounded diagnostic context without discarding operational envelopes.
+    pub fn context(self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        let limit = 4096;
+        let context = if context.len() > limit {
+            let mut head = limit / 2;
+            while !context.is_char_boundary(head) {
+                head -= 1;
+            }
+            let mut tail = context.len() - limit / 2;
+            while !context.is_char_boundary(tail) {
+                tail += 1;
+            }
+            format!(
+                "{} [context omitted {} bytes] {}",
+                &context[..head],
+                tail - head,
+                &context[tail..],
+            )
+        } else {
+            context
+        };
+        match self {
+            Self::OwnedWork {
+                source,
+                writers,
+                facts,
+            } => Self::OwnedWork {
+                source: Box::new(source.context(context)),
+                writers,
+                facts,
+            },
+            Self::CacheSafety(source) => Self::CacheSafety(Box::new(source.context(context))),
+            Self::LaneFailures { primary, secondary } => Self::LaneFailures {
+                primary: Box::new(primary.context(context.clone())),
+                secondary: Box::new(secondary.context(context)),
+            },
+            Self::Cancelled(detail) => Self::Cancelled(format!("{context}: {detail}")),
+            Self::SettledCancellation(detail) => {
+                Self::SettledCancellation(format!("{context}: {detail}"))
+            }
+            Self::SettledCommandFailure(detail) => {
+                Self::SettledCommandFailure(format!("{context}: {detail}"))
+            }
+            Self::NotStartedAfterFailure => Self::NotStartedAfterFailure,
+            source => Self::Context {
+                context,
+                source: Box::new(source),
+            },
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CiError>;
 pub mod arm32_abi_helper;
+pub mod caller_command_budget;
 pub mod exact_harness;
 pub mod external_consumer;
+pub mod launch_event_wait;
 #[cfg(target_os = "linux")]
 pub mod linux_snapshot_probe;
 pub mod macos_performance;
 pub mod native_acceptance_catalogue;
 pub mod performance_plan;
+pub mod terminal_capture;
+mod windows_provider_control;
+pub mod windows_readiness_policy;

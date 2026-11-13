@@ -35,7 +35,21 @@ jobs:
           persist-credentials: false
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_15_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_15_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_15_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_15_3
+        if: ${{ !cancelled() && steps.acquire_node_15_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: &action_1 actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         continue-on-error: true
@@ -308,7 +322,21 @@ jobs:
           persist-credentials: false
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_83_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_83_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_83_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_83_3
+        if: ${{ !cancelled() && steps.acquire_node_83_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -987,7 +1015,21 @@ jobs:
           ref: ${{ github.sha }}
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_248_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_248_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_248_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_248_3
+        if: ${{ !cancelled() && steps.acquire_node_248_2.outcome == 'failure' }}
       - id: fuzz-setup-download
         timeout-minutes: 5
         uses: &action_3 actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -1526,7 +1568,21 @@ jobs:
           persist-credentials: false
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_381_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_381_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_381_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_381_3
+        if: ${{ !cancelled() && steps.acquire_node_381_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -2310,7 +2366,21 @@ jobs:
           persist-credentials: false
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_568_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_568_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_568_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_568_3
+        if: ${{ !cancelled() && steps.acquire_node_568_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -3092,7 +3162,21 @@ jobs:
           persist-credentials: false
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_755_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_755_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_755_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_755_3
+        if: ${{ !cancelled() && steps.acquire_node_755_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -3875,7 +3959,21 @@ jobs:
           path: target/ci/stress-artifacts
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_943_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_943_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_943_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_943_3
+        if: ${{ !cancelled() && steps.acquire_node_943_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -4156,7 +4254,21 @@ jobs:
           ref: ${{ github.sha }}
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 1/3)
+        id: acquire_node_1012_1
+        continue-on-error: true
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 2/3)
+        id: acquire_node_1012_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_1012_1.outcome == 'failure' }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        name: Install pinned toolchain (attempt 3/3)
+        id: acquire_node_1012_3
+        if: ${{ !cancelled() && steps.acquire_node_1012_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -4692,9 +4804,22 @@ jobs:
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - name: Install pinned Cargo toolchain
+      - name: Install pinned Cargo toolchain (attempt 1/3)
         run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        id: acquire_node_1143_1
+        continue-on-error: true
+      - name: Install pinned Cargo toolchain (attempt 2/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1143_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_1143_1.outcome == 'failure' }}
+      - name: Install pinned Cargo toolchain (attempt 3/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1143_3
+        if: ${{ !cancelled() && steps.acquire_node_1143_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -4745,9 +4870,22 @@ jobs:
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - name: Install pinned Cargo toolchain
+      - name: Install pinned Cargo toolchain (attempt 1/3)
         run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        id: acquire_node_1157_1
+        continue-on-error: true
+      - name: Install pinned Cargo toolchain (attempt 2/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1157_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_1157_1.outcome == 'failure' }}
+      - name: Install pinned Cargo toolchain (attempt 3/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1157_3
+        if: ${{ !cancelled() && steps.acquire_node_1157_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -4823,9 +4961,22 @@ jobs:
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - name: Install pinned Cargo toolchain
+      - name: Install pinned Cargo toolchain (attempt 1/3)
         run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        id: acquire_node_1179_1
+        continue-on-error: true
+      - name: Install pinned Cargo toolchain (attempt 2/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1179_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_1179_1.outcome == 'failure' }}
+      - name: Install pinned Cargo toolchain (attempt 3/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1179_3
+        if: ${{ !cancelled() && steps.acquire_node_1179_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -4847,7 +4998,7 @@ jobs:
           key: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-${{ hashFiles('tools/memcordon-ci/**/*.rs', 'crates/**/*.rs', 'fuzz/Cargo.toml', 'fuzz/corpus/**', '.github/workflows/deep-ci.yml') }}
           restore-keys: mc-tooling-contracts-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/toolchains.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}-
       - name: Current external consumer contracts
-        run: rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy
+        run: rustup run 1.97.1 cargo test --locked --target-dir target/ci-tooling-contracts -p memcordon-ci --test external_consumer --test windows_installed_paths --test target_shard --test fuzz_targets --test msrv_source --test workflow_policy --test concurrency_budget --test private_phase_workflow --test release_fuzz_phase --test windows_fixture_workflow --test suite_failure_policy --test windows_consumer_readiness --test launch_event_wait
         timeout-minutes: 10
       - id: tooling-contracts-save
         uses: *action_2
@@ -4886,9 +5037,22 @@ jobs:
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - name: Install pinned Cargo toolchain
+      - name: Install pinned Cargo toolchain (attempt 1/3)
         run: rustup toolchain install 1.97.1 --profile minimal
-        timeout-minutes: 15
+        timeout-minutes: 5
+        id: acquire_node_1196_1
+        continue-on-error: true
+      - name: Install pinned Cargo toolchain (attempt 2/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1196_2
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.acquire_node_1196_1.outcome == 'failure' }}
+      - name: Install pinned Cargo toolchain (attempt 3/3)
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 5
+        id: acquire_node_1196_3
+        if: ${{ !cancelled() && steps.acquire_node_1196_2.outcome == 'failure' }}
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true

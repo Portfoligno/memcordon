@@ -31,6 +31,8 @@ pub fn required_keys() -> Vec<CaseKey> {
 }
 
 pub fn accepted(records: &[CapacityAssessment]) -> bool {
+    let mut attempts = std::collections::BTreeSet::new();
+    let mut roots = std::collections::BTreeSet::new();
     records.len() == required_keys().len()
         && required_keys()
             .iter()
@@ -39,9 +41,79 @@ pub fn accepted(records: &[CapacityAssessment]) -> bool {
             record.behavior.is_ok()
                 && record.collection.is_ok()
                 && record.retirement.is_ok()
-                && !record.attempts.is_empty()
+                && Some(record.attempts.len()) == planned_attempt_count(&record.key)
+                && record.attempts.iter().all(|attempt| {
+                    use crate::windows_readiness_policy::{
+                        ExecutionDisposition, IntrinsicContract,
+                    };
+                    let Some(evidence) = &attempt.contract.evidence else {
+                        return false;
+                    };
+                    let joins = [
+                        (
+                            &evidence.association.request_sha256,
+                            attempt.provider_request_sha256.as_deref(),
+                        ),
+                        (
+                            &evidence.workload_request_sha256,
+                            attempt.request_sha256.as_deref(),
+                        ),
+                        (
+                            &evidence.descriptor_sha256,
+                            Some(attempt.descriptor_sha256.as_str()),
+                        ),
+                        (&evidence.result_sha256, attempt.result_sha256.as_deref()),
+                        (&evidence.stdout_sha256, attempt.stdout_sha256.as_deref()),
+                        (&evidence.stderr_sha256, attempt.stderr_sha256.as_deref()),
+                        (
+                            &evidence.transcript_sha256,
+                            attempt.transcript_sha256.as_deref(),
+                        ),
+                        (
+                            &evidence.terminal_observation_sha256,
+                            attempt.terminal_observation_sha256.as_deref(),
+                        ),
+                    ];
+                    let Ok(origin) = serde_json::to_string(&(
+                        &evidence.association.provider,
+                        &evidence.association.attempt_id,
+                    )) else {
+                        return false;
+                    };
+                    attempt.key == record.key
+                        && attempt.revision
+                            == crate::windows_consumer_readiness::CASE_ASSESSMENT_REVISION
+                        && attempt.behavior.is_ok()
+                        && attempt.collection.is_ok()
+                        && attempt.retirement.is_ok()
+                        && attempt.contract.intrinsic == IntrinsicContract::Validated
+                        && attempt.contract.execution == ExecutionDisposition::Completed
+                        && attempt.contract.comparison
+                            == crate::windows_readiness_policy::ComparisonStatus::NotMeasured
+                        && evidence.association.provider.is_consistent()
+                        && evidence.root.pid != 0
+                        && evidence.root.birth != 0
+                        && joins.iter().all(|(expected, actual)| {
+                            actual.is_some_and(|actual| actual == String::from((*expected).clone()))
+                        })
+                        && attempts.insert(origin)
+                        && roots.insert((evidence.root.pid, evidence.root.birth))
+                })
                 && !record.artifacts.is_empty()
         })
+}
+
+/// Completeness of these bounded CI samples, never a product concurrency quota.
+pub fn planned_attempt_count(key: &CaseKey) -> Option<usize> {
+    if key.family != "W-CAPACITY" {
+        return None;
+    }
+    match key.scenario.as_str() {
+        "serial-retirement" => Some(3),
+        "bounded-concurrency" => Some(2),
+        "fresh-positive-after-recovery" => Some(1),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -150,6 +222,8 @@ mod native {
 
     fn blank(key: CaseKey) -> CaseAssessment {
         CaseAssessment {
+            revision: crate::windows_consumer_readiness::CASE_ASSESSMENT_REVISION,
+            contract: crate::windows_readiness_policy::CaseContract::not_run(),
             key,
             behavior: Err("not executed".into()),
             collection: Err("not collected".into()),
@@ -160,6 +234,7 @@ mod native {
             stderr_sha256: None,
             transcript_sha256: None,
             request_sha256: None,
+            provider_request_sha256: None,
             terminal_observation_sha256: None,
         }
     }
@@ -172,11 +247,17 @@ mod native {
     ) -> Result<()> {
         let suite: SuiteInput = serde_json::from_slice(&read(input_path, 4 * 1024 * 1024)?)?;
         crate::windows_consumer_readiness::validate_suite(&suite)?;
-        let base = suite
+        let ordinary = suite
             .cases
             .iter()
             .find(|case| case.key.family == "W-JOINT" && case.key.scenario == "ordinary")
-            .ok_or_else(|| CiError::Message("capacity lacks owned finite joint workload".into()))?;
+            .ok_or_else(|| {
+                CiError::Message("capacity lacks original ordinary invocation".into())
+            })?;
+        let base = crate::windows_consumer_readiness::prepare_capacity_completion(
+            ordinary,
+            &required_keys()[0],
+        )?;
         for key in required_keys() {
             records.push(CapacityAssessment {
                 key: key.clone(),
@@ -194,18 +275,14 @@ mod native {
             fs::create_dir_all(&directory)?;
             inventory(config, &directory, 0, record, work_deadline)?;
             if key.scenario == "bounded-concurrency" {
-                overlap(config, base, &directory, record, work_deadline)?;
+                overlap(config, &base, &directory, record, work_deadline)?;
                 inventory(config, &directory, 1, record, work_deadline)?;
                 record.behavior = Ok(());
                 record.collection = Ok(());
                 record.retirement = Ok(());
                 continue;
             }
-            let count = if key.scenario == "serial-retirement" {
-                3
-            } else {
-                1
-            };
+            let count = planned_attempt_count(&key).expect("finite capacity identity");
             for ordinal in 0..count {
                 let mut owned = config.clone();
                 owned.output_directory = directory.join(format!("attempt-{ordinal}"));
@@ -233,6 +310,14 @@ mod native {
                         ))?,
                     key.scenario
                 ));
+                input.descriptor.cohort_gate = Some(format!(
+                    "{}-child",
+                    input
+                        .descriptor
+                        .start_gate
+                        .as_ref()
+                        .expect("prepared capacity start")
+                ));
                 input.workload_request = base.workload_request.clone();
                 let contract = read(&input.workload_request, 256 * 1024)?;
                 memcordon_core::workload_request::WorkloadRequestV1::parse(&contract)
@@ -240,13 +325,24 @@ mod native {
                 let mut attempt = blank(key.clone());
                 attempt.request_sha256 = Some(crate::windows_causal_acceptance::sha256(&contract));
                 let result = execute_until(&owned, &input, &mut attempt, work_deadline);
-                retain(
-                    &directory.join(format!("attempt-{ordinal}.json")),
-                    &serde_json::to_vec(&attempt)?,
-                    record,
-                )?;
+                let retained = serde_json::to_vec(&attempt)
+                    .map_err(CiError::from)
+                    .and_then(|bytes| {
+                        retain(
+                            &directory.join(format!("attempt-{ordinal}.json")),
+                            &bytes,
+                            record,
+                        )
+                    });
                 record.attempts.push(attempt);
-                result?;
+                match (result, retained) {
+                    (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                        primary: Box::new(primary),
+                        secondary: Box::new(secondary.context("capacity observation publication")),
+                    }),
+                    (Err(primary), _) => Err(primary),
+                    (Ok(()), retained) => retained,
+                }?;
                 inventory(config, &directory, ordinal + 1, record, work_deadline)?;
             }
             record.behavior = Ok(());
@@ -305,6 +401,14 @@ mod native {
                     .start_gate
                     .as_ref()
                     .ok_or_else(|| CiError::Message("capacity start gate missing".into()))?
+            ));
+            input.descriptor.cohort_gate = Some(format!(
+                "{}-child",
+                input
+                    .descriptor
+                    .start_gate
+                    .as_ref()
+                    .expect("prepared capacity start")
             ));
             input.workload_request = base.workload_request.clone();
             let mut assessment = blank(record.key.clone());
@@ -380,19 +484,20 @@ mod native {
                 .live_target_identity
                 .as_ref()
                 .ok_or_else(|| CiError::Message("capacity first held target missing".into()))?;
-            let peer: serde_json::Value = serde_json::from_slice(&read(
-                &first_case_directory.join("native-tcp-peer.json"),
+            let child_bytes = read(
+                &first_case_directory.join("native-capacity-child.json"),
                 16 * 1024,
-            )?)?;
+            )?;
+            let peer: serde_json::Value = serde_json::from_slice(&child_bytes)?;
             let peer_pid = u32::try_from(
                 peer["pid"]
                     .as_u64()
-                    .ok_or_else(|| CiError::Message("capacity TCP peer PID missing".into()))?,
+                    .ok_or_else(|| CiError::Message("capacity child PID missing".into()))?,
             )
-            .map_err(|_| CiError::Message("capacity TCP peer PID exceeds native width".into()))?;
+            .map_err(|_| CiError::Message("capacity child PID exceeds native width".into()))?;
             let peer_birth = peer["birth"]
                 .as_u64()
-                .ok_or_else(|| CiError::Message("capacity TCP peer birth missing".into()))?;
+                .ok_or_else(|| CiError::Message("capacity child birth missing".into()))?;
             let parents = process_parents()?;
             let first_family: Vec<_> = memcordon_testkit::windows_processes_for_image_until(
                 &config.fixture.path,
@@ -407,6 +512,12 @@ mod native {
             })
             .collect();
             if !observed.is_consistent()
+                || peer["format"] != "memcordon.windows-native-capacity-child"
+                || peer["revision"].as_u64() != Some(1)
+                || peer["native_parent_edge_observed"].as_bool() != Some(true)
+                || peer["parent_and_child_held_live"].as_bool() != Some(true)
+                || peer_pid == root.process_id
+                || peer_birth == 0
                 || observed.association.provider != config.provider
                 || first_family.len() != 2
                 || first_family
@@ -421,6 +532,11 @@ mod native {
                     "capacity first family lacks exact held live native ancestry".into(),
                 ));
             }
+            retain(
+                &directory.join("overlap-held-native-child.json"),
+                &child_bytes,
+                record,
+            )?;
             retain(
                 &directory.join("overlap-live-association.json"),
                 &live_bytes,
@@ -445,19 +561,44 @@ mod native {
         let (first_record, first_result) = first
             .join()
             .map_err(|_| CiError::Message("owned capacity controller panicked".into()))?;
-        retain(
-            &directory.join("attempt-0.json"),
-            &serde_json::to_vec(&first_record)?,
-            record,
-        )?;
-        retain(
-            &directory.join("attempt-1.json"),
-            &serde_json::to_vec(&second_record)?,
-            record,
-        )?;
+        let first_retained = serde_json::to_vec(&first_record)
+            .map_err(CiError::from)
+            .and_then(|bytes| retain(&directory.join("attempt-0.json"), &bytes, record));
+        let second_retained = serde_json::to_vec(&second_record)
+            .map_err(CiError::from)
+            .and_then(|bytes| retain(&directory.join("attempt-1.json"), &bytes, record));
+        let retained = match (first_retained, second_retained) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary.context("second capacity observation publication")),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
         record.attempts.extend([first_record, second_record]);
-        release?;
-        first_result?;
-        second
+        let first_result = match (release, first_result) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary.context("first capacity attempt")),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
+        let executed = match (first_result, second) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary.context("second capacity attempt")),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        };
+        match (executed, retained) {
+            (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary.context("capacity observations publication")),
+            }),
+            (Err(primary), _) => Err(primary),
+            (Ok(()), result) => result,
+        }
     }
 }

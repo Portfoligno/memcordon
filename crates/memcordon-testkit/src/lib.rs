@@ -23,16 +23,21 @@ pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
 #[cfg(windows)]
 pub use memcordon_platform::test_support::{
     ProcessIdentity, WINDOWS_WAIT_OBSERVER_BOUND, WindowsHeldFileIdentity, WindowsImageProcess,
-    WindowsRenameCommitted, WindowsSynchronousRenameSource, WindowsThreadActivitySample,
-    WindowsWaitInherited, WindowsWaitObserver, WindowsWaitObserverRetirement,
-    WindowsWaitObserverSnapshot, WindowsWaitThreadHandle, windows_available_memory_bytes,
-    windows_console_host_path, windows_held_file_identity, windows_held_file_metadata,
-    windows_native_work_cutoff, windows_observe_transferred_wait_cleanup,
-    windows_open_synchronous_rename_source, windows_performance_counter,
-    windows_prepare_persistent_stage, windows_processes_for_image,
+    WindowsProcessCandidate, WindowsRenameCommitted, WindowsSynchronousRenameSource,
+    WindowsThreadActivitySample, WindowsWaitInherited, WindowsWaitObserver,
+    WindowsWaitObserverRetirement, WindowsWaitObserverSnapshot, WindowsWaitThreadHandle,
+    windows_available_memory_bytes, windows_console_host_path,
+    windows_fixture_input_candidate_for_image_until,
+    windows_fixture_input_processes_for_image_until, windows_held_file_identity,
+    windows_held_file_metadata, windows_native_work_cutoff,
+    windows_observe_transferred_wait_cleanup, windows_open_synchronous_rename_source,
+    windows_performance_counter, windows_prepare_persistent_stage,
+    windows_process_candidate_for_image_until, windows_processes_for_image,
     windows_processes_for_image_until, windows_unresolved_wait_owner_count,
 };
 
+#[cfg(windows)]
+pub use memcordon_platform::test_support::windows_winsock_registry::Projection as WindowsWinsockRegistryProjection;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -130,6 +135,10 @@ pub struct CancellationObservation {
 pub enum ProcessTestError {
     Spawn(io::Error),
     Wait(io::Error),
+    ApplicationEnded {
+        error: io::Error,
+        settlement: Result<Box<ObservedOutput>, Box<ProcessTestError>>,
+    },
     Callback {
         error: io::Error,
         stdout: Vec<u8>,
@@ -167,6 +176,35 @@ impl fmt::Display for ProcessTestError {
         match self {
             Self::Spawn(error) => write!(formatter, "test command failed to spawn: {error}"),
             Self::Wait(error) => write!(formatter, "test command wait failed: {error}"),
+            Self::ApplicationEnded { error, settlement } => {
+                write!(
+                    formatter,
+                    "test application ended: {error}; frontend settlement="
+                )?;
+                match settlement {
+                    Ok(output) => write!(
+                        formatter,
+                        "natural status={:?}; elapsed={:?}; stdout-bytes={}; stderr-bytes={}",
+                        output.status,
+                        output.elapsed,
+                        output.stdout.len(),
+                        output.stderr.len()
+                    ),
+                    Err(secondary) => {
+                        let kind = match secondary.as_ref() {
+                            Self::Spawn(_) => "spawn",
+                            Self::Wait(_) => "wait",
+                            Self::ApplicationEnded { .. } => "application-ended",
+                            Self::Callback { .. } => "callback",
+                            Self::Output(_) => "capture",
+                            Self::OutputLimit { .. } => "output-limit",
+                            Self::Timeout { .. } => "timeout",
+                            Self::Cancelled { .. } => "cancelled",
+                        };
+                        write!(formatter, "failed ({kind}); exact secondary retained")
+                    }
+                }
+            }
             Self::Callback {
                 error,
                 observed_status,
@@ -214,7 +252,23 @@ impl fmt::Display for ProcessTestError {
     }
 }
 
-impl std::error::Error for ProcessTestError {}
+impl std::error::Error for ProcessTestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ApplicationEnded { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Only callers with an authenticated application-exit observation may defer
+/// frontend termination. An application failure remains an error regardless of
+/// whether that frontend subsequently settles naturally.
+pub enum OwnedCallbackOutcome {
+    Completed,
+    Abort(io::Error),
+    ApplicationEnded(io::Error),
+}
 
 struct OutputReader {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -479,6 +533,85 @@ pub fn run_with_deadline_owned_spawn_after_output_limit(
     )
 }
 
+/// Use one absolute execution cutoff, including the custom exec-stop callback.
+/// Existing duration-based entrypoints retain their original behavior.
+pub fn run_until_owned_spawn_after_output_limit(
+    command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_until_owned_spawn_with_io_output_limit(command, cutoff, limit, spawn, move |pid, _, _| {
+        after_spawn(pid)
+    })
+}
+
+/// Own the exact child pipes while preserving one absolute execution cutoff.
+pub fn run_until_owned_spawn_with_io_output_limit(
+    command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_until_owned_spawn_with_io_controlled_output_limit(
+        command,
+        cutoff,
+        limit,
+        None,
+        spawn,
+        after_spawn,
+    )
+}
+
+/// The cancellation flag requests settlement of this exact owned child only.
+pub fn run_until_owned_spawn_with_io_controlled_output_limit(
+    mut command: Command,
+    cutoff: Instant,
+    limit: usize,
+    cancelled: Option<Arc<AtomicBool>>,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    let started = Instant::now();
+    let deadline = cutoff
+        .checked_duration_since(started)
+        .filter(|value| !value.is_zero())
+        .ok_or_else(|| {
+            ProcessTestError::Spawn(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original absolute child cutoff exhausted before spawn",
+            ))
+        })?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    OuterTestBoundary::configure(&mut command).map_err(ProcessTestError::Spawn)?;
+    if Instant::now() >= cutoff {
+        return Err(ProcessTestError::Spawn(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original absolute child cutoff exhausted during setup",
+        )));
+    }
+    let child = spawn(command).map_err(ProcessTestError::Spawn)?;
+    let spawn_returned = started.elapsed();
+    observe_deadline_child(
+        child,
+        started,
+        spawn_returned,
+        deadline,
+        after_spawn,
+        Some(limit),
+        ProcessControl {
+            cancelled,
+            ..ProcessControl::default()
+        },
+    )
+}
+
 /// Snapshot access is observational only. Streams remain bounded and owned
 /// by joined readers; callback stdin is the exact sole configured child pipe.
 pub fn run_with_deadline_owned_spawn_with_io_output_limit(
@@ -504,6 +637,56 @@ pub fn run_with_deadline_owned_spawn_with_io_output_limit(
         Some(limit),
         ProcessControl::default(),
     )
+}
+
+/// Opt in to preserving a failed application's frontend for its existing
+/// terminal exchange. The original owner loop, bounded readers and execution
+/// budget are shared with the strict entrypoint; aborts retain its immediate
+/// cleanup behavior. No application-ended outcome can return success.
+pub fn run_until_owned_spawn_with_io_output_limit_outcome(
+    command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(
+        u32,
+        Option<std::process::ChildStdin>,
+        OutputSnapshot,
+    ) -> OwnedCallbackOutcome
+    + Send
+    + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    let application_error = Arc::new(Mutex::new(None));
+    let callback_error = Arc::clone(&application_error);
+    let settlement = run_until_owned_spawn_with_io_output_limit(
+        command,
+        cutoff,
+        limit,
+        spawn,
+        move |pid, input, snapshot| match after_spawn(pid, input, snapshot) {
+            OwnedCallbackOutcome::Completed => Ok(()),
+            OwnedCallbackOutcome::Abort(error) => Err(error),
+            OwnedCallbackOutcome::ApplicationEnded(error) => {
+                // This only completes controller work in the shared loop. The
+                // public result below always retains this application failure.
+                *callback_error
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(error);
+                Ok(())
+            }
+        },
+    );
+    let primary = application_error
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    match primary {
+        Some(error) => Err(ProcessTestError::ApplicationEnded {
+            error,
+            settlement: settlement.map(Box::new).map_err(Box::new),
+        }),
+        None => settlement,
+    }
 }
 
 fn observe_deadline_child(

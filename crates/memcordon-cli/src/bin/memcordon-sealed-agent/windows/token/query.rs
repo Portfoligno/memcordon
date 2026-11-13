@@ -215,6 +215,47 @@ pub fn authenticate_pipe_client(
     ),
     String,
 > {
+    authenticate_pipe_client_impl(pipe, client_process_id, certification_fault, None)
+}
+
+pub fn authenticate_launch_pipe_client(
+    pipe: HANDLE,
+    client_process_id: u32,
+    certification_fault: Option<WindowsSealedFault>,
+) -> Result<
+    (
+        OwnedHandle,
+        WindowsCallerTokenEnvelopeV1,
+        OwnedHandle,
+        memcordon_core::WindowsProcessIdentityV1,
+        memcordon_core::NativeInputCaptureV1,
+    ),
+    String,
+> {
+    let mut capture = memcordon_core::NativeInputCaptureV1::default();
+    let (primary, envelope, frontend, identity) = authenticate_pipe_client_impl(
+        pipe,
+        client_process_id,
+        certification_fault,
+        Some(&mut capture),
+    )?;
+    Ok((primary, envelope, frontend, identity, capture))
+}
+
+fn authenticate_pipe_client_impl(
+    pipe: HANDLE,
+    client_process_id: u32,
+    certification_fault: Option<WindowsSealedFault>,
+    mut capture: Option<&mut memcordon_core::NativeInputCaptureV1>,
+) -> Result<
+    (
+        OwnedHandle,
+        WindowsCallerTokenEnvelopeV1,
+        OwnedHandle,
+        memcordon_core::WindowsProcessIdentityV1,
+    ),
+    String,
+> {
     reject_fault(
         certification_fault,
         WindowsSealedFault::CallerTokenImpersonation,
@@ -247,7 +288,11 @@ pub fn authenticate_pipe_client(
     let impersonation = OwnedHandle::new(impersonation).map_err(|error| {
         format!("MCSEALED-WINDOWS-CALLER-AUTH: own impersonation token: {error}")
     })?;
-    let source_envelope = envelope(impersonation.raw()).map_err(|error| {
+    let source_envelope = observed_envelope(
+        impersonation.raw(),
+        capture.as_deref_mut().map(|value| &mut value.authenticated),
+    )
+    .map_err(|error| {
         format!("MCSEALED-WINDOWS-CALLER-AUTH: capture source token envelope: {error}")
     })?;
     if source_envelope.token_type != TokenImpersonation as u32
@@ -277,6 +322,21 @@ pub fn authenticate_pipe_client(
     let identity_before = super::process::process_identity(frontend.raw()).map_err(|error| {
         format!("MCSEALED-WINDOWS-CALLER-AUTH: capture frontend-before identity; pid={client_process_id}: {error}")
     })?;
+    if let Some(capture) = capture.as_deref_mut() {
+        capture.frontend = match process_token_detailed(frontend.raw()) {
+            Ok(token) => match envelope_input_observation(token.raw()) {
+                Ok((_, observed)) => observed,
+                Err(_) => memcordon_core::NativeInputStageV1::Unavailable {
+                    reason: memcordon_core::NativeInputUnavailableV1::FrontendEnvelopeQuery,
+                    native_error: None,
+                },
+            },
+            Err(error) => memcordon_core::NativeInputStageV1::Unavailable {
+                reason: memcordon_core::NativeInputUnavailableV1::FrontendTokenOpen,
+                native_error: error.os_code().map(|code| code as u32),
+            },
+        };
+    }
     let mut primary = ptr::null_mut();
     reject_fault(
         certification_fault,
@@ -303,7 +363,11 @@ pub fn authenticate_pipe_client(
     let primary = OwnedHandle::new(primary).map_err(|error| {
         format!("MCSEALED-WINDOWS-CALLER-AUTH: own duplicated primary token: {error}")
     })?;
-    let primary_envelope = envelope(primary.raw()).map_err(|error| {
+    let primary_envelope = observed_envelope(
+        primary.raw(),
+        capture.as_deref_mut().map(|value| &mut value.duplicated),
+    )
+    .map_err(|error| {
         format!("MCSEALED-WINDOWS-CALLER-AUTH: capture duplicated primary envelope: {error}")
     })?;
     if primary_envelope.token_type != TokenPrimary as u32
@@ -329,7 +393,11 @@ pub fn authenticate_pipe_client(
         .map_err(|error| format!("MCSEALED-WINDOWS-CALLER-TOKEN-DACL: peer SID: {error}"))?;
     super::security::converge_token_peer_query(primary.raw(), &launcher_sid)
         .map_err(|error| format!("MCSEALED-WINDOWS-CALLER-TOKEN-DACL: {error}"))?;
-    let prepared_envelope = envelope(primary.raw()).map_err(|error| {
+    let prepared_envelope = observed_envelope(
+        primary.raw(),
+        capture.as_deref_mut().map(|value| &mut value.prepared),
+    )
+    .map_err(|error| {
         format!("MCSEALED-WINDOWS-CALLER-TOKEN-DACL: capture prepared primary envelope: {error}")
     })?;
     if prepared_envelope != primary_envelope {
@@ -761,6 +829,45 @@ pub(super) fn current_thread_token() -> Result<OwnedHandle, String> {
 pub fn envelope(token: HANDLE) -> Result<WindowsCallerTokenEnvelopeV1, String> {
     let statistics = token_statistics(token)?;
     envelope_with_statistics(token, &statistics)
+}
+
+fn observed_envelope(
+    token: HANDLE,
+    stage: Option<&mut memcordon_core::NativeInputStageV1>,
+) -> Result<WindowsCallerTokenEnvelopeV1, String> {
+    match stage {
+        None => envelope(token),
+        Some(stage) => {
+            let (envelope, observed) = envelope_input_observation(token)?;
+            *stage = observed;
+            Ok(envelope)
+        }
+    }
+}
+
+/// Reuses the same statistics/envelope native reads as envelope(), preserving
+/// untouched native values and counts already obtained by that existing query.
+pub fn envelope_input_observation(
+    token: HANDLE,
+) -> Result<
+    (
+        WindowsCallerTokenEnvelopeV1,
+        memcordon_core::NativeInputStageV1,
+    ),
+    String,
+> {
+    let statistics = token_statistics(token)?;
+    let envelope = envelope_with_statistics(token, &statistics)?;
+    let observed = match memcordon_core::NativeTokenSummaryV1::from_envelope(&envelope) {
+        Ok(summary) => memcordon_core::NativeInputStageV1::Observed {
+            summary: summary.with_counts(statistics.GroupCount, statistics.PrivilegeCount),
+        },
+        Err(_) => memcordon_core::NativeInputStageV1::Unavailable {
+            reason: memcordon_core::NativeInputUnavailableV1::SummaryEncoding,
+            native_error: None,
+        },
+    };
+    Ok((envelope, observed))
 }
 
 pub(crate) fn token_appcontainer_sid(token: HANDLE) -> Result<Option<String>, String> {

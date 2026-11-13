@@ -21,3 +21,31 @@ pub(crate) fn package_phases(package: &str, target: &Path) -> [(Vec<OsString>, D
         (arguments, Duration::from_secs(900)),
     ]
 }
+
+pub(crate) fn original_listener_diagnostic(
+    package: &str,
+    target: &Path,
+    windows: bool,
+) -> Option<(Vec<OsString>, Duration)> {
+    if !windows || package != "memcordon" {
+        return None;
+    }
+    Some((
+        vec![
+            OsString::from("test"),
+            OsString::from("--target-dir"),
+            target.as_os_str().to_owned(),
+            OsString::from("--package"),
+            OsString::from("memcordon"),
+            OsString::from("--test"),
+            OsString::from("original_listener_result"),
+            OsString::from("--all-features"),
+            OsString::from("--locked"),
+            OsString::from("--release"),
+            OsString::from("--"),
+            OsString::from("--test-threads=1"),
+            OsString::from("--nocapture"),
+        ],
+        Duration::from_secs(900),
+    ))
+}

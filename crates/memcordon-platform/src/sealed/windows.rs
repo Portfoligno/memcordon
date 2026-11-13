@@ -23,9 +23,9 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NO_DATA, ERROR_NOT_FOUND,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -37,8 +37,7 @@ use windows_sys::Win32::Security::{
     TokenRestrictedSids, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalServiceSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, FILE_TYPE_PIPE, GetFileType,
-    OPEN_EXISTING, ReadFile, WriteFile,
+    CreateFileW, FILE_SHARE_NONE, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -94,6 +93,12 @@ mod loader_diagnostic_observation;
 pub use loader_diagnostic_observation::{
     WindowsLoaderDiagnosticObservation, WindowsLoaderDiagnosticScope,
 };
+#[path = "windows_client_input_observation.rs"]
+mod client_input;
+#[path = "windows_client_input_observation_native.rs"]
+mod client_input_native;
+#[path = "windows_control_pipe_flags.rs"]
+mod control_pipe_flags;
 #[path = "windows_prepared_observation.rs"]
 mod prepared_observation;
 #[path = "windows_terminal_observation.rs"]
@@ -114,7 +119,9 @@ const TOKEN_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
 #[path = "windows_rejection_retirement.rs"]
 mod rejection_retirement;
-use rejection_retirement::{RejectionContext, complete_rejection_ack, observed_terminal_delivery};
+use rejection_retirement::{
+    RejectionContext, complete_rejection_ack, complete_terminal_ack, observed_terminal_delivery,
+};
 
 fn recovery_challenge() -> Result<String, String> {
     let mut random = [0_u8; 16];
@@ -152,15 +159,57 @@ pub fn recover_windows_attempt(
 pub fn observe_windows_owner_request(
     request: &WindowsProviderRequestV4,
 ) -> Result<Vec<u8>, String> {
+    let diagnostic_provider = if let WindowsProviderRequestV4::ObserveAttemptDiagnostics {
+        schema_version,
+        attempt_id,
+        nonce,
+        request_sha256,
+        challenge,
+    } = request
+    {
+        memcordon_core::validate_windows_attempt_diagnostics_request(
+            *schema_version,
+            attempt_id,
+            nonce,
+            request_sha256,
+            challenge,
+        )?;
+        Some(runtime::installed_binding()?)
+    } else {
+        None
+    };
     let cutoff = Instant::now() + Duration::from_secs(30);
     prepare_current_process_for_restricted_broker()
         .map_err(|error| format!("caller-process: {error}"))?;
     let pipe = connect_until(cutoff).map_err(|error| format!("connect: {error}"))?;
     authenticate_peer(pipe.raw()).map_err(|error| format!("peer-authentication: {error}"))?;
     write_frame_until(pipe.raw(), request, cutoff).map_err(|error| format!("write: {error}"))?;
-    read_frame_with_raw_until::<WindowsProviderResponseV4>(pipe.raw(), cutoff, &mut || Ok(()))
-        .map(|(_, raw)| raw)
-        .map_err(|error| format!("response: {error}"))
+    let (response, raw) =
+        read_frame_with_raw_until::<WindowsProviderResponseV4>(pipe.raw(), cutoff, &mut || Ok(()))
+            .map_err(|error| format!("response: {error}"))?;
+    if let (
+        WindowsProviderRequestV4::ObserveAttemptDiagnostics {
+            schema_version,
+            attempt_id,
+            request_sha256,
+            challenge,
+            ..
+        },
+        Some(provider),
+        WindowsProviderResponseV4::AttemptDiagnostics(reply),
+    ) = (request, diagnostic_provider.as_ref(), &response)
+    {
+        reply.validate_bound(
+            *schema_version,
+            challenge,
+            attempt_id,
+            request_sha256,
+            provider,
+        )?;
+    }
+    // Raw observation never adopts an unexpected authority response or ACKs it.
+    // The bounded consumer must record that protocol gap without exporting it.
+    Ok(raw)
 }
 
 pub fn recover_windows_attempt_with_request(
@@ -189,7 +238,7 @@ pub fn recover_windows_attempt_with_request(
         challenge: challenge.clone(),
     };
     write_frame_until(pipe.raw(), &request, cutoff)?;
-    let (response, authority_raw) =
+    let (response, _authority_raw) =
         read_frame_with_raw_until::<WindowsProviderResponseV4>(pipe.raw(), cutoff, &mut || Ok(()))
             .map_err(|error| error.to_string())?;
     match &response {
@@ -245,29 +294,24 @@ pub fn recover_windows_attempt_with_request(
         }
         _ => return Err("recovery response is not bound to the requested attempt".to_owned()),
     }
-    let authority_sha256 = digest_bytes(
-        response
-            .terminal_authority_json()
-            .map_err(|error| error.to_string())?
-            .as_bytes(),
-    );
-    let retired_raw = acknowledge_terminal_retirement(
-        pipe.raw(),
+    let context = RejectionContext {
         attempt_id,
         nonce,
         request_sha256,
-        &authority_sha256,
-        &provider_binding,
-        cutoff,
-    )
-    .map_err(|error| error.to_string())?;
-    let delivery = observed_terminal_delivery(
-        attempt_id,
-        nonce,
-        request_sha256,
-        &authority_raw,
-        &retired_raw,
-    )
+        provider: &provider_binding,
+    };
+    let delivery = complete_terminal_ack(&response, &context, |authority_sha256| {
+        acknowledge_terminal_retirement(
+            pipe.raw(),
+            attempt_id,
+            nonce,
+            request_sha256,
+            authority_sha256,
+            &provider_binding,
+            cutoff,
+        )
+        .map_err(Box::new)
+    })
     .map_err(|error| error.to_string())?;
     Ok((response, Some(delivery), request))
 }
@@ -563,7 +607,8 @@ fn run_observed(
     })?;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-probe-end");
-    let mut pipe = connect_until(setup_cutoff).map_err(transport_error)?;
+    terminal_observation::client_begin(&provider_binding, setup_cutoff);
+    let mut pipe = connect_launch_until(setup_cutoff).map_err(transport_error)?;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-connect-end");
     authenticate_peer(pipe.raw()).map_err(transport_error)?;
@@ -604,12 +649,27 @@ fn run_observed(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    terminal_observation::client_request(&nonce, &request_sha256);
     #[cfg(feature = "test-support")]
     let provider_request =
         loader_diagnostic_observation::route(request).map_err(transport_error)?;
     #[cfg(not(feature = "test-support"))]
     let provider_request = WindowsProviderRequestV4::Launch(request);
-    write_frame_until(pipe.raw(), &provider_request, setup_cutoff).map_err(transport_error)?;
+    if terminal_observation::client_enabled() {
+        terminal_observation::client_before_write(client_input_native::capture(setup_cutoff));
+    }
+    // Existing native writer freezes its error (including WriteFile last-error)
+    // and deadline settlement before any post-call token queries can run.
+    let written = write_frame_until(pipe.raw(), &provider_request, setup_cutoff);
+    client_input::after_io(written, |result| {
+        if terminal_observation::client_enabled() {
+            terminal_observation::client_after_write(
+                result,
+                client_input_native::capture(setup_cutoff),
+            );
+        }
+    })
+    .map_err(transport_error)?;
     let mut pending_console_signal = None;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-launch-written");
@@ -623,9 +683,10 @@ fn run_observed(
         accepted
             .validate()
             .map_err(|error| transport_error(error.into()))?;
+        let frontend_identity =
+            prepared_observation::current_process_identity().map_err(transport_error)?;
         if accepted.provider != provider_binding
-            || accepted.frontend
-                != prepared_observation::current_process_identity().map_err(transport_error)?
+            || accepted.frontend != frontend_identity
             || accepted.nonce != nonce
             || accepted.request_sha256 != request_sha256
         {
@@ -633,6 +694,13 @@ fn run_observed(
                 "native preallocation association differs from actual invocation".into(),
             ));
         }
+        terminal_observation::retain_accepted(
+            &accepted,
+            &request_bytes,
+            &provider_binding,
+            &frontend_identity,
+        )
+        .map_err(transport_error)?;
         observed.association = Some(provider_attempt_association(
             &provider_binding,
             &accepted.attempt_id,
@@ -1453,7 +1521,6 @@ impl Drop for OwnedHandle {
 struct Relays {
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<Result<(), String>>>,
-    handles: Vec<OwnedHandle>,
     relay_retired_event: OwnedHandle,
     retired: bool,
 }
@@ -1499,20 +1566,16 @@ impl Relays {
             }
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::with_capacity(prepared.len());
         let mut threads = Vec::with_capacity(prepared.len());
         for (role, handle) in prepared {
-            let raw = handle.raw() as usize;
             let stop_for_thread = Arc::clone(&stop);
             threads.push(std::thread::spawn(move || {
-                relay(role, raw as HANDLE, &stop_for_thread)
+                relay(role, handle, &stop_for_thread)
             }));
-            handles.push(handle);
         }
         Ok(Self {
             stop,
             threads,
-            handles,
             relay_retired_event,
             retired: false,
         })
@@ -1541,22 +1604,45 @@ impl Relays {
             }
         }
         for thread in &threads {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let wait_millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
-            // SAFETY: the JoinHandle owns a live Windows thread handle.
-            match unsafe { WaitForSingleObject(thread.as_raw_handle() as HANDLE, wait_millis) } {
-                WAIT_OBJECT_0 => {}
-                WAIT_TIMEOUT => {
-                    // A stuck relay would otherwise keep the frontend and its
-                    // provider-owned stream handles alive indefinitely. Exit
-                    // the frontend so the guardian becomes cleanup authority.
-                    std::process::abort();
+            let mut cancellation_error = None;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let wait_millis = u32::try_from(remaining.as_millis().min(20)).unwrap_or(20);
+                // SAFETY: the JoinHandle owns a live Windows thread handle.
+                match unsafe { WaitForSingleObject(thread.as_raw_handle() as HANDLE, wait_millis) }
+                {
+                    WAIT_OBJECT_0 => break,
+                    WAIT_TIMEOUT => {
+                        if std::time::Instant::now() >= deadline {
+                            // Preserve bounded containment if an original relay
+                            // cannot settle within the existing retirement cap.
+                            std::process::abort();
+                        }
+                        // Cancellation may have preceded the thread entering
+                        // its blocking call. Reissue against the same original
+                        // thread, never by closing its borrowed endpoint.
+                        if unsafe { CancelSynchronousIo(thread.as_raw_handle() as HANDLE) } == 0 {
+                            let error = io::Error::last_os_error();
+                            if error.raw_os_error().map(|code| code as u32) != Some(ERROR_NOT_FOUND)
+                            {
+                                cancellation_error.get_or_insert_with(|| {
+                                    format!("failed to cancel stream relay I/O: {error}")
+                                });
+                            }
+                        }
+                    }
+                    WAIT_FAILED => {
+                        // An unproven join cannot extend the retirement cap;
+                        // even writing a diagnostic could block on a full sink.
+                        std::process::abort();
+                    }
+                    _ => {
+                        std::process::abort();
+                    }
                 }
-                WAIT_FAILED => errors.push(format!(
-                    "failed while waiting for stream relay retirement: {}",
-                    io::Error::last_os_error()
-                )),
-                status => errors.push(format!("unexpected stream relay wait status: {status}")),
+            }
+            if let Some(error) = cancellation_error {
+                errors.push(error);
             }
         }
         for thread in threads {
@@ -1566,7 +1652,6 @@ impl Relays {
                 Err(_) => errors.push("stream relay thread panicked".to_owned()),
             }
         }
-        self.handles.clear();
         // SAFETY: this event is the exact launcher-created retirement channel
         // adopted before validating the transferred manifest.
         if unsafe { SetEvent(self.relay_retired_event.raw()) } == 0 {
@@ -1590,21 +1675,31 @@ impl Drop for Relays {
     }
 }
 
-fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result<(), String> {
+fn relay(role: WindowsStreamRoleV1, remote: OwnedHandle, stop: &AtomicBool) -> Result<(), String> {
+    // This thread is the sole owner of the transferred endpoint. In particular,
+    // stdin EOF closes its writer before the target can finish and retire.
+    let remote_handle = remote.raw();
     let (source, destination) = match role {
         // SAFETY: standard handle selectors do not transfer ownership.
-        WindowsStreamRoleV1::Stdin => (unsafe { GetStdHandle(STD_INPUT_HANDLE) }, remote),
-        WindowsStreamRoleV1::Stdout => (remote, unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }),
-        WindowsStreamRoleV1::Stderr => (remote, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
+        WindowsStreamRoleV1::Stdin => (unsafe { GetStdHandle(STD_INPUT_HANDLE) }, remote_handle),
+        WindowsStreamRoleV1::Stdout => (remote_handle, unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }),
+        WindowsStreamRoleV1::Stderr => (remote_handle, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
     };
+    relay_io(remote, source, destination, stop)
+}
+
+fn relay_io(
+    _endpoint: OwnedHandle,
+    source: HANDLE,
+    destination: HANDLE,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let mut buffer = [0_u8; 16 * 1024];
     while !stop.load(Ordering::SeqCst) {
-        // SAFETY: source is a live standard/pipe handle used only for waiting.
-        if unsafe { WaitForSingleObject(source, 20) } != WAIT_OBJECT_0 {
-            continue;
-        }
         let mut read = 0_u32;
-        // SAFETY: buffer and count are live for synchronous IO.
+        // SAFETY: buffer/count and the source are live for synchronous IO.
+        // Standard input may be NUL or a finite file, not a waitable pipe;
+        // retirement cancels this thread's synchronous IO before joining it.
         if unsafe {
             ReadFile(
                 source,
@@ -1615,7 +1710,18 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
             )
         } == 0
         {
-            break;
+            let error = io::Error::last_os_error();
+            let code = error.raw_os_error().map(|code| code as u32);
+            if matches!(
+                code,
+                Some(
+                    ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
+                )
+            ) || code == Some(ERROR_OPERATION_ABORTED) && stop.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            return Err(format!("stream relay read failed: {error}"));
         }
         if read == 0 {
             break;
@@ -1634,7 +1740,16 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
                 )
             } == 0
             {
-                return Ok(());
+                let error = io::Error::last_os_error();
+                let code = error.raw_os_error().map(|code| code as u32);
+                if matches!(
+                    code,
+                    Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
+                ) || code == Some(ERROR_OPERATION_ABORTED) && stop.load(Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
+                return Err(format!("stream relay write failed: {error}"));
             }
             if written == 0 {
                 return Err("zero-byte stream relay write".to_owned());
@@ -1644,6 +1759,10 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/private/windows_relay_eof.rs"]
+mod relay_eof_tests;
 
 fn native_api_failure(operation: &'static str) -> String {
     let error = io::Error::last_os_error();
@@ -1658,12 +1777,28 @@ fn connect() -> Result<OwnedHandle, String> {
 }
 
 fn connect_until(cutoff: Instant) -> Result<OwnedHandle, String> {
+    connect_with_client_observation(cutoff, false)
+}
+
+fn connect_launch_until(cutoff: Instant) -> Result<OwnedHandle, String> {
+    connect_with_client_observation(cutoff, true)
+}
+
+fn connect_with_client_observation(cutoff: Instant, launch: bool) -> Result<OwnedHandle, String> {
     let name: Vec<u16> = WINDOWS_CONTROL_PIPE
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    for _ in 0..100 {
+    for ordinal in 1..=100 {
         if Instant::now() >= cutoff {
+            return Err("original provider connection cutoff expired".into());
+        }
+        let sample = if launch && terminal_observation::client_enabled() {
+            Some(client_input_native::capture(cutoff))
+        } else {
+            None
+        };
+        if sample.is_some() && Instant::now() >= cutoff {
             return Err("original provider connection cutoff expired".into());
         }
         // SAFETY: name is NUL-terminated and returned handle transfers to wrapper.
@@ -1674,12 +1809,23 @@ fn connect_until(cutoff: Instant) -> Result<OwnedHandle, String> {
                 FILE_SHARE_NONE,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                control_pipe_flags::FLAGS,
                 ptr::null_mut(),
             )
         };
         if handle != INVALID_HANDLE_VALUE {
-            return OwnedHandle::new(handle);
+            let owned = OwnedHandle::new(handle)?;
+            if let Some(before_create_file) = sample {
+                terminal_observation::client_connected(client_input::Connection {
+                    attempt_ordinal: ordinal,
+                    desired_access: PIPE_CLIENT_READ_WRITE,
+                    share_mode: FILE_SHARE_NONE,
+                    creation_disposition: OPEN_EXISTING,
+                    flags_and_attributes: control_pipe_flags::FLAGS,
+                    before_create_file,
+                });
+            }
+            return Ok(owned);
         }
         let error = io::Error::last_os_error();
         if error

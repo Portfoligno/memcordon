@@ -292,18 +292,9 @@ fn execute_with_terminal_observation(
                 return 126;
             }
         };
-        let request_path = match std::path::absolute(path)
-            .map(|path| path.with_extension("provider-request.bin"))
-        {
-            Ok(path) => path,
-            Err(error) => {
-                eprintln!("error[MCCLI-WINDOWS-OBSERVATION]: {error}");
-                return 126;
-            }
-        };
         let scope =
-            match memcordon_platform::WindowsTerminalObservationScope::begin_with_request_path(
-                &request_path,
+            match memcordon_platform::WindowsTerminalObservationScope::begin_with_terminal_path(
+                path,
             ) {
                 Ok(scope) => scope,
                 Err(error) => {

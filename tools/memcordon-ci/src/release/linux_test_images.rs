@@ -14,7 +14,7 @@ pub(super) fn monotonic_millis() -> crate::Result<u64> {
 use super::installed_consumer::MaterializedPayload;
 use crate::{CiError, Result, command::CommandSpec};
 use memcordon_core::{
-    BoundedVec, DiagnosticSha256,
+    DiagnosticSha256,
     identifiers::LogicalId,
     workload_bundle::SnapshotManifestV1,
     workload_files::{ImageEntryV1, ImageEntrypointV1, RootRelativePath},
@@ -269,26 +269,19 @@ impl ImageBuilder {
         entrypoints: Vec<ImageEntrypointV1>,
         libraries: &[PathBuf],
     ) -> Result<SnapshotManifestV1> {
-        let mut library_directories = libraries
+        let library_directories = libraries
             .iter()
             .filter_map(|directory| directory.strip_prefix("/").ok())
             .map(path)
             .collect::<Result<Vec<_>>>()?;
-        library_directories.retain(|directory| {
-            self.entries
-                .values()
-                .any(|entry| memcordon_core::workload_files::is_beneath(entry.path(), directory))
-        });
-        let value = SnapshotManifestV1 {
-            format: "memcordon.workload-snapshot".into(),
-            revision: 1,
-            target: target.into(),
-            entries: bounded(self.entries.into_values())?,
-            entrypoints: bounded(entrypoints)?,
-            library_directories: bounded(library_directories)?,
-        };
-        value.validate().map_err(CiError::Message)?;
-        Ok(value)
+        super::native_toolchain_search::definition(
+            target,
+            self.entries.into_values().collect(),
+            entrypoints,
+            library_directories,
+            &self.toolchain_searches,
+        )
+        .map_err(CiError::Message)
     }
 }
 
@@ -319,16 +312,6 @@ fn path(value: &Path) -> Result<RootRelativePath> {
     .map_err(CiError::Message)
 }
 
-fn bounded<T, const N: usize>(values: impl IntoIterator<Item = T>) -> Result<BoundedVec<T, N>> {
-    let mut result = BoundedVec::default();
-    for value in values {
-        result.try_push(value).map_err(|_| {
-            CiError::Message("owned image inventory exceeds frozen native bound".into())
-        })?;
-    }
-    Ok(result)
-}
-
 pub fn materialize_until(
     payload: &MaterializedPayload,
     workspace: &Path,
@@ -351,7 +334,12 @@ pub fn materialize_until(
     std::fs::create_dir(output)?;
     std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o700))?;
     let fixture = workspace.join("target/ci/native/release/memcordon-linux-readiness-fixture");
-    let fixture_bytes = std::fs::read(&fixture)?;
+    let fixture_bytes = std::fs::read(&fixture).map_err(|error| {
+        CiError::Message(format!(
+            "required Linux readiness fixture {} could not be read: {error}",
+            fixture.display()
+        ))
+    })?;
     super::target::validate_executable(&fixture_bytes, &payload.distribution.target)?;
     let rustc = CommandSpec::new("rustup", workspace, Duration::from_secs(30))
         .bounded_until(deadline)
@@ -520,15 +508,6 @@ pub fn materialize_until(
             .join(&payload.distribution.target)
             .join("lib"),
     );
-    let mut declared = libraries
-        .iter()
-        .map(|directory| {
-            directory
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
     for (_, _, directory) in &runtime.toolchain_searches {
         let copied = runtime.root.join(directory);
         let present = match std::fs::symlink_metadata(&copied) {
@@ -551,13 +530,7 @@ pub fn materialize_until(
                 "absent toolchain search has copied members".into(),
             ));
         }
-        super::native_toolchain_search::declare(&mut declared, directory.clone())
-            .map_err(CiError::Message)?;
     }
-    libraries = declared
-        .into_iter()
-        .map(|directory| Path::new("/").join(directory))
-        .collect();
     let runtime = runtime.definition(
         &payload.distribution.target,
         vec![ImageEntrypointV1 {

@@ -38,7 +38,10 @@ impl Evidence {
         drop(self.writer);
         let mut bytes = Vec::new();
         // Read at most one tiny event; failures and full channels cannot block.
-        let result = self.reader.take(1024).read_to_end(&mut bytes);
+        let result = self
+            .reader
+            .take(memcordon_platform::DeliveryObservation::TEST_EVIDENCE_BYTES as u64)
+            .read_to_end(&mut bytes);
         if let Err(error) = result {
             assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         }

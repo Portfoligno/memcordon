@@ -1,5 +1,142 @@
+#[path = "../src/bin/consumer_readiness_windows/controller_gate_error.rs"]
+mod controller_gate_error;
 #[path = "../src/bin/consumer_readiness_windows/toolchain_diagnostics.rs"]
 mod diagnostics;
+
+// Native CI only. Exercise the actual publisher and retained old readers;
+// portability checks must not simulate native replacement success.
+#[cfg(all(windows, feature = "test-fixtures"))]
+#[test]
+fn native_current_record_replacement_retains_old_readers_and_refuses_foreign_destinations() {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+    let root = tempfile::tempdir().unwrap();
+    let owner =
+        diagnostics::PublicationOwner::new(root.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, json!({"challenge":[7]})).unwrap();
+    publisher
+        .publish(false, "first", &json!({"value":1}))
+        .unwrap();
+    let path = root.path().join("toolchain-current-phase.json");
+    let mut old = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(&path)
+        .unwrap();
+    publisher
+        .publish(false, "second", &json!({"value":2}))
+        .unwrap();
+    let mut previous = Vec::new();
+    old.read_to_end(&mut previous).unwrap();
+    let previous: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(previous["phase"], "first");
+    assert_eq!(current["phase"], "second");
+    assert!(!root.path().join("toolchain-current-phase.pending").exists());
+    let pending = root.path().join("toolchain-current-phase.pending");
+    let current_bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&pending, b"preserve failed stage evidence").unwrap();
+    assert!(
+        publisher
+            .publish(false, "blocked-stage", &json!({}))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&pending).unwrap(),
+        b"preserve failed stage evidence"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), current_bytes);
+    std::fs::remove_file(&pending).unwrap();
+    publisher
+        .publish(false, "after-refusal", &json!({}))
+        .unwrap();
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(current["transition_sequence"], 3);
+    // A second compiler publisher shares the same real destination custody.
+    let next = diagnostics::Publisher::new(&owner, json!({"challenge":[8]})).unwrap();
+    next.publish(false, "next-compiler", &json!({})).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"foreign bytes").unwrap();
+    assert!(next.publish(false, "must-refuse", &json!({})).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"foreign bytes");
+    drop(next);
+    drop(publisher);
+    drop(owner);
+
+    let foreign = tempfile::tempdir().unwrap();
+    std::fs::write(
+        foreign.path().join("toolchain-current-phase.json"),
+        b"foreign",
+    )
+    .unwrap();
+    let owner =
+        diagnostics::PublicationOwner::new(foreign.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, json!({})).unwrap();
+    assert!(publisher.publish(false, "must-refuse", &json!({})).is_err());
+
+    let reparse = tempfile::tempdir().unwrap();
+    let target = reparse.path().join("foreign-target");
+    std::fs::write(&target, b"foreign target").unwrap();
+    std::os::windows::fs::symlink_file(
+        &target,
+        reparse.path().join("toolchain-current-phase.json"),
+    )
+    .unwrap();
+    let owner =
+        diagnostics::PublicationOwner::new(reparse.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, json!({})).unwrap();
+    assert!(
+        publisher
+            .publish(false, "must-refuse-reparse", &json!({}))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"foreign target");
+}
+
+#[cfg(all(windows, feature = "test-fixtures"))]
+#[test]
+fn native_source_substitution_and_expired_publication_never_replace_destination() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let root = tempfile::tempdir().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root.path())
+        .unwrap();
+    let stage = root.path().join("source.pending");
+    std::fs::write(&stage, b"original verified bytes").unwrap();
+    let original = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&stage)
+        .unwrap();
+    std::fs::rename(&stage, root.path().join("original-retained")).unwrap();
+    std::fs::write(&stage, b"substituted bytes").unwrap();
+    assert!(
+        memcordon_platform::test_support::windows_open_synchronous_rename_source(
+            &parent,
+            std::ffi::OsStr::new("source.pending"),
+            &original,
+            deadline,
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&stage).unwrap(), b"substituted bytes");
+    assert!(diagnostics::PublicationOwner::new(root.path(), Instant::now()).is_err());
+    assert!(!root.path().join("toolchain-current-phase.json").exists());
+}
 
 use serde_json::json;
 
@@ -177,9 +314,23 @@ fn socket_stage_preserves_original_error_kind_and_native_code() {
             .contains("toolchain-diagnostic-publication=before-debug-wait")
     );
     assert!(error.to_string().contains("original-raw-os-error=Some(5)"));
+    assert_eq!(
+        error
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(5)
+    );
     let missing = diagnostics::observer_gate_error(
         "selected-start-toolchain-observer",
-        std::io::Error::from_raw_os_error(2),
+        controller_gate_error::open_diagnostic(
+            std::io::Error::from_raw_os_error(2),
+            Ok("{}".into()),
+        ),
     );
     assert!(
         missing
@@ -193,13 +344,87 @@ fn socket_stage_preserves_original_error_kind_and_native_code() {
     );
     let blocked = diagnostics::observer_gate_error(
         "selected-start-toolchain-observer",
-        std::io::Error::other("controller descendant gate did not release"),
+        controller_gate_error::context(
+            controller_gate_error::Stage::Wait,
+            Some(258),
+            std::io::Error::other("controller descendant gate did not release"),
+        ),
     );
     assert!(
         blocked
             .to_string()
             .contains("toolchain-operation=wait-toolchain-observer-gate")
     );
+}
+
+#[test]
+fn observer_gate_context_keeps_typed_operation_and_original_error_chain() {
+    use std::io;
+    for (stage, operation, code) in [
+        (
+            controller_gate_error::Stage::Open,
+            "open-toolchain-observer-gate",
+            5,
+        ),
+        (
+            controller_gate_error::Stage::Wait,
+            "wait-toolchain-observer-gate",
+            6,
+        ),
+        (
+            controller_gate_error::Stage::PublishRelease,
+            "publish-toolchain-observer-release",
+            32,
+        ),
+    ] {
+        let native = io::Error::from_raw_os_error(code);
+        let kind = native.kind();
+        let boundary = controller_gate_error::context(stage, Some(u32::MAX), native);
+        assert_eq!(boundary.raw_os_error(), None);
+        let projected = diagnostics::observer_gate_error("exact-selected-gate", boundary);
+        assert_eq!(projected.kind(), kind);
+        assert!(
+            projected
+                .to_string()
+                .contains(&format!("toolchain-operation={operation}"))
+        );
+        assert!(
+            projected
+                .to_string()
+                .contains(&format!("original-raw-os-error=Some({code})"))
+        );
+        let original = projected
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(
+            original
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<controller_gate_error::BoundaryError>()
+                .unwrap()
+                .observation(),
+            (stage, Some(code))
+        );
+        let native = original
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(native.raw_os_error(), Some(code));
+    }
+    let unknown = diagnostics::observer_gate_error("gate", io::Error::from_raw_os_error(2));
+    assert!(
+        unknown
+            .to_string()
+            .contains("toolchain-operation=toolchain-observer-gate;")
+    );
+    assert!(!unknown.to_string().contains("toolchain-operation=open-"));
 }
 
 #[test]
@@ -259,12 +484,14 @@ fn active_descendant_survives_original_exit_and_omission_is_explicit() {
     assert_eq!(incomplete["complete"], false);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-fixtures"))]
 #[test]
 fn native_current_record_replacement_publishes_only_complete_readback() {
     let directory = tempfile::tempdir().unwrap();
+    let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let owner = diagnostics::PublicationOwner::new(directory.path(), cutoff).unwrap();
     let binding = json!({"role":"child","original_child":{"process_id":20,"creation_time_100ns":200},"native_work_cutoff_ticks":900});
-    let publisher = diagnostics::Publisher::new(directory.path(), binding.clone()).unwrap();
+    let publisher = diagnostics::Publisher::new(&owner, binding.clone()).unwrap();
     for phase in ["before-debug-run", "after-debug-run-before-wait-retired"] {
         publisher
             .publish(false, phase, &json!({"diagnostic_only":true}))

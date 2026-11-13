@@ -8,6 +8,7 @@ mod formatting;
 mod release;
 mod semantics;
 mod source_seed;
+pub mod toolchain_acquisition;
 mod workflow_budget;
 
 use crate::{CiError, Result};
@@ -16,9 +17,6 @@ use std::{collections::BTreeSet, fs, path::Path, sync::OnceLock};
 
 fn text(value: &str) -> Value {
     Value::String(value.to_owned())
-}
-fn number(value: &str) -> Value {
-    serde_yaml::from_str(value).expect("source-defined number")
 }
 
 pub const FILES: [&str; 4] = [

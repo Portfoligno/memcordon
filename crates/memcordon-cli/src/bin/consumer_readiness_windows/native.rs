@@ -25,6 +25,82 @@ fn wide(value: &Path) -> Vec<u16> {
 
 /// Observe the catalog in the original failing child; never load or replace a provider.
 pub fn tcp_bind_failure(original: io::Error) -> io::Error {
+    tcp_failure("listener-bind", original)
+}
+
+fn winsock_cleanup() {
+    // SAFETY: this callback owns exactly one successful explicit startup reference.
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::WSACleanup();
+    }
+}
+pub fn winsock_startup(
+    trace: Option<super::winsock_trace::Context<'_>>,
+) -> io::Result<super::winsock_startup::Startup<fn()>> {
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+    // SAFETY: WSADATA is a native output structure valid with all scalar/pointer fields zeroed.
+    let mut data: WSADATA = unsafe { std::mem::zeroed() };
+    let mut observed = trace.as_ref().map(|context| {
+        super::winsock_trace::call(
+            WSAStartup as *const () as usize,
+            context.clock.work_cutoff_qpc,
+            context.clock.qpc_frequency,
+        )
+    });
+    if observed
+        .as_ref()
+        .is_some_and(|value| value.packet.called != 1)
+    {
+        let mut observation = observed.expect("checked trace");
+        if let Some(context) = &trace {
+            observation.retain(context);
+        }
+        let error = if observation.packet.setup_error != 0 {
+            io::Error::from_raw_os_error(observation.packet.setup_error as i32)
+        } else {
+            io::Error::other("original startup call unavailable")
+        };
+        return Err(observation.context(error));
+    }
+    let (returned, version) = if let Some(observed) = &observed {
+        (
+            observed.packet.original_return,
+            observed.packet.negotiated_version as u16,
+        )
+    } else {
+        // SAFETY: initialized native output; this original process/token owns this call.
+        (unsafe { WSAStartup(0x0202, &mut data) }, data.wVersion)
+    };
+    let acquired = super::winsock_startup::acquire(returned, version, winsock_cleanup as fn());
+    // Successful native ownership is established before any allocating/file diagnostic.
+    if let (Some(observation), Some(context)) = (&mut observed, &trace) {
+        observation.retain(context);
+    }
+    acquired.map_err(|error| {
+        let error = match observed {
+            Some(trace) => trace.context(error),
+            None => error,
+        };
+        tcp_failure("startup", error)
+    })
+}
+
+#[derive(Debug)]
+struct TcpFailure {
+    original: io::Error,
+    diagnostic: String,
+}
+impl std::fmt::Display for TcpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+impl std::error::Error for TcpFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
+}
+fn tcp_failure(stage: &str, original: io::Error) -> io::Error {
     use windows_sys::Win32::Networking::WinSock::{
         WSAPROTOCOL_INFOW, WSCEnumProtocols, WSCGetProviderPath,
     };
@@ -34,7 +110,8 @@ pub fn tcp_bind_failure(original: io::Error) -> io::Error {
     let mut entries: Vec<WSAPROTOCOL_INFOW> = (0..ENTRIES)
         .map(|_| unsafe { std::mem::zeroed() })
         .collect();
-    let mut bytes = (ENTRIES * std::mem::size_of::<WSAPROTOCOL_INFOW>()) as u32;
+    let initial_bytes = (ENTRIES * std::mem::size_of::<WSAPROTOCOL_INFOW>()) as u32;
+    let mut bytes = initial_bytes;
     let mut catalog_error = 0;
     // SAFETY: the aligned vector has the exact advertised writable capacity.
     let count = unsafe {
@@ -46,15 +123,17 @@ pub fn tcp_bind_failure(original: io::Error) -> io::Error {
         )
     };
     let mut observations = Vec::new();
-    let mut matching_count = 0;
+    let mut matching_count = None;
     if count >= 0 && (count as usize) <= ENTRIES {
-        matching_count = entries
-            .iter()
-            .take(count as usize)
-            .filter(|entry| {
-                entry.iAddressFamily == 2 && entry.iSocketType == 1 && entry.iProtocol == 6
-            })
-            .count();
+        matching_count = Some(
+            entries
+                .iter()
+                .take(count as usize)
+                .filter(|entry| {
+                    entry.iAddressFamily == 2 && entry.iSocketType == 1 && entry.iProtocol == 6
+                })
+                .count(),
+        );
         for entry in entries
             .iter()
             .take(count as usize)
@@ -108,15 +187,21 @@ pub fn tcp_bind_failure(original: io::Error) -> io::Error {
             ));
         }
     }
+    let diagnostic = format!(
+        "native TCP {stage} failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-initial-bytes={initial_bytes}; catalog-returned-bytes={bytes}; catalog-structure-bytes={}; catalog-observation-complete={}; matching-provider-count={matching_count:?}; providers-truncated={}; provider-paths-are-configuration-not-load-proof=true; IPv4-TCP-provider-observations={observations:?}",
+        original.raw_os_error(),
+        std::env::var_os("SystemRoot").is_some(),
+        std::env::var_os("windir").is_some(),
+        std::mem::size_of::<WSAPROTOCOL_INFOW>(),
+        count >= 0 && (count as usize) <= ENTRIES,
+        matching_count.is_some_and(|count| count > 8),
+    );
     io::Error::new(
         original.kind(),
-        format!(
-            "native TCP listener bind failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-bytes={bytes}; matching-provider-count={matching_count}; providers-truncated={}; IPv4-TCP-provider-observations={observations:?}",
-            original.raw_os_error(),
-            std::env::var_os("SystemRoot").is_some(),
-            std::env::var_os("windir").is_some(),
-            matching_count > 8,
-        ),
+        TcpFailure {
+            original,
+            diagnostic,
+        },
     )
 }
 
@@ -296,15 +381,23 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
 }
 
 pub fn token_observation() -> io::Result<Vec<u8>> {
+    // Borrowed GetCurrentProcessToken SDK pseudo handle; never close or transfer.
+    token_observation_from(-4isize as windows_sys::Win32::Foundation::HANDLE)
+}
+
+pub fn effective_token_observation() -> io::Result<Vec<u8>> {
+    // Borrowed GetCurrentThreadEffectiveToken SDK pseudo handle. Resolve and
+    // query synchronously on this thread, without reverting or reopening it.
+    token_observation_from(-6isize as windows_sys::Win32::Foundation::HANDLE)
+}
+
+pub(super) fn token_observation_from(
+    token: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::{GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount};
     use windows_sys::Win32::Security::{
         TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenRestrictedSids,
     };
-    // GetCurrentProcessToken is an inline Windows SDK function returning -4.
-    // Its pseudo-handle queries this process's actual token without reopening
-    // the token object through its DACL. It grants only query access, cannot be
-    // inherited or duplicated, and must not be treated as an owned handle.
-    let token = -4isize as windows_sys::Win32::Foundation::HANDLE;
     let user = token_bytes(token, TokenUser)?;
     let integrity = token_bytes(token, TokenIntegrityLevel)?;
     let elevation = token_bytes(token, TokenElevation)?;
@@ -326,7 +419,7 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
             level,
         )
     };
-    // SAFETY: IsTokenRestricted only observes this process's token pseudo-handle.
+    // SAFETY: IsTokenRestricted only observes this borrowed query-only token.
     let restricted = unsafe { IsTokenRestricted(token) } != 0;
     let groups = token_bytes(token, TokenRestrictedSids)?;
     // SAFETY: native TokenRestrictedSids result is an aligned TOKEN_GROUPS
@@ -761,17 +854,26 @@ fn frontend_os_error(operation: &'static str) -> io::Error {
 /// Trusted test launcher only: it changes the frontend caller envelope and waits
 /// for that frontend. The installed provider remains the workload supervisor.
 pub fn restricted_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, true, None, false)
+    launch_frontend(arguments, true, None, false, None)
 }
 
 pub fn system_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, false, None, true)
+    launch_frontend(arguments, false, None, true, None)
 }
 
 pub fn system_restricted_frontend(
     arguments: impl Iterator<Item = std::ffi::OsString>,
 ) -> io::Result<i32> {
-    launch_frontend(arguments, true, None, true)
+    launch_frontend(arguments, true, None, true, None)
+}
+
+pub fn system_restricted_gate_control_frontend(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> io::Result<i32> {
+    let descriptor = arguments
+        .next()
+        .ok_or_else(|| io::Error::other("gate control descriptor missing"))?;
+    launch_frontend(arguments, true, None, true, Some(Path::new(&descriptor)))
 }
 
 pub fn system_sentinel_frontend(
@@ -780,7 +882,7 @@ pub fn system_sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)), true)
+    launch_frontend(arguments, false, Some(Path::new(&descriptor)), true, None)
 }
 
 pub fn sentinel_frontend(
@@ -789,7 +891,65 @@ pub fn sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)), false)
+    launch_frontend(arguments, false, Some(Path::new(&descriptor)), false, None)
+}
+
+/// The same private preparation is used once for both members of a matched
+/// pair. The ordinary launcher retains its original two token owners too.
+pub(super) fn select_frontend_caller(restrict: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
+        TOKEN_ALL_ACCESS, WinRestrictedCodeSid,
+    };
+    let mut primary = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary) } == 0 {
+        return Err(frontend_os_error("OpenProcessToken"));
+    }
+    let primary_owned = unsafe { OwnedHandle::from_raw_handle(primary.cast()) };
+    let mut restricting_sid = [0u32; 17];
+    let mut restricting_length = std::mem::size_of_val(&restricting_sid) as u32;
+    if unsafe {
+        CreateWellKnownSid(
+            WinRestrictedCodeSid,
+            std::ptr::null_mut(),
+            restricting_sid.as_mut_ptr().cast(),
+            &mut restricting_length,
+        )
+    } == 0
+    {
+        return Err(frontend_os_error("CreateWellKnownSid"));
+    }
+    let restricting = SID_AND_ATTRIBUTES {
+        Sid: restricting_sid.as_mut_ptr().cast(),
+        Attributes: 0,
+    };
+    let mut restricted = std::ptr::null_mut();
+    if unsafe {
+        CreateRestrictedToken(
+            primary,
+            DISABLE_MAX_PRIVILEGE,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            1,
+            &restricting,
+            &mut restricted,
+        )
+    } == 0
+    {
+        return Err(frontend_os_error("CreateRestrictedToken"));
+    }
+    let restricted_owned = unsafe { OwnedHandle::from_raw_handle(restricted.cast()) };
+    if restrict && unsafe { IsTokenRestricted(restricted) } == 0 {
+        return Err(io::Error::other(
+            "native restricted token was not restricted",
+        ));
+    }
+    if restrict {
+        super::native_fixture_default_dacl::prepare(primary, restricted)?;
+    }
+    Ok((primary_owned, restricted_owned))
 }
 
 fn launch_frontend(
@@ -797,13 +957,12 @@ fn launch_frontend(
     restrict: bool,
     sentinel_descriptor: Option<&Path>,
     system_environment: bool,
+    gate_control_descriptor: Option<&Path>,
 ) -> io::Result<i32> {
+    let original_watchdog = std::time::Instant::now() + std::time::Duration::from_secs(660);
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
         GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
-    };
-    use windows_sys::Win32::Security::{
-        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -831,66 +990,7 @@ fn launch_frontend(
             "restricted frontend argv exceeds its native bound",
         ));
     }
-    let mut primary = std::ptr::null_mut();
-    // SAFETY: current process pseudo-handle and writable output are valid.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary) } == 0 {
-        return Err(frontend_os_error("OpenProcessToken"));
-    }
-    // SAFETY: successful OpenProcessToken transfers one token reference.
-    let primary_owned = unsafe { OwnedHandle::from_raw_handle(primary.cast()) };
-    use windows_sys::Win32::Security::{CreateWellKnownSid, WinRestrictedCodeSid};
-    let mut restricting_sid = [0u32; 17];
-    let mut restricting_length = std::mem::size_of_val(&restricting_sid) as u32;
-    // SAFETY: aligned maximum native SID buffer; this distinct principal has
-    // explicit read grants on inputs and write grants only on candidate outputs.
-    if unsafe {
-        CreateWellKnownSid(
-            WinRestrictedCodeSid,
-            std::ptr::null_mut(),
-            restricting_sid.as_mut_ptr().cast(),
-            &mut restricting_length,
-        )
-    } == 0
-    {
-        return Err(frontend_os_error("CreateWellKnownSid"));
-    }
-    let restricting = SID_AND_ATTRIBUTES {
-        Sid: restricting_sid.as_mut_ptr().cast(),
-        Attributes: 0,
-    };
-    let mut restricted = std::ptr::null_mut();
-    // SAFETY: live source token/SID; output acquires a new restricted primary
-    // token. Privileges are removed, and access must also satisfy RestrictedCode
-    // independently of the ordinary driver's owning user SID.
-    if unsafe {
-        CreateRestrictedToken(
-            primary,
-            DISABLE_MAX_PRIVILEGE,
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            1,
-            &restricting,
-            &mut restricted,
-        )
-    } == 0
-    {
-        return Err(frontend_os_error("CreateRestrictedToken"));
-    }
-    // SAFETY: newly returned restricted token reference transfers once.
-    let restricted_owned = unsafe { OwnedHandle::from_raw_handle(restricted.cast()) };
-    // SAFETY: query only against held restricted token.
-    if restrict && unsafe { IsTokenRestricted(restricted) } == 0 {
-        return Err(io::Error::other(
-            "native restricted token was not restricted",
-        ));
-    }
-    if restrict {
-        // This launcher owns the newly derived fixture token. Its default
-        // objects must satisfy both ordinary and RestrictedCode access checks.
-        super::native_fixture_default_dacl::prepare(primary, restricted)?;
-    }
+    let (primary_owned, restricted_owned) = select_frontend_caller(restrict)?;
     // SAFETY: read only this launcher's three standard handles.
     let standard_handles = unsafe {
         [
@@ -1005,6 +1105,18 @@ fn launch_frontend(
         } else {
             primary_owned.as_raw_handle()
         };
+        if let Some(path) = gate_control_descriptor {
+            super::native_gate_precondition::run(
+                primary_owned.as_raw_handle(),
+                token,
+                &startup,
+                environment
+                    .as_ref()
+                    .map_or(std::ptr::null(), |block| block.as_ptr().cast()),
+                path,
+                original_watchdog,
+            )?;
+        }
         if unsafe {
             CreateProcessAsUserW(
                 token,
@@ -1041,7 +1153,20 @@ fn launch_frontend(
             return Err(cause);
         }
         // SAFETY: held frontend process, bounded driver owns emergency termination.
-        if unsafe { WaitForSingleObject(process_owned.as_raw_handle(), 660_000) } != 0 {
+        if unsafe {
+            WaitForSingleObject(
+                process_owned.as_raw_handle(),
+                if gate_control_descriptor.is_some() {
+                    original_watchdog
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(u128::from(u32::MAX - 1)) as u32
+                } else {
+                    660_000
+                },
+            )
+        } != 0
+        {
             terminate_frontend(&process_owned)?;
             return Err(io::Error::other(
                 "restricted frontend exceeded its driver watchdog",

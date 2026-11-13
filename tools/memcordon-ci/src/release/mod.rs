@@ -24,6 +24,8 @@ pub mod linux_current_provider_state;
 pub mod linux_current_relay;
 #[cfg(target_os = "linux")]
 pub mod linux_installed_tests;
+#[cfg(target_os = "linux")]
+pub mod linux_journal_publication;
 pub mod linux_recovery_owners;
 #[cfg(unix)]
 pub mod linux_request_fixture;
@@ -58,15 +60,7 @@ pub mod linux_test_snapshots;
 #[cfg(target_os = "linux")]
 pub mod linux_test_socket_imports;
 pub mod linux_unit_diagnostics;
-#[cfg(target_os = "linux")]
-mod native_cargo_aliases;
 pub mod native_coverage_owner;
-#[cfg(target_os = "linux")]
-mod native_executable;
-#[cfg(target_os = "linux")]
-mod native_execution_association;
-#[cfg(target_os = "linux")]
-mod native_source_identity;
 #[cfg(target_os = "linux")]
 mod native_toolchain_search;
 pub mod ordinary_consumer_cache;
@@ -151,6 +145,21 @@ pub enum ReleaseCommand {
         destination: PathBuf,
         #[arg(long, value_enum)]
         channel: ConsumerChannel,
+    },
+    WorkingWindowsMatchedOwned {
+        #[arg(long, default_value = "target/ci/windows-prepared")]
+        prepared: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    WorkingWindowsProviderExperiment {
+        #[arg(long, default_value = "target/ci/windows-prepared")]
+        prepared: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        /// Independent file-marker experiment; directory layout remains the default.
+        #[arg(long)]
+        dot_local_file: bool,
     },
     ConsumerCache {
         /// Stable ordinary preparation owns job-local sources; ephemeral only reports downloads.
@@ -410,6 +419,20 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                     crate::windows_causal_acceptance::InstalledChannel::CargoPackage
                 }
             },
+        ),
+        ReleaseCommand::WorkingWindowsMatchedOwned {
+            prepared,
+            destination,
+        } => windows_installed_consumer::run_matched_owned(root, &prepared, &destination),
+        ReleaseCommand::WorkingWindowsProviderExperiment {
+            prepared,
+            destination,
+            dot_local_file,
+        } => windows_installed_consumer::run_provider_input_experiment(
+            root,
+            &prepared,
+            &destination,
+            dot_local_file,
         ),
         ReleaseCommand::ConsumerCache {
             layout,

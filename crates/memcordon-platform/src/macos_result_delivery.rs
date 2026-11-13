@@ -94,8 +94,21 @@ impl DeliveryStage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationProvenance {
+    #[default]
+    Unavailable,
+    PreOwnerRejection,
+    CallerDeadlineSnapshot,
+    /// The owner published its result after settlement attempts. Check cleanup_outstanding independently.
+    OwnerResult,
+    NoWork,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeliveryObservation {
+    pub provenance: ObservationProvenance,
     pub writer_pid: Option<NonZeroU32>,
     pub exit_code: Option<i32>,
     pub frame_transferred: bool,
@@ -106,6 +119,9 @@ pub struct DeliveryObservation {
     pub writer_phase_error: Option<i32>,
     pub writer_phase_malformed: bool,
     pub writer_phase_truncated: bool,
+}
+impl DeliveryObservation {
+    pub const TEST_EVIDENCE_BYTES: usize = 1024;
 }
 
 #[derive(Debug)]
@@ -359,7 +375,10 @@ impl MacosDeliveryRuntime {
         }
         if request.diagnostics.is_empty() && request.report.is_none() {
             return DeliveryOutcome::Completed {
-                observation: DeliveryObservation::default(),
+                observation: DeliveryObservation {
+                    provenance: ObservationProvenance::NoWork,
+                    ..Default::default()
+                },
             };
         }
         let start = match now() {
@@ -489,11 +508,15 @@ fn failed(stage: DeliveryStage, error: io::Error) -> DeliveryOutcome {
     DeliveryOutcome::Failed {
         stage,
         error: Some(error),
-        observation: DeliveryObservation::default(),
+        observation: DeliveryObservation {
+            provenance: ObservationProvenance::PreOwnerRejection,
+            ..Default::default()
+        },
     }
 }
 fn observation(lane: &Lane) -> DeliveryObservation {
     DeliveryObservation {
+        provenance: ObservationProvenance::CallerDeadlineSnapshot,
         writer_pid: NonZeroU32::new(lane.pid.load(Ordering::Acquire)),
         frame_transferred: lane.transferred.load(Ordering::Acquire),
         cleanup_outstanding: lane.cleanup_outstanding.load(Ordering::Acquire),
@@ -685,6 +708,7 @@ fn owner_loop(inner: Arc<Inner>, index: usize, receive: mpsc::Receiver<()>) {
         observed.writer_pid = NonZeroU32::new(lane.pid.load(Ordering::Acquire));
         observed.frame_transferred = lane.transferred.load(Ordering::Acquire);
         observed.cleanup_outstanding = lost;
+        observed.provenance = ObservationProvenance::OwnerResult;
         let current_stage = DeliveryStage::from_byte(lane.stage.load(Ordering::Acquire));
         let outcome = match result {
             Ok(()) if !lost => DeliveryOutcome::Completed {

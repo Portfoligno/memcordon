@@ -25,6 +25,13 @@ use crate::{
     windows_installed_cases::SelectedArtifact,
 };
 
+/// Shared producer layout for the Windows installed-consumer output and carriers.
+pub const WINDOWS_CASE_DIRECTORY: &str = "windows-installed";
+
+pub fn windows_case_output_directory(output: &Path) -> PathBuf {
+    output.join(WINDOWS_CASE_DIRECTORY)
+}
+
 pub struct MaterializedPayload {
     pub channel: InstalledChannel,
     pub source: BuildSourceIdentity,
@@ -37,6 +44,10 @@ pub struct MaterializedPayload {
 }
 
 impl MaterializedPayload {
+    #[cfg(windows)]
+    pub(crate) fn retain(self) -> PathBuf {
+        self._owner.keep()
+    }
     pub fn selected_case_artifacts(&self) -> Result<Vec<SelectedArtifact>> {
         installed_case_artifacts(
             &self.artifacts,
@@ -1313,11 +1324,21 @@ pub fn run_cli_case(
     #[cfg(not(target_os = "linux"))]
     let output = command
         .output_limit(1024 * 1024)
+        .defer_group_failure()
         .output_owned()
         .into_result()?;
     #[cfg(not(target_os = "linux"))]
     capture(&output)?;
-    let bytes = artifacts::read_file(&report_path)?;
+    let bytes = artifacts::read_file(&report_path).map_err(|error| {
+        CiError::Message(format!(
+            "selected CLI case {name} report {} could not be read: {error}; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr={:?}",
+            report_path.display(),
+            output.status,
+            output.stdout.len(),
+            output.stderr.len(),
+            crate::command::bounded_excerpt(&output.stderr),
+        ))
+    })?;
     if bytes.len() > 8 * 1024 * 1024 {
         return Err(CiError::Message(
             "ordinary execution report exceeds byte bound".into(),
@@ -1462,7 +1483,7 @@ pub fn run_materialized_channel_until(
             &payload.directory,
             payload.fixture.clone(),
             &installed,
-            output.join("windows-installed"),
+            windows_case_output_directory(output),
         )?;
         fs::create_dir_all(&config.output_directory)?;
         let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;

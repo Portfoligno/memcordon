@@ -33,7 +33,7 @@ fn authenticated_failed_receipt_preserves_actual_release_and_retirement_facts() 
         error.windows_provider_rejection_v3.as_deref(),
         Some(&rejection)
     );
-    let retained = error.provider_failure.as_ref().unwrap();
+    let retained = error.provider_failure.as_deref().unwrap();
     assert_eq!(retained, &projection);
     assert_eq!(
         error.provider_association.as_ref().unwrap().provider,

@@ -3,12 +3,16 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::fmt;
+#[path = "native_input_observation.rs"]
+mod native_input_observation;
+pub use native_input_observation::*;
 
 pub fn hash_bytes(bytes: &[u8]) -> DiagnosticSha256 {
     DiagnosticSha256::from_bytes(Sha256Hasher::digest(bytes).into())
 }
 
 pub const CAUSAL_DIAGNOSTIC_SCHEMA: u32 = 1;
+pub const NATIVE_INPUT_DIAGNOSTIC_SCHEMA: u32 = 2;
 pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 512;
 pub const MAX_DIAGNOSTIC_SECONDARY_EVENTS: usize = 8;
 pub const MAX_DIAGNOSTIC_PROJECTION_BYTES: usize = 16 * 1024;
@@ -172,6 +176,7 @@ fn response_kind_frame_limit(remainder: &[u8], public: bool) -> Result<usize, &'
         b"attempt-retained-v2"
         | b"replay-pending-v2"
         | b"workload-accepted"
+        | b"attempt-diagnostics"
         | b"preallocation-cancelled"
         | b"workload-prepared" => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
         b"read-only-query-failure" => crate::WindowsReadOnlyQueryFailure::MAX_FRAME_BYTES,
@@ -545,6 +550,8 @@ pub struct WindowsCausalDiagnosticsV1 {
     pub sequence: u64,
     pub durable_through_sequence: Option<u64>,
     pub loss: DiagnosticLossV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_inputs: Option<WindowsNativeInputObservationV1>,
 }
 impl Default for WindowsCausalDiagnosticsV1 {
     fn default() -> Self {
@@ -557,10 +564,27 @@ impl Default for WindowsCausalDiagnosticsV1 {
             sequence: 0,
             durable_through_sequence: None,
             loss: DiagnosticLossV1::default(),
+            native_inputs: None,
         }
     }
 }
 impl WindowsCausalDiagnosticsV1 {
+    pub fn set_native_inputs(
+        &mut self,
+        next: WindowsNativeInputObservationV1,
+    ) -> Result<(), &'static str> {
+        if !next.is_consistent()
+            || self
+                .native_inputs
+                .as_ref()
+                .is_some_and(|previous| !next.is_monotonic_extension_of(previous))
+        {
+            return Err("native input observation replacement refused");
+        }
+        self.native_inputs = Some(next);
+        self.schema_version = NATIVE_INPUT_DIAGNOSTIC_SCHEMA;
+        Ok(())
+    }
     /// Copy into the storage reserved at attempt admission. Events contain only
     /// closed enums and scalar fields, so this operation does not allocate.
     pub fn copy_into_reserved(&self, target: &mut Self) {
@@ -570,6 +594,7 @@ impl WindowsCausalDiagnosticsV1 {
         target.sequence = self.sequence;
         target.durable_through_sequence = self.durable_through_sequence;
         target.loss.clone_from(&self.loss);
+        target.native_inputs.clone_from(&self.native_inputs);
     }
     pub fn observe_secondary(&mut self, mut event: CausalEventV1) -> Result<(), &'static str> {
         self.sequence = self
@@ -606,7 +631,16 @@ impl WindowsCausalDiagnosticsV1 {
         Ok(())
     }
     pub fn is_consistent(&self) -> bool {
-        if self.schema_version != CAUSAL_DIAGNOSTIC_SCHEMA
+        if self.schema_version
+            != if self.native_inputs.is_some() {
+                NATIVE_INPUT_DIAGNOSTIC_SCHEMA
+            } else {
+                CAUSAL_DIAGNOSTIC_SCHEMA
+            }
+            || self
+                .native_inputs
+                .as_ref()
+                .is_some_and(|value| !value.is_consistent())
             || self
                 .durable_through_sequence
                 .is_some_and(|v| v > self.sequence)
@@ -699,6 +733,8 @@ pub struct ProviderFailureDiagnosticV1 {
     pub original: OriginalFailureV1,
     pub secondary: BoundedVec<CausalEventV1, MAX_DIAGNOSTIC_SECONDARY_EVENTS>,
     pub loss: DiagnosticLossV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_inputs: Option<WindowsNativeInputObservationV1>,
     pub projection_sha256: DiagnosticSha256,
 }
 impl ProviderFailureDiagnosticV1 {
@@ -722,7 +758,7 @@ impl ProviderFailureDiagnosticV1 {
         journal: &WindowsCausalDiagnosticsV1,
     ) -> Result<Self, &'static str> {
         let mut projection = Self {
-            schema_version: CAUSAL_DIAGNOSTIC_SCHEMA,
+            schema_version: journal.schema_version,
             provider_binding,
             attempt_id: DiagnosticSha256::try_from(BoundedText::new(attempt_id)?)?,
             request_sha256: DiagnosticSha256::try_from(BoundedText::new(request_sha256)?)?,
@@ -731,6 +767,7 @@ impl ProviderFailureDiagnosticV1 {
             original: journal.original.clone(),
             secondary: journal.secondary.clone(),
             loss: journal.loss.clone(),
+            native_inputs: journal.native_inputs.clone(),
             projection_sha256: DiagnosticSha256::from_bytes([0; 32]),
         };
         if !projection.is_consistent() {
@@ -752,18 +789,26 @@ impl ProviderFailureDiagnosticV1 {
         request_sha256: &str,
         journal: &WindowsCausalDiagnosticsV1,
     ) -> bool {
-        String::from(self.attempt_id.clone()) == attempt_id
+        self.schema_version == journal.schema_version
+            && String::from(self.attempt_id.clone()) == attempt_id
             && String::from(self.request_sha256.clone()) == request_sha256
             && self.diagnostic_sequence == journal.sequence
             && self.durable_through_sequence == journal.durable_through_sequence
             && self.original == journal.original
             && self.secondary == journal.secondary
             && self.loss == journal.loss
+            && self.native_inputs == journal.native_inputs
     }
     /// Structural validation is independent from authenticating the enclosing transport.
     pub fn is_consistent(&self) -> bool {
-        self.schema_version == CAUSAL_DIAGNOSTIC_SCHEMA
-            && self.provider_binding.is_consistent()
+        matches!(
+            self.schema_version,
+            CAUSAL_DIAGNOSTIC_SCHEMA | NATIVE_INPUT_DIAGNOSTIC_SCHEMA
+        ) && self.provider_binding.is_consistent()
+            && self.native_inputs.as_ref().is_none_or(|value| {
+                value.attempt_sha256 == *self.attempt_id.bytes()
+                    && value.request_sha256 == *self.request_sha256.bytes()
+            })
             && WindowsCausalDiagnosticsV1 {
                 schema_version: self.schema_version,
                 original: self.original.clone(),
@@ -771,6 +816,7 @@ impl ProviderFailureDiagnosticV1 {
                 sequence: self.diagnostic_sequence,
                 durable_through_sequence: self.durable_through_sequence,
                 loss: self.loss.clone(),
+                native_inputs: self.native_inputs.clone(),
             }
             .is_consistent()
     }
@@ -824,6 +870,13 @@ impl ProviderFailureDiagnosticV1 {
             u8::from(self.loss.persistence_failure_observed),
             u8::from(self.loss.writer_unavailable),
         ]);
+        if let Some(observation) = &self.native_inputs {
+            // Absence deliberately leaves the original v1 digest unchanged.
+            hash.update(b"memcordon:native-input-observation:v1\0");
+            let bytes = serde_json::to_vec(observation).expect("fixed native observation encoding");
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
         DiagnosticSha256::from_bytes(hash.finalize().into())
     }
     pub fn parse_bound(

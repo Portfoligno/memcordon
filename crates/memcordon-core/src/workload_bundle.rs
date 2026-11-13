@@ -20,6 +20,8 @@ pub struct SnapshotManifestV1 {
     pub target: String,
     pub entries: BoundedVec<ImageEntryV1, 16384>,
     pub entrypoints: BoundedVec<ImageEntrypointV1, 16>,
+    /// Exact immutable search paths. An anchored empty path may remain absent
+    /// in the closed read-only root and cannot supply a dependency member.
     pub library_directories: BoundedVec<crate::workload_request::RootRelativePath, 32>,
 }
 impl SnapshotManifestV1 {
@@ -99,19 +101,38 @@ impl SnapshotManifestV1 {
         let mut ids = BTreeSet::new();
         let mut libraries = BTreeSet::new();
         for directory in self.library_directories.as_slice() {
+            let populated = self
+                .entries
+                .as_slice()
+                .iter()
+                .any(|entry| crate::workload_files::is_beneath(entry.path(), directory));
+            // An empty search authorizes no bytes. A non-root ancestor must
+            // already be an implicit directory of this immutable image.
+            // Any implicit non-root ancestor also establishes the first
+            // component as an implicit directory. Check that component once,
+            // rather than rescanning entries for every absent path component.
+            let anchored = directory
+                .as_str()
+                .split_once('/')
+                .is_some_and(|(ancestor, _)| {
+                    self.entries.as_slice().iter().any(|entry| {
+                        entry
+                            .path()
+                            .as_str()
+                            .strip_prefix(ancestor)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                    })
+                });
             if !libraries.insert(directory)
                 || matches!(
                     directory.as_str().split('/').next(),
                     Some("proc" | "dev" | "sys" | "run")
                 )
-                || !self
-                    .entries
-                    .as_slice()
-                    .iter()
-                    .any(|entry| crate::workload_files::is_beneath(entry.path(), directory))
+                || (!populated && !anchored)
             {
                 return Err("library directory lacks confined immutable snapshot members".into());
             }
+            reject_search_file_ancestors(directory, paths.keys().copied())?;
         }
         for entrypoint in self.entrypoints.as_slice() {
             if !ids.insert(&entrypoint.id)
@@ -170,6 +191,23 @@ impl SnapshotManifestV1 {
         entries.sort_by(|a, b| a.path().cmp(b.path()));
         entries
     }
+}
+
+fn reject_search_file_ancestors<'a>(
+    directory: &crate::workload_request::RootRelativePath,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let directory = directory.as_str();
+    for path in paths {
+        if directory == path
+            || directory
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err("immutable loader search is occupied by a file or symlink".into());
+        }
+    }
+    Ok(())
 }
 
 pub fn write_bundle_headers<W: Write>(
@@ -246,6 +284,14 @@ pub fn validate_combined(
             }
             current = parent;
         }
+    }
+    for directory in runtime
+        .library_directories
+        .as_slice()
+        .iter()
+        .chain(input.library_directories.as_slice())
+    {
+        reject_search_file_ancestors(directory, paths.iter().copied())?;
     }
     if total > IMAGE_BYTES {
         return Err("combined immutable root exceeds byte ceiling".into());

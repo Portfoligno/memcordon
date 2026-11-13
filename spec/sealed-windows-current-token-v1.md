@@ -5,6 +5,28 @@ It provides Job supervision and cleanup, not a filesystem or network sandbox.
 OS access checks apply independently to the provider endpoint and caller token.
 Requests cannot select an identity, token, provider handle, or administrator grant.
 
+Every new client connection to the authenticated control pipe requests dynamic
+context tracking at impersonation level 2, with all aspects of the effective
+writer context available (`SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION |
+SECURITY_CONTEXT_TRACKING`, without `SECURITY_EFFECTIVE_ONLY`). This retains
+disabled privilege entries without enabling them or changing their attributes; it does not
+substitute the frontend process primary for an impersonating writer. Launch,
+owner observation, recovery and replay share this connection policy. Cancellation
+on an existing authenticated connection retains that connection.
+
+Native fixture measurements on x64 and ARM64 establish privilege-inventory
+preservation and tracking when a process-primary client replaces its thread
+context before writing. Historical flags-128 rows remain comparison controls.
+These measurements do not exhaust in-place token changes or establish other
+security-envelope, descriptor, target-execution or retirement properties.
+
+Same-boot owner authorization continues to require the exact admitted token hash.
+An older enabled-only launch can therefore reject a newer full-context owner
+request, even for the same user. There is no old-flags retry, hash normalization,
+record rewrite or SID-only fallback. Existing connections are not retroactively
+changed. Transition requires genuine authorized settlement or clean/verified
+compatible custody under the existing installer rules; unknown debt stays refused.
+
 The restricted control service authenticates the caller. The launcher creates a
 fresh unnamed Job and suspended target with creation-time Job/handle lists,
 verifies the caller token, resource limits and inherited streams, and retains an

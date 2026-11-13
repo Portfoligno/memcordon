@@ -2,6 +2,70 @@ use super::*;
 use memcordon_core::*;
 
 #[test]
+fn neutral_stages_survive_real_owner_merges_without_creating_failure_events() {
+    let _scope = AttemptDiagnosticScope::enter();
+    let frontend = WindowsProcessIdentityV1 {
+        process_id: 10,
+        creation_time_100ns: 20,
+    };
+    let original = WindowsNativeInputObservationV1::new(
+        [1; 32],
+        [2; 32],
+        frontend,
+        NativeInputCaptureV1::default(),
+    );
+    observe_native_inputs(&original);
+    let mut record = WindowsCausalDiagnosticsV1::default();
+    merge_into(&mut record);
+    assert_eq!(record.sequence, 0);
+    assert!(record.secondary.as_slice().is_empty());
+    assert!(matches!(
+        record.original,
+        OriginalFailureV1::Unavailable {
+            reason: OriginalUnavailableReasonV1::NoEarlierErrorObserved
+        }
+    ));
+    assert_eq!(record.native_inputs.as_ref(), Some(&original));
+    let mut advanced = original.clone();
+    advanced.launcher_primary = NativeInputStageV1::Unavailable {
+        reason: NativeInputUnavailableV1::QueryFailed,
+        native_error: Some(5),
+    };
+    record.set_native_inputs(advanced.clone()).unwrap();
+    // CURRENT is still the earlier stage. A later real failure must copy only
+    // failure facts, preserving the record's newer neutral native observation.
+    capture(failure(1234));
+    merge_into(&mut record);
+    assert_eq!(record.native_inputs.as_ref(), Some(&advanced));
+    assert_eq!(record.sequence, 1);
+    assert!(
+        matches!(record.original, OriginalFailureV1::Observed {ref event} if event.native_code==Some(NativeFailureCodeV1::Win32(1234)))
+    );
+    advanced.target_identity = Some(WindowsProcessIdentityV1 {
+        process_id: 30,
+        creation_time_100ns: 40,
+    });
+    advanced.suspended_target = NativeInputStageV1::Unavailable {
+        reason: NativeInputUnavailableV1::QueryFailed,
+        native_error: None,
+    };
+    observe_native_inputs(&advanced);
+    merge_into(&mut record);
+    assert_eq!(
+        record.sequence, 1,
+        "neutral extension has no fake failure sequence"
+    );
+    assert_eq!(record.native_inputs.as_ref(), Some(&advanced));
+    let mut changed = advanced.clone();
+    changed.launcher_primary = NativeInputStageV1::NotReached;
+    observe_native_inputs(&changed);
+    merge_into(&mut record);
+    assert_eq!(record.native_inputs.as_ref(), Some(&advanced));
+    assert!(record.loss.writer_unavailable);
+    assert!(record.is_consistent());
+}
+
+#[test]
 #[cfg(windows)]
 fn native_invalid_handle_capture_preserves_first_cause_across_phase_change() {
     let _scope = AttemptDiagnosticScope::enter();

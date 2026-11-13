@@ -1,5 +1,4 @@
 //! Installed caller-byte workloads. No policy registry or image installation enters this driver.
-use super::installed_consumer::MaterializedPayload;
 use super::linux_request_fixture::{CallerRequestFixture, CallerSession, CallerSnapshot};
 use super::linux_request_launch::{LaunchInput, RequestLaunch};
 use crate::linux_consumer_readiness::HeldLinuxProcess;
@@ -8,7 +7,6 @@ use memcordon_core::workload_bundle::SnapshotManifestV1;
 use memcordon_core::workload_request::WorkloadAttemptAssociationV1;
 use memcordon_core::workload_request::{PrivateRootLayoutV1, RootRelativePath};
 use memcordon_core::{BoundedVec, PublicProviderBindingV1};
-use sha2::Digest;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -271,6 +269,8 @@ pub struct TestInput<'a> {
     pub cleanup_cutoff: Instant,
 }
 pub struct ExecutedCase {
+    pub frontend_wait: std::process::ExitStatus,
+    pub frontend_identity: (u32, u64),
     pub start: Vec<u8>,
     pub lifetime: memcordon_core::Lifetime,
     pub memory_bytes: Option<u64>,
@@ -606,25 +606,17 @@ fn run_recipe_inner(
             let original_frontend = launch.retain_frontend(input.work_cutoff)?;
             let frontend_identity = (original_frontend.process_id, original_frontend.birth);
             let locator_path = input.directory.join("workload-observation.json");
-            while !locator_path.try_exists()? {
-                if Instant::now() >= input.work_cutoff {
-                    return Err(CiError::Message(
-                        "original attempt locator cutoff expired".into(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            launch.wait_for_event(input.work_cutoff, "original attempt locator", || {
+                locator_path.try_exists().map_err(CiError::from)
+            })?;
             let locator = launch.association()?;
             let prepared_name = format!("{}.prepared.json", hex::encode(locator.attempt));
             let prepared_path = observation_directory.join(&prepared_name);
-            while !prepared_path.try_exists()? {
-                if Instant::now() >= input.work_cutoff {
-                    return Err(CiError::Message(
-                        "original native prepared observation cutoff expired".into(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            launch.wait_for_event(
+                input.work_cutoff,
+                "original native prepared observation",
+                || prepared_path.try_exists().map_err(CiError::from),
+            )?;
             let mut prepared_file = File::from(
                 rustix::fs::openat(
                     &observation_owner,
@@ -914,8 +906,7 @@ fn run_recipe_inner(
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                let frontend = HeldLinuxProcess::acquire(frontend_identity.0, frontend_identity.1)
-                    .map_err(CiError::Message)?;
+                let frontend = launch.retained_frontend(input.work_cutoff)?;
                 controller["relay_pressure"] = super::linux_current_relay::observe(
                     &frontend,
                     &held[4],
@@ -1056,6 +1047,15 @@ fn run_recipe_inner(
                                     CiError::Message("original export writer was not held".into())
                                 })?;
                                 let writer = &held[index];
+                                let namespace_pid = writer
+                                    .namespace_pid
+                                    .filter(|pid| *pid != 0)
+                                    .ok_or_else(|| {
+                                        CiError::Message(
+                                            "original export writer namespace mapping absent"
+                                                .into(),
+                                        )
+                                    })?;
                                 let mut first = root.writer_sample()?;
                                 loop {
                                     let value: Vec<u8> =
@@ -1096,7 +1096,7 @@ fn run_recipe_inner(
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
-                                controller["export_writer_native"] = serde_json::json!({"writer":{"pid":writer.process_id,"birth":writer.birth},"first":first,"second":second,"final":root.writer_sample()?,"pidfd_readable_after_stop":true,"target_alive_after_writer":!held[4].exited().map_err(CiError::Message)?});
+                                controller["export_writer_native"] = serde_json::json!({"writer":{"pid":writer.process_id,"birth":writer.birth,"namespace_pid":namespace_pid},"first":first,"second":second,"final":root.writer_sample()?,"pidfd_readable_after_stop":true,"target_alive_after_writer":!held[4].exited().map_err(CiError::Message)?});
                             }
                             drop(root);
                             launch.send_input(b"R".to_vec())?;
@@ -1182,11 +1182,12 @@ fn run_recipe_inner(
                 None
             };
             let observed = launch.capture_until(input.work_cutoff)?;
+            let frontend_wait = observed.status;
             let stdout = observed.stdout.clone();
             let stderr = observed.stderr.clone();
             if report_failure {
                 use std::os::unix::process::ExitStatusExt;
-                controller["report_directory"]["frontend_wait"] = serde_json::json!({"status":observed.status.code(),"raw_wait_status":observed.status.into_raw(),"frontend":{"pid":frontend_identity.0,"birth":frontend_identity.1}});
+                controller["report_directory"]["frontend_wait"] = serde_json::json!({"status":frontend_wait.code(),"raw_wait_status":frontend_wait.into_raw(),"frontend":{"pid":frontend_identity.0,"birth":frontend_identity.1}});
                 directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
                 let after = directory.metadata()?;
                 controller["report_directory"]["restored_mode"] = after.mode().into();
@@ -1214,6 +1215,8 @@ fn run_recipe_inner(
                 .map_err(|error| CiError::Message(error.to_string()))?;
                 launch.retire_bundle_exact(&fixture)?;
                 return Ok(ExecutedCase {
+                    frontend_wait,
+                    frontend_identity,
                     start,
                     lifetime,
                     memory_bytes: Some(memory_bytes),
@@ -1235,7 +1238,30 @@ fn run_recipe_inner(
                     directory: input.directory.into(),
                 });
             }
-            let result = launch.result()?;
+            let result = launch.result().map_err(|error| {
+                error.context(format!(
+                    "scenario={}/{}; original frontend status={:?}; stderr-bytes={}; stderr={}",
+                    recipe.key.family,
+                    recipe.key.scenario,
+                    frontend_wait,
+                    stderr.len(),
+                    crate::linux_result_publication::stderr_detail(&stderr)
+                ))
+            })?;
+            crate::linux_result_publication::wrapper_status(
+                frontend_wait.code(),
+                result.outcome.wrapper_status,
+            )
+            .map_err(|error| {
+                CiError::Message(error).context(format!(
+                    "scenario={}/{}; original frontend status={:?}; stderr-bytes={}; stderr={}",
+                    recipe.key.family,
+                    recipe.key.scenario,
+                    frontend_wait,
+                    stderr.len(),
+                    crate::linux_result_publication::stderr_detail(&stderr)
+                ))
+            })?;
             if let Some((socket, before)) = &host_service_socket {
                 let named = std::fs::symlink_metadata("/run/memcordon/sealed-agent.sock")?;
                 let after = socket.metadata()?;
@@ -1355,6 +1381,8 @@ fn run_recipe_inner(
             .map_err(|e| CiError::Message(e.to_string()))?;
             launch.retire_bundle_exact(&fixture)?;
             Ok(ExecutedCase {
+                frontend_wait,
+                frontend_identity,
                 start,
                 lifetime,
                 prepared_ack,
@@ -1386,7 +1414,11 @@ fn run_recipe_inner(
                 eprintln!("caller directory restoration after unwind: {error}");
             }
             match launch.cancel_and_settle(input.cleanup_cutoff) {
-                Ok(_) => {
+                Ok(receipt) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "original frontend settlement after unwind (interrupt_sent is cleanup action, not producer cause): {receipt}"
+                    );
                     if let Err(error) = launch.retire_bundle_exact(&fixture) {
                         eprintln!("caller input retirement after unwind: {error}");
                     }
@@ -1398,26 +1430,36 @@ fn run_recipe_inner(
     };
     let execution = match restored {
         Ok(()) => execution,
-        Err(error) => Err(CiError::Message(format!(
-            "original case result: {}; caller directory restoration failed: {error}",
-            execution
-                .as_ref()
-                .err()
-                .map_or("observed".into(), ToString::to_string)
-        ))),
+        Err(error) => {
+            let restoration = CiError::from(error).context("caller directory restoration");
+            Err(match execution {
+                Ok(_) => restoration,
+                Err(primary) => CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(restoration),
+                },
+            })
+        }
     };
     match execution {
         Ok(case) => Ok(case),
         Err(primary) => match launch.cancel_and_settle(input.cleanup_cutoff) {
-            Ok(_) => match launch.retire_bundle_exact(&fixture) {
-                Ok(()) => Err(primary),
-                Err(retirement) => Err(CiError::Message(format!(
-                    "{primary}; original caller input retirement: {retirement}"
-                ))),
-            },
-            Err(cleanup) => Err(CiError::Message(format!(
-                "{primary}; original frontend settlement: {cleanup}"
-            ))),
+            Ok(receipt) => {
+                let primary = primary.context(format!(
+                    "original frontend settlement receipt (interrupt_sent is cleanup action, not producer cause): {receipt}"
+                ));
+                match launch.retire_bundle_exact(&fixture) {
+                    Ok(()) => Err(primary),
+                    Err(retirement) => Err(CiError::LaneFailures {
+                        primary: Box::new(primary),
+                        secondary: Box::new(retirement.context("original caller input retirement")),
+                    }),
+                }
+            }
+            Err(cleanup) => Err(CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(cleanup.context("original frontend settlement")),
+            }),
         },
     }
 }
