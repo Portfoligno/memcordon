@@ -2245,6 +2245,17 @@ pub fn check_positive_barrier_result(
         {
             detail.push_str(&format!("; windows-status={status} (0x{status:08X})"));
         }
+        // This is the original abnormal frontend result, before controller
+        // retirement; package uninstall is owned and reported separately.
+        detail.push_str(&format!(
+            "; first-observed-failure-stage=post-install-positive-fixture-barrier; frontend-cleanup-state={:?}; controller-retirement-evidence=not-assessed-at-barrier; original-provider-failure-evidence={}",
+            result.cleanup.state,
+            if result.provider_failure.is_some() {
+                "reported"
+            } else {
+                "not-reported"
+            }
+        ));
         if let Some(rejection) = &result.windows_rejection {
             detail.push_str(&format!("; {}: {}", rejection.code, rejection.detail));
         }
