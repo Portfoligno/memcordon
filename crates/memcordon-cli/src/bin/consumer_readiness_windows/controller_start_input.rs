@@ -316,7 +316,10 @@ impl Session {
                         binding.scope == super::descriptor::matched::Scope::JointListenerPrefix
                     }),
                 )
-            } else if descriptor.case == super::descriptor::Case::Joint {
+            } else if matches!(
+                descriptor.case,
+                super::descriptor::Case::Joint | super::descriptor::Case::Toolchain
+            ) {
                 controller_start::Receiver::joint()
             } else {
                 controller_start::Receiver::default()
@@ -375,8 +378,21 @@ impl Session {
         phase: controller_start::Phase,
         peer: Option<&controller_start::PeerRecipient>,
     ) -> io::Result<()> {
+        use super::operation_context::{Operation, ToolchainOperation, wrap};
+        let observe = |operation, error| {
+            if phase == controller_start::Phase::ToolchainObserverRelease {
+                wrap(Operation::Toolchain(operation), error)
+            } else {
+                error
+            }
+        };
         let timer = memcordon_platform::WindowsSynchronousIoDeadline::start(self.deadline)
-            .map_err(io::Error::other)?;
+            .map_err(|error| {
+                observe(
+                    ToolchainOperation::ObserverDeadlineArm,
+                    io::Error::other(error),
+                )
+            })?;
         let deadline = self.deadline;
         let check = || {
             if Instant::now() >= deadline {
@@ -394,6 +410,7 @@ impl Session {
                     .receive(&mut OriginalInput(self.handle), &self.binding, check)
             }
             controller_start::Phase::ToolchainObserverRelease
+            | controller_start::Phase::PrivatePeerSpawnRelease
             | controller_start::Phase::ProviderPreludeRelease => self.receiver.receive_phase(
                 &mut OriginalInput(self.handle),
                 &self.binding,
@@ -425,16 +442,22 @@ impl Session {
             }
         });
         match (result, settled) {
-            (Ok(()), Ok(())) if Instant::now() >= self.deadline => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "original START cutoff elapsed during deadline settlement",
+            (Ok(()), Ok(())) if Instant::now() >= self.deadline => Err(observe(
+                ToolchainOperation::ObserverDeadlineSettle,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original START cutoff elapsed during deadline settlement",
+                ),
             )),
             (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(io::Error::other(error)),
-            (Err(original), Err(deadline)) => Err(io::Error::new(
-                original.kind(),
-                Failure { original, deadline },
+            (Err(error), Ok(())) => Err(observe(ToolchainOperation::ObserverFrameRead, error)),
+            (Ok(()), Err(error)) => Err(observe(
+                ToolchainOperation::ObserverDeadlineSettle,
+                io::Error::other(error),
+            )),
+            (Err(original), Err(deadline)) => Err(observe(
+                ToolchainOperation::ObserverFrameRead,
+                io::Error::new(original.kind(), Failure { original, deadline }),
             )),
         }
     }

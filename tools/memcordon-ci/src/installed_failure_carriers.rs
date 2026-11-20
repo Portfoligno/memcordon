@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RELATIVE_PATHS: [&str; 27] = [
+pub const RELATIVE_PATHS: [&str; 32] = [
     "windows-installed/C-IO/empty-message/result.callback-failure.json",
     "windows-installed/C-IO/empty-message/result.failed-frontend.json",
     "windows-installed/C-IO/empty-message/result.failed-terminal-observation.json",
@@ -33,6 +33,11 @@ pub const RELATIVE_PATHS: [&str; 27] = [
     "windows-installed/C-IO/native-argv/result.stderr.bin",
     "windows-installed/W-TOOLCHAIN/restricted/result.toolchain-held-gate-summary.json",
     "windows-installed/W-TOOLCHAIN/restricted/result.toolchain-failure-summary.json",
+    "windows-installed/W-TOOLCHAIN/ordinary/result.toolchain-loader-lookup.json",
+    "windows-installed/W-TOOLCHAIN/restricted/result.toolchain-loader-lookup.json",
+    "windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json",
+    "windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json",
+    "windows-installed/windows-reduced-compiler-qualification.json",
 ];
 
 /// These exact leaves are already written by bounded package/recovery capture.

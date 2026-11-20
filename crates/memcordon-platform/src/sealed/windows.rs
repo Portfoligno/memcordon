@@ -364,7 +364,49 @@ pub fn converge_windows_recovery(
 pub fn observe_windows_guardian_attempt(
     guardian_identity: memcordon_core::WindowsProcessIdentityV1,
 ) -> Result<memcordon_core::WindowsGuardianAttemptObservation, String> {
-    let cutoff = Instant::now() + Duration::from_secs(30);
+    observe_guardian_attempt(guardian_identity, None)
+}
+
+pub fn observe_windows_guardian_release(
+    guardian_identity: memcordon_core::WindowsProcessIdentityV1,
+    wait: memcordon_core::WindowsGuardianReleaseWaitV1,
+) -> Result<memcordon_core::WindowsGuardianAttemptObservation, String> {
+    observe_guardian_attempt(guardian_identity, Some(wait))
+}
+
+pub fn windows_guardian_release_cutoff(
+    wait: &memcordon_core::WindowsGuardianReleaseWaitV1,
+) -> Result<Instant, String> {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let sampled = Instant::now();
+    let mut now = 0;
+    let mut frequency = 0;
+    // SAFETY: both outputs are live native scalar storage.
+    if unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
+        || unsafe { QueryPerformanceCounter(&mut now) } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let now = u64::try_from(now).map_err(|error| error.to_string())?;
+    let frequency = u64::try_from(frequency).map_err(|error| error.to_string())?;
+    sampled
+        .checked_add(wait.remaining_at(now, frequency)?)
+        .ok_or_else(|| "original guardian release clock conversion overflowed".into())
+}
+
+fn observe_guardian_attempt(
+    guardian_identity: memcordon_core::WindowsProcessIdentityV1,
+    release_wait: Option<memcordon_core::WindowsGuardianReleaseWaitV1>,
+) -> Result<memcordon_core::WindowsGuardianAttemptObservation, String> {
+    let cutoff = match release_wait.as_ref() {
+        Some(wait) => windows_guardian_release_cutoff(wait)?,
+        None => Instant::now() + Duration::from_secs(30),
+    };
+    let expected_target = release_wait
+        .as_ref()
+        .map(|wait| wait.target_identity.clone());
     let provider = runtime::installed_binding()?;
     let pipe = connect_until(cutoff)?;
     authenticate_peer(pipe.raw())?;
@@ -375,6 +417,7 @@ pub fn observe_windows_guardian_attempt(
             schema_version: WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
             challenge: challenge.clone(),
             guardian_identity: guardian_identity.clone(),
+            release_wait,
         },
         cutoff,
     )?;
@@ -383,6 +426,9 @@ pub fn observe_windows_guardian_attempt(
         || observation.challenge.as_str() != challenge
         || observation.guardian_identity != guardian_identity
         || observation.association.provider != provider
+        || expected_target.as_ref().is_some_and(|target| {
+            observation.live_target_identity.as_ref() != Some(target) || Instant::now() >= cutoff
+        })
     {
         return Err(
             "live guardian observation differs from independently authenticated invocation".into(),

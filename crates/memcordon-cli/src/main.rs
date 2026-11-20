@@ -81,10 +81,20 @@ fn main() {
         argv
     };
     #[cfg(target_os = "windows")]
-    if let [command, pid, birth] = argv.as_slice() {
-        if command == "__observe-windows-guardian" {
-            std::process::exit(commands::windows_guardian_observation(pid, birth));
+    match argv.as_slice() {
+        [command, pid, birth] if command == "__observe-windows-guardian" => {
+            std::process::exit(commands::windows_guardian_observation(pid, birth, None));
         }
+        [command, pid, birth, target, target_birth, cutoff, frequency]
+            if command == "__observe-windows-guardian" =>
+        {
+            std::process::exit(commands::windows_guardian_observation(
+                pid,
+                birth,
+                Some([target, target_birth, cutoff, frequency]),
+            ));
+        }
+        _ => {}
     }
     if let Some(internal) = commands::route_internal(&argv) {
         let code = match internal {

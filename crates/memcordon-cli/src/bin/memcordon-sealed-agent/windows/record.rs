@@ -5490,29 +5490,171 @@ pub fn observe_live_guardian_attempt(
     observe_live_guardian_details(expected).map(|details| details.0)
 }
 
+type LiveGuardianDetails = (
+    memcordon_core::execution_facts::ProviderAttemptAssociationV1,
+    String,
+    WindowsProcessIdentityV1,
+    WindowsWorkerThreadIdentityV1,
+    WindowsProcessIdentityV1,
+);
+
+struct GuardianReleaseSnapshot {
+    details: LiveGuardianDetails,
+    record_binding_sha256: String,
+    revision: u64,
+    state: GuardianReleaseState,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GuardianReleaseState {
+    Pending,
+    Released,
+}
+
+impl GuardianReleaseSnapshot {
+    fn verify_after_pending(&self, pending: &Self) -> Result<(), String> {
+        let expected_revision = match self.state {
+            GuardianReleaseState::Pending => Some(pending.revision),
+            GuardianReleaseState::Released => pending.revision.checked_add(1),
+        };
+        if self.details != pending.details
+            || self.record_binding_sha256 != pending.record_binding_sha256
+            || Some(self.revision) != expected_revision
+        {
+            return Err("guardian record changed beyond the original release transition".into());
+        }
+        Ok(())
+    }
+}
+
+enum GuardianInventoryObservation {
+    OneShot(LiveGuardianDetails),
+    Release(GuardianReleaseSnapshot),
+}
+
+struct GuardianReleaseQuery<'a> {
+    target: &'a WindowsProcessIdentityV1,
+    guardian: &'a OwnedHandle,
+    cutoff: Instant,
+}
+
+impl GuardianReleaseQuery<'_> {
+    fn check_cutoff(&self) -> Result<(), String> {
+        check_guardian_release_cutoff(self.cutoff)
+    }
+
+    fn require_live(
+        &self,
+        expected: &WindowsProcessIdentityV1,
+        phase: GuardianObservationPhase,
+    ) -> Result<(), String> {
+        self.check_cutoff()?;
+        let observation = observe_held_process_liveness(self.guardian.raw(), expected.clone())?;
+        if let Some(detail) = guardian_liveness_refusal(expected, &observation, phase) {
+            return Err(detail);
+        }
+        self.check_cutoff()
+    }
+}
+
+fn check_guardian_release_cutoff(cutoff: Instant) -> Result<(), String> {
+    if Instant::now() >= cutoff {
+        return Err("original guardian release observation cutoff expired".into());
+    }
+    Ok(())
+}
+
 pub fn observe_live_guardian_details(
     expected: &WindowsProcessIdentityV1,
-) -> Result<
-    (
-        memcordon_core::execution_facts::ProviderAttemptAssociationV1,
-        String,
-        WindowsProcessIdentityV1,
-        WindowsWorkerThreadIdentityV1,
-        WindowsProcessIdentityV1,
-    ),
-    String,
-> {
+) -> Result<LiveGuardianDetails, String> {
+    let GuardianInventoryObservation::OneShot(details) = scan_live_guardian(expected, None)? else {
+        unreachable!("one-shot guardian inventory cannot await release");
+    };
+    Ok(details)
+}
+
+pub(super) fn await_live_guardian_release(
+    expected: &WindowsProcessIdentityV1,
+    target: &WindowsProcessIdentityV1,
+    cutoff: Instant,
+) -> Result<LiveGuardianDetails, String> {
+    check_guardian_release_cutoff(cutoff)?;
+    // SAFETY: open a query-only reference to the named PID. Each inventory
+    // proves its birth and liveness through this same retained native handle.
+    let guardian = OwnedHandle::new(unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+            0,
+            expected.process_id,
+        )
+    })?;
+    let query = GuardianReleaseQuery {
+        target,
+        guardian: &guardian,
+        cutoff,
+    };
+    let mut pending = None;
+    loop {
+        let GuardianInventoryObservation::Release(snapshot) =
+            scan_live_guardian(expected, Some(&query))?
+        else {
+            unreachable!("scoped guardian inventory must return a release snapshot");
+        };
+        if let Some(original) = &pending {
+            snapshot.verify_after_pending(original)?;
+        }
+        if snapshot.state == GuardianReleaseState::Released {
+            query.check_cutoff()?;
+            return Ok(snapshot.details);
+        }
+        if pending.is_none() {
+            pending = Some(snapshot);
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(cutoff.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn scan_live_guardian(
+    expected: &WindowsProcessIdentityV1,
+    query: Option<&GuardianReleaseQuery<'_>>,
+) -> Result<GuardianInventoryObservation, String> {
+    let require_live = |phase| {
+        if let Some(query) = query {
+            query.require_live(expected, phase)
+        } else {
+            require_live_guardian(expected, phase)
+        }
+    };
+    if let Some(query) = query {
+        query.check_cutoff()?;
+    }
     let root = attempts_root();
     super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
         .verify_path(&root)?;
-    require_live_guardian(expected, GuardianObservationPhase::BeforeInventory)?;
+    require_live(GuardianObservationPhase::BeforeInventory)?;
     let provider = package::installed_public_provider_binding()?;
     let boot = boot_identity()?;
+    scan_guardian_records(&root, expected, &provider, &boot, query, require_live)
+}
+
+fn scan_guardian_records(
+    root: &Path,
+    expected: &WindowsProcessIdentityV1,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    boot: &str,
+    query: Option<&GuardianReleaseQuery<'_>>,
+    require_live: impl FnOnce(GuardianObservationPhase) -> Result<(), String>,
+) -> Result<GuardianInventoryObservation, String> {
     let mut selected = None;
-    for (index, entry) in fs::read_dir(&root)
+    for (index, entry) in fs::read_dir(root)
         .map_err(|error| error.to_string())?
         .enumerate()
     {
+        if let Some(query) = query {
+            query.check_cutoff()?;
+        }
         if index >= 256 {
             return Err("live association record inventory exceeds its bound".into());
         }
@@ -5537,14 +5679,14 @@ pub fn observe_live_guardian_details(
             duplicate_match: selected.is_some(),
             boot_mismatch: record.boot_identity != boot,
             provider_mismatch: record.provider_generation != provider.generation.as_str(),
-            target_not_released: !record.target_released,
+            target_not_released: query.is_none() && !record.target_released,
             resume_not_attempted: !record.resume_attempted,
             authorization_missing: record.authorization_unix_millis.is_none(),
         };
         if let Some(refusal) = predicates.refusal(expected, record.record_revision) {
             return Err(refusal.to_string());
         }
-        selected = Some((
+        let details = (
             memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
                 provider: provider.clone(),
                 attempt_id: memcordon_core::DiagnosticSha256::try_from(
@@ -5569,10 +5711,80 @@ pub fn observe_live_guardian_details(
                 .target_identity
                 .clone()
                 .ok_or("live released target identity missing")?,
-        ));
+        );
+        let observation = match query {
+            Some(query) => GuardianInventoryObservation::Release(guardian_release_snapshot(
+                record,
+                details,
+                query.target,
+            )?),
+            None => GuardianInventoryObservation::OneShot(details),
+        };
+        selected = Some(observation);
     }
-    require_live_guardian(expected, GuardianObservationPhase::AfterInventory)?;
+    require_live(GuardianObservationPhase::AfterInventory)?;
     selected.ok_or_else(|| "held live guardian has no unique native attempt record".into())
+}
+
+fn guardian_release_snapshot(
+    mut record: WindowsAttemptRecordV1,
+    details: LiveGuardianDetails,
+    expected_target: &WindowsProcessIdentityV1,
+) -> Result<GuardianReleaseSnapshot, String> {
+    let cleanup = &record.cleanup_state;
+    let terminal = &record.terminalization;
+    let diagnostics = &record.causal_diagnostics;
+    if &details.4 != expected_target
+        || details.0.attempt_id == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+        || details.0.request_sha256 == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+        || !details.0.provider.is_consistent()
+        || details.1.len() > 128
+        || details.3.thread_id == 0
+        || details.3.creation_time_100ns == 0
+        || record.provider_incarnation != provider_incarnation()?
+        || record.state != WindowsAttemptStateV1::Authorized
+        || record.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::Executing
+        || terminal.owner != WindowsTerminalizationOwnerV1::LauncherWorker
+        || terminal.checkpoint != WindowsTerminalizationCheckpointV1::Executing
+        || terminal.sequence != 1
+        || terminal.last_error.is_some()
+        || !terminal.secondary_errors.is_empty()
+        || cleanup.termination_requested
+        || cleanup.active_processes_zero
+        || cleanup.guardian_reaped
+        || cleanup.final_handles_closed
+        // The V5 authenticator requires the original recovery authorization,
+        // frozen owner manifest, and publication reservation during execution.
+        || record.authorization_unix_millis.is_none_or(|time| time == 0)
+        || record.terminal_seed.is_some()
+        || record.retirement_proof.is_some()
+        || record.terminal_response_json.is_some()
+        || record.terminal_disposition.is_some()
+        || diagnostics.original != (memcordon_core::OriginalFailureV1::Unavailable {
+            reason: memcordon_core::OriginalUnavailableReasonV1::NoEarlierErrorObserved,
+        })
+        || diagnostics.sequence != 0
+        || diagnostics.loss != memcordon_core::DiagnosticLossV1::default()
+    {
+        return Err("guardian release query requires the original active authorized target".into());
+    }
+    let revision = record.record_revision;
+    let state = if record.target_released {
+        GuardianReleaseState::Released
+    } else {
+        GuardianReleaseState::Pending
+    };
+    // mark_released changes only the flag, then the writer advances revision
+    // and recomputes integrity. Pin everything else in the authenticated image.
+    record.target_released = false;
+    record.record_revision = 0;
+    record.integrity_sha256.clear();
+    Ok(GuardianReleaseSnapshot {
+        details,
+        record_binding_sha256: digest(&canonical_record_bytes(&record)?),
+        revision,
+        state,
+    })
 }
 
 pub fn quarantine_root() -> PathBuf {

@@ -147,7 +147,7 @@ pub fn requirement_class(
     match (key.family.as_str(), key.scenario.as_str()) {
         ("C-IO" | "W-IO", "empty-message")
         | ("W-JOINT", "ordinary" | "restricted" | "endpoint-mismatch")
-        | ("W-TOOLCHAIN", "ordinary" | "restricted")
+        | ("W-TOOLCHAIN", "ordinary" | "restricted" | "group-privilege-reduced")
         | ("W-CHURN", "natural-4096-three-generations")
         | ("W-DESCENDANT", "allowed-token-change") => Some(RequirementClass::ContextualWorkload),
         _ => None,
@@ -190,6 +190,17 @@ pub enum ExecutionDisposition {
     Completed,
     OriginalListenerRefusal {
         raw_os_error: i32,
+    },
+    OriginalPeerSpawnRefusal {
+        raw_os_error: i32,
+    },
+    OriginalCompilerLoaderRefusal {
+        native_status: u32,
+        evidence_sha256: [u8; 32],
+    },
+    OriginalCompilerSpawnRefusal {
+        raw_os_error: i32,
+        evidence_sha256: [u8; 32],
     },
 }
 
@@ -235,6 +246,7 @@ pub enum CoverageKind {
     CoreCompleted,
     ContextualCompleted,
     ObservedListenerPrefix,
+    ObservedCompilerRefusal,
     Unmeasured,
 }
 
@@ -314,10 +326,17 @@ fn derived_coverage(
         evidence: None,
     };
     match execution {
-        ExecutionDisposition::NotRun | ExecutionDisposition::Unvalidated => {}
+        ExecutionDisposition::NotRun
+        | ExecutionDisposition::Unvalidated
+        | ExecutionDisposition::OriginalPeerSpawnRefusal { .. } => {}
         ExecutionDisposition::OriginalListenerRefusal { .. } => {
             result.kind = CoverageKind::ObservedListenerPrefix;
             result.capabilities.listener = CapabilityAvailability::Unavailable;
+        }
+        ExecutionDisposition::OriginalCompilerLoaderRefusal { .. }
+        | ExecutionDisposition::OriginalCompilerSpawnRefusal { .. } => {
+            result.kind = CoverageKind::ObservedCompilerRefusal;
+            result.capabilities.compiler = CapabilityAvailability::Unavailable;
         }
         ExecutionDisposition::Completed => {
             result.kind = if obligation.is_some() {
@@ -339,7 +358,7 @@ fn derived_coverage(
                 ("W-JOINT", "endpoint-mismatch") => {
                     result.capabilities.listener = CapabilityAvailability::Available
                 }
-                ("W-TOOLCHAIN", "ordinary" | "restricted") => {
+                ("W-TOOLCHAIN", "ordinary" | "restricted" | "group-privilege-reduced") => {
                     result.capabilities.compiler = CapabilityAvailability::Available
                 }
                 ("C-LIFETIME", "root-first")
@@ -421,6 +440,20 @@ fn validate_case(
             ComparisonStatus::NotMeasured | ComparisonStatus::MatchedRefusal,
         ) if class == RequirementClass::ContextualWorkload
             && supports_listener_refusal(&record.key) => {}
+        (
+            ExecutionDisposition::OriginalCompilerLoaderRefusal {
+                native_status: 0xc000_0135,
+                evidence_sha256,
+            }
+            | ExecutionDisposition::OriginalCompilerSpawnRefusal {
+                raw_os_error: 5,
+                evidence_sha256,
+            },
+            ComparisonStatus::MatchedRefusal,
+        ) if class == RequirementClass::ContextualWorkload
+            && (record.key.family.as_str(), record.key.scenario.as_str())
+                == ("W-TOOLCHAIN", "restricted")
+            && evidence_sha256 != [0; 32] => {}
         _ => return Err("case execution or scheduled comparison is unvalidated"),
     }
     Ok(derived_coverage(&record.key, contract.execution))
@@ -470,7 +503,10 @@ pub fn assess_suite(
                 if measured.kind == CoverageKind::CoreCompleted {
                     core.insert(record.key.clone());
                 }
-                if measured.kind == CoverageKind::ObservedListenerPrefix {
+                if matches!(
+                    measured.kind,
+                    CoverageKind::ObservedListenerPrefix | CoverageKind::ObservedCompilerRefusal
+                ) {
                     unavailable_cases.push(record.key.clone());
                 }
                 coverage.push(measured);

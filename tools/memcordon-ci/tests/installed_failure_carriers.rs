@@ -100,6 +100,25 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
             .unwrap();
         expected.push(path);
     }
+    for scenario in ["ordinary", "restricted"] {
+        let path = producer_output
+            .join("W-TOOLCHAIN")
+            .join(scenario)
+            .join("result.toolchain-loader-lookup.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"original compiler diagnostic").unwrap();
+        expected.push(path);
+    }
+    for leaf in [
+        "W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json",
+        "W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json",
+        "windows-reduced-compiler-qualification.json",
+    ] {
+        let path = producer_output.join(leaf);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"redacted group-privilege-reduced evidence").unwrap();
+        expected.push(path);
+    }
     for name in [
         "package-uninstall.stdout.bin",
         "package-uninstall.stderr.bin",
@@ -194,17 +213,21 @@ fn absent_priority_does_not_suppress_ordinary_recent_diagnostics() {
 }
 
 #[test]
-fn toolchain_priority_names_only_the_two_redacted_restricted_leaves() {
+fn toolchain_priority_names_only_redacted_diagnostic_leaves() {
     let selected = paths("root")
         .lines()
         .filter(|path| path.contains("W-TOOLCHAIN/"))
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let expected = [
-        "result.toolchain-held-gate-summary.json",
-        "result.toolchain-failure-summary.json",
+        "restricted/result.toolchain-held-gate-summary.json",
+        "restricted/result.toolchain-failure-summary.json",
+        "ordinary/result.toolchain-loader-lookup.json",
+        "restricted/result.toolchain-loader-lookup.json",
+        "group-privilege-reduced/result.group-privilege-reduced-control.json",
+        "group-privilege-reduced/result.reduced-startup-comparison.json",
     ]
-    .map(|leaf| format!("root/windows-installed/W-TOOLCHAIN/restricted/{leaf}"));
+    .map(|leaf| format!("root/windows-installed/W-TOOLCHAIN/{leaf}"));
     assert_eq!(selected, expected);
     // This is the narrow workflow export list. The existing optional full
     // diagnostics recent-file fallback has a separate, unchanged policy.

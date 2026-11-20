@@ -3,6 +3,245 @@ use serde::{Deserialize, Serialize};
 
 pub const RECORD_BYTES: usize = 64 * 1024;
 
+pub const REDUCED_COMPILER_SENTINEL: &str = "reduced-compiler-sentinel.bin";
+pub const REDUCED_COMPILER_OUTPUT: &str = "reduced-compiler-output.bin";
+pub const COMPILER_ADMINISTRATORS_SID: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+pub const COMPILER_AUTHORITY_MEMBERS: usize = 128;
+pub const COMPILER_AUTHORITY_PROBE_BYTES: usize = 15 * 1024;
+#[allow(
+    dead_code,
+    reason = "used by the controller receiving the fixture report"
+)]
+pub const COMPILER_QUALIFICATION_FAILURE_BYTES: usize = 1024;
+const ENABLED_BY_DEFAULT: u32 = 2;
+const ENABLED: u32 = 4;
+const DENY_ONLY: u32 = 16;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompilerQualificationStage {
+    SourceSnapshot,
+    SourceToken,
+    SourceInventory,
+    SourceValidation,
+    AdministratorsSid,
+    CreateRestrictedToken,
+    ReducedInventory,
+    AuthorityReduction,
+    FrontendSetup,
+    CreateSuspendedFrontend,
+    SuspendedToken,
+    ResumeFrontend,
+    ReadFrontendStatus,
+    EffectiveSnapshot,
+    EffectiveValidation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerQualificationFailure {
+    pub stage: CompilerQualificationStage,
+    pub win32: Option<i32>,
+    pub premise: Option<String>,
+}
+
+#[allow(
+    dead_code,
+    reason = "parsing is used on the controller side of the fixture report"
+)]
+impl CompilerQualificationFailure {
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > COMPILER_QUALIFICATION_FAILURE_BYTES {
+            return None;
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(bytes).ok()?;
+        let failure: Self = serde_json::from_slice(bytes).ok()?;
+        if failure.premise.as_ref().is_some_and(|premise| {
+            premise.is_empty()
+                || premise.len() > 170
+                || !premise
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'))
+        }) {
+            return None;
+        }
+        Some(failure)
+    }
+
+    pub fn held_child_status(bytes: &[u8], wrapper_status: Option<i32>) -> Option<i32> {
+        if bytes.len() > 64 {
+            return None;
+        }
+        let status = std::str::from_utf8(bytes)
+            .ok()?
+            .strip_prefix("reduced-compiler-child-exit=")?
+            .strip_suffix('\n')?
+            .parse::<i32>()
+            .ok()?;
+        (Some(status) == wrapper_status && status != 0).then_some(status)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerGroup {
+    pub sid: Vec<u8>,
+    pub attributes: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerPrivilege {
+    pub luid: [u32; 2],
+    pub attributes: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerAuthoritySnapshot {
+    pub token: TokenObservation,
+    pub authentication_id: [u32; 2],
+    pub session_id: u32,
+    pub primary: bool,
+    pub administrators_attributes: u32,
+    pub groups: Vec<CompilerGroup>,
+    pub privileges: Vec<CompilerPrivilege>,
+    pub traversal_luid: [u32; 2],
+}
+
+impl CompilerAuthoritySnapshot {
+    fn bounded(&self) -> bool {
+        self.primary
+            && !self.token.user_sid.is_empty()
+            && self.token.user_sid.len() <= 68
+            && !self.token.restricted
+            && self.token.restricting_sids.is_empty()
+            && self.authentication_id != [0; 2]
+            && self.traversal_luid != [0; 2]
+            && self.groups.len() <= COMPILER_AUTHORITY_MEMBERS
+            && self.privileges.len() <= COMPILER_AUTHORITY_MEMBERS
+            && self
+                .groups
+                .iter()
+                .all(|group| !group.sid.is_empty() && group.sid.len() <= 68)
+            && self
+                .groups
+                .windows(2)
+                .all(|entries| entries[0].sid < entries[1].sid)
+            && self
+                .privileges
+                .windows(2)
+                .all(|entries| entries[0].luid < entries[1].luid)
+            && self
+                .groups
+                .iter()
+                .find(|group| group.sid == COMPILER_ADMINISTRATORS_SID)
+                .is_some_and(|group| group.attributes == self.administrators_attributes)
+    }
+
+    pub fn validate_source(&self) -> Result<(), &'static str> {
+        if !self.bounded() {
+            return Err("reduced compiler source has invalid token shape or inventory");
+        }
+        if self.administrators_attributes & ENABLED == 0
+            || self.administrators_attributes & DENY_ONLY != 0
+        {
+            return Err("reduced compiler source lacks enabled Administrators");
+        }
+        if !self
+            .privileges
+            .iter()
+            .any(|privilege| privilege.luid != self.traversal_luid)
+        {
+            return Err("reduced compiler source lacks removable privileges");
+        }
+        Ok(())
+    }
+
+    pub fn validate_reduced(&self) -> Result<(), &'static str> {
+        if !self.bounded() {
+            return Err("reduced compiler target has invalid token shape or inventory");
+        }
+        if self.administrators_attributes & DENY_ONLY == 0
+            || self.administrators_attributes & (ENABLED | ENABLED_BY_DEFAULT) != 0
+        {
+            return Err("reduced compiler target lacks exclusive deny-only Administrators");
+        }
+        if self
+            .privileges
+            .iter()
+            .any(|privilege| privilege.luid != self.traversal_luid)
+        {
+            return Err("reduced compiler target retains deleted privileges");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_compiler_authority_reduction(
+    source: &CompilerAuthoritySnapshot,
+    reduced: &CompilerAuthoritySnapshot,
+) -> Result<(), &'static str> {
+    source.validate_source()?;
+    reduced.validate_reduced()?;
+    if source.token.user_sid != reduced.token.user_sid
+        || source.token.integrity_rid != reduced.token.integrity_rid
+        || source.authentication_id != reduced.authentication_id
+        || source.session_id != reduced.session_id
+        || source.traversal_luid != reduced.traversal_luid
+        || source.groups.len() != reduced.groups.len()
+    {
+        return Err("reduced compiler token source identity differs");
+    }
+    for (ordinary, actual) in source.groups.iter().zip(&reduced.groups) {
+        // The disabled SID is checked above against the three flags Windows specifies.
+        if ordinary.sid != actual.sid
+            || (ordinary.sid != COMPILER_ADMINISTRATORS_SID
+                && ordinary.attributes != actual.attributes)
+        {
+            return Err("reduced compiler group inventories differ outside the expected reduction");
+        }
+    }
+    if !source
+        .privileges
+        .iter()
+        .filter(|entry| entry.luid == source.traversal_luid)
+        .eq(&reduced.privileges)
+    {
+        return Err("reduced compiler traversal privilege does not match its source");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerAuthorityFileIdentity {
+    pub volume_serial: u32,
+    pub file_index: u64,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerAuthorityProbes {
+    pub challenge_sha256: String,
+    pub effective_token_sha256: String,
+    pub protected: CompilerAuthorityFileIdentity,
+    pub protected_write_win32: u32,
+    pub output_write_verified: bool,
+    pub authority: CompilerAuthoritySnapshot,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerAuthorityOrdinaryControl {
+    pub challenge_sha256: String,
+    pub effective_token_sha256: String,
+    pub protected: CompilerAuthorityFileIdentity,
+    pub protected_write_verified: bool,
+    pub token: TokenObservation,
+    pub authority: CompilerAuthoritySnapshot,
+}
+
 pub fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest;
     const HEX: &[u8; 16] = b"0123456789abcdef";

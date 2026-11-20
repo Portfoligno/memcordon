@@ -444,11 +444,6 @@ fn retain_original_observation(
     witness: super::original_listener_result::OriginalListenerIoFailure,
 ) -> io::Result<()> {
     use super::descriptor::original_listener_observation as observation;
-    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FileRenameInfo,
-        SetFileInformationByHandle,
-    };
     if context.peer {
         return Err(io::Error::other(
             "original listener observation requires root context",
@@ -482,7 +477,28 @@ fn retain_original_observation(
         port: 0,
     };
     let bytes = observation::encode(&value)?;
-    let final_path = context.output_root.join(observation::LEAF);
+    publish_original_observation(
+        context.output_root,
+        context.clock,
+        observation::LEAF,
+        observation::MAX_BYTES,
+        &bytes,
+    )
+}
+
+pub(super) fn publish_original_observation(
+    output_root: &std::path::Path,
+    clock: &super::descriptor::ControlClock,
+    leaf: &str,
+    max_bytes: usize,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FileRenameInfo,
+        SetFileInformationByHandle,
+    };
+    let final_path = output_root.join(leaf);
     let wide: Vec<_> = final_path.as_os_str().encode_wide().collect();
     if !final_path.is_absolute() || wide.len() > 32767 || wide.contains(&0) {
         return Err(io::Error::other(
@@ -491,15 +507,21 @@ fn retain_original_observation(
     }
     let name_bytes = wide
         .len()
-        .checked_mul(2)
+        .checked_mul(std::mem::size_of::<u16>())
         .ok_or_else(|| io::Error::other("original listener rename length overflow"))?;
     let extent = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes)
-        .ok_or_else(|| io::Error::other("original listener rename extent overflow"))?;
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+        .ok_or_else(|| io::Error::other("original listener rename extent overflow"))?
+        .max(std::mem::size_of::<FILE_RENAME_INFO>());
     let mut rename = vec![0usize; extent.div_ceil(std::mem::size_of::<usize>())];
     let info = rename.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let backing_bytes =
+        u32::try_from(std::mem::size_of_val(rename.as_slice())).map_err(io::Error::other)?;
     // SAFETY: owned pointer-aligned storage covers the complete bounded native
-    // filename. Zero initialization selects no replacement and no root handle.
+    // filename and its trailing NUL. Zero initialization selects no replacement
+    // and no root handle. FileNameLength excludes the NUL, but the buffer size
+    // passed to SetFileInformationByHandle includes it and alignment padding.
     unsafe {
         (*info).FileNameLength = u32::try_from(name_bytes).map_err(io::Error::other)?;
         std::ptr::copy_nonoverlapping(
@@ -508,7 +530,7 @@ fn retain_original_observation(
             wide.len(),
         );
     }
-    live(context.clock)?;
+    live(clock)?;
     let mut owner = OpenOptions::new()
         .read(true)
         .write(true)
@@ -517,20 +539,20 @@ fn retain_original_observation(
         .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
         .open(final_path.with_extension("observation-pending"))?;
-    owner.write_all(&bytes)?;
+    owner.write_all(bytes)?;
     owner.sync_all()?;
-    live(context.clock)?;
+    live(clock)?;
     owner.rewind()?;
     let mut readback = Vec::new();
     (&mut owner)
-        .take(observation::MAX_BYTES as u64 + 1)
+        .take(max_bytes as u64 + 1)
         .read_to_end(&mut readback)?;
     if readback != bytes {
         return Err(io::Error::other(
             "original listener observation owned readback differs",
         ));
     }
-    live(context.clock)?;
+    live(clock)?;
     // Final visibility is the commit. Every fallible data/clock/readback step
     // precedes it; a known failed publication cannot leave an accepted leaf.
     // SAFETY: original owned file handle and the complete live native buffer.
@@ -539,7 +561,7 @@ fn retain_original_observation(
             owner.as_raw_handle(),
             FileRenameInfo,
             info.cast(),
-            u32::try_from(extent).map_err(io::Error::other)?,
+            backing_bytes,
         )
     } == 0
     {

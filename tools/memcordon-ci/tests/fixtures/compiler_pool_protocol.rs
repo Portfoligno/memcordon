@@ -48,11 +48,22 @@ impl Drop for Lock {
 impl Protocol {
     pub fn create(root: &Path, budget: usize, deadline: SystemTime) -> io::Result<Self> {
         fs::create_dir(root)?;
+        Self::create_in(root, budget, deadline)
+    }
+
+    /// Publish the protocol after the caller has staged the wrapper binaries.
+    pub fn create_in(root: &Path, budget: usize, deadline: SystemTime) -> io::Result<Self> {
         let millis = deadline
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_millis();
-        fs::write(root.join("protocol"), format!("1 {millis} {budget}\n"))?;
+        writeln!(
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(root.join("protocol"))?,
+            "1 {millis} {budget}"
+        )?;
         fs::write(root.join("state"), "0 0 0\n")?;
         fs::write(root.join("events"), "")?;
         Self::open(root)
@@ -84,9 +95,15 @@ impl Protocol {
             Ok(())
         }
     }
-    fn lock(&self) -> io::Result<Lock> {
+    fn lock(&self, cutoff: Option<Instant>) -> io::Result<Lock> {
         let path = self.root.join("lock");
         loop {
+            if cutoff.is_some_and(|cutoff| Instant::now() >= cutoff) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original coordinator cutoff exhausted",
+                ));
+            }
             match fs::create_dir(&path) {
                 Ok(()) => return Ok(Lock(path)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -114,11 +131,11 @@ impl Protocol {
         })
     }
     pub fn snapshot(&self) -> io::Result<State> {
-        let _lock = self.lock()?;
+        let _lock = self.lock(None)?;
         self.state()
     }
     fn change(&self, role: Role, add: bool) -> io::Result<State> {
-        let _lock = self.lock()?;
+        let _lock = self.lock(None)?;
         let mut state = self.state()?;
         let count = match role {
             Role::Product => &mut state.product,
@@ -200,7 +217,10 @@ impl Protocol {
                     "original coordinator cutoff exhausted",
                 ));
             }
-            let state = self.snapshot()?;
+            let state = {
+                let _lock = self.lock(Some(cutoff))?;
+                self.state()?
+            };
             if state.maximum > self.budget || state.product > 1 {
                 return Err(io::Error::other("compiler observer exceeded capacity"));
             }

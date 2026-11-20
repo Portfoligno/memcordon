@@ -3577,6 +3577,42 @@ impl OuterTestBoundary {
             Ok(())
         }
     }
+
+    pub fn wait_empty_until(&self, cutoff: std::time::Instant) -> io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+        while std::time::Instant::now() < cutoff {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            let mut extent = 0;
+            let size = std::mem::size_of_val(&accounting) as u32;
+            // SAFETY: held Job and bounded accounting output.
+            if unsafe {
+                QueryInformationJobObject(
+                    self.job,
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut accounting).cast(),
+                    size,
+                    &raw mut extent,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if extent != size {
+                return Err(io::Error::other("test Job accounting extent differs"));
+            }
+            if accounting.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            std::thread::yield_now();
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "test Job retirement unproved at original cutoff",
+        ))
+    }
 }
 
 #[cfg(windows)]

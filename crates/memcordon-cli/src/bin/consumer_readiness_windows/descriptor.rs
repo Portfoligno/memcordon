@@ -17,6 +17,8 @@ pub mod matched;
 pub mod matched_plan;
 #[path = "original_listener_observation.rs"]
 pub mod original_listener_observation;
+#[path = "original_peer_spawn_observation.rs"]
+pub mod original_peer_spawn_observation;
 #[path = "stream_bytes.rs"]
 mod stream_bytes;
 #[path = "toolchain_command.rs"]
@@ -32,6 +34,8 @@ pub const CHURN_CREATIONS: u32 = 4096;
 // profile's maximum of 64 simultaneous workload descendants.
 pub const CHURN_LIVE: u32 = 63;
 pub const MAX_TOOLCHAIN_IMAGES: usize = 256;
+pub const MAX_COMPILER_IMPORT_SIBLINGS: usize = 8;
+pub const MAX_COMPILER_LOAD_METADATA: u32 = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +120,10 @@ pub struct Toolchain {
     pub native_work_frequency: u64,
     pub linker_mode: LinkerMode,
     pub input_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_input_root: Option<ToolchainInputRoot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compiler_import_siblings: Vec<CompilerImportSibling>,
     pub rustc: PathBuf,
     pub native_linker: PathBuf,
     pub selected_images: Vec<ToolchainImage>,
@@ -128,6 +136,86 @@ pub struct Toolchain {
     pub target: String,
 }
 
+/// Staged direct import identity for an optional, original debugger observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerImportSibling {
+    pub staged_sha256: memcordon_core::DiagnosticSha256,
+    pub volume_serial: u32,
+    pub file_index: u64,
+    pub byte_length: u64,
+    pub last_write_100ns: u64,
+}
+
+impl CompilerImportSibling {
+    pub fn observed_metadata_matches(
+        &self,
+        identity: (u32, u64),
+        length: u64,
+        write_time: u64,
+    ) -> Option<bool> {
+        ((self.volume_serial, self.file_index) == identity)
+            .then_some(self.byte_length == length && self.last_write_100ns == write_time)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalCompilerLoads {
+    pub matched_staged_sha256: Vec<memcordon_core::DiagnosticSha256>,
+    pub bounded_events: u32,
+    pub unavailable_file_identity: u32,
+    pub events_after_bound: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization: Option<OriginalCompilerInitialization>,
+}
+
+pub const MAX_COMPILER_EXCEPTIONS: usize = 16;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalCompilerException {
+    pub code: u32,
+    pub first_chance: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalCompilerInitialization {
+    pub exceptions: Vec<OriginalCompilerException>,
+    pub exceptions_after_bound: u32,
+    pub observed_exit_status: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainInputRoot {
+    pub volume_serial: u32,
+    pub file_index: u64,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainRootReady {
+    pub input_root: ToolchainInputRoot,
+    pub descriptor_sha256: [u8; 32],
+    pub challenge_sha256: [u8; 32],
+    pub pid: u32,
+    pub birth: u64,
+}
+
+impl ToolchainRootReady {
+    pub fn from_start(input_root: ToolchainInputRoot, binding: &controller_start::Binding) -> Self {
+        Self {
+            input_root,
+            descriptor_sha256: binding.descriptor_sha256,
+            challenge_sha256: controller_start::descriptor_digest(&binding.challenge),
+            pid: binding.pid,
+            birth: binding.birth,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LinkerMode {
@@ -137,6 +225,25 @@ pub enum LinkerMode {
 impl Toolchain {
     pub fn validate_selected_images(&self) -> Result<(), String> {
         toolchain_command::linker_argument(self)?;
+        if self.compiler_import_siblings.len() > MAX_COMPILER_IMPORT_SIBLINGS
+            || (!self.compiler_import_siblings.is_empty() && self.controller_input_root.is_none())
+            || self
+                .compiler_import_siblings
+                .iter()
+                .enumerate()
+                .any(|(index, sibling)| {
+                    sibling.file_index == 0
+                        || sibling.byte_length == 0
+                        || sibling.last_write_100ns == 0
+                        || self.compiler_import_siblings[..index].iter().any(|other| {
+                            (other.volume_serial, other.file_index)
+                                == (sibling.volume_serial, sibling.file_index)
+                                || other.staged_sha256 == sibling.staged_sha256
+                        })
+                })
+        {
+            return Err("compiler direct-import diagnostic selection is invalid".into());
+        }
         let projected = project_toolchain_images(
             self.selected_images
                 .iter()
@@ -243,6 +350,21 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Descriptor {
+    pub fn reduced_compiler_sentinel(&self) -> Option<&Path> {
+        if self.case != Case::Toolchain
+            || self.start_transport
+                != (StartTransport::ControllerStdin {
+                    version: controller_start::VERSION,
+                })
+        {
+            return None;
+        }
+        let [path] = self.denied_write_paths.as_slice() else {
+            return None;
+        };
+        Some(path)
+    }
+
     fn registry_start_version(&self) -> u32 {
         if self.provider_input_experiment {
             if self
@@ -317,6 +439,41 @@ impl Descriptor {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.case == Case::Toolchain
+            && self.denied_write_paths.len() == 1
+            && self.reduced_compiler_sentinel().is_none_or(|path| {
+                !path.is_absolute()
+                    || path
+                        .file_name()
+                        .is_none_or(|leaf| leaf != gate_precondition::REDUCED_COMPILER_SENTINEL)
+                    || path.starts_with(&self.output_root)
+            })
+        {
+            return Err(
+                "reduced compiler sentinel requires its original controller stdin START".into(),
+            );
+        }
+        if self
+            .toolchain
+            .as_ref()
+            .and_then(|input| input.controller_input_root)
+            .is_some_and(|root| {
+                self.case != Case::Toolchain
+                    || self.start_transport
+                        != (StartTransport::ControllerStdin {
+                            version: controller_start::VERSION,
+                        })
+                    || self.matched_control.is_some()
+                    || self.provider_input_experiment
+                    || self.reduced_compiler_sentinel().is_some()
+                    || root.file_index == 0
+            })
+        {
+            return Err(
+                "compiler root custody requires an original standalone stdin Toolchain fixture"
+                    .into(),
+            );
+        }
         if self.case == Case::CapacityCompletion {
             let valid_gate = |name: &String| {
                 name.starts_with("Local\\memcordon-readiness-")
@@ -455,7 +612,7 @@ impl Descriptor {
                         Case::Joint | Case::EndpointMismatch | Case::Churn
                     )
                 } else {
-                    matches!(self.case, Case::Envelope | Case::Joint)
+                    matches!(self.case, Case::Envelope | Case::Joint | Case::Toolchain)
                         || (self.case == Case::BinaryFiles
                             && self.matched_control.as_ref().is_some_and(|binding| {
                                 binding.scope == matched::Scope::BinaryFiles
@@ -463,7 +620,7 @@ impl Descriptor {
                 })
                 || self.start_gate.is_none()
             {
-                return Err("controller stdin requires supported versioned Envelope/Joint control and separate diagnostic name".into());
+                return Err("controller stdin requires a supported versioned fixture case and a separate diagnostic name".into());
             }
             if let Some(input) = &self.control_clock {
                 input.validate()?;

@@ -347,16 +347,17 @@ pub fn assert_job_and_sentinels(sentinels: &[super::descriptor::Sentinel]) -> io
     Ok(())
 }
 
-fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
+pub(super) fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
     let mut length = 0;
     // SAFETY: sizing query does not read a buffer.
     unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length) };
     if length == 0 || length > 64 * 1024 {
         let cause = io::Error::last_os_error();
-        return Err(io::Error::other(format!(
+        let context = format!(
             "token-snapshot GetTokenInformation sizing; class={class}; length={length}; raw-os-error={:?}; cause={cause}; token field exceeds bound",
             cause.raw_os_error()
-        )));
+        );
+        return Err(super::compiler_authority::token_read_error(cause, context));
     }
     let slots = (length as usize).div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0usize; slots];
@@ -371,11 +372,12 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
         )
     } == 0
     {
-        let cause = frontend_os_error("token-snapshot GetTokenInformation read");
-        return Err(io::Error::new(
-            cause.kind(),
-            format!("{cause}; class={class}"),
-        ));
+        let cause = io::Error::last_os_error();
+        let context = format!(
+            "native frontend token-snapshot GetTokenInformation read: raw-os-error={:?}; {cause}; class={class}",
+            cause.raw_os_error()
+        );
+        return Err(super::compiler_authority::token_read_error(cause, context));
     }
     Ok(buffer)
 }
@@ -854,17 +856,23 @@ fn frontend_os_error(operation: &'static str) -> io::Error {
 /// Trusted test launcher only: it changes the frontend caller envelope and waits
 /// for that frontend. The installed provider remains the workload supervisor.
 pub fn restricted_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, true, None, false, None)
+    launch_frontend(arguments, true, None, false, None, false)
 }
 
 pub fn system_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, false, None, true, None)
+    launch_frontend(arguments, false, None, true, None, false)
 }
 
 pub fn system_restricted_frontend(
     arguments: impl Iterator<Item = std::ffi::OsString>,
 ) -> io::Result<i32> {
-    launch_frontend(arguments, true, None, true, None)
+    launch_frontend(arguments, true, None, true, None, false)
+}
+
+pub fn reduced_compiler_frontend(
+    arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> io::Result<i32> {
+    launch_frontend(arguments, false, None, true, None, true)
 }
 
 pub fn system_restricted_gate_control_frontend(
@@ -873,7 +881,14 @@ pub fn system_restricted_gate_control_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("gate control descriptor missing"))?;
-    launch_frontend(arguments, true, None, true, Some(Path::new(&descriptor)))
+    launch_frontend(
+        arguments,
+        true,
+        None,
+        true,
+        Some(Path::new(&descriptor)),
+        false,
+    )
 }
 
 pub fn system_sentinel_frontend(
@@ -882,7 +897,14 @@ pub fn system_sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)), true, None)
+    launch_frontend(
+        arguments,
+        false,
+        Some(Path::new(&descriptor)),
+        true,
+        None,
+        false,
+    )
 }
 
 pub fn sentinel_frontend(
@@ -891,7 +913,14 @@ pub fn sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)), false, None)
+    launch_frontend(
+        arguments,
+        false,
+        Some(Path::new(&descriptor)),
+        false,
+        None,
+        false,
+    )
 }
 
 /// The same private preparation is used once for both members of a matched
@@ -958,8 +987,11 @@ fn launch_frontend(
     sentinel_descriptor: Option<&Path>,
     system_environment: bool,
     gate_control_descriptor: Option<&Path>,
+    reduced_compiler: bool,
 ) -> io::Result<i32> {
     let original_watchdog = std::time::Instant::now() + std::time::Duration::from_secs(660);
+    use super::compiler_authority::{qualification_premise, qualification_stage};
+    use super::descriptor::gate_precondition::CompilerQualificationStage::*;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
         GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
@@ -990,7 +1022,13 @@ fn launch_frontend(
             "restricted frontend argv exceeds its native bound",
         ));
     }
-    let (primary_owned, restricted_owned) = select_frontend_caller(restrict)?;
+    let (primary_owned, restricted_owned, reduced_profile) = if reduced_compiler {
+        let (primary, reduced, profile) = super::compiler_authority::select()?;
+        (primary, reduced, Some(profile))
+    } else {
+        let (primary, restricted) = select_frontend_caller(restrict)?;
+        (primary, restricted, None)
+    };
     // SAFETY: read only this launcher's three standard handles.
     let standard_handles = unsafe {
         [
@@ -1100,7 +1138,7 @@ fn launch_frontend(
         };
         // SAFETY: measured absolute image, reviewed native argv encoder, held
         // token and exact three-handle list. This is never a shell invocation.
-        let token = if restrict {
+        let token = if restrict || reduced_compiler {
             restricted_owned.as_raw_handle()
         } else {
             primary_owned.as_raw_handle()
@@ -1141,13 +1179,44 @@ fn launch_frontend(
             )
         } == 0
         {
+            if reduced_compiler {
+                return Err(qualification_stage(
+                    CreateSuspendedFrontend,
+                    io::Error::last_os_error(),
+                ));
+            }
             return Err(frontend_os_error("CreateProcessAsUserW measured frontend"));
         }
         // SAFETY: returned process/thread references transfer exactly once.
         let process_owned = unsafe { OwnedHandle::from_raw_handle(process.hProcess.cast()) };
         let thread_owned = unsafe { OwnedHandle::from_raw_handle(process.hThread.cast()) };
+        if let Some(expected) = &reduced_profile {
+            let observed = super::compiler_authority::process(&process_owned);
+            if !observed.as_ref().is_ok_and(|actual| actual == expected) {
+                let cause = observed.err().map_or_else(
+                    || {
+                        qualification_premise(
+                            SuspendedToken,
+                            "suspended reduced compiler frontend authority differs",
+                        )
+                    },
+                    |error| qualification_stage(SuspendedToken, error),
+                );
+                if let Err(cleanup) = terminate_frontend(&process_owned) {
+                    eprintln!("reduced compiler suspended frontend cleanup failed: {cleanup}");
+                }
+                return Err(cause);
+            }
+        }
         // SAFETY: only this launcher owns the frontend's initial suspended thread.
         if unsafe { ResumeThread(thread_owned.as_raw_handle()) } == u32::MAX {
+            if reduced_compiler {
+                let cause = qualification_stage(ResumeFrontend, io::Error::last_os_error());
+                if let Err(cleanup) = terminate_frontend(&process_owned) {
+                    eprintln!("reduced compiler frontend cleanup failed: {cleanup}");
+                }
+                return Err(cause);
+            }
             let cause = frontend_os_error("ResumeThread");
             terminate_frontend(&process_owned)?;
             return Err(cause);
@@ -1175,10 +1244,24 @@ fn launch_frontend(
         let mut code = 0;
         // SAFETY: process is held and has reached a terminal state.
         if unsafe { GetExitCodeProcess(process_owned.as_raw_handle(), &mut code) } == 0 {
+            if reduced_compiler {
+                return Err(qualification_stage(
+                    ReadFrontendStatus,
+                    io::Error::last_os_error(),
+                ));
+            }
             return Err(frontend_os_error("GetExitCodeProcess"));
         }
         if code != 0 {
             use std::io::Write;
+            if reduced_compiler {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "reduced-compiler-child-exit={}",
+                    code as i32
+                );
+                return Ok(code as i32);
+            }
             // Fixed native scalar fields bound this diagnostic independently of
             // image paths or argv. A failed diagnostic write must not replace
             // the original held child's exit status.
@@ -1209,6 +1292,10 @@ fn launch_frontend(
             )
         } == 0
         {
+            if reduced_compiler && !matches!(&operation, Ok(0)) {
+                eprintln!("reduced compiler frontend stream restoration failed");
+                continue;
+            }
             return Err(io::Error::last_os_error());
         }
     }

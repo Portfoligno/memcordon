@@ -1173,6 +1173,7 @@ fn handle_control(
             schema_version,
             challenge,
             guardian_identity,
+            release_wait,
         } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
             && !challenge.as_str().is_empty()
             && guardian_identity.process_id != 0
@@ -1181,10 +1182,20 @@ fn handle_control(
             // This read-only path executes under the existing authenticated
             // launcher owner; guardian and record ACLs remain unchanged.
             let provider = super::package::installed_public_provider_binding()?;
+            let cutoff = release_wait
+                .as_ref()
+                .map(memcordon_platform::windows_guardian_release_cutoff)
+                .transpose()?;
             let result: Result<memcordon_core::WindowsGuardianAttemptObservation, String> =
                 (|| {
-                    let (association, nonce, worker, thread, target) =
-                        super::record::observe_live_guardian_details(&guardian_identity)?;
+                    let (association, nonce, worker, thread, target) = match release_wait.as_ref() {
+                        Some(wait) => super::record::await_live_guardian_release(
+                            &guardian_identity,
+                            &wait.target_identity,
+                            cutoff.expect("validated guardian release cutoff"),
+                        ),
+                        None => super::record::observe_live_guardian_details(&guardian_identity),
+                    }?;
                     let observation = memcordon_core::WindowsGuardianAttemptObservation {
                         format: "memcordon.windows-live-guardian-observation".into(),
                         revision: 1,
@@ -1218,7 +1229,10 @@ fn handle_control(
                     )?,
                 ),
             };
-            pipe::write_frame(connection, &response)
+            match cutoff {
+                Some(cutoff) => pipe::write_frame_until(connection, &response, cutoff),
+                None => pipe::write_frame(connection, &response),
+            }
         }
         #[cfg(any(test, feature = "test-support"))]
         WindowsLauncherRequestV4::CertificationMachineRestart { schema_version }

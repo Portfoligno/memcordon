@@ -74,6 +74,139 @@ fn validate(observation: &Observation) -> Result<(), String> {
 }
 
 #[test]
+fn compiler_authority_reduction_requires_actual_group_and_privilege_changes() {
+    use control::{
+        CompilerAuthoritySnapshot, CompilerGroup, CompilerPrivilege,
+        validate_compiler_authority_reduction,
+    };
+    let mut token = input().expected_token;
+    token.restricted = false;
+    token.restricting_sids.clear();
+    token.elevated = true;
+    let traversal = CompilerPrivilege {
+        luid: [23, 0],
+        attributes: 3,
+    };
+    let administrative = CompilerPrivilege {
+        luid: [32, 0],
+        attributes: 0,
+    };
+    let source = CompilerAuthoritySnapshot {
+        token,
+        authentication_id: [12, 0],
+        session_id: 3,
+        primary: true,
+        administrators_attributes: 7,
+        groups: vec![CompilerGroup {
+            sid: control::COMPILER_ADMINISTRATORS_SID.to_vec(),
+            attributes: 7,
+        }],
+        privileges: vec![traversal.clone(), administrative.clone()],
+        traversal_luid: traversal.luid,
+    };
+    let mut reduced = source.clone();
+    reduced.administrators_attributes = 17;
+    reduced.groups[0].attributes = 17;
+    reduced.privileges.pop();
+    assert!(validate_compiler_authority_reduction(&source, &reduced).is_ok());
+    let mut owner_source = source.clone();
+    owner_source.administrators_attributes |= 8;
+    owner_source.groups[0].attributes |= 8;
+    assert!(validate_compiler_authority_reduction(&owner_source, &reduced).is_ok());
+    for attributes in [0, 16 | 2, 16 | 4] {
+        let mut invalid_admin = reduced.clone();
+        invalid_admin.administrators_attributes = attributes;
+        invalid_admin.groups[0].attributes = attributes;
+        assert!(validate_compiler_authority_reduction(&owner_source, &invalid_admin).is_err());
+    }
+    assert!(validate_compiler_authority_reduction(&source, &source).is_err());
+    assert!(validate_compiler_authority_reduction(&reduced, &reduced).is_err());
+    let mut missing_deletion = reduced.clone();
+    missing_deletion.privileges.push(administrative);
+    assert!(validate_compiler_authority_reduction(&source, &missing_deletion).is_err());
+    let mut other_target = reduced.clone();
+    other_target.authentication_id = [13, 0];
+    assert!(validate_compiler_authority_reduction(&source, &other_target).is_err());
+    other_target = reduced.clone();
+    other_target.token.user_sid.push(7);
+    assert!(validate_compiler_authority_reduction(&source, &other_target).is_err());
+    other_target = reduced.clone();
+    other_target.privileges.clear();
+    assert!(validate_compiler_authority_reduction(&source, &other_target).is_err());
+
+    let token_hash = control::sha256(&serde_json::to_vec(&reduced.token).unwrap());
+    let challenge_hash = control::sha256(&[21; 32]);
+    let proof = serde_json::json!({
+        "effective_token_sha256": token_hash,
+        "challenge_sha256": challenge_hash,
+        "protected": {"volume_serial": 7, "file_index": 21},
+        "protected_write_win32": 5,
+        "output_write_verified": true,
+        "authority":reduced,
+    });
+    let parsed: control::CompilerAuthorityProbes = serde_json::from_value(proof.clone()).unwrap();
+    assert!(serde_json::to_vec(&parsed).unwrap().len() <= control::COMPILER_AUTHORITY_PROBE_BYTES);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), proof);
+    let mut changed = proof;
+    changed["administrators_enabled"] = false.into();
+    assert!(serde_json::from_value::<control::CompilerAuthorityProbes>(changed).is_err());
+    let ordinary_bytes = serde_json::to_vec(&source.token).unwrap();
+    let ordinary = serde_json::json!({
+        "effective_token_sha256": control::sha256(&ordinary_bytes),
+        "challenge_sha256": challenge_hash,
+        "protected": {"volume_serial": 7, "file_index": 21},
+        "protected_write_verified": true,
+        "token": source.token,
+        "authority": source,
+    });
+    let observed: control::CompilerAuthorityOrdinaryControl =
+        serde_json::from_value(ordinary.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&observed).unwrap(), ordinary);
+    assert_eq!(
+        [
+            control::REDUCED_COMPILER_SENTINEL,
+            control::REDUCED_COMPILER_OUTPUT
+        ],
+        [
+            "reduced-compiler-sentinel.bin",
+            "reduced-compiler-output.bin"
+        ]
+    );
+}
+
+#[test]
+fn reduced_compiler_qualification_preserves_bounded_failure_origin() {
+    use control::{CompilerQualificationFailure as Failure, CompilerQualificationStage as Stage};
+    for failure in [
+        Failure {
+            stage: Stage::CreateRestrictedToken,
+            win32: Some(87),
+            premise: None,
+        },
+        Failure {
+            stage: Stage::EffectiveValidation,
+            win32: None,
+            premise: Some("reduced compiler target retains deleted privileges".into()),
+        },
+    ] {
+        assert_eq!(
+            Failure::parse(&serde_json::to_vec(&failure).unwrap()),
+            Some(failure)
+        );
+    }
+    assert!(Failure::parse(&[b' '; control::COMPILER_QUALIFICATION_FAILURE_BYTES + 1]).is_none());
+    assert!(Failure::parse(br#"{"stage":"other","win32":7,"premise":null}"#).is_none());
+    assert_eq!(
+        Failure::held_child_status(b"reduced-compiler-child-exit=2\n", Some(2)),
+        Some(2)
+    );
+    assert_eq!(
+        Failure::held_child_status(b"reduced-compiler-child-exit=2\n", Some(3)),
+        None
+    );
+}
+
+#[test]
 fn optional_native_trace_never_changes_original_result_or_grants_authority() {
     let mut actual = observation(false);
     actual.original_call_trace = Some(serde_json::json!({

@@ -1,4 +1,4 @@
-//! Start-gate-only selected waiter policy. Other event roles keep their policy.
+//! Selected waiter policy for start gates and the Limited Toolchain observer gate.
 use std::io;
 pub const BASE_SDDL: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x00100000;;;RC)";
 pub const WAIT_ACCESS: u32 = 0x0010_0000;

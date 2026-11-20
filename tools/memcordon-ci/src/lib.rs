@@ -113,6 +113,9 @@ pub mod windows_readiness_native_tests;
 pub mod windows_readiness_refusals;
 #[cfg(windows)]
 mod windows_receipt_identity;
+#[cfg(windows)]
+mod windows_toolchain_file_trace;
+pub mod windows_toolchain_lookup_record;
 #[doc(hidden)]
 pub mod work_outcome;
 pub mod workflow_definitions;

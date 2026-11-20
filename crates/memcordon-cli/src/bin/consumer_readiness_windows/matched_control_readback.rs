@@ -38,7 +38,7 @@ pub(super) fn token_hash(clock: &super::descriptor::ControlClock) -> io::Result<
     Ok(hash)
 }
 
-fn environment() -> io::Result<Vec<memcordon_core::WindowsEnvironmentEntryV1>> {
+pub(super) fn environment() -> io::Result<Vec<memcordon_core::WindowsEnvironmentEntryV1>> {
     use windows_sys::Win32::System::Environment::{
         FreeEnvironmentStringsW, GetEnvironmentStringsW,
     };

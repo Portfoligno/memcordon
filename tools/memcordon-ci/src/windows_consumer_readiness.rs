@@ -30,6 +30,8 @@ mod guardian_query;
 pub mod matched_control_input_record;
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/matched_control_report.rs"]
 pub mod matched_control_report;
+#[path = "../../../crates/memcordon-cli/src/toolchain_creation_ack.rs"]
+mod toolchain_creation_ack;
 
 /// A scoped measurement is positive only after every declared operation completes.
 /// Matching stopped failures remain observations, never positive coverage.
@@ -233,6 +235,28 @@ pub struct CaseKey {
     pub scenario: String,
 }
 
+#[derive(Clone, Copy)]
+pub enum GuardianReleaseWaitScope {
+    MandatoryPositiveSuite,
+    ExistingCaseSelection,
+}
+
+impl GuardianReleaseWaitScope {
+    pub fn waits_for_original_release(self, key: &CaseKey) -> bool {
+        match self {
+            Self::MandatoryPositiveSuite => true,
+            Self::ExistingCaseSelection => waits_for_original_guardian_release(key),
+        }
+    }
+}
+
+pub fn waits_for_original_guardian_release(key: &CaseKey) -> bool {
+    matches!(
+        (key.family.as_str(), key.scenario.as_str()),
+        ("W-IO", "empty-message") | ("C-STATUS", "deadline") | ("W-TOOLCHAIN", "restricted")
+    )
+}
+
 pub fn controller_case_directory(output_directory: &Path, key: &CaseKey) -> PathBuf {
     output_directory.join(&key.family).join(&key.scenario)
 }
@@ -269,6 +293,8 @@ pub fn loader_fileio_retention(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderExperimentRecord {
     ListenerTrace,
+    OriginalListenerObservation,
+    OriginalPeerSpawnObservation,
     PeerListenerTrace,
     NativeFileRequests,
     PeerNativeFileRequests,
@@ -295,8 +321,10 @@ pub enum ProviderExperimentRecord {
 }
 
 impl ProviderExperimentRecord {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 26] = [
         Self::ListenerTrace,
+        Self::OriginalListenerObservation,
+        Self::OriginalPeerSpawnObservation,
         Self::PeerListenerTrace,
         Self::NativeFileRequests,
         Self::PeerNativeFileRequests,
@@ -325,6 +353,8 @@ impl ProviderExperimentRecord {
     pub fn leaf(self) -> &'static str {
         match self {
             Self::ListenerTrace => "listener-call-trace.json",
+            Self::OriginalListenerObservation => descriptor::original_listener_observation::LEAF,
+            Self::OriginalPeerSpawnObservation => descriptor::original_peer_spawn_observation::LEAF,
             Self::PeerListenerTrace => "peer-listener-call-trace.json",
             Self::NativeFileRequests => "listener-native-file-requests.json",
             Self::PeerNativeFileRequests => "peer-listener-native-file-requests.json",
@@ -405,6 +435,11 @@ impl ProviderExperimentRecord {
         fixture_output: &Path,
     ) -> PathBuf {
         match self {
+            Self::OriginalListenerObservation | Self::OriginalPeerSpawnObservation => {
+                controller_case_directory(controller_output, key)
+                    .join("result.json")
+                    .with_extension(self.leaf())
+            }
             Self::NativeListener
             | Self::NativeTcpPeer
             | Self::LoaderFileIo
@@ -485,6 +520,59 @@ pub struct CaseInput {
 }
 
 pub use descriptor::gate_precondition::TokenObservation;
+
+pub(crate) fn reduced_compiler_toolchain(key: &CaseKey) -> bool {
+    (key.family.as_str(), key.scenario.as_str()) == ("W-TOOLCHAIN", "group-privilege-reduced")
+}
+
+#[cfg(windows)]
+fn reduced_compiler_sentinel(directory: &Path) -> PathBuf {
+    directory
+        .join("group-privilege-reduced-protected")
+        .join(descriptor::gate_precondition::REDUCED_COMPILER_SENTINEL)
+}
+
+pub fn validate_reduced_compiler_probes(
+    bytes: &[u8],
+    challenge: &[u8],
+    token: &[u8],
+) -> Result<descriptor::gate_precondition::CompilerAuthorityProbes> {
+    use descriptor::gate_precondition::{
+        COMPILER_AUTHORITY_PROBE_BYTES, CompilerAuthorityProbes, sha256,
+    };
+    if bytes.len() > COMPILER_AUTHORITY_PROBE_BYTES {
+        return Err(CiError::Message(
+            "group-privilege-reduced probe exceeds bound".into(),
+        ));
+    }
+    let probe: CompilerAuthorityProbes = serde_json::from_slice(bytes)?;
+    probe
+        .authority
+        .validate_reduced()
+        .map_err(|reason| CiError::Message(reason.into()))?;
+    if probe.authority.token != serde_json::from_slice::<TokenObservation>(token)?
+        || probe.challenge_sha256 != sha256(challenge)
+        || probe.effective_token_sha256 != sha256(token)
+        || probe.protected.file_index == 0
+        || probe.protected_write_win32 != 5
+        || !probe.output_write_verified
+    {
+        return Err(CiError::Message(
+            "group-privilege-reduced probe differs from its bound challenge, token, or access result"
+                .into(),
+        ));
+    }
+    Ok(probe)
+}
+
+#[cfg(windows)]
+const REDUCED_COMPILER_SOURCE: &str = "windows-reduced-compiler-source.json";
+#[cfg(windows)]
+const REDUCED_COMPILER_SELECTED: &str = "windows-reduced-compiler-token.json";
+#[cfg(windows)]
+const REDUCED_COMPILER_FAILURE: &str = "windows-reduced-compiler-qualification.json";
+#[cfg(windows)]
+const COMPILER_AUTHORITY_BYTES: usize = descriptor::gate_precondition::RECORD_BYTES;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -813,7 +901,10 @@ pub fn positive_keys() -> BTreeSet<CaseKey> {
             "W-JOINT",
             &["ordinary", "restricted", "endpoint-mismatch"][..],
         ),
-        ("W-TOOLCHAIN", &["ordinary", "restricted"][..]),
+        (
+            "W-TOOLCHAIN",
+            &["ordinary", "restricted", "group-privilege-reduced"][..],
+        ),
         (
             "W-IO",
             &[
@@ -881,49 +972,13 @@ pub fn validate_suite(input: &SuiteInput) -> Result<()> {
             "matched observations are separate from required full-positive suite inputs".into(),
         ));
     }
-    if input.format != "memcordon.windows-readiness-input" || input.revision != 2 {
-        return Err(CiError::Message(
-            "unsupported Windows readiness input format/revision".into(),
-        ));
-    }
+    validate_input_header(input)?;
     let mut keys = BTreeSet::new();
     for case in &input.cases {
         if !keys.insert(case.key.clone()) {
             return Err(CiError::Message("duplicate Windows positive case".into()));
         }
-        validate_descriptor(&case.key, &case.descriptor)?;
-        if !case.workload_request.is_absolute()
-            || !case.descriptor_path.is_absolute()
-            || matches!(
-                case.key.scenario.as_str(),
-                "restricted" | "restricted-token-preserved"
-            ) && !case.expected_token.restricted
-        {
-            return Err(CiError::Message(
-                "case input lacks exact contract/path/caller binding".into(),
-            ));
-        }
-        validate_vectors(case)?;
-        let expected = expected_fixture_case(&case.key)?;
-        if case.descriptor.case != expected {
-            return Err(CiError::Message(
-                "case descriptor substituted another positive workload".into(),
-            ));
-        }
-        let status = expected_status(&case.key);
-        if case.descriptor.application_status != status {
-            return Err(CiError::Message(
-                "case descriptor substituted target outcome".into(),
-            ));
-        }
-        if matches!(case.key.family.as_str(), "W-JOINT" | "W-ENVELOPE")
-            && case.key.scenario == "restricted"
-            && case.descriptor.denied_write_paths.len() < 2
-        {
-            return Err(CiError::Message(
-                "restricted composite must probe protected driver/provider writes".into(),
-            ));
-        }
+        validate_case_input(case)?;
     }
     if keys != positive_keys() {
         return Err(CiError::Message(
@@ -931,6 +986,72 @@ pub fn validate_suite(input: &SuiteInput) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_input_header(input: &SuiteInput) -> Result<()> {
+    if input.format != "memcordon.windows-readiness-input" || input.revision != 2 {
+        return Err(CiError::Message(
+            "unsupported Windows readiness input format/revision".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_case_input(case: &CaseInput) -> Result<()> {
+    validate_descriptor(&case.key, &case.descriptor)?;
+    if !case.workload_request.is_absolute()
+        || !case.descriptor_path.is_absolute()
+        || matches!(
+            case.key.scenario.as_str(),
+            "restricted" | "restricted-token-preserved"
+        ) && !case.expected_token.restricted
+    {
+        return Err(CiError::Message(
+            "case input lacks exact contract/path/caller binding".into(),
+        ));
+    }
+    validate_vectors(case)?;
+    let expected = expected_fixture_case(&case.key)?;
+    if case.descriptor.case != expected {
+        return Err(CiError::Message(
+            "case descriptor substituted another positive workload".into(),
+        ));
+    }
+    let status = expected_status(&case.key);
+    if case.descriptor.application_status != status {
+        return Err(CiError::Message(
+            "case descriptor substituted target outcome".into(),
+        ));
+    }
+    if matches!(case.key.family.as_str(), "W-JOINT" | "W-ENVELOPE")
+        && case.key.scenario == "restricted"
+        && case.descriptor.denied_write_paths.len() < 2
+    {
+        return Err(CiError::Message(
+            "restricted composite must probe protected driver/provider writes".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn provider_joint_input(input: SuiteInput, scenario: &str) -> Result<CaseInput> {
+    validate_input_header(&input)?;
+    let [case]: [CaseInput; 1] = input.cases.try_into().map_err(|_| {
+        CiError::Message("experiment requires exactly one prepared Joint row".into())
+    })?;
+    if !matches!(scenario, "ordinary" | "restricted")
+        || case.key.family != "W-JOINT"
+        || case.key.scenario != scenario
+        || case.expected_token.restricted != (scenario == "restricted")
+        || case.descriptor.matched_control.is_some()
+        || case.descriptor.provider_input_experiment
+    {
+        return Err(CiError::Message(
+            "experiment Joint row or caller profile differs".into(),
+        ));
+    }
+    validate_case_input(&case)?;
+    Ok(case)
 }
 
 /// Preserve the entire catalogue while running independent prepared core
@@ -947,6 +1068,7 @@ pub fn readiness_execution_order(keys: &[CaseKey]) -> Result<Vec<usize>> {
         (
             crate::windows_readiness_policy::requirement_class(&keys[*index])
                 == Some(crate::windows_readiness_policy::RequirementClass::ContextualWorkload),
+            reduced_compiler_toolchain(&keys[*index]),
             keys[*index].clone(),
         )
     });
@@ -1160,6 +1282,29 @@ pub fn prepare_gate_clock(
 
 /// Validate the actual input once complete, retaining its case and wire-size boundary.
 pub fn validate_descriptor(key: &CaseKey, descriptor: &descriptor::Descriptor) -> Result<()> {
+    let sentinel = descriptor.reduced_compiler_sentinel().is_some_and(|path| {
+        path.file_name()
+            .is_some_and(|name| name == descriptor::gate_precondition::REDUCED_COMPILER_SENTINEL)
+            && path.is_absolute()
+            && !path.starts_with(&descriptor.output_root)
+    });
+    if reduced_compiler_toolchain(key) != sentinel
+        || (descriptor.case == descriptor::Case::Toolchain
+            && descriptor.denied_write_paths.len() == 1
+            && !sentinel)
+    {
+        return Err(CiError::Message(
+            "group-privilege-reduced compiler sentinel scope differs".into(),
+        ));
+    }
+    if descriptor
+        .toolchain
+        .as_ref()
+        .is_some_and(|input| input.controller_input_root.is_some())
+        && (key.family.as_str(), key.scenario.as_str()) != ("W-TOOLCHAIN", "restricted")
+    {
+        return Err(CiError::Message("controller compiler root custody is restricted to the original standalone restricted case".into()));
+    }
     if (descriptor.case == descriptor::Case::CapacityCompletion || key.family == "W-CAPACITY")
         && (descriptor.case != descriptor::Case::CapacityCompletion
             || !crate::windows_readiness_capacity::required_keys().contains(key))
@@ -1226,6 +1371,7 @@ pub fn expected_start_transport(key: &CaseKey) -> descriptor::StartTransport {
         ("W-ENVELOPE", "restricted")
             | ("W-BINDING", "restricted-token-preserved")
             | ("W-JOINT", "restricted")
+            | ("W-TOOLCHAIN", "restricted" | "group-privilege-reduced")
     ) {
         descriptor::StartTransport::ControllerStdin {
             version: descriptor::controller_start::VERSION,
@@ -1479,6 +1625,8 @@ pub(crate) fn public_component_command(
 enum FrontendObservation<'a> {
     Terminal,
     #[cfg(windows)]
+    ReducedCompilerSnapshot,
+    #[cfg(windows)]
     Request,
     #[cfg(windows)]
     None,
@@ -1579,7 +1727,12 @@ fn public_command_observation(
     case: &CaseInput,
     observation: FrontendObservation<'_>,
 ) -> Result<crate::command::CommandSpec> {
-    let terminal_observation = matches!(observation, FrontendObservation::Terminal);
+    #[cfg(windows)]
+    let reduced_snapshot = matches!(observation, FrontendObservation::ReducedCompilerSnapshot);
+    #[cfg(not(windows))]
+    let reduced_snapshot = false;
+    let terminal_observation =
+        matches!(observation, FrontendObservation::Terminal) || reduced_snapshot;
     let system_environment = terminal_observation
         || matches!(
             observation,
@@ -1626,8 +1779,12 @@ fn public_command_observation(
     args.push("--".into());
     args.push(std::path::absolute(fixture)?.into_os_string());
     args.push("consumer-readiness-windows".into());
-    args.push(case.descriptor_path.clone().into_os_string());
-    args.extend(case.descriptor.arguments.iter().map(OsString::from));
+    if reduced_snapshot {
+        args.push("reduced-compiler-snapshot".into());
+    } else {
+        args.push(case.descriptor_path.clone().into_os_string());
+        args.extend(case.descriptor.arguments.iter().map(OsString::from));
+    }
     if let FrontendObservation::Diagnostic {
         selection,
         observation,
@@ -1644,7 +1801,22 @@ fn public_command_observation(
         .collect();
     }
     let cli = std::path::absolute(cli)?;
-    if case.expected_token.restricted {
+    if reduced_compiler_toolchain(&case.key) {
+        let args: Vec<_> = [
+            OsString::from("consumer-readiness-windows"),
+            OsString::from("system-reduced-compiler-frontend"),
+            cli.into_os_string(),
+        ]
+        .into_iter()
+        .chain(args)
+        .collect();
+        Ok(crate::command::CommandSpec::new(
+            std::path::absolute(fixture)?,
+            &std::path::absolute(directory)?,
+            Duration::from_secs(660),
+        )
+        .args(args))
+    } else if case.expected_token.restricted {
         let gate_control = terminal_observation && case.descriptor.gate_precondition.is_some();
         let mut restricted: Vec<OsString> = vec![
             "consumer-readiness-windows".into(),
@@ -1848,6 +2020,85 @@ fn live_events(bytes: &[u8]) -> Result<Vec<Event>> {
     decode_events(bytes, true)
 }
 
+pub fn standalone_toolchain_observer_ready(
+    bytes: &[u8],
+    binding: &descriptor::controller_start::Binding,
+    input_root: Option<descriptor::ToolchainInputRoot>,
+) -> Result<bool> {
+    let events = decode_events(bytes, true)?;
+    standalone_toolchain_ready_events(&events, binding, input_root)
+}
+
+pub fn standalone_toolchain_ended_transcript(
+    bytes: &[u8],
+    binding: &descriptor::controller_start::Binding,
+    input_root: descriptor::ToolchainInputRoot,
+) -> Result<bool> {
+    let events = decode_events(bytes, false)?;
+    let stages = [
+        "started",
+        "native-argv-observed",
+        "sentinel-handles-excluded",
+        "token-envelope",
+        "controller-released",
+        "toolchain-ready-for-native-observer",
+    ];
+    if events.len() != stages.len()
+        || events.iter().zip(stages).any(|(event, stage)| {
+            event.stage != stage || event.pid != binding.pid || event.ordinal.is_some()
+        })
+        || events[0].value != binding.challenge
+    {
+        return Ok(false);
+    }
+    standalone_toolchain_ready_events(&events, binding, Some(input_root))
+}
+
+fn standalone_toolchain_ready_events(
+    events: &[Event],
+    binding: &descriptor::controller_start::Binding,
+    input_root: Option<descriptor::ToolchainInputRoot>,
+) -> Result<bool> {
+    let mut barriers = events.iter().filter(|event| {
+        matches!(
+            event.stage.as_str(),
+            "controller-released" | "toolchain-ready-for-native-observer"
+        )
+    });
+    let is_stage = |event: &Event, stage| {
+        event.stage == stage && event.pid == binding.pid && event.ordinal.is_none()
+    };
+    let differs =
+        || CiError::Message("original standalone toolchain observer barrier differs".into());
+    let Some(start) = barriers.next() else {
+        return Ok(false);
+    };
+    if !is_stage(start, "controller-released") || start.value != binding.challenge {
+        return Err(differs());
+    }
+    let Some(ready) = barriers.next() else {
+        return Ok(false);
+    };
+    if !is_stage(ready, "toolchain-ready-for-native-observer") || barriers.next().is_some() {
+        return Err(differs());
+    }
+    let valid = match input_root {
+        Some(input_root) => {
+            ready.value.len() <= 512
+                && serde_json::from_slice::<descriptor::ToolchainRootReady>(&ready.value).is_ok_and(
+                    |observed| {
+                        observed == descriptor::ToolchainRootReady::from_start(input_root, binding)
+                    },
+                )
+        }
+        None => ready.value == binding.challenge,
+    };
+    if !valid {
+        return Err(differs());
+    }
+    Ok(true)
+}
+
 #[cfg(windows)]
 pub(crate) fn provider_prelude_complete(
     bytes: &[u8],
@@ -2025,6 +2276,7 @@ pub fn released_target_loader_event_candidate(result: &ResultV3) -> bool {
 }
 
 /// Original frontend exit observations retained by the running controller.
+#[derive(Clone, Copy)]
 pub struct FrontendExit {
     pub status: i32,
     pub original_pid: Option<u32>,
@@ -2046,6 +2298,17 @@ pub struct IntrinsicListenerInput<'a> {
     pub observation: &'a [u8],
 }
 
+fn private_provider_listener_refusal_scope(case: &CaseInput) -> bool {
+    case.key.family == "W-JOINT"
+        && case.key.scenario == "restricted"
+        && case.descriptor.case == descriptor::Case::Joint
+        && case.descriptor.provider_input_experiment
+        && case.descriptor.provider_input_binding.is_some()
+        && case.descriptor.matched_control.is_none()
+        && case.descriptor.completion_gate.is_none()
+        && case.descriptor.descendant_gate.is_none()
+}
+
 pub fn assess_original_listener_unavailable(
     input: IntrinsicListenerInput<'_>,
 ) -> Result<descriptor::original_listener_observation::Observation> {
@@ -2054,7 +2317,8 @@ pub fn assess_original_listener_unavailable(
     if !crate::windows_readiness_policy::supports_listener_refusal(&case.key)
         || expected_fixture_case(&case.key)? != case.descriptor.case
         || case.descriptor.matched_control.is_some()
-        || case.descriptor.provider_input_experiment
+        || (case.descriptor.provider_input_experiment
+            && !private_provider_listener_refusal_scope(case))
     {
         return Err(CiError::Message(
             "case does not support intrinsic listener refusal".into(),
@@ -2227,6 +2491,27 @@ pub fn assess(
             "native target token differs from protected caller expectation".into(),
         ));
     }
+    if reduced_compiler_toolchain(&case.key) {
+        let mut checks = event
+            .iter()
+            .filter(|event| event.stage == "reduced-compiler-probes");
+        let proof = checks.next().ok_or_else(|| {
+            CiError::Message(
+                "group-privilege-reduced compiler did not prove its access boundaries".into(),
+            )
+        })?;
+        if proof.pid != first.pid || proof.ordinal.is_some() || checks.next().is_some() {
+            return Err(CiError::Message(
+                "group-privilege-reduced compiler did not prove its held caller and access boundaries"
+                    .into(),
+            ));
+        }
+        validate_reduced_compiler_probes(
+            &proof.value,
+            &case.descriptor.challenge,
+            &envelope.value,
+        )?;
+    }
     if (case.key.scenario == "sentinel-handles" || case.descriptor.matched_control.is_some())
         && !event.iter().any(|event| {
             event.stage == "sentinel-handles-excluded" && event.value == 1u32.to_le_bytes()
@@ -2387,6 +2672,238 @@ pub fn validate_retirement(result: &ResultV3) -> Result<()> {
         return Err(CiError::Message(
             "native Windows boundary or authoritative retirement is incomplete".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Join the original frontend ResultV3 with its authenticated terminal and
+/// the provider attempt observed while the same root was held live.
+pub fn validate_peer_spawn_job_retirement(
+    result: &ResultV3,
+    terminal: &memcordon_core::WindowsTerminalReceiptV3,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
+    authority: &str,
+    live: &memcordon_core::execution_facts::ProviderAttemptAssociationV1,
+    live_nonce: &str,
+    root: &memcordon_core::WindowsProcessIdentityV1,
+) -> Result<()> {
+    validate_held_application_job_retirement(
+        result,
+        terminal,
+        delivery,
+        authority,
+        live,
+        live_nonce,
+        root,
+        2,
+        "original private peer Job retirement evidence differs",
+    )
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum ReducedStartupFrontend {
+    OriginalCallback {
+        observed_status: Option<i32>,
+        cleanup_status: Option<i32>,
+    },
+    Comparison {
+        observed_status: Option<i32>,
+    },
+}
+
+pub fn classify_reduced_console_pair(record: &serde_json::Value) -> Option<&'static str> {
+    let settled = |leg: &serde_json::Value| {
+        leg["natural_exit"] == true
+            && leg["job_empty_verified"] == true
+            && leg["suspended_token_and_image_verified"] == true
+            && leg["pid"]
+                .as_u64()
+                .is_some_and(|pid| (1..=u64::from(u32::MAX)).contains(&pid))
+            && leg["birth"].as_u64().is_some_and(|birth| birth != 0)
+    };
+    let baseline = &record["baseline"];
+    let detached = &record["detached"];
+    if record["state"] != "complete"
+        || record["desktop_closed"] != true
+        || [
+            "reduced_primary",
+            "desktop",
+            "stdio_endpoints",
+            "creation_job",
+        ]
+        .into_iter()
+        .any(|field| record["same_held_inputs"][field] != true)
+        || !settled(baseline)
+        || !settled(detached)
+        || baseline["flags"] != 0x0008_0604
+        || detached["flags"] != 0x0008_060c
+        || (baseline["pid"] == detached["pid"] && baseline["birth"] == detached["birth"])
+    {
+        return None;
+    }
+    Some(
+        match (
+            baseline["native_status"].as_u64(),
+            detached["native_status"].as_u64(),
+            detached["snapshot_matches"].as_bool(),
+            baseline["snapshot_matches"].as_bool(),
+        ) {
+            (Some(0xc000_0142), Some(0), Some(true), Some(false))
+                if baseline["stdout_bytes"] == 0 =>
+            {
+                "detachment-changed-fixture-startup"
+            }
+            (Some(0xc000_0142), Some(0xc000_0142), _, _) => {
+                "detachment-did-not-resolve-fixture-startup"
+            }
+            (Some(0), Some(0), Some(true), Some(true)) => "fixture-baseline-did-not-reproduce",
+            _ => "inconclusive",
+        },
+    )
+}
+
+/// Wrapper status is authenticated by the product receipt. An outer
+/// frontend wait is independent evidence and may have been interrupted.
+pub fn validate_reduced_startup_settlement(
+    result: &ResultV3,
+    terminal: &memcordon_core::WindowsTerminalReceiptV3,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
+    authority: &str,
+    frontend: ReducedStartupFrontend,
+) -> Result<()> {
+    let expected = result.outcome.wrapper_status;
+    match frontend {
+        ReducedStartupFrontend::OriginalCallback {
+            observed_status, ..
+        } => {
+            if observed_status.is_some_and(|status| status != expected) {
+                return Err(CiError::Message(
+                    "original natural frontend exit differs from product wrapper status".into(),
+                ));
+            }
+        }
+        ReducedStartupFrontend::Comparison { observed_status } => {
+            if observed_status != Some(expected) {
+                return Err(CiError::Message(
+                    "comparison lacks a matching natural frontend exit".into(),
+                ));
+            }
+        }
+    }
+    if result.release != ReleaseKnowledgeV3::Released
+        || result.outcome.kind != OutcomeKindV1::Completed
+    {
+        return Err(CiError::Message(
+            "installed startup product did not complete and release".into(),
+        ));
+    }
+    let root = current_native(result)?
+        .target_identity
+        .as_ref()
+        .ok_or_else(|| {
+            CiError::Message("installed startup terminal lacks a target identity".into())
+        })?;
+    let status = match result.outcome.native_termination.as_ref() {
+        Some(ChildTermination::WindowsStatus { status }) => *status,
+        Some(ChildTermination::ExitCode { code }) => *code as u32,
+        _ => {
+            return Err(CiError::Message(
+                "installed startup terminal lacks a target status".into(),
+            ));
+        }
+    };
+    validate_held_application_job_retirement(
+        result,
+        terminal,
+        delivery,
+        authority,
+        current_association(result)?,
+        &terminal.nonce,
+        root,
+        status,
+        "installed startup product retirement differs",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_held_application_job_retirement(
+    result: &ResultV3,
+    terminal: &memcordon_core::WindowsTerminalReceiptV3,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
+    authority: &str,
+    live: &memcordon_core::execution_facts::ProviderAttemptAssociationV1,
+    live_nonce: &str,
+    root: &memcordon_core::WindowsProcessIdentityV1,
+    expected_status: u32,
+    mismatch: &'static str,
+) -> Result<()> {
+    use memcordon_core::{
+        BoundaryMechanismEvidence, RunOutcome, WindowsProviderResponseV4,
+        WindowsRetirementProofSourceV2,
+    };
+    let differs = || CiError::Message(mismatch.into());
+    validate_retirement(result)?;
+    terminal
+        .validate_for_attempt()
+        .map_err(|error| CiError::Message(error.into()))?;
+    let native = current_native(result)?;
+    let proof = &terminal.retirement_proof;
+    let Some((
+        child_pid,
+        RunOutcome::Exited { child, cleanup, .. },
+        BoundaryMechanismEvidence::WindowsJobObjectV3(boundary),
+    )) = terminal.execution()
+    else {
+        return Err(differs());
+    };
+    memcordon_core::canonical_json::reject_duplicate_json_keys(authority.as_bytes())
+        .map_err(CiError::Message)?;
+    let response: WindowsProviderResponseV4 = serde_json::from_str(authority)?;
+    if !matches!(response, WindowsProviderResponseV4::Terminal(held) if held == *terminal)
+        || !delivery.is_consistent()
+        || crate::windows_causal_acceptance::sha256(authority.as_bytes())
+            != delivery.terminal_sha256
+        || native.frontend_delivery.as_ref() != Some(delivery)
+        || terminal.attempt_id != delivery.attempt_id
+        || terminal.nonce != delivery.nonce
+        || terminal.request_sha256 != delivery.request_sha256
+        || current_association(result)? != live
+        || terminal.attempt_id != String::from(live.attempt_id.clone())
+        || terminal.request_sha256 != String::from(live.request_sha256.clone())
+        || terminal.nonce != live_nonce
+        || proof.provider_generation != live.provider.generation.as_str()
+        || proof.source != WindowsRetirementProofSourceV2::LiveNative
+        || !terminal
+            .restart_safety
+            .is_safe_for(memcordon_core::BoundaryRequirement::Sealed)
+        || native.retirement.as_deref() != Some(proof)
+        || !native.target_released
+        || !native.prepared_boundary_is_verified()
+        || native.target_identity.as_ref() != Some(root)
+        || !boundary.prepared_boundary_is_verified()
+        || !boundary.target_released
+        || boundary.target_identity.as_ref() != Some(root)
+        || boundary.process_observation.as_deref() != Some(&terminal.process_observation)
+        || native.process_observation.as_deref() != Some(&terminal.process_observation)
+        || terminal.process_observation.root_identity.as_ref() != Some(root)
+        || terminal
+            .process_observation
+            .final_accounting
+            .as_ref()
+            .is_none_or(|accounting| {
+                accounting.active_processes_native_u32 != 0
+                    || !accounting.observed_after_target_retirement
+                    || accounting.counter_regression_observed
+            })
+        || child_pid != root.process_id
+        || !(matches!(child, ChildTermination::WindowsStatus { status } if *status == expected_status)
+            || matches!(child, ChildTermination::ExitCode { code } if *code as u32 == expected_status))
+        || !cleanup.direct_child_reaped
+        || cleanup.workload_empty != Some(true)
+        || !cleanup.errors.is_empty()
+    {
+        return Err(differs());
     }
     Ok(())
 }
@@ -2612,14 +3129,25 @@ pub fn redacted_toolchain_held_gate_observation(
     const SNAPSHOT_BYTE_BOUND: u64 = 64 * 1024;
     fn project(input: &Value, label: bool) -> Option<Value> {
         if input["state"] == "unavailable" {
-            let kind = match input["kind"].as_str() {
-                Some(
-                    kind @ ("PermissionDenied" | "TimedOut" | "InvalidData" | "Other" | "NotFound"
-                    | "Unsupported" | "OutOfMemory" | "Interrupted" | "UnexpectedEof"
-                    | "InvalidInput" | "Uncategorized"),
-                ) => kind,
-                _ => "Unknown",
-            };
+            let kind = input["kind"]
+                .as_str()
+                .filter(|&kind| {
+                    matches!(
+                        kind,
+                        "PermissionDenied"
+                            | "TimedOut"
+                            | "InvalidData"
+                            | "Other"
+                            | "NotFound"
+                            | "Unsupported"
+                            | "OutOfMemory"
+                            | "Interrupted"
+                            | "UnexpectedEof"
+                            | "InvalidInput"
+                            | "Uncategorized"
+                    )
+                })
+                .unwrap_or("Unknown");
             return Some(json!({"state":"unavailable","kind":kind,
                 "raw_os_error":input["raw_os_error"].as_i64().and_then(|v|i32::try_from(v).ok())}));
         }
@@ -2800,6 +3328,59 @@ pub fn redacted_toolchain_held_gate_observation(
         "same_held_event_mandatory_label":project(label, true).unwrap_or_else(unavailable)})
 }
 
+fn known_compiler_failure(stage: &str, resource: &str) -> bool {
+    matches!(
+        (stage, resource),
+        (
+            "directory-open"
+                | "directory-metadata"
+                | "directory-named-open"
+                | "directory-retained-metadata"
+                | "directory-named-metadata"
+                | "directory-named-identity",
+            "outside-input-root"
+                | "input-root"
+                | "input-ancestor"
+                | "native-library-directory"
+                | "linker-directory"
+        ) | (
+            "linker-open"
+                | "linker-metadata"
+                | "linker-read"
+                | "linker-measure"
+                | "linker-named-open"
+                | "linker-retained-metadata"
+                | "linker-named-metadata"
+                | "linker-named-identity",
+            "linker"
+        ) | (
+            "compiler-open"
+                | "compiler-metadata"
+                | "compiler-read"
+                | "compiler-spawn"
+                | "capture-start"
+                | "child-retain"
+                | "child-identity"
+                | "debug-observation"
+                | "child-retirement"
+                | "child-wait"
+                | "capture-receive"
+                | "child-status",
+            "compiler"
+        ) | (
+            "qualify-selection"
+                | "qualify-command"
+                | "qualify-clock"
+                | "directory-owner-bound"
+                | "parent-identity"
+                | "checkpoint-initialize"
+                | "checkpoint-publish"
+                | "retirement-receipt",
+            "fixture"
+        )
+    )
+}
+
 /// Export only reviewed scalar observations. The reader owns each bounded local
 /// original; unsupported formats never acquire a complete-file hash claim.
 pub fn redacted_toolchain_failure_summary(
@@ -2827,6 +3408,123 @@ pub fn redacted_toolchain_failure_summary(
         termination: Option<i32>,
         capture_complete: bool,
         cleanup: Cleanup,
+    }
+    fn stderr_observation(bytes: &[u8]) -> Option<serde_json::Value> {
+        const MARKER: &str = "memcordon-test-fixture: toolchain-failure-";
+        const LEGACY: &str =
+            "memcordon-test-fixture: operation=OpenEventW-controller-wait; access=";
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut markers = text
+            .split_inclusive('\n')
+            .filter(|line| line.starts_with(MARKER));
+        if let Some(line) = markers.next() {
+            let original = text.strip_prefix(line)?;
+            if !line.ends_with('\n')
+                || original.trim().is_empty()
+                || !original.ends_with('\n')
+                || markers.next().is_some()
+                || original
+                    .lines()
+                    .any(|line| line.starts_with("memcordon-test-fixture: "))
+            {
+                return None;
+            }
+            let line = line.strip_suffix('\n')?;
+            let line = line
+                .strip_suffix('\r')
+                .unwrap_or(line)
+                .strip_suffix("; end")?;
+            let (bounded, has_compiler_detail) = if let Some(bounded) =
+                line.strip_prefix("memcordon-test-fixture: toolchain-failure-v2; operation=")
+            {
+                (bounded, true)
+            } else {
+                (
+                    line.strip_prefix("memcordon-test-fixture: toolchain-failure-v1; operation=")?,
+                    false,
+                )
+            };
+            let (operation, fields) = bounded.split_once("; source-role=")?;
+            let (fields, raw) = fields.split_once("; raw-os-error=")?;
+            let (role, compiler_detail) = if has_compiler_detail {
+                let (role, fields) = fields.split_once("; compiler-operation=")?;
+                let (stage, resource) = fields.split_once("; resource-role=")?;
+                if operation != "compile-library"
+                    || role != "none"
+                    || !known_compiler_failure(stage, resource)
+                {
+                    return None;
+                }
+                (role, Some((stage, resource)))
+            } else {
+                (fields, None)
+            };
+            let role = match (operation, role) {
+                ("copy-source", role @ ("library" | "tests" | "child" | "dll" | "loader")) => {
+                    Some(role)
+                }
+                (
+                    "observer-session"
+                    | "observer-deadline-arm"
+                    | "observer-frame-read"
+                    | "observer-deadline-settle"
+                    | "create-compiled-directory"
+                    | "validate-clock"
+                    | "sample-deadline"
+                    | "publication-deadline"
+                    | "retain-publication-parent"
+                    | "compile-library",
+                    "none",
+                ) => None,
+                _ => return None,
+            };
+            let code = if raw == "none" {
+                None
+            } else {
+                let code = raw.parse::<i32>().ok()?;
+                if code.to_string() != raw {
+                    return None;
+                }
+                Some(code)
+            };
+            let mut observation = json!({
+                "diagnostic_reported":true,"operation":operation,"source_role":role,
+                "raw_os_error":code,"acceptance_authority":false
+            });
+            if let Some((stage, resource)) = compiler_detail {
+                observation["compiler_operation"] = json!(stage);
+                observation["resource_role"] = json!(resource);
+            }
+            return Some(observation);
+        }
+        let mut lines = text.lines().filter_map(|line| line.strip_prefix(LEGACY));
+        let line = lines.next()?;
+        if lines.next().is_some() {
+            return None;
+        }
+        let mut fields = line.split("; ");
+        let access = u32::from_str_radix(fields.next()?.strip_prefix("0x")?, 16).ok()?;
+        let kind = fields.next()?.strip_prefix("kind=")?;
+        if !matches!(
+            kind,
+            "PermissionDenied" | "NotFound" | "InvalidInput" | "Other"
+        ) {
+            return None;
+        }
+        let error = fields
+            .next()?
+            .strip_prefix("raw-os-error=Some(")?
+            .strip_suffix(')')?
+            .parse::<i32>()
+            .ok()?;
+        if fields.next()? != "wait-status=None" {
+            return None;
+        }
+        // The legacy suffix is deliberately opaque and never supplies authority.
+        Some(
+            json!({"diagnostic_reported":true,"operation":"OpenEventW-controller-wait",
+            "requested_access":access,"error_kind":kind,"raw_os_error":error,"wait_status":null}),
+        )
     }
     let callback_bytes = read_source("result.callback-failure.json");
     let callback = callback_bytes
@@ -2880,22 +3578,7 @@ pub fn redacted_toolchain_failure_summary(
                         "termination":value.termination,"capture_complete":value.capture_complete,
                         "cleanup":match &value.cleanup { Cleanup::Ok(()) => "ok", Cleanup::Err(_error) => "error" }}))
                 } else if leaf == "result.stderr.bin" && capture_complete {
-                    std::str::from_utf8(&bytes).ok().and_then(|text| {
-                        let mut lines = text.lines().filter_map(|line|line.strip_prefix(
-                            "memcordon-test-fixture: operation=OpenEventW-controller-wait; access="));
-                        let line = lines.next()?;
-                        if lines.next().is_some() { return None; }
-                        let mut fields = line.split("; ");
-                        let access = u32::from_str_radix(fields.next()?.strip_prefix("0x")?, 16).ok()?;
-                        let kind = fields.next()?.strip_prefix("kind=")?;
-                        if !matches!(kind, "PermissionDenied" | "NotFound" | "InvalidInput" | "Other") { return None; }
-                        let error = fields.next()?.strip_prefix("raw-os-error=Some(")?.strip_suffix(')')?.parse::<i32>().ok()?;
-                        if fields.next()? != "wait-status=None" { return None; }
-                        // The remainder is intentionally not copied, parsed or
-                        // interpreted as a token/access/native identity proof.
-                        Some(json!({"diagnostic_reported":true,"operation":"OpenEventW-controller-wait",
-                            "requested_access":access,"error_kind":kind,"raw_os_error":error,"wait_status":null}))
-                    })
+                    stderr_observation(&bytes)
                 } else {
                     None
                 };
@@ -2919,13 +3602,586 @@ pub fn redacted_toolchain_failure_summary(
         "diagnostic_only":true,"acceptance_authority":false,"sources":sources})
 }
 
+/// Join the retired compiler receipt only to a complete original child-status
+/// failure and the independently held child. Only selected staged hashes leave
+/// this projection, without an inference about unobserved loads.
+pub fn redacted_original_compiler_loads(
+    summary: &serde_json::Value,
+    receipt: &[u8],
+    challenge: &[u8],
+    root: &memcordon_core::WindowsProcessIdentityV1,
+    compiler_sha256: &str,
+    selected: &[descriptor::CompilerImportSibling],
+    original_child: impl FnOnce(&memcordon_core::WindowsProcessIdentityV1) -> Option<(u32, Vec<u8>)>,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Loads {
+        loads: descriptor::OriginalCompilerLoads,
+        compiler_stderr_bytes: usize,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Receipt {
+        format: String,
+        revision: u32,
+        role: String,
+        challenge: Vec<u8>,
+        parent: memcordon_core::WindowsProcessIdentityV1,
+        child: memcordon_core::WindowsProcessIdentityV1,
+        image_sha256: String,
+        #[serde(rename = "compiler_inputs")]
+        _compiler_inputs: serde_json::Value,
+        held_from_process_creation: bool,
+        held_live_before_wait: bool,
+        native_parent_edge_observed: bool,
+        native_wait_completed: bool,
+        native_status: i32,
+        original_compiler_loads: Loads,
+    }
+    let source = &summary["sources"][1];
+    let observation = &source["observation"];
+    if source["leaf"] != "result.stderr.bin"
+        || source["state"] != "complete"
+        || observation["operation"] != "compile-library"
+        || observation["compiler_operation"] != "child-status"
+        || observation["resource_role"] != "compiler"
+        || observation.get("raw_os_error") != Some(&serde_json::Value::Null)
+        || receipt.len() > 16 * 1024
+        || selected.is_empty()
+        || selected.len() > descriptor::MAX_COMPILER_IMPORT_SIBLINGS
+    {
+        return None;
+    }
+    let receipt: Receipt = serde_json::from_slice(receipt).ok()?;
+    let witness = receipt.original_compiler_loads;
+    let loads = witness.loads;
+    let matched = &loads.matched_staged_sha256;
+    if receipt.format != "memcordon.windows-fixture-owned-child-retired"
+        || receipt.revision != 1
+        || receipt.role != "readiness.rlib"
+        || receipt.challenge != challenge
+        || &receipt.parent != root
+        || receipt.child.process_id == 0
+        || receipt.child.process_id == root.process_id
+        || receipt.child.creation_time_100ns < root.creation_time_100ns
+        || receipt.image_sha256 != compiler_sha256
+        || !receipt.held_from_process_creation
+        || !receipt.held_live_before_wait
+        || !receipt.native_parent_edge_observed
+        || !receipt.native_wait_completed
+        || receipt.native_status == 0
+        || witness.compiler_stderr_bytes > 16 * 1024 * 1024
+        || loads.bounded_events > descriptor::MAX_COMPILER_LOAD_METADATA
+        || loads.unavailable_file_identity > loads.bounded_events
+        || (loads.events_after_bound != 0
+            && loads.bounded_events != descriptor::MAX_COMPILER_LOAD_METADATA)
+        || loads.events_after_bound > 131_072 - loads.bounded_events
+        || matched.len() > selected.len()
+        || matched.len() > (loads.bounded_events - loads.unavailable_file_identity) as usize
+        || matched.iter().enumerate().any(|(index, hash)| {
+            matched[..index].contains(hash)
+                || !selected
+                    .iter()
+                    .any(|candidate| &candidate.staged_sha256 == hash)
+        })
+    {
+        return None;
+    }
+    let (status, creation_ack) = original_child(&receipt.child)?;
+    if status != receipt.native_status as u32
+        || toolchain_creation_ack::validate(
+            &creation_ack,
+            toolchain_creation_ack::Expected {
+                challenge,
+                root_pid: root.process_id,
+                child: &receipt.child,
+                parent: root,
+                image_sha256: compiler_sha256,
+            },
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(json!({
+        "state":"observed",
+        "observation":"original-compiler-load-dll-events",
+        "match_basis":"staged-file-identity-and-metadata",
+        "compiler_image_sha256":compiler_sha256,
+        "native_child_status":receipt.native_status as u32,
+        "compiler_stderr_bytes":witness.compiler_stderr_bytes,
+        "matched_staged_sha256":matched,
+        "selected_staged_count":selected.len(),
+        "bounded_events":loads.bounded_events,
+        "unavailable_file_identity":loads.unavailable_file_identity,
+        "events_after_bound":loads.events_after_bound,
+        "event_metadata_incomplete":loads.bounded_events == 0
+            || loads.unavailable_file_identity != 0 || loads.events_after_bound != 0,
+        "unobserved_loads":"unknown",
+        "acceptance_authority":false,
+    }))
+}
+
+pub fn redacted_compiler_spawn_routes(
+    summary: &serde_json::Value,
+    stderr: &[u8],
+    binding: &descriptor::controller_start::Binding,
+    cutoff_qpc: u64,
+    frequency: u64,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Returned {
+        api: String,
+        failed: bool,
+        #[serde(deserialize_with = "explicit_option")]
+        ntstatus: Option<i32>,
+        #[serde(deserialize_with = "explicit_option")]
+        win32_error: Option<u32>,
+    }
+    fn explicit_option<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<T>, D::Error> {
+        Option::<T>::deserialize(d)
+    }
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Routes {
+        covered: Vec<String>,
+        returns: Vec<Returned>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Witness {
+        pid: u32,
+        birth: u64,
+        descriptor_sha256: [u8; 32],
+        challenge_sha256: [u8; 32],
+        cutoff_qpc: u64,
+        frequency: u64,
+        raw_os_error: i32,
+        routes: Option<Routes>,
+    }
+    let source = &summary["sources"][1];
+    let observation = &source["observation"];
+    if stderr.len() > 64 * 1024
+        || source["leaf"] != "result.stderr.bin"
+        || source["state"] != "complete"
+        || source["sha256"] != crate::windows_causal_acceptance::sha256(stderr)
+        || observation["operation"] != "compile-library"
+        || observation["compiler_operation"] != "compiler-spawn"
+        || observation["resource_role"] != "compiler"
+    {
+        return None;
+    }
+    let mut lines = std::str::from_utf8(stderr)
+        .ok()?
+        .lines()
+        .filter_map(|line| line.strip_prefix("compiler-spawn-routes-v1 "));
+    let line = lines.next()?;
+    if line.len() > 4096 || lines.next().is_some() {
+        return None;
+    }
+    let witness: Witness = serde_json::from_str(line).ok()?;
+    if witness.pid != binding.pid
+        || witness.birth != binding.birth
+        || witness.pid == 0
+        || witness.birth == 0
+        || witness.descriptor_sha256 != binding.descriptor_sha256
+        || witness.challenge_sha256
+            != descriptor::controller_start::descriptor_digest(&binding.challenge)
+        || witness.cutoff_qpc != cutoff_qpc
+        || cutoff_qpc == 0
+        || witness.frequency != frequency
+        || frequency == 0
+        || observation["raw_os_error"] != witness.raw_os_error
+    {
+        return None;
+    }
+    let routes = witness.routes?;
+    let api = |name: &str| match name {
+        "NtOpenFile" | "NtCreateNamedPipeFile" => Some(true),
+        "CreateFileW" | "DuplicateHandle" | "CreateProcessW" => Some(false),
+        _ => None,
+    };
+    if routes.covered.is_empty()
+        || routes.covered.len() > 5
+        || routes.returns.is_empty()
+        || routes.returns.len() > 16
+        || routes
+            .covered
+            .iter()
+            .enumerate()
+            .any(|(index, name)| api(name).is_none() || routes.covered[..index].contains(name))
+        || routes.returns.iter().any(|row| {
+            !routes.covered.contains(&row.api)
+                || match api(&row.api) {
+                    Some(true) => {
+                        row.win32_error.is_some()
+                            || !row.ntstatus.is_some_and(|code| (code < 0) == row.failed)
+                    }
+                    Some(false) => {
+                        row.ntstatus.is_some() || row.win32_error.is_some() != row.failed
+                    }
+                    None => true,
+                }
+        })
+    {
+        return None;
+    }
+    Some(json!({
+        "state":"observed",
+        "routes":routes,
+        "global_route_coverage":false,
+        "denied_object_proved":false,
+        "acceptance_authority":false,
+    }))
+}
+
+/// Joins a no-debug experiment to its complete original failure. The result is
+/// diagnostic evidence only and is never consumed by workload acceptance.
+pub fn redacted_compiler_no_debug_comparison(
+    summary: &serde_json::Value,
+    stderr: &[u8],
+    case: &CaseKey,
+    binding: &descriptor::controller_start::Binding,
+    clock: (u64, u64),
+    images: (&str, &str),
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    #[derive(Deserialize, Serialize)]
+    #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+    enum Return {
+        Success {
+            win32_error: (),
+            native_flags: u32,
+            #[serde(deserialize_with = "explicit_option")]
+            process_id: Option<u32>,
+        },
+        Failure {
+            win32_error: u32,
+            native_flags: u32,
+        },
+        Unobserved {
+            win32_error: (),
+        },
+    }
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Child {
+        returned: Return,
+        #[serde(deserialize_with = "explicit_option")]
+        identity: Option<memcordon_core::WindowsProcessIdentityV1>,
+        retired: bool,
+        #[serde(deserialize_with = "explicit_option")]
+        native_status: Option<i32>,
+        operation_failed: bool,
+        cleanup_failed: bool,
+    }
+    #[derive(Deserialize, Serialize)]
+    #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+    enum Outcome {
+        PreparationError {
+            #[serde(deserialize_with = "explicit_option")]
+            raw_os_error: Option<i32>,
+        },
+        SpawnError {
+            #[serde(deserialize_with = "explicit_option")]
+            raw_os_error: Option<i32>,
+            returned: Return,
+        },
+        ChildComplete(Child),
+        ChildIncomplete(Child),
+    }
+    fn explicit_option<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<T>, D::Error> {
+        Option::<T>::deserialize(deserializer)
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Witness {
+        pid: u32,
+        birth: u64,
+        descriptor_sha256: [u8; 32],
+        challenge_sha256: [u8; 32],
+        cutoff_qpc: u64,
+        frequency: u64,
+        compiler_sha256: memcordon_core::DiagnosticSha256,
+        linker_sha256: memcordon_core::DiagnosticSha256,
+        role: String,
+        original_ordinal: u8,
+        original_flags: u32,
+        original_native_flags: u32,
+        comparison_ordinal: u8,
+        comparison_flags: u32,
+        outcome: Outcome,
+    }
+    const MARKER: &str = "compiler-no-debug-comparison-v1";
+    if case.family != "W-TOOLCHAIN" || case.scenario != "restricted" {
+        return None;
+    }
+    let original = redacted_compiler_spawn_routes(summary, stderr, binding, clock.0, clock.1)?;
+    let mut returned = original["routes"]["returns"]
+        .as_array()?
+        .iter()
+        .filter(|row| row["api"] == "CreateProcessW");
+    let refusal = returned.next()?;
+    if returned.next().is_some()
+        || refusal["failed"] != true
+        || refusal["win32_error"] != 5
+        || summary["sources"][1]["observation"]["raw_os_error"] != 5
+    {
+        return None;
+    }
+    let mut markers = std::str::from_utf8(stderr)
+        .ok()?
+        .lines()
+        .filter_map(|line| line.strip_prefix(MARKER));
+    let marker = markers.next()?.strip_prefix(' ')?;
+    if marker.len() > 4096 || markers.next().is_some() {
+        return None;
+    }
+    let witness: Witness = serde_json::from_str(marker).ok()?;
+    if witness.pid != binding.pid
+        || witness.birth != binding.birth
+        || witness.descriptor_sha256 != binding.descriptor_sha256
+        || witness.challenge_sha256
+            != descriptor::controller_start::descriptor_digest(&binding.challenge)
+        || (witness.cutoff_qpc, witness.frequency) != clock
+        || String::from(witness.compiler_sha256.clone()) != images.0
+        || String::from(witness.linker_sha256.clone()) != images.1
+        || witness.role != "readiness.rlib"
+        || witness.original_ordinal != 1
+        || witness.original_flags != 1 // DEBUG_PROCESS
+        || witness.original_native_flags & witness.original_flags == 0
+        || witness.comparison_ordinal != 2
+        || witness.comparison_flags != 0
+    {
+        return None;
+    }
+    let valid_child = |child: &Child| {
+        child.identity.as_ref().is_none_or(|identity| {
+            identity.process_id != 0
+                && identity.process_id != binding.pid
+                && identity.creation_time_100ns >= binding.birth
+        }) && (child.retired || child.native_status.is_none())
+    };
+    let no_debug_native_flags = witness.original_native_flags & !witness.original_flags;
+    let state = match &witness.outcome {
+        Outcome::SpawnError {
+            raw_os_error: Some(5),
+            returned:
+                Return::Failure {
+                    win32_error: 5,
+                    native_flags,
+                },
+        } if *native_flags == no_debug_native_flags => "both-create-process-access-denied",
+        Outcome::ChildComplete(child) => {
+            if !valid_child(child)
+                || child.identity.is_none()
+                || !child.retired
+                || child.native_status.is_none()
+                || child.operation_failed
+                || child.cleanup_failed
+            {
+                return None;
+            }
+            if matches!(
+                child.returned,
+                Return::Success { native_flags, process_id: Some(pid), .. }
+                    if native_flags == no_debug_native_flags
+                        && child.identity.as_ref().is_some_and(|id| id.process_id == pid)
+            ) {
+                "no-debug-child-verified"
+            } else {
+                "inconclusive"
+            }
+        }
+        Outcome::ChildIncomplete(child) => {
+            if !valid_child(child)
+                || !child.operation_failed
+                || !(child.retired || child.cleanup_failed)
+            {
+                return None;
+            }
+            "inconclusive"
+        }
+        Outcome::PreparationError { .. } | Outcome::SpawnError { .. } => "inconclusive",
+    };
+    let rust = match &witness.outcome {
+        Outcome::PreparationError { .. } => "not-attempted",
+        Outcome::SpawnError { .. } => "error",
+        Outcome::ChildComplete(_) | Outcome::ChildIncomplete(_) => "child",
+    };
+    Some(json!({
+        "state":state,"case":case,"acceptance_authority":false,
+        "original":{"ordinal":1,"flags":1,"rust":"error","raw_os_error":5,
+            "returned_create_process":{"state":"failure","win32_error":5,
+                "native_flags":witness.original_native_flags}},
+        "comparison":{"ordinal":2,"flags":0,"rust":rust,"outcome":witness.outcome},
+        "compiler_sha256":witness.compiler_sha256,"linker_sha256":witness.linker_sha256,
+        "stderr_sha256":summary["sources"][1]["sha256"],
+        "comparison_limits":["fresh native pipes and handles", "sequential scheduling and OS state"],
+        "denied_object_proved":false,
+    }))
+}
+
+pub fn compiler_pre_creation_marker(stderr: &[u8]) -> Option<std::result::Result<&str, &str>> {
+    if stderr.len() > 64 * 1024 {
+        return None;
+    }
+    let mut markers = std::str::from_utf8(stderr)
+        .ok()?
+        .lines()
+        .filter_map(|line| line.strip_prefix("compiler-pre-creation-v1"));
+    let digest = markers.next()?.strip_prefix(' ')?;
+    if markers.next().is_some() {
+        return None;
+    }
+    if let Some(stage) = digest.strip_prefix("unavailable ") {
+        return matches!(
+            stage,
+            "original-clock"
+                | "source-read"
+                | "environment-read"
+                | "encode"
+                | "byte-bound"
+                | "exclusive-open"
+                | "write"
+                | "sync"
+        )
+        .then_some(Err(stage));
+    }
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(Ok(digest))
+}
+
+pub fn direct_x64_compiler_disposition(
+    outcome: &serde_json::Value,
+    original_flags: u64,
+) -> &'static str {
+    let returned = &outcome["returned_create_process"];
+    if original_flags & 1 == 0 || returned["native_flags"] != original_flags {
+        return "inconclusive";
+    }
+    match outcome["state"].as_str() {
+        Some("spawn-error")
+            if returned["win32_error"] == 5
+                && returned.get("pid") == Some(&serde_json::Value::Null)
+                && outcome.get("child_pid").is_none()
+                && outcome.get("native_status").is_none()
+                && outcome["raw_os_error"] == 5 =>
+        {
+            "direct-create-process-access-denied"
+        }
+        Some("retired")
+            if outcome["native_status"]
+                .as_u64()
+                .and_then(|code| u32::try_from(code).ok())
+                .is_some()
+                && returned["win32_error"].is_null()
+                && returned["pid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .is_some_and(|pid| pid != 0)
+                && returned["pid"] == outcome["child_pid"] =>
+        {
+            "direct-child-retired"
+        }
+        _ => "inconclusive",
+    }
+}
+
+pub fn matches_settled_x64_compiler_refusal(
+    summary: &serde_json::Value,
+    stderr_sha256: &str,
+) -> bool {
+    let source = &summary["sources"][1];
+    let pair = &summary["compiler_no_debug_comparison"];
+    let direct = &summary["direct_restricted_baseline"];
+    let original = &pair["original"];
+    let returned = &original["returned_create_process"];
+    let no_debug = &pair["comparison"];
+    let no_debug_outcome = &no_debug["outcome"];
+    let baseline = &direct["evidence"];
+    let Some(flags) = returned["native_flags"].as_u64() else {
+        return false;
+    };
+    source["state"] == "complete"
+        && source["sha256"] == stderr_sha256
+        && pair["state"] == "both-create-process-access-denied"
+        && pair["stderr_sha256"] == stderr_sha256
+        && original["rust"] == "error"
+        && original["raw_os_error"] == 5
+        && returned["state"] == "failure"
+        && returned["win32_error"] == 5
+        && no_debug["rust"] == "error"
+        && no_debug_outcome["state"] == "spawn-error"
+        && no_debug_outcome["raw_os_error"] == 5
+        && no_debug_outcome["returned"]["state"] == "failure"
+        && no_debug_outcome["returned"]["win32_error"] == 5
+        && no_debug_outcome["returned"]["native_flags"] == flags & !1
+        && summary["original_final_settlement"]["terminal_settled"] == true
+        && summary["original_final_settlement"]["retirement_verified"] == true
+        && direct["scratch_retired"] == true
+        && direct["diagnostic_job_empty_verified"] == true
+        && direct["installed_original"]["stderr_sha256"] == stderr_sha256
+        && direct["installed_original"]["native_flags"] == flags
+        && baseline["original_witness_sha256"]
+            .as_str()
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+        && pair["compiler_sha256"].is_string()
+        && pair["linker_sha256"].is_string()
+        && baseline["compiler_sha256"] == pair["compiler_sha256"]
+        && baseline["linker_sha256"] == pair["linker_sha256"]
+        && direct["state"] == "direct-create-process-access-denied"
+        && direct_x64_compiler_disposition(&baseline["outcome"], flags)
+            == "direct-create-process-access-denied"
+}
+
+pub enum ProviderExperimentOutcome {
+    Full {
+        report: serde_json::Value,
+        private_availability: crate::windows_provider_projection_record::PrivateAvailability,
+    },
+    OriginalListenerRefusal {
+        report: serde_json::Value,
+    },
+    OriginalPeerSpawnRefusal {
+        report: serde_json::Value,
+    },
+}
+
+impl ProviderExperimentOutcome {
+    #[cfg(windows)]
+    pub(crate) fn report(&self) -> &serde_json::Value {
+        match self {
+            Self::Full { report, .. }
+            | Self::OriginalListenerRefusal { report }
+            | Self::OriginalPeerSpawnRefusal { report } => report,
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn run_provider_input_experiment_until(
     root: &Path,
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
     deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
     dot_local_file: bool,
-) -> Result<serde_json::Value> {
+) -> Result<ProviderExperimentOutcome> {
     native::provider_input_experiment(root, config, deadlines, dot_local_file)
 }
 
@@ -3027,10 +4283,88 @@ pub(crate) mod native {
         Ok(remaining)
     }
 
+    const COMPILER_IMPORT_STAGE: &str = "windows-compiler-import-stage.json";
+    const COMPILER_IMPORT_STAGE_BYTES: usize = 4096;
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct CompilerImportStage {
+        compiler_sha256: String,
+        siblings: Vec<descriptor::CompilerImportSibling>,
+    }
+
+    struct CompilerImportCopy {
+        bin: PathBuf,
+        normal_imports: Vec<String>,
+        stage: CompilerImportStage,
+        unavailable: bool,
+    }
+
+    fn compiler_normal_imports(bytes: &[u8]) -> Option<Vec<String>> {
+        if bytes.len() > 2 * 1024 * 1024 {
+            return None;
+        }
+        let imports = memcordon_core::parse_windows_pe_imports(bytes).ok()?.normal;
+        (imports.len() <= 64).then_some(imports)
+    }
+
+    fn direct_compiler_sibling(path: &Path, bin: &Path, imports: &[String]) -> bool {
+        path.parent() == Some(bin)
+            && path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+            && path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| {
+                    imports
+                        .iter()
+                        .any(|import| import.eq_ignore_ascii_case(name))
+                })
+    }
+
+    fn staged_identity(
+        file: &std::fs::File,
+        digest: &str,
+    ) -> Option<descriptor::CompilerImportSibling> {
+        let native = memcordon_testkit::windows_held_file_metadata(file).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file()
+            || native.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || native.links != 1
+            || native.file_index == 0
+            || native.length == 0
+            || metadata.last_write_time() == 0
+            || metadata.len() != native.length
+        {
+            return None;
+        }
+        Some(descriptor::CompilerImportSibling {
+            staged_sha256: memcordon_core::BoundedText::new(digest)
+                .ok()?
+                .try_into()
+                .ok()?,
+            volume_serial: native.volume_serial,
+            file_index: native.file_index,
+            byte_length: native.length,
+            last_write_100ns: metadata.last_write_time(),
+        })
+    }
+
     pub fn provision(
         root: &Path,
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         work_deadline: Instant,
+    ) -> Result<()> {
+        provision_for(root, config, work_deadline, None)
+    }
+
+    fn provision_for(
+        root: &Path,
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        work_deadline: Instant,
+        case: Option<&CaseKey>,
     ) -> Result<()> {
         use memcordon_core::workload_request::*;
         use std::num::NonZeroU64;
@@ -3051,7 +4385,9 @@ pub(crate) mod native {
             locate_budget,
             16 * 1024,
         )
-        .map_err(|error| CiError::Message(error.to_string()))?;
+        .map_err(|error| {
+            CiError::from(error).context("readiness provisioning command=rustup-which")
+        })?;
         if !located.status.success() {
             return Err(CiError::Message(
                 "locked native Rust compiler is unavailable".into(),
@@ -3076,7 +4412,9 @@ pub(crate) mod native {
             version_budget,
             16 * 1024,
         )
-        .map_err(|error| CiError::Message(error.to_string()))?;
+        .map_err(|error| {
+            CiError::from(error).context("readiness provisioning command=rustc-version")
+        })?;
         let text = std::str::from_utf8(&version.stdout)
             .map_err(|error| CiError::Message(error.to_string()))?;
         if !version.status.success()
@@ -3108,6 +4446,8 @@ pub(crate) mod native {
             native_work_frequency,
             linker_mode: descriptor::LinkerMode::BundledLldLink,
             input_root: PathBuf::new(),
+            controller_input_root: None,
+            compiler_import_siblings: Vec::new(),
             rustc: compiler,
             native_linker: PathBuf::new(),
             selected_images: Vec::new(),
@@ -3120,6 +4460,7 @@ pub(crate) mod native {
             target: config.target.clone(),
         };
         let mut measured = Vec::new();
+        let mut compiler_imports = None;
         for path in [
             &toolchain.rustc,
             &toolchain.library_source,
@@ -3129,9 +4470,14 @@ pub(crate) mod native {
             &toolchain.loader_source,
         ] {
             let bytes = read(path, 64 * 1024 * 1024)?;
+            let sha256 = crate::windows_causal_acceptance::sha256(&bytes);
+            if path == &toolchain.rustc {
+                compiler_imports =
+                    compiler_normal_imports(&bytes).map(|imports| (imports, sha256.clone()));
+            }
             measured.push(crate::windows_installed_cases::SelectedArtifact {
                 path: path.clone(),
-                sha256: crate::windows_causal_acceptance::sha256(&bytes),
+                sha256,
             });
         }
         let measurement = serde_json::to_vec_pretty(&measured)?;
@@ -3148,7 +4494,9 @@ pub(crate) mod native {
             snapshot_budget,
             16 * 1024,
         )
-        .map_err(|error| CiError::Message(error.to_string()))?;
+        .map_err(|error| {
+            CiError::from(error).context("readiness provisioning command=fixture-acl-sid-snapshot")
+        })?;
         if !snapshot.status.success() {
             return Err(CiError::Message(
                 "native caller SID observation failed".into(),
@@ -3175,13 +4523,43 @@ pub(crate) mod native {
             })?;
         let copied_compiler = owned_inputs.join("toolchain");
         let mut copied_measurements = Vec::new();
-        copy_owned_inputs(
+        let mut import_copy =
+            compiler_imports.map(|(normal_imports, compiler_sha256)| CompilerImportCopy {
+                bin: copied_compiler.join("bin"),
+                normal_imports,
+                stage: CompilerImportStage {
+                    compiler_sha256,
+                    siblings: Vec::new(),
+                },
+                unavailable: false,
+            });
+        copy_owned_inputs_observed(
             compiler_root,
             &copied_compiler,
             &mut copied_measurements,
             work_deadline,
+            import_copy.as_mut(),
         )?;
         toolchain.rustc = copied_compiler.join("bin").join("rustc.exe");
+        if let Some(copy) = import_copy.filter(|copy| {
+            !copy.unavailable
+                && !copy.stage.siblings.is_empty()
+                && copied_measurements.iter().any(|image| {
+                    image.path == toolchain.rustc && image.sha256 == copy.stage.compiler_sha256
+                })
+        }) {
+            if provision_budget(work_deadline).is_ok() {
+                if let Ok(bytes) = serde_json::to_vec(&copy.stage) {
+                    if bytes.len() <= COMPILER_IMPORT_STAGE_BYTES {
+                        let _ = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(directory.join(COMPILER_IMPORT_STAGE))
+                            .and_then(|mut file| file.write_all(&bytes));
+                    }
+                }
+            }
+        }
         let (_measured_msvc_linker, libraries) = provision_native_linker(
             config,
             &owned_inputs,
@@ -3283,11 +4661,12 @@ pub(crate) mod native {
                 provider_probe.join("denied-write.bin"),
             ],
         };
-        prepare(
+        prepare_for(
             config,
             &plan,
             &directory.join("windows-readiness-input.json"),
             work_deadline,
+            case,
         )
     }
 
@@ -3296,6 +4675,16 @@ pub(crate) mod native {
         destination: &Path,
         measured: &mut Vec<crate::windows_installed_cases::SelectedArtifact>,
         work_deadline: Instant,
+    ) -> Result<()> {
+        copy_owned_inputs_observed(source, destination, measured, work_deadline, None)
+    }
+
+    fn copy_owned_inputs_observed(
+        source: &Path,
+        destination: &Path,
+        measured: &mut Vec<crate::windows_installed_cases::SelectedArtifact>,
+        work_deadline: Instant,
+        mut import_copy: Option<&mut CompilerImportCopy>,
     ) -> Result<()> {
         provision_budget(work_deadline)?;
         if destination.components().count() > 256 {
@@ -3318,11 +4707,12 @@ pub(crate) mod native {
             fs::create_dir(destination)?;
             for entry in fs::read_dir(source)? {
                 let entry = entry?;
-                copy_owned_inputs(
+                copy_owned_inputs_observed(
                     &entry.path(),
                     &destination.join(entry.file_name()),
                     measured,
                     work_deadline,
+                    import_copy.as_deref_mut(),
                 )?;
             }
         } else if metadata.is_file() {
@@ -3332,15 +4722,33 @@ pub(crate) mod native {
                 .create_new(true)
                 .open(destination)?
                 .write_all(&bytes)?;
-            let persisted = read(destination, 512 * 1024 * 1024)?;
+            let (persisted, readback, before) = read_with_owner(destination, 512 * 1024 * 1024)?;
             if persisted != bytes {
                 return Err(CiError::Message(
                     "copied native toolchain input readback differs".into(),
                 ));
             }
+            let sha256 = crate::windows_causal_acceptance::sha256(&persisted);
+            if let Some(copy) = import_copy.filter(|copy| {
+                !copy.unavailable
+                    && direct_compiler_sibling(destination, &copy.bin, &copy.normal_imports)
+            }) {
+                let identity = (copy.stage.siblings.len()
+                    < descriptor::MAX_COMPILER_IMPORT_SIBLINGS)
+                    .then(|| staged_identity(&readback, &sha256))
+                    .flatten()
+                    .filter(|identity| {
+                        identity.byte_length == persisted.len() as u64
+                            && identity.last_write_100ns == before.last_write_time()
+                    });
+                match identity {
+                    Some(identity) => copy.stage.siblings.push(identity),
+                    None => copy.unavailable = true,
+                }
+            }
             measured.push(crate::windows_installed_cases::SelectedArtifact {
                 path: destination.to_owned(),
-                sha256: crate::windows_causal_acceptance::sha256(&persisted),
+                sha256,
             });
         } else {
             return Err(CiError::Message(
@@ -3471,7 +4879,9 @@ pub(crate) mod native {
             discover_budget,
             16 * 1024,
         )
-        .map_err(|error| CiError::Message(error.to_string()))?;
+        .map_err(|error| {
+            CiError::from(error).context("readiness provisioning command=vswhere-native-linker")
+        })?;
         if !output.status.success() || !output.stderr.is_empty() {
             return Err(CiError::Message("native VS discovery failed".into()));
         }
@@ -3997,6 +5407,16 @@ pub(crate) mod native {
         input_path: &Path,
         work_deadline: Instant,
     ) -> Result<()> {
+        prepare_for(config, plan, input_path, work_deadline, None)
+    }
+
+    fn prepare_for(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        plan: &WindowsReadinessPlan,
+        input_path: &Path,
+        work_deadline: Instant,
+        selected_case: Option<&CaseKey>,
+    ) -> Result<()> {
         if !plan.candidate_output_root.is_absolute() || plan.protected_write_probes.len() < 2 {
             return Err(CiError::Message(
                 "native Windows plan must grant a candidate root and protect driver/provider paths"
@@ -4022,7 +5442,13 @@ pub(crate) mod native {
             command.env_clear();
             let output =
                 memcordon_testkit::run_with_deadline_output_limit(&mut command, budget, 16 * 1024)
-                    .map_err(|error| CiError::Message(error.to_string()))?;
+                    .map_err(|error| {
+                        CiError::from(error).context(if restricted {
+                            "readiness provisioning command=restricted-fixture-token-snapshot"
+                        } else {
+                            "readiness provisioning command=ordinary-fixture-token-snapshot"
+                        })
+                    })?;
             crate::release::source::write_diagnostic_json(
                 &config.output_directory.join(if restricted {
                     "windows-restricted-token-capture.json"
@@ -4080,12 +5506,119 @@ pub(crate) mod native {
             }
             Ok(token)
         };
-        let ordinary = snapshot(false)?;
-        let restricted = snapshot(true)?;
+        let ordinary = selected_case
+            .is_none_or(|key| key.scenario == "ordinary")
+            .then(|| snapshot(false))
+            .transpose()?;
+        let restricted = selected_case
+            .is_none_or(|key| key.scenario == "restricted")
+            .then(|| snapshot(true))
+            .transpose()?;
+        let mut qualification_stage = "source-snapshot";
+        let mut qualification_failure = None;
+        let mut qualification_status = None;
+        let mut qualification_child_status = None;
+        let reduced_compiler = selected_case
+            .is_none()
+            .then(|| -> Result<TokenObservation> {
+                use descriptor::gate_precondition::{
+                    CompilerAuthoritySnapshot, CompilerQualificationFailure,
+                    CompilerQualificationStage, validate_compiler_authority_reduction,
+                };
+                let mut observe =
+                    |frontend, entry: &'static str| -> Result<CompilerAuthoritySnapshot> {
+                        let budget = provision_budget(work_deadline)?.min(Duration::from_secs(8));
+                        let mut command = std::process::Command::new(&config.fixture.path);
+                        command
+                            .current_dir(&config.output_directory)
+                            .env_clear()
+                            .stdin(std::process::Stdio::null())
+                            .args(["consumer-readiness-windows", frontend])
+                            .arg(&config.fixture.path)
+                            .args(["consumer-readiness-windows", entry]);
+                        let output = memcordon_testkit::run_with_deadline_output_limit(
+                            &mut command,
+                            budget,
+                            COMPILER_AUTHORITY_BYTES,
+                        )
+                        .map_err(|error| CiError::from(error).context(entry))?;
+                        if !output.status.success() || !output.stderr.is_empty() {
+                            qualification_status = output.status.code();
+                            qualification_child_status = CompilerQualificationFailure::held_child_status(
+                                &output.stderr,
+                                qualification_status,
+                            );
+                            if !output.status.success() {
+                                qualification_failure =
+                                    CompilerQualificationFailure::parse(&output.stdout);
+                            }
+                            return Err(CiError::Message(format!(
+                                "{entry} refused with wrapper status {:?}; held child status {:?}; originating failure {:?}",
+                                qualification_status, qualification_child_status, qualification_failure
+                            )));
+                        }
+                        Ok(serde_json::from_slice(&output.stdout)?)
+                    };
+                let source = observe("system-frontend", "reduced-compiler-source-snapshot")?;
+                let source_matches = ordinary.as_ref() == Some(&source.token);
+                if !source_matches {
+                    qualification_failure = Some(CompilerQualificationFailure {
+                        stage: CompilerQualificationStage::SourceValidation,
+                        win32: None,
+                        premise: Some("compiler authority source differs from ordinary caller".into()),
+                    });
+                    return Err(CiError::Message(
+                        "compiler authority source differs from ordinary caller".into(),
+                    ));
+                }
+                qualification_stage = "reduced-snapshot";
+                let selected = observe(
+                    "system-reduced-compiler-frontend",
+                    "reduced-compiler-snapshot",
+                )?;
+                qualification_stage = "authority-reduction";
+                validate_compiler_authority_reduction(&source, &selected)
+                    .map_err(|reason| {
+                        qualification_failure = Some(CompilerQualificationFailure {
+                            stage: CompilerQualificationStage::AuthorityReduction,
+                            win32: None,
+                            premise: Some(reason.into()),
+                        });
+                        CiError::Message(reason.into())
+                    })?;
+                qualification_stage = "snapshot-publication";
+                provision_budget(work_deadline)?;
+                for (leaf, value) in [
+                    (REDUCED_COMPILER_SOURCE, &source),
+                    (REDUCED_COMPILER_SELECTED, &selected),
+                ] {
+                    drop(crate::windows_native_files::publish_owned_file(
+                        &config.output_directory.join(leaf),
+                        &serde_json::to_vec(value)?,
+                    )?);
+                }
+                Ok(selected.token)
+            });
+        if let Some(Err(error)) = &reduced_compiler {
+            eprintln!("mandatory group-privilege-reduced compiler caller unavailable: {error}");
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.windows-reduced-compiler-qualification",
+                "revision":1,"state":"failed","stage":qualification_stage,
+                "wrapper_status":qualification_status,
+                "held_child_status":qualification_child_status,
+                "failure":qualification_failure,
+            }))?;
+            if let Err(error) = crate::windows_native_files::publish_owned_file(
+                &config.output_directory.join(REDUCED_COMPILER_FAILURE),
+                &bytes,
+            ) {
+                eprintln!("reduced compiler qualification evidence publication failed: {error}");
+            }
+        }
         let random = random_challenge()?;
         let run = crate::windows_causal_acceptance::sha256(&random);
         let mut cases = Vec::new();
-        for key in positive_keys() {
+        for key in selected_case.map_or_else(positive_keys, |key| BTreeSet::from([key.clone()])) {
             provision_budget(work_deadline)?;
             let output = plan
                 .candidate_output_root
@@ -4113,14 +5646,24 @@ pub(crate) mod native {
                     .to_string_lossy()
                     .into_owned()
             });
-            let caller = if matches!(
+            let caller = if reduced_compiler_toolchain(&key) {
+                // Preserve other original attempts if qualification failed. The
+                // group-privilege-reduced case requires its independently published snapshot
+                // before constructing the launch, even with this inert plan value.
+                reduced_compiler
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.as_ref().ok())
+                    .or(ordinary.as_ref())
+            } else if matches!(
                 key.scenario.as_str(),
                 "restricted" | "restricted-token-preserved"
             ) {
-                restricted.clone()
+                restricted.as_ref()
             } else {
-                ordinary.clone()
-            };
+                ordinary.as_ref()
+            }
+            .ok_or_else(|| CiError::Message("selected native caller snapshot is missing".into()))?
+            .clone();
             let descriptor = descriptor::Descriptor {
                 matched_control: None,
                 format: "memcordon.fixture-workload".into(),
@@ -4135,7 +5678,9 @@ pub(crate) mod native {
                 application_status: status,
                 churn_creations: descriptor::CHURN_CREATIONS,
                 churn_live: descriptor::CHURN_LIVE,
-                denied_write_paths: if matches!(
+                denied_write_paths: if reduced_compiler_toolchain(&key) {
+                    vec![reduced_compiler_sentinel(&config.output_directory)]
+                } else if matches!(
                     key.scenario.as_str(),
                     "restricted" | "restricted-token-preserved"
                 ) {
@@ -4191,6 +5736,13 @@ pub(crate) mod native {
     }
 
     pub(crate) fn read(path: &Path, bound: usize) -> Result<Vec<u8>> {
+        read_with_owner(path, bound).map(|(bytes, _, _)| bytes)
+    }
+
+    fn read_with_owner(
+        path: &Path,
+        bound: usize,
+    ) -> Result<(Vec<u8>, std::fs::File, std::fs::Metadata)> {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -4213,7 +5765,7 @@ pub(crate) mod native {
                 "readiness evidence exceeded bound during read".into(),
             ));
         }
-        Ok(bytes)
+        Ok((bytes, file, metadata))
     }
 
     fn retain_callback_product_context(
@@ -4288,6 +5840,414 @@ pub(crate) mod native {
             serde_json::json!({"authority":"diagnostic-only", "original":original,
             "terminal":terminal_context, "terminal_use":"associated context, never outcome acceptance"}),
         )
+    }
+
+    fn reduced_startup_comparison(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &CaseInput,
+        original_report: &Path,
+        original_frontend: ReducedStartupFrontend,
+        original_window: [u64; 2],
+        work_deadline: Instant,
+    ) -> Result<Option<serde_json::Value>> {
+        use descriptor::gate_precondition::CompilerAuthoritySnapshot;
+        use std::os::windows::ffi::OsStrExt;
+        const DLL_INIT_FAILED: u32 = 0xc000_0142;
+        let status = |result: &ResultV3| match result.outcome.native_termination.as_ref() {
+            Some(ChildTermination::WindowsStatus { status }) => Some(*status),
+            Some(ChildTermination::ExitCode { code }) => Some(*code as u32),
+            _ => None,
+        };
+        let load_result = |path: &Path| {
+            ResultV3::parse(&read(
+                path,
+                crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+            )?)
+            .map_err(CiError::Message)
+        };
+        if !original_report.try_exists()? || input.descriptor.transcript.try_exists()? {
+            return Ok(None);
+        }
+        let original = load_result(original_report)
+            .map_err(|error| error.context("original product result readback"))?;
+        if status(&original) != Some(DLL_INIT_FAILED) {
+            return Ok(None);
+        }
+        let settled =
+            |path: &Path, result: &ResultV3, frontend: ReducedStartupFrontend| -> Result<_> {
+                let bytes = read(
+                    &path.with_extension("terminal-observation.json"),
+                    memcordon_platform::MAX_TERMINAL_OBSERVATION_BYTES,
+                )?;
+                let observation: memcordon_platform::AuthenticatedWindowsTerminalObservation =
+                    serde_json::from_slice(&bytes)?;
+                let association = super::current_association(result)?;
+                if observation.format != "memcordon.windows-terminal-observation"
+                    || observation.revision != 2
+                    || association.provider != config.provider
+                    || observation.provider != config.provider
+                    || crate::windows_causal_acceptance::sha256(&observation.provider_request)
+                        != observation.terminal.request_sha256
+                {
+                    return Err(CiError::Message(
+                        "installed startup terminal provider or request digest differs".into(),
+                    ));
+                }
+                // The product binds the native target even when it exits before the
+                // fixture protocol can supply a live controller-owned handle.
+                super::validate_reduced_startup_settlement(
+                    result,
+                    &observation.terminal,
+                    &observation.frontend_delivery,
+                    &observation.terminal_authority_json,
+                    frontend,
+                )?;
+                let request: memcordon_core::WindowsLaunchRequestV2 =
+                    serde_json::from_slice(&observation.provider_request)?;
+                if request.nonce != observation.terminal.nonce
+                    || request.expected_provider_binding != config.provider
+                {
+                    return Err(CiError::Message(
+                        "installed startup request binding differs".into(),
+                    ));
+                }
+                Ok((
+                    request,
+                    serde_json::json!({
+                        "native_status":status(result),
+                        "wrapper_status":result.outcome.wrapper_status,
+                        "frontend":frontend,
+                        "target":super::current_native(result)?.target_identity,
+                        "native_job_retired":true,
+                        "initial_target_token_matches_caller":true,
+                        "terminal_sha256":crate::windows_causal_acceptance::sha256(&bytes),
+                        "request_sha256":observation.terminal.request_sha256,
+                    }),
+                ))
+            };
+        let (mut expected, original_summary) =
+            settled(original_report, &original, original_frontend)
+                .map_err(|error| error.context("original installed startup settlement"))?;
+        let original_deadline = reduced_startup_deadline(&expected, original_window)
+            .map_err(|error| error.context("original installed startup deadline"))?;
+        provision_budget(work_deadline)?;
+        let _fixture_owner = crate::windows_native_files::hold_artifact(
+            &config.fixture.path,
+            Some(&config.fixture.sha256),
+            64 * 1024 * 1024,
+        )?;
+        let snapshot_bytes = read(
+            &config.output_directory.join(REDUCED_COMPILER_SELECTED),
+            COMPILER_AUTHORITY_BYTES,
+        )?;
+        let selected: CompilerAuthoritySnapshot = serde_json::from_slice(&snapshot_bytes)?;
+        selected
+            .validate_reduced()
+            .map_err(|reason| CiError::Message(reason.into()))?;
+        let fixture_program: Vec<u16> = config.fixture.path.as_os_str().encode_wide().collect();
+        let fixture_prefix: Vec<u16> = "consumer-readiness-windows".encode_utf16().collect();
+        let original_arguments: Vec<_> = std::iter::once(fixture_prefix.clone())
+            .chain(std::iter::once(
+                input.descriptor_path.as_os_str().encode_wide().collect(),
+            ))
+            .chain(
+                input
+                    .descriptor
+                    .arguments
+                    .iter()
+                    .map(|arg| arg.encode_utf16().collect()),
+            )
+            .collect();
+        if selected.token != input.expected_token
+            || expected.command.program != fixture_program
+            || expected.command.arguments != original_arguments
+            || expected.environment != fixture_environment::entries()?
+        {
+            return Err(CiError::Message(
+                "installed startup original fixture or input tuple differs".into(),
+            ));
+        }
+        let comparison_report = original_report.with_extension("reduced-startup-snapshot.json");
+        if comparison_report.try_exists()?
+            || comparison_report
+                .with_extension("terminal-observation.json")
+                .try_exists()?
+        {
+            return Err(CiError::Message(
+                "installed startup comparison paths already exist".into(),
+            ));
+        }
+        let mut command = super::public_command_observation(
+            &config.cli.path,
+            &config.fixture.path,
+            &config.output_directory,
+            &comparison_report,
+            input,
+            super::FrontendObservation::ReducedCompilerSnapshot,
+        )?
+        .materialize()?;
+        command.env_clear().stdin(std::process::Stdio::piped());
+        provision_budget(work_deadline)
+            .map_err(|error| error.context("installed snapshot work cutoff"))?;
+        let comparison_cutoff = work_deadline.min(Instant::now() + Duration::from_secs(8));
+        let comparison_start = native_uptime_millis();
+        let output = memcordon_testkit::run_until_owned_windows_job_output_limit(
+            command,
+            comparison_cutoff,
+            COMPILER_AUTHORITY_BYTES,
+        )
+        .map_err(|error| CiError::from(error).context("installed reduced startup comparison"))?;
+        let comparison_window = [comparison_start, native_uptime_millis()];
+        let comparison = load_result(&comparison_report)
+            .map_err(|error| error.context("comparison product result readback"))?;
+        let (actual, comparison_summary) = settled(
+            &comparison_report,
+            &comparison,
+            ReducedStartupFrontend::Comparison {
+                observed_status: output.status.code(),
+            },
+        )
+        .map_err(|error| error.context("comparison installed startup settlement"))?;
+        let comparison_deadline = reduced_startup_deadline(&actual, comparison_window)
+            .map_err(|error| error.context("comparison installed startup deadline"))?;
+        if expected.nonce == actual.nonce {
+            return Err(CiError::Message(
+                "installed startup comparison reused the original nonce".into(),
+            ));
+        }
+        expected.nonce.clone_from(&actual.nonce);
+        expected.policy.absolute_deadline_millis = actual.policy.absolute_deadline_millis;
+        expected.command.arguments = vec![
+            fixture_prefix,
+            "reduced-compiler-snapshot".encode_utf16().collect(),
+        ];
+        if expected != actual {
+            return Err(CiError::Message(
+                "installed startup comparison changed the authenticated launch tuple".into(),
+            ));
+        }
+        let snapshot_matches = status(&comparison) == Some(0)
+            && output.status.success()
+            && output.stderr.is_empty()
+            && serde_json::from_slice::<CompilerAuthoritySnapshot>(&output.stdout)
+                .is_ok_and(|snapshot| snapshot == selected);
+        let mut evidence = serde_json::json!({
+            "state":if snapshot_matches { "snapshot-matches-direct" } else if status(&comparison) == Some(DLL_INIT_FAILED) { "same-native-startup-status" } else { "different-or-unverified-result" },
+            "original":original_summary,
+            "comparison":comparison_summary,
+            "comparison_frontend_job_empty_verified":true,
+            "fixture_sha256":config.fixture.sha256,
+            "direct_snapshot_sha256":crate::windows_causal_acceptance::sha256(&snapshot_bytes),
+            "same_authenticated_launch_tuple_except_command_arguments_nonce_and_deadline_tick":true,
+            "deadline_budget_ms":600_000,
+            "original_boot_window_ms":original_window,
+            "original_deadline_boot_ms":original_deadline,
+            "comparison_boot_window_ms":comparison_window,
+            "comparison_deadline_boot_ms":comparison_deadline,
+            "same_token_object_proved":false,
+            "diagnostic_only":true,
+        });
+        if status(&comparison) == Some(DLL_INIT_FAILED) {
+            let calibration =
+                reduced_console_calibration(config, input, &actual, &snapshot_bytes, work_deadline)
+                    .unwrap_or_else(|error| {
+                        eprintln!("fixture console calibration unavailable: {error}");
+                        serde_json::json!({
+                            "state":"unavailable","stage":"controller","diagnostic_only":true,
+                        })
+                    });
+            evidence["console_calibration"] = if serde_json::to_vec(&calibration)
+                .is_ok_and(|bytes| bytes.len() <= 8 * 1024)
+            {
+                calibration
+            } else {
+                serde_json::json!({"state":"unavailable","stage":"compact-bound","diagnostic_only":true})
+            };
+        }
+        Ok(Some(evidence))
+    }
+
+    fn reduced_console_calibration(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &CaseInput,
+        request: &memcordon_core::WindowsLaunchRequestV2,
+        snapshot: &[u8],
+        deadline: Instant,
+    ) -> Result<serde_json::Value> {
+        use descriptor::gate_precondition::{
+            CompilerAuthoritySnapshot, sha256, validate_compiler_authority_reduction,
+        };
+        use serde_json::{Value, json};
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        const CAPTURE: usize = 8 * 1024;
+        let budget = provision_budget(deadline)?.min(Duration::from_secs(8));
+        if budget < Duration::from_secs(4) {
+            return Ok(json!({"state":"unavailable","stage":"deadline","diagnostic_only":true}));
+        }
+        let outer_cutoff = Instant::now() + budget;
+        let native_tick = native_uptime_millis();
+        let budget_ms = u64::try_from(budget.as_millis())
+            .map_err(|error| CiError::Message(error.to_string()))?;
+        let native_cleanup = native_tick + budget_ms - 500;
+        let native_work = native_cleanup - 1_000;
+        let source = crate::windows_native_files::hold_artifact(
+            &config.output_directory.join(REDUCED_COMPILER_SOURCE),
+            None,
+            COMPILER_AUTHORITY_BYTES as u64,
+        )?;
+        let source_authority: CompilerAuthoritySnapshot = serde_json::from_slice(&source.bytes)?;
+        let selected: CompilerAuthoritySnapshot = serde_json::from_slice(snapshot)?;
+        validate_compiler_authority_reduction(&source_authority, &selected)
+            .map_err(|reason| CiError::Message(reason.into()))?;
+        let selected_sha256 = sha256(snapshot);
+        let challenge = sha256(&input.descriptor.challenge);
+        if request.current_directory.is_empty()
+            || request.current_directory.len() > 32_768
+            || request.current_directory.contains(&0)
+        {
+            return Err(CiError::Message(
+                "console calibration authenticated cwd differs".into(),
+            ));
+        }
+        let cwd = PathBuf::from(OsString::from_wide(&request.current_directory));
+        if !cwd.is_absolute() {
+            return Err(CiError::Message(
+                "console calibration cwd is not absolute".into(),
+            ));
+        }
+        let mut command = std::process::Command::new(&config.fixture.path);
+        command
+            .current_dir(cwd)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .args([
+                "consumer-readiness-windows",
+                "reduced-compiler-console-calibration",
+            ])
+            .args([
+                &config.fixture.sha256,
+                &source.sha256,
+                &selected_sha256,
+                &challenge,
+            ])
+            .arg(native_work.to_string())
+            .arg(native_cleanup.to_string());
+        let output = memcordon_testkit::run_until_owned_windows_job_output_limit(
+            command,
+            outer_cutoff.min(deadline),
+            CAPTURE,
+        )
+        .map_err(|error| CiError::from(error).context("fixture console calibration subprocess"))?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Ok(json!({"state":"unavailable","stage":"fixture-exit",
+                "status":output.status.code(),"stderr_bytes":output.stderr.len(),"diagnostic_only":true}));
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
+            .map_err(CiError::Message)?;
+        let mut record: Value = serde_json::from_slice(&output.stdout)?;
+        if record["format"] != "memcordon.windows-fixture-console-calibration"
+            || record["revision"] != 1
+            || record["fixture_sha256"] != config.fixture.sha256
+            || record["selected_sha256"] != selected_sha256
+            || record["source_sha256"] != source.sha256
+            || record["challenge_sha256"] != challenge
+            || record["diagnostic_only"] != true
+        {
+            return Err(CiError::Message(
+                "fixture console calibration binding differs".into(),
+            ));
+        }
+        record["outer_job_empty_verified"] = json!(true);
+        record["production_context"] = json!({
+            "equivalent":false,
+            "parent":"ordinary fixture process",
+            "desktop":"private fixture desktop on existing station",
+            "process_and_thread_security":"default",
+            "job":"fixture-owned kill-on-close",
+            "stdio":"fixture-owned pipes",
+        });
+        if record["state"] == "unavailable" {
+            if matches!(
+                record["stage"].as_str(),
+                Some(
+                    "deadline"
+                        | "image"
+                        | "caller"
+                        | "prepared-inputs"
+                        | "parent-console"
+                        | "desktop"
+                        | "baseline-create"
+                        | "baseline-run"
+                        | "detached-create"
+                        | "detached-run"
+                        | "desktop-retirement"
+                )
+            ) {
+                return Ok(record);
+            }
+            return Err(CiError::Message(
+                "unknown fixture console calibration stage".into(),
+            ));
+        }
+        let wide_digest = |units: &[u16]| {
+            sha256(
+                &units
+                    .iter()
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let environment = memcordon_core::encode_windows_environment_block(&request.environment)
+            .map_err(|error| CiError::Message(error.into()))?;
+        let program: Vec<_> = config.fixture.path.as_os_str().encode_wide().collect();
+        let argv_sha256 = sha256(&serde_json::to_vec(
+            &std::iter::once(program)
+                .chain(request.command.arguments.iter().cloned())
+                .collect::<Vec<_>>(),
+        )?);
+        if record["cwd_sha256"] != wide_digest(&request.current_directory)
+            || record["environment_sha256"] != wide_digest(&environment)
+            || record["argv_sha256"] != argv_sha256
+            || record["fixture_identity"]["file_index"]
+                .as_u64()
+                .is_none_or(|id| id == 0)
+        {
+            return Err(CiError::Message(
+                "fixture console calibration launch inputs differ".into(),
+            ));
+        }
+        let interpretation = super::classify_reduced_console_pair(&record).ok_or_else(|| {
+            CiError::Message("fixture console calibration native pair differs".into())
+        })?;
+        record["interpretation"] = json!(interpretation);
+        Ok(record)
+    }
+
+    #[allow(unsafe_code)] // Read-only monotonic clock shared with the Windows public frontend.
+    fn native_uptime_millis() -> u64 {
+        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    }
+
+    fn reduced_startup_deadline(
+        request: &memcordon_core::WindowsLaunchRequestV2,
+        window: [u64; 2],
+    ) -> Result<u64> {
+        // The frontend's elapsed supervision budget uses a higher-resolution
+        // clock than the boot tick used on the wire. Allow two 16-ms ticks at
+        // the lower edge for quantization and rounding the remaining lifetime.
+        request
+            .policy
+            .absolute_deadline_millis
+            .filter(|deadline| {
+                (window[0].saturating_add(600_000 - 32)..=window[1].saturating_add(600_000))
+                    .contains(deadline)
+            })
+            .ok_or_else(|| {
+                CiError::Message(format!(
+                    "authenticated deadline tick {:?} differs from 600-second invocation boot window {window:?}",
+                    request.policy.absolute_deadline_millis,
+                ))
+            })
     }
 
     #[allow(unsafe_code)] // Fixed-size native cryptographic challenge generation.
@@ -4389,11 +6349,18 @@ pub(crate) mod native {
             }
         }
         fn release(&mut self, phase: descriptor::controller_start::Phase) -> io::Result<()> {
+            self.release_before(phase, self.deadline)
+        }
+        fn release_before(
+            &mut self,
+            phase: descriptor::controller_start::Phase,
+            cutoff: Instant,
+        ) -> io::Result<()> {
             if self.writer.is_none() {
                 return Err(io::Error::other("original control writer already closed"));
             }
-            let owner = match memcordon_platform::WindowsSynchronousIoDeadline::start(self.deadline)
-            {
+            let deadline = self.deadline.min(cutoff);
+            let owner = match memcordon_platform::WindowsSynchronousIoDeadline::start(deadline) {
                 Ok(owner) => owner,
                 Err(error) => {
                     self.writer.take();
@@ -4402,7 +6369,7 @@ pub(crate) mod native {
             };
             let writer = self.writer.as_mut().expect("checked original writer");
             let written = self.sender.send(writer, &self.binding, phase, || {
-                provision_budget(self.deadline)
+                provision_budget(deadline)
                     .map(|_| ())
                     .map_err(io::Error::other)
             });
@@ -4440,6 +6407,506 @@ pub(crate) mod native {
         toolchain_held_gate: Option<serde_json::Value>,
     }
 
+    struct ToolchainDirectoryCustody {
+        directories: Option<crate::windows_native_files::HeldCompilerDirectories>,
+        import_files: Vec<std::fs::File>,
+        root: descriptor::ToolchainInputRoot,
+        release_may_have_reached_fixture: std::sync::atomic::AtomicBool,
+    }
+
+    impl ToolchainDirectoryCustody {
+        fn acquire(
+            config: &crate::windows_installed_cases::InstalledWindowsPayload,
+            input: &mut CaseInput,
+            deadline: Instant,
+        ) -> Result<Option<Arc<Self>>> {
+            let Some(toolchain) = &mut input.descriptor.toolchain else {
+                return Ok(None);
+            };
+            if toolchain.controller_input_root.is_some() {
+                return Err(CiError::Message(
+                    "fixture plan cannot supply compiler directory custody".into(),
+                ));
+            }
+            toolchain.compiler_import_siblings.clear();
+            if (input.key.family.as_str(), input.key.scenario.as_str())
+                != ("W-TOOLCHAIN", "restricted")
+            {
+                return Ok(None);
+            }
+            if !input.expected_token.restricted
+                || input.descriptor.case != descriptor::Case::Toolchain
+                || input.descriptor.matched_control.is_some()
+                || input.descriptor.provider_input_experiment
+                || input.descriptor.start_transport != expected_start_transport(&input.key)
+                || input.descriptor.control_clock.is_none()
+            {
+                return Err(CiError::Message(
+                    "original restricted standalone compiler scope differs".into(),
+                ));
+            }
+            toolchain
+                .validate_selected_images()
+                .map_err(CiError::Message)?;
+            let root = std::path::absolute(&config.output_directory)?.join("locked-inputs");
+            if root.as_os_str() != toolchain.input_root.as_os_str()
+                || toolchain.target != config.target
+            {
+                return Err(CiError::Message(
+                    "compiler input layout differs from original configured custody".into(),
+                ));
+            }
+            let directories = crate::windows_native_files::HeldCompilerDirectories::acquire(
+                std::iter::once(root.as_path())
+                    .chain(toolchain.rustc.parent())
+                    .chain(toolchain.native_linker.parent())
+                    .chain(
+                        toolchain
+                            .native_library_directories
+                            .iter()
+                            .map(PathBuf::as_path),
+                    ),
+                || {
+                    provision_budget(deadline)
+                        .map(|_| ())
+                        .map_err(io::Error::other)
+                },
+            )?;
+            let (volume_serial, file_index) = directories.identity(&root)?;
+            let root = descriptor::ToolchainInputRoot {
+                volume_serial,
+                file_index,
+            };
+            toolchain.controller_input_root = Some(root);
+            Ok(Some(Arc::new(Self {
+                directories: Some(directories),
+                import_files: Vec::new(),
+                root,
+                release_may_have_reached_fixture: std::sync::atomic::AtomicBool::new(false),
+            })))
+        }
+
+        fn verify(&self, deadline: Instant) -> io::Result<()> {
+            self.directories
+                .as_ref()
+                .expect("original compiler directory owner retained")
+                .verify(|| {
+                    provision_budget(deadline)
+                        .map(|_| ())
+                        .map_err(io::Error::other)
+                })
+        }
+
+        fn release_started(&self) {
+            self.release_may_have_reached_fixture
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn retired(&self) {
+            self.release_may_have_reached_fixture
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl Drop for ToolchainDirectoryCustody {
+        fn drop(&mut self) {
+            if *self.release_may_have_reached_fixture.get_mut() {
+                // A partially written observer release is sufficient for the
+                // ownership obligation. Retain these no-delete owners until
+                // process teardown if mandatory retirement was not proved.
+                std::mem::forget(self.directories.take());
+                std::mem::forget(std::mem::take(&mut self.import_files));
+            }
+        }
+    }
+
+    fn hold_compiler_import_siblings(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        compiler: &descriptor::ToolchainImage,
+        bytes: &[u8],
+        measured: &[crate::windows_installed_cases::SelectedArtifact],
+        deadline: Instant,
+    ) -> Option<(Vec<descriptor::CompilerImportSibling>, Vec<std::fs::File>)> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        provision_budget(deadline).ok()?;
+        let original = read(
+            &config.output_directory.join(COMPILER_IMPORT_STAGE),
+            COMPILER_IMPORT_STAGE_BYTES,
+        )
+        .ok()?;
+        let stage: CompilerImportStage = serde_json::from_slice(&original).ok()?;
+        if stage.compiler_sha256 != compiler.sha256
+            || stage.siblings.is_empty()
+            || stage.siblings.len() > descriptor::MAX_COMPILER_IMPORT_SIBLINGS
+        {
+            return None;
+        }
+        let imports = compiler_normal_imports(bytes)?;
+        let bin = compiler.path.parent()?;
+        let mut files = Vec::with_capacity(stage.siblings.len());
+        let mut names = BTreeSet::new();
+        for sibling in &stage.siblings {
+            provision_budget(deadline).ok()?;
+            let sha256 = String::from(sibling.staged_sha256.clone());
+            let mut candidates = measured.iter().filter(|artifact| {
+                artifact.sha256 == sha256 && direct_compiler_sibling(&artifact.path, bin, &imports)
+            });
+            let candidate = candidates.next()?;
+            let name = candidate.path.file_name()?.to_str()?.to_ascii_uppercase();
+            if candidates.next().is_some() || !names.insert(name) {
+                return None;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&candidate.path)
+                .ok()?;
+            if staged_identity(&file, &sha256).as_ref() != Some(sibling) {
+                return None;
+            }
+            files.push(file);
+        }
+        provision_budget(deadline).ok()?;
+        Some((stage.siblings, files))
+    }
+
+    fn original_lookup_target(
+        descriptor: &descriptor::Descriptor,
+        compiler: &descriptor::ToolchainImage,
+        family: &Arc<Mutex<Vec<WindowsImageProcess>>>,
+    ) -> Option<(crate::windows_toolchain_file_trace::Target, String)> {
+        use crate::windows_toolchain_lookup_record::{RECEIPT_BYTES, first_library_receipts};
+        let compiled = descriptor.output_root.join("compiled");
+        let receipt = |leaf| {
+            crate::windows_native_files::hold_artifact(
+                &compiled.join(leaf),
+                None,
+                RECEIPT_BYTES as u64,
+            )
+            .ok()
+            .map(|evidence| evidence.bytes)
+        };
+        let created = receipt("native-child-readiness.rlib.created.json")?;
+        let retired = receipt("native-child-readiness.rlib.retired.json")?;
+        let (root, child, native_status, original) = {
+            let held = family.lock().ok()?;
+            let actual = held.first()?.identity;
+            let root = memcordon_core::WindowsProcessIdentityV1 {
+                process_id: actual.pid,
+                creation_time_100ns: u64::try_from(actual.birth).ok()?,
+            };
+            let (child, native_status) = first_library_receipts(
+                &created,
+                &retired,
+                &descriptor.challenge,
+                &root,
+                &compiler.sha256,
+            )?;
+            let original = held
+                .iter()
+                .find(|candidate| {
+                    candidate.identity.pid == child.process_id
+                        && candidate.identity.birth == u128::from(child.creation_time_100ns)
+                })?
+                .clone();
+            (root, child, native_status, original)
+        };
+        if original.native_parent_process_id().ok()? != root.process_id
+            || original.native_exit_status().ok().flatten()? != native_status
+        {
+            return None;
+        }
+        let ack = descriptor.output_root.join(format!(
+            "native-toolchain-{}-{}.ack.json",
+            child.process_id, child.creation_time_100ns
+        ));
+        let ack =
+            crate::windows_native_files::hold_artifact(&ack, None, RECEIPT_BYTES as u64).ok()?;
+        toolchain_creation_ack::validate(
+            &ack.bytes,
+            toolchain_creation_ack::Expected {
+                challenge: &descriptor.challenge,
+                root_pid: root.process_id,
+                child: &child,
+                parent: &root,
+                image_sha256: &compiler.sha256,
+            },
+        )
+        .ok()?;
+        Some((
+            crate::windows_toolchain_file_trace::Target {
+                pid: child.process_id,
+                birth_filetime: child.creation_time_100ns,
+                parent_pid: root.process_id,
+                parent_birth_filetime: root.creation_time_100ns,
+                native_status,
+            },
+            crate::windows_causal_acceptance::sha256(&created),
+        ))
+    }
+
+    enum DirectCompilerOriginal<'a> {
+        Arm64 {
+            native_status: u32,
+        },
+        X64 {
+            native_flags: u64,
+            stderr_sha256: &'a str,
+        },
+    }
+
+    fn observe_direct_compiler(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &CaseInput,
+        descriptor_sha256: &str,
+        witness_sha256: &str,
+        original: DirectCompilerOriginal<'_>,
+        deadline: Instant,
+    ) -> Result<serde_json::Value> {
+        use serde_json::json;
+        let x64 = matches!(original, DirectCompilerOriginal::X64 { .. });
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(8));
+        let toolchain =
+            input.descriptor.toolchain.as_ref().ok_or_else(|| {
+                CiError::Message("direct baseline compiler selection missing".into())
+            })?;
+        let Some(child_deadline) = deadline
+            .checked_sub(Duration::from_secs(1))
+            .filter(|deadline| *deadline > Instant::now())
+        else {
+            return Ok(json!({"state":"unavailable","reason":"baseline-deadline"}));
+        };
+        let (cutoff, frequency) = memcordon_testkit::windows_native_work_cutoff(child_deadline)?;
+        let cutoff = cutoff.min(toolchain.native_work_cutoff_ticks).min(
+            input
+                .descriptor
+                .control_clock
+                .as_ref()
+                .map_or(u64::MAX, |clock| clock.work_cutoff_qpc),
+        );
+        let source_sha256 = crate::windows_causal_acceptance::sha256(&read(
+            &toolchain.library_source,
+            1024 * 1024,
+        )?);
+        let token_sha256 =
+            crate::windows_causal_acceptance::sha256(&serde_json::to_vec(&input.expected_token)?);
+        let environment =
+            memcordon_core::encode_windows_environment_block(&fixture_environment::entries()?)
+                .map_err(|error| CiError::Message(error.into()))?;
+        let environment_bytes: Vec<_> = environment
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        let environment_sha256 = crate::windows_causal_acceptance::sha256(&environment_bytes);
+        let scratch = tempfile::Builder::new()
+            .prefix(if x64 {
+                "direct-x64-compiler-baseline-"
+            } else {
+                "direct-arm64-compiler-baseline-"
+            })
+            .tempdir_in(&input.descriptor.output_root)?;
+        let mut command = std::process::Command::new(&config.fixture.path);
+        command
+            .current_dir(&config.output_directory)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .args(["consumer-readiness-windows", "system-restricted-frontend"])
+            .arg(&config.fixture.path)
+            .args(["consumer-readiness-windows", "direct-compiler-baseline"])
+            .arg(&input.descriptor_path)
+            .arg(scratch.path())
+            .args([descriptor_sha256, witness_sha256, &token_sha256])
+            .arg(cutoff.to_string())
+            .arg(frequency.to_string());
+        let settled = memcordon_testkit::run_until_owned_windows_job_output_limit(
+            command,
+            deadline,
+            8 * 1024,
+        );
+        let scratch_retired = scratch.close().is_ok();
+        let output = match settled {
+            Ok(output) => output,
+            Err(error) => {
+                use memcordon_testkit::ProcessTestError;
+                let (stage, raw) = match &error {
+                    ProcessTestError::Spawn(cause) => {
+                        ("baseline-wrapper-spawn", cause.raw_os_error())
+                    }
+                    ProcessTestError::Wait(cause) => ("baseline-job-or-wait", cause.raw_os_error()),
+                    ProcessTestError::Timeout { .. } => ("baseline-deadline", None),
+                    ProcessTestError::Output(_) | ProcessTestError::OutputLimit { .. } => {
+                        ("baseline-output", None)
+                    }
+                    _ => ("baseline-owner-settlement", None),
+                };
+                return Ok(
+                    json!({"state":"incomplete","reason":"restricted-launch-settlement",
+                    "helper_failure":{"stage":stage,"raw_os_error":raw},
+                    "scratch_retired":scratch_retired}),
+                );
+            }
+        };
+        if !output.status.success() || !output.stderr.is_empty() {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct HelperFailure {
+                format: String,
+                revision: u8,
+                stage: String,
+                raw_os_error: Option<i32>,
+            }
+            let helper_failure = serde_json::from_slice::<HelperFailure>(&output.stdout)
+                .ok()
+                .filter(|record| {
+                    record.format == "memcordon.windows-direct-compiler-helper-failure"
+                        && record.revision == 1
+                        && matches!(
+                            record.stage.as_str(),
+                            "input-validation" | "compiler-capture-or-retirement"
+                        )
+                });
+            return Ok(
+                json!({"state":"incomplete","reason":"restricted-baseline-helper-refused",
+                "helper_status":output.status.code(),"helper_stderr_bytes":output.stderr.len(),
+                "helper_failure":helper_failure.map(|record| json!({
+                    "stage":record.stage,"raw_os_error":record.raw_os_error,
+                })),
+                "scratch_retired":scratch_retired}),
+            );
+        }
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let selected_digest = |path: &Path| {
+            toolchain
+                .selected_images
+                .iter()
+                .find(|image| image.path == path)
+                .map(|image| image.sha256.as_str())
+        };
+        let format = if x64 {
+            "memcordon.windows-direct-x64-compiler-baseline"
+        } else {
+            "memcordon.windows-direct-arm64-compiler-baseline"
+        };
+        if report["format"] != format
+            || report["revision"] != 1
+            || report["descriptor_sha256"] != descriptor_sha256
+            || report["original_witness_sha256"] != witness_sha256
+            || report["token_profile_sha256"] != token_sha256
+            || report["environment_sha256"] != environment_sha256
+            || report["source_sha256"] != source_sha256
+            || report["compiler_sha256"].as_str() != selected_digest(&toolchain.rustc)
+            || report["linker_sha256"].as_str() != selected_digest(&toolchain.native_linker)
+            || report["requested_creation_flags"]
+                != windows_sys::Win32::System::Threading::DEBUG_PROCESS
+            || report["role"] != "readiness.rlib"
+        {
+            return Ok(
+                json!({"state":"incomplete","reason":"restricted-baseline-binding-differs"}),
+            );
+        }
+        if !scratch_retired {
+            return Ok(
+                json!({"state":"incomplete","reason":"direct-owned-scratch-retirement-unproved",
+                "evidence":report,"diagnostic_job_empty_verified":true,"scratch_retired":false,
+                "acceptance_authority":false}),
+            );
+        }
+        let (comparison, original_evidence) = match original {
+            DirectCompilerOriginal::Arm64 { native_status } => (
+                crate::windows_toolchain_lookup_record::direct_compiler_disposition(
+                    &report["outcome"],
+                    native_status,
+                ),
+                json!({"native_status":native_status}),
+            ),
+            DirectCompilerOriginal::X64 {
+                native_flags,
+                stderr_sha256,
+            } => (
+                super::direct_x64_compiler_disposition(&report["outcome"], native_flags),
+                json!({"native_flags":native_flags,"raw_os_error":5,"stderr_sha256":stderr_sha256}),
+            ),
+        };
+        Ok(json!({
+            "state":comparison,"evidence":report,"installed_original":original_evidence,
+            "token_binding":"matching measured profile subset; distinct token and authorization context",
+            "provider_and_original_controller_ack_excluded":true,
+            "output_path_isolated":true,"scratch_retired":scratch_retired,
+            "diagnostic_job_empty_verified":true,
+            "compiler_stdin":"inherited diagnostic null handle","outer_job_context_differs":true,"acceptance_authority":false,
+            "unique_cause_proved":false,
+        }))
+    }
+
+    fn original_lookup_static_imports(
+        compiler: &descriptor::ToolchainImage,
+        staged: &[crate::windows_installed_cases::SelectedArtifact],
+        observed_loads: &[String],
+        deadline: Instant,
+    ) -> serde_json::Value {
+        use crate::windows_toolchain_lookup_record::{dll_basename, static_image};
+        use serde_json::json;
+        let intersections: Vec<_> = staged
+            .iter()
+            .filter_map(|image| {
+                let name = image.path.file_name()?.to_str()?;
+                dll_basename(name).then(|| (name.to_ascii_lowercase(), image.sha256.clone()))
+            })
+            .collect();
+        let inspect = |role, path: &Path, hash: &str, maximum| {
+            if Instant::now() >= deadline {
+                return json!({"role":role,"sha256":hash,"state":"incomplete","reason":"diagnostic-deadline"});
+            }
+            match read(path, maximum) {
+                Ok(bytes) => static_image(role, hash, &bytes, &intersections),
+                Err(_) => {
+                    json!({"role":role,"sha256":hash,"state":"incomplete","reason":"bounded-image-read-unavailable"})
+                }
+            }
+        };
+        let rustc = inspect(
+            "compiler",
+            &compiler.path,
+            &compiler.sha256,
+            2 * 1024 * 1024,
+        );
+        let drivers: Vec<_> = staged
+            .iter()
+            .filter(|image| {
+                let Some(name) = image.path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                    return false;
+                };
+                let name = name.to_ascii_lowercase();
+                name.starts_with("rustc_driver-")
+                    && rustc["imports"].as_array().is_some_and(|edges| {
+                        edges
+                            .iter()
+                            .any(|edge| edge["kind"] == "normal" && edge["basename"] == name)
+                    })
+            })
+            .collect();
+        let driver = if let [image] = drivers.as_slice() {
+            json!({
+                "basis":if observed_loads.contains(&image.sha256) {
+                    "original-debug-image-load-file-identity"
+                } else {
+                    "unique-direct-staged-import-candidate"
+                },
+                "inventory":inspect("staged-compiler-driver", &image.path, &image.sha256, 256 * 1024 * 1024),
+            })
+        } else {
+            json!({"state":"incomplete","reason":"unique-staged-compiler-driver-unavailable"})
+        };
+        json!({
+            "basis":"static-import-table-candidates",
+            "compiler":rustc,"driver":driver,
+            "stage_intersection_scope":"measured-dll-basenames-in-compiler-directory",
+            "limitations":["forwarded-export-chains-unresolved","api-set-host-mapping-unresolved",
+                "dynamic-loads-unobserved","static-imports-do-not-establish-lookup-or-causality"],
+        })
+    }
+
     fn prepare_gate_input(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &CaseInput,
@@ -4450,14 +6917,50 @@ pub(crate) mod native {
             CiError::Message("positive input omitted held-root native barrier".into())
         })?;
         provision_budget(work_deadline)?;
-        let observed_path = config
-            .output_directory
-            .join(if input.expected_token.restricted {
+        let selected = if reduced_compiler_toolchain(&input.key) {
+            let failure_path = config.output_directory.join(REDUCED_COMPILER_FAILURE);
+            if failure_path.try_exists()? {
+                use descriptor::gate_precondition::{
+                    COMPILER_QUALIFICATION_FAILURE_BYTES, CompilerQualificationFailure,
+                };
+                let record: serde_json::Value = serde_json::from_slice(&read(
+                    &failure_path,
+                    COMPILER_QUALIFICATION_FAILURE_BYTES * 2,
+                )?)?;
+                let stage = match record["stage"].as_str() {
+                    Some("source-snapshot") => "source-snapshot",
+                    Some("reduced-snapshot") => "reduced-snapshot",
+                    Some("authority-reduction") => "authority-reduction",
+                    Some("snapshot-publication") => "snapshot-publication",
+                    _ => "unrecognized",
+                };
+                let failure =
+                    CompilerQualificationFailure::parse(&serde_json::to_vec(&record["failure"])?);
+                return Err(CiError::Message(format!(
+                    "mandatory group-privilege-reduced compiler qualification failed at {stage}; wrapper status {:?}; held child status {:?}; originating failure {failure:?}",
+                    record["wrapper_status"].as_i64(),
+                    record["held_child_status"].as_i64()
+                )));
+            }
+            let selected: descriptor::gate_precondition::CompilerAuthoritySnapshot =
+                serde_json::from_slice(
+                    &read(
+                        &config.output_directory.join(REDUCED_COMPILER_SELECTED),
+                        COMPILER_AUTHORITY_BYTES,
+                    )
+                    .map_err(|error| {
+                        error.context("mandatory group-privilege-reduced compiler qualification")
+                    })?,
+                )?;
+            selected.token
+        } else {
+            let leaf = if input.expected_token.restricted {
                 "windows-restricted-token.json"
             } else {
                 "windows-ordinary-token.json"
-            });
-        let selected: TokenObservation = serde_json::from_slice(&read(&observed_path, 16 * 1024)?)?;
+            };
+            serde_json::from_slice(&read(&config.output_directory.join(leaf), 16 * 1024)?)?
+        };
         if selected != input.expected_token {
             return Err(CiError::Message(
                 "start-gate waiter differs from original selected native caller observation".into(),
@@ -4468,12 +6971,16 @@ pub(crate) mod native {
             input.descriptor.start_transport,
             descriptor::StartTransport::ControllerStdin { .. }
         );
-        let created = start_gate_create(name, &selected.user_sid, work_deadline);
-        let (gate, requested_sddl, creation_error) = match created {
-            Ok((gate, sddl)) => (Some(Arc::new(gate)), sddl, None),
-            Err(error) if stdin_start => (None, String::new(), Some(error.to_string())),
-            Err(error) => return Err(error),
-        };
+        let (gate, requested_sddl, creation_error) =
+            if stdin_start && input.descriptor.case == descriptor::Case::Toolchain {
+                (None, String::new(), None)
+            } else {
+                match start_gate_create(name, &selected.user_sid, work_deadline) {
+                    Ok((gate, sddl)) => (Some(Arc::new(gate)), sddl, None),
+                    Err(error) if stdin_start => (None, String::new(), Some(error.to_string())),
+                    Err(error) => return Err(error),
+                }
+            };
         let mut final_input = input.clone();
         // Serialized suite input is a plan, never a substitute descriptor owner.
         final_input.descriptor.gate_access_diagnostic = None;
@@ -4765,6 +7272,234 @@ pub(crate) mod native {
         Ok(())
     }
 
+    struct CompilerAuthorityControl {
+        sentinel: std::fs::File,
+        receipt: descriptor::gate_precondition::CompilerAuthorityOrdinaryControl,
+        selected: descriptor::gate_precondition::CompilerAuthoritySnapshot,
+    }
+
+    impl CompilerAuthorityControl {
+        fn observe(
+            config: &crate::windows_installed_cases::InstalledWindowsPayload,
+            input: &CaseInput,
+            deadline: Instant,
+        ) -> Result<Self> {
+            use descriptor::gate_precondition::{
+                CompilerAuthorityFileIdentity, CompilerAuthorityOrdinaryControl,
+                CompilerAuthoritySnapshot, sha256, validate_compiler_authority_reduction,
+            };
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            };
+            let path = reduced_compiler_sentinel(&config.output_directory);
+            if input.descriptor.denied_write_paths.as_slice() != std::slice::from_ref(&path) {
+                return Err(CiError::Message(
+                    "group-privilege-reduced sentinel is outside the owned fixture namespace"
+                        .into(),
+                ));
+            }
+            let caller = read(
+                &config.output_directory.join("windows-ordinary-token.json"),
+                16 * 1024,
+            )?;
+            let token: TokenObservation = serde_json::from_slice(&caller)?;
+            let snapshot = |leaf| -> Result<CompilerAuthoritySnapshot> {
+                Ok(serde_json::from_slice(&read(
+                    &config.output_directory.join(leaf),
+                    COMPILER_AUTHORITY_BYTES,
+                )?)?)
+            };
+            let source = snapshot(REDUCED_COMPILER_SOURCE)?;
+            let selected = snapshot(REDUCED_COMPILER_SELECTED)?;
+            validate_compiler_authority_reduction(&source, &selected)
+                .map_err(|reason| CiError::Message(reason.into()))?;
+            if token != source.token || selected.token != input.expected_token {
+                return Err(CiError::Message(
+                    "group-privilege-reduced ordinary control caller differs".into(),
+                ));
+            }
+            let sid = sid_text(&token.user_sid)?;
+            fs::create_dir(path.parent().expect("owned sentinel parent"))?;
+            let created = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&path)?;
+            let initial = memcordon_testkit::windows_held_file_metadata(&created)?;
+            set_directory_acl(
+                &path,
+                &format!("D:P(A;;GR;;;{sid})(A;;GR;;;OW)(A;;0x00000002;;;BA)(A;;GR;;;SY)"),
+            )?;
+            let sentinel = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&path)?;
+            let before = memcordon_testkit::windows_held_file_metadata(&sentinel)?;
+            if before.attributes
+                & (FILE_ATTRIBUTE_DIRECTORY
+                    | FILE_ATTRIBUTE_READONLY
+                    | FILE_ATTRIBUTE_REPARSE_POINT)
+                != 0
+                || before.links != 1
+                || before.length != 0
+                || before.file_index == 0
+                || (before.volume_serial, before.file_index)
+                    != (initial.volume_serial, initial.file_index)
+            {
+                return Err(CiError::Message(
+                    "group-privilege-reduced control sentinel is not an owned empty file".into(),
+                ));
+            }
+            drop(created);
+            let budget = provision_budget(deadline)?.min(Duration::from_secs(8));
+            let mut command = std::process::Command::new(&config.fixture.path);
+            command
+                .current_dir(&config.output_directory)
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .args(["consumer-readiness-windows", "system-frontend"])
+                .arg(&config.fixture.path)
+                .args([
+                    "consumer-readiness-windows",
+                    "reduced-compiler-ordinary-control",
+                ])
+                .arg(&input.descriptor_path);
+            let observed = memcordon_testkit::run_with_deadline_output_limit(
+                &mut command,
+                budget,
+                COMPILER_AUTHORITY_BYTES,
+            )
+            .map_err(CiError::from)?;
+            if !observed.status.success() || !observed.stderr.is_empty() {
+                return Err(CiError::Message(format!(
+                    "ordinary group-privilege-reduced sentinel control failed with status {:?}",
+                    observed.status.code()
+                )));
+            }
+            provision_budget(deadline)?;
+            let receipt: CompilerAuthorityOrdinaryControl =
+                serde_json::from_slice(&observed.stdout)?;
+            if receipt.authority != source
+                || receipt.token != token
+                || receipt.effective_token_sha256 != sha256(&caller)
+                || receipt.challenge_sha256 != sha256(&input.descriptor.challenge)
+                || !receipt.protected_write_verified
+                || receipt.protected
+                    != (CompilerAuthorityFileIdentity {
+                        volume_serial: before.volume_serial,
+                        file_index: before.file_index,
+                    })
+                || read(&path, 4096)? != input.descriptor.challenge
+            {
+                return Err(CiError::Message(
+                    "ordinary sentinel write does not match its held token, identity and bytes"
+                        .into(),
+                ));
+            }
+            Ok(Self {
+                sentinel,
+                receipt,
+                selected,
+            })
+        }
+
+        fn probes(
+            &self,
+            input: &CaseInput,
+            transcript: &[u8],
+            deadline: Instant,
+        ) -> Result<descriptor::gate_precondition::CompilerAuthorityProbes> {
+            use descriptor::gate_precondition::REDUCED_COMPILER_OUTPUT;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+            provision_budget(deadline)?;
+            let events = super::events(transcript)?;
+            let expected_event = |stage| {
+                let mut matching = events.iter().filter(|event| event.stage == stage);
+                let event = matching.next().ok_or_else(|| {
+                    CiError::Message("group-privilege-reduced workload evidence absent".into())
+                })?;
+                if matching.next().is_some()
+                    || event.ordinal.is_some()
+                    || events.first().is_none_or(|root| root.pid != event.pid)
+                {
+                    return Err(CiError::Message(
+                        "group-privilege-reduced workload evidence identity differs".into(),
+                    ));
+                }
+                Ok(event)
+            };
+            let envelope = expected_event("token-envelope")?;
+            let released = expected_event("controller-released")?;
+            let observed = expected_event("reduced-compiler-probes")?;
+            let ready = expected_event("toolchain-ready-for-native-observer")?;
+            if !(envelope.sequence < released.sequence
+                && released.sequence < observed.sequence
+                && observed.sequence < ready.sequence)
+                || released.value != input.descriptor.challenge
+                || serde_json::from_slice::<TokenObservation>(&envelope.value)?
+                    != input.expected_token
+            {
+                return Err(CiError::Message(
+                    "group-privilege-reduced probe sequence, caller or challenge differs".into(),
+                ));
+            }
+            let probes = super::validate_reduced_compiler_probes(
+                &observed.value,
+                &input.descriptor.challenge,
+                &envelope.value,
+            )?;
+            let held = memcordon_testkit::windows_held_file_metadata(&self.sentinel)?;
+            let path = &input.descriptor.denied_write_paths[0];
+            if probes.authority != self.selected
+                || probes.protected != self.receipt.protected
+                || held.volume_serial != self.receipt.protected.volume_serial
+                || held.file_index != self.receipt.protected.file_index
+                || held.links != 1
+                || held.attributes & FILE_ATTRIBUTE_READONLY != 0
+                || held.length != input.descriptor.challenge.len() as u64
+                || read(path, 4096)? != input.descriptor.challenge
+                || read(
+                    &input.descriptor.output_root.join(REDUCED_COMPILER_OUTPUT),
+                    4096,
+                )? != input.descriptor.challenge
+            {
+                return Err(CiError::Message(
+                    "paired group-privilege-reduced sentinel identity or output bytes differ"
+                        .into(),
+                ));
+            }
+            provision_budget(deadline)?;
+            Ok(probes)
+        }
+
+        fn verify(
+            &self,
+            input: &CaseInput,
+            transcript: &[u8],
+            report: &Path,
+            deadline: Instant,
+        ) -> Result<()> {
+            let probes = self.probes(input, transcript, deadline)?;
+            provision_budget(deadline)?;
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.windows-group-privilege-reduced-compiler-control","revision":1,
+                "challenge_sha256":self.receipt.challenge_sha256,
+                "ordinary_effective_token_sha256":self.receipt.effective_token_sha256,
+                "ordinary_protected_write_verified":true,"source_authority":self.receipt.authority,
+                "reduced_compiler":probes,
+                "protected_and_output_bytes_verified":true,
+            }))?;
+            drop(crate::windows_native_files::publish_owned_file(
+                &report.with_extension("group-privilege-reduced-control.json"),
+                &bytes,
+            )?);
+            Ok(())
+        }
+    }
+
     fn fixture_products(input: &CaseInput) -> Result<()> {
         let root = &input.descriptor.output_root;
         let bytes: Vec<u8> = (0..=255).collect();
@@ -5046,19 +7781,20 @@ pub(crate) mod native {
         last_root_stage: &'static str,
     }
 
+    fn toolchain_transcript(transcript: &Path) -> io::Result<Vec<u8>> {
+        read(transcript, 16 * 1024 * 1024)
+            .map_err(io::Error::other)
+            .map_err(|error| {
+                toolchain_observation_error("read fixture transcript", transcript, error)
+            })
+    }
+
     fn toolchain_completion_published(
-        transcript: &Path,
+        bytes: &[u8],
         root_pid: u32,
         deadline: Instant,
     ) -> io::Result<ToolchainTranscriptSnapshot> {
-        let published = super::live_events(
-            &read(transcript, 16 * 1024 * 1024)
-                .map_err(io::Error::other)
-                .map_err(|error| {
-                    toolchain_observation_error("read fixture transcript", transcript, error)
-                })?,
-        )
-        .map_err(io::Error::other)?;
+        let published = super::live_events(bytes).map_err(io::Error::other)?;
         if Instant::now() >= deadline {
             return Err(io::Error::other(
                 "native compiler descendant observer deadline expired",
@@ -5100,11 +7836,14 @@ pub(crate) mod native {
         root_pid: u32,
         family: &Arc<Mutex<Vec<WindowsImageProcess>>>,
         deadline: Instant,
+        end_binding: Option<&ToolchainEndBinding<'_>>,
     ) -> io::Result<bool> {
-        if toolchain_completion_published(transcript, root_pid, deadline)?.complete {
+        if toolchain_completion_published(&toolchain_transcript(transcript)?, root_pid, deadline)?
+            .complete
+        {
             return Ok(true);
         }
-        let (retired, native_status) = {
+        let (retired, native_status, birth) = {
             let held = family
                 .lock()
                 .map_err(|_| io::Error::other("compiler family ownership poisoned"))?;
@@ -5120,14 +7859,16 @@ pub(crate) mod native {
             // This diagnostic query uses THAT SAME original retained handle.
             // Its failure cannot replace the original premature-retirement error.
             let native_status = retired.then(|| root.native_exit_status());
-            (retired, native_status)
+            (retired, native_status, root.identity.birth)
         };
         if retired {
             // A final durable event may have raced the native retirement read.
-            let final_snapshot = toolchain_completion_published(transcript, root_pid, deadline)?;
+            let bytes = toolchain_transcript(transcript)?;
+            let final_snapshot = toolchain_completion_published(&bytes, root_pid, deadline)?;
             if final_snapshot.complete {
                 return Ok(true);
             }
+            let ended_status = matches!(&native_status, Some(Ok(Some(2))));
             let native_status = match native_status {
                 Some(Ok(Some(status))) => format!("observed:{status:#010x}"),
                 Some(Ok(None)) => "unavailable-not-observed".into(),
@@ -5138,18 +7879,163 @@ pub(crate) mod native {
                 ),
                 None => "unavailable-not-queried".into(),
             };
-            return Err(io::Error::other(format!(
+            let original = format!(
                 "native compiler fixture retired before publishing toolchain completion; held-root-native-exit={native_status}; last-validated-root-stage={}",
                 final_snapshot.last_root_stage,
-            )));
+            );
+            if let Some(end) = end_binding.filter(|end| {
+                ended_status && end.start.pid == root_pid && u128::from(end.start.birth) == birth
+            }) {
+                match super::standalone_toolchain_ended_transcript(&bytes, end.start, end.root) {
+                    Ok(true) => {
+                        let transcript_sha256 =
+                            descriptor::controller_start::descriptor_digest(&bytes);
+                        if Instant::now() < deadline {
+                            return Err(io::Error::other(ToolchainApplicationEnd {
+                                original,
+                                root: memcordon_core::WindowsProcessIdentityV1 {
+                                    process_id: root_pid,
+                                    creation_time_100ns: end.start.birth,
+                                },
+                                status: 2,
+                                live_nonce: end.live_nonce.to_owned(),
+                                transcript_sha256,
+                                descriptor_sha256: end.start.descriptor_sha256,
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(io::Error::other(format!(
+                            "{original}; final held-root transcript: {error}"
+                        )));
+                    }
+                    Ok(false) => {}
+                }
+            }
+            return Err(io::Error::other(original));
         }
         Ok(false)
+    }
+
+    struct OriginalLookupStop<'a> {
+        compiler_sha256: &'a str,
+        request: std::sync::mpsc::SyncSender<WindowsImageProcess>,
+    }
+
+    type OriginalLookupWorker =
+        std::thread::JoinHandle<(crate::windows_toolchain_file_trace::Capture, &'static str)>;
+
+    fn start_original_lookup(
+        deadline: Instant,
+    ) -> (
+        std::result::Result<OriginalLookupWorker, serde_json::Value>,
+        Option<std::sync::mpsc::SyncSender<WindowsImageProcess>>,
+    ) {
+        use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+        let mut capture = match crate::windows_toolchain_file_trace::Capture::start() {
+            Ok(capture) => capture,
+            Err(error) => {
+                return (
+                    Err(serde_json::json!({"state":"unavailable","start_error":error})),
+                    None,
+                );
+            }
+        };
+        let (request, receiver) = sync_channel::<WindowsImageProcess>(1);
+        match std::thread::Builder::new()
+            .name("windows-original-compiler-lookup-stop".into())
+            .spawn(move || {
+                let reason = match receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(compiler) => loop {
+                        match compiler.has_exited() {
+                            Ok(true) => break "original-first-compiler-retired",
+                            Ok(false) => {}
+                            Err(_) => break "original-first-compiler-retirement-query-failed",
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break "work-deadline";
+                        }
+                        if matches!(
+                            receiver.recv_timeout(remaining.min(Duration::from_millis(5))),
+                            Err(RecvTimeoutError::Disconnected),
+                        ) {
+                            break "native-observer-ended";
+                        }
+                    },
+                    Err(RecvTimeoutError::Disconnected) => "native-observer-ended",
+                    Err(RecvTimeoutError::Timeout) => "work-deadline",
+                };
+                capture.stop();
+                (capture, reason)
+            }) {
+            Ok(worker) => (Ok(worker), Some(request)),
+            Err(error) => (
+                Err(
+                    serde_json::json!({"state":"unavailable","reason":"stop-worker-spawn",
+                    "raw_os_error":error.raw_os_error()}),
+                ),
+                None,
+            ),
+        }
+    }
+
+    fn join_original_lookup(
+        worker: OriginalLookupWorker,
+        cleanup_deadline: Instant,
+    ) -> std::result::Result<
+        (crate::windows_toolchain_file_trace::Capture, &'static str),
+        serde_json::Value,
+    > {
+        let wait_deadline = cleanup_deadline.min(Instant::now() + Duration::from_secs(1));
+        while !worker.is_finished() {
+            let remaining = wait_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // The worker still owns its ETW session and private file. Its
+                // result is discarded and dropped when native stop returns.
+                return Err(
+                    serde_json::json!({"state":"incomplete","reason":"stop-worker-deadline"}),
+                );
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        worker
+            .join()
+            .map_err(|_| serde_json::json!({"state":"unavailable","reason":"stop-worker-panicked"}))
     }
 
     struct ToolchainObservationImages<'a> {
         images: &'a [descriptor::ToolchainImage],
         clock: (u64, u64),
+        end: Option<ToolchainEndBinding<'a>>,
+        lookup_stop: Option<OriginalLookupStop<'a>>,
     }
+
+    struct ToolchainEndBinding<'a> {
+        start: &'a descriptor::controller_start::Binding,
+        root: descriptor::ToolchainInputRoot,
+        live_nonce: &'a str,
+    }
+
+    #[derive(Debug)]
+    struct ToolchainApplicationEnd {
+        original: String,
+        root: memcordon_core::WindowsProcessIdentityV1,
+        status: u32,
+        live_nonce: String,
+        transcript_sha256: [u8; 32],
+        descriptor_sha256: [u8; 32],
+    }
+
+    impl std::fmt::Display for ToolchainApplicationEnd {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.original)
+        }
+    }
+
+    impl std::error::Error for ToolchainApplicationEnd {}
 
     struct PendingHelperSample {
         hint: super::toolchain_sampling::Hint,
@@ -5373,6 +8259,7 @@ pub(crate) mod native {
         let mut pending: Option<PendingHelperSample> = None;
         let mut diagnostic_owners = Vec::new();
         let mut diagnostic_error = None;
+        let mut lookup_compiler_sent = false;
         let context = HelperSampleContext {
             directory,
             output_root,
@@ -5403,11 +8290,23 @@ pub(crate) mod native {
                         }
                     }
                 }
-                if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
+                if toolchain_observation_complete(
+                    transcript,
+                    root_pid,
+                    family,
+                    deadline,
+                    selected.end.as_ref(),
+                )? {
                     return Ok(());
                 }
                 for image in selected.images {
-                    if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
+                    if toolchain_observation_complete(
+                        transcript,
+                        root_pid,
+                        family,
+                        deadline,
+                        selected.end.as_ref(),
+                    )? {
                         return Ok(());
                     }
                     let processes =
@@ -5439,6 +8338,19 @@ pub(crate) mod native {
                             || process.has_exited()?
                         {
                             continue;
+                        }
+                        // This hint is written and closed before the separate
+                        // no-debug child can exist. Only the original debug
+                        // workload uses the live creation-ACK contract.
+                        if let Some(end) = selected.end.as_ref() {
+                            let hint = output_root
+                                .join("compiled")
+                                .join("native-compiler-no-debug-comparison.started");
+                            if read(&hint, 32)
+                                .is_ok_and(|bytes| bytes == end.start.descriptor_sha256)
+                            {
+                                continue;
+                            }
                         }
                         let parent_birth = parent.identity.birth;
                         if held
@@ -5495,6 +8407,17 @@ pub(crate) mod native {
                             ));
                         }
                         let child_identity = process.identity;
+                        if !lookup_compiler_sent
+                            && parent_pid == root_pid
+                            && let Some(stop) = &selected.lookup_stop
+                            && stop.compiler_sha256 == image.sha256
+                        {
+                            // This is the first held direct creation of the measured
+                            // compiler. The debugger waits for its original ACK, so a
+                            // later compile cannot overtake admission of this one.
+                            let _ = stop.request.try_send(process.clone());
+                            lookup_compiler_sent = true;
+                        }
                         held.push(process);
                         if Instant::now() >= deadline
                             || !held.iter().any(|owner| {
@@ -5614,7 +8537,13 @@ pub(crate) mod native {
                         }
                     }
                 }
-                if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
+                if toolchain_observation_complete(
+                    transcript,
+                    root_pid,
+                    family,
+                    deadline,
+                    selected.end.as_ref(),
+                )? {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -5660,7 +8589,14 @@ pub(crate) mod native {
         record: &mut CaseAssessment,
         work_deadline: Instant,
     ) -> Result<()> {
-        execute_until_with_cleanup(config, input, record, work_deadline, None)
+        execute_until_with_cleanup(
+            config,
+            input,
+            record,
+            work_deadline,
+            None,
+            super::GuardianReleaseWaitScope::ExistingCaseSelection,
+        )
     }
 
     fn execute_until_with_cleanup(
@@ -5669,6 +8605,7 @@ pub(crate) mod native {
         record: &mut CaseAssessment,
         work_deadline: Instant,
         cleanup: Option<Instant>,
+        guardian_release_wait: super::GuardianReleaseWaitScope,
     ) -> Result<()> {
         let baseline = GuardianBaseline::quiescent(
             &config.installed_agent.path,
@@ -5685,6 +8622,7 @@ pub(crate) mod native {
             None,
             ExecutionClocks {
                 work: work_deadline,
+                guardian_release_wait,
                 matched: None,
                 cleanup,
                 registry: None,
@@ -5737,6 +8675,7 @@ pub(crate) mod native {
             excluded_fixture,
             ExecutionClocks {
                 work: work_deadline,
+                guardian_release_wait: super::GuardianReleaseWaitScope::ExistingCaseSelection,
                 matched: None,
                 cleanup: None,
                 registry: None,
@@ -5750,6 +8689,7 @@ pub(crate) mod native {
     struct ExecutionClocks {
         matched: Option<MatchedExecution>,
         work: Instant,
+        guardian_release_wait: super::GuardianReleaseWaitScope,
         cleanup: Option<Instant>,
         registry: Option<Arc<Mutex<memcordon_testkit::WindowsWinsockRegistryProjection>>>,
         registry_lifetime: RegistryProjectionLifetime,
@@ -5788,6 +8728,45 @@ pub(crate) mod native {
     struct ProjectionObservation {
         root: Option<(u32, u128, memcordon_core::WindowsCallerTokenEnvelopeV1)>,
         peer: Option<(u32, u128, memcordon_core::WindowsCallerTokenEnvelopeV1)>,
+    }
+
+    #[derive(Debug)]
+    struct PeerSpawnApplicationEnd {
+        original: post_listener_end::Failure,
+        grant: descriptor::original_peer_spawn_observation::Grant,
+        transcript_sha256: [u8; 32],
+        live_nonce: String,
+    }
+
+    impl std::fmt::Display for PeerSpawnApplicationEnd {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.original, f)
+        }
+    }
+
+    impl std::error::Error for PeerSpawnApplicationEnd {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.original)
+        }
+    }
+
+    fn hold_original_frontend_child(
+        cli: &Path,
+        parent: u32,
+        deadline: Instant,
+    ) -> io::Result<WindowsImageProcess> {
+        let mut selected = Vec::new();
+        for process in memcordon_testkit::windows_processes_for_image_until(cli, deadline)? {
+            if process.native_parent_process_id()? == parent && !process.has_exited()? {
+                selected.push(process);
+            }
+        }
+        if selected.len() != 1 {
+            return Err(io::Error::other(
+                "status fixture lacks one original held frontend child",
+            ));
+        }
+        Ok(selected.pop().expect("exact original frontend cardinality"))
     }
 
     fn execute_with_baseline_clocks(
@@ -5977,7 +8956,94 @@ pub(crate) mod native {
             None => GateClock::PrepareFromDeadline,
         };
         clock.validate_selection(&input.descriptor)?;
-        let prepared = prepare_gate_input(config, input, work_deadline, clock)?;
+        let mut prepared = prepare_gate_input(config, input, work_deadline, clock)?;
+        let mut compiler_custody =
+            ToolchainDirectoryCustody::acquire(config, &mut prepared.input, work_deadline)?;
+        let original_lookup_requested = cfg!(target_arch = "aarch64")
+            && config.target == crate::windows_toolchain_lookup_record::ARM64_TARGET
+            && prepared.input.descriptor.case == descriptor::Case::Toolchain
+            && prepared.input.key.family == "W-TOOLCHAIN"
+            && matches!(
+                prepared.input.key.scenario.as_str(),
+                "ordinary" | "restricted"
+            )
+            && prepared.input.descriptor.matched_control.is_none();
+        let original_x64_refusal_requested = cfg!(target_arch = "x86_64")
+            && config.target == "x86_64-pc-windows-msvc"
+            && prepared.input.descriptor.case == descriptor::Case::Toolchain
+            && prepared.input.key.family == "W-TOOLCHAIN"
+            && prepared.input.key.scenario == "restricted"
+            && prepared.input.descriptor.matched_control.is_none()
+            && !prepared.input.descriptor.provider_input_experiment;
+        let mut original_lookup_staged = Vec::new();
+        let mut original_lookup_staged_truncated = false;
+        let mut toolchain_images = Vec::new();
+        if super::needs_descriptor_toolchain_observer(&prepared.input.descriptor)? {
+            let measured: Vec<crate::windows_installed_cases::SelectedArtifact> =
+                serde_json::from_slice(&read(
+                    &config.output_directory.join("windows-owned-inputs.json"),
+                    64 * 1024 * 1024,
+                )?)?;
+            let selected = descriptor::project_toolchain_images(
+                measured
+                    .iter()
+                    .map(|image| (image.path.clone(), image.sha256.clone())),
+            )
+            .map_err(CiError::Message)?;
+            let toolchain = prepared
+                .input
+                .descriptor
+                .toolchain
+                .as_mut()
+                .ok_or_else(|| {
+                    CiError::Message("native compiler descriptor inventory absent".into())
+                })?;
+            super::validate_toolchain_inventory(toolchain, &selected)?;
+            if original_lookup_requested {
+                let peers = measured.iter().filter(|image| {
+                    image.path.parent() == toolchain.rustc.parent()
+                        && image
+                            .path
+                            .file_name()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .is_some_and(crate::windows_toolchain_lookup_record::dll_basename)
+                });
+                original_lookup_staged.extend(peers.take(65).cloned());
+                original_lookup_staged_truncated = original_lookup_staged.len() > 64;
+                original_lookup_staged.truncate(64);
+            }
+            for image in selected {
+                let bytes = read(&image.path, 512 * 1024 * 1024)?;
+                if crate::windows_causal_acceptance::sha256(&bytes) != image.sha256 {
+                    return Err(CiError::Message("native compiler observer input image is unmeasured or exceeds finite closure".into()));
+                }
+                if image.path == toolchain.rustc {
+                    if let Some(custody) = compiler_custody.as_mut().and_then(Arc::get_mut) {
+                        if let Some((siblings, files)) = hold_compiler_import_siblings(
+                            config,
+                            &image,
+                            &bytes,
+                            &measured,
+                            work_deadline,
+                        ) {
+                            toolchain.compiler_import_siblings = siblings;
+                            if toolchain.validate_selected_images().is_ok() {
+                                custody.import_files = files;
+                            } else {
+                                toolchain.compiler_import_siblings.clear();
+                            }
+                        }
+                    }
+                }
+                toolchain_images.push(image);
+            }
+            if toolchain_images.is_empty() {
+                return Err(CiError::Message(
+                    "native compiler observer has no measured compiler/linker images".into(),
+                ));
+            }
+        }
+        let callback_compiler_custody = compiler_custody.clone();
         let input = &prepared.input;
         let gate_name = input.descriptor.start_gate.as_ref().ok_or_else(|| {
             CiError::Message("positive input omitted held-root native barrier".into())
@@ -5996,35 +9062,6 @@ pub(crate) mod native {
             ))
         .then(|| event_create(&format!("{gate_name}-toolchain-observer")))
         .transpose()?;
-        let mut toolchain_images = Vec::new();
-        if needs_toolchain_observer {
-            let measured: Vec<crate::windows_installed_cases::SelectedArtifact> =
-                serde_json::from_slice(&read(
-                    &config.output_directory.join("windows-owned-inputs.json"),
-                    64 * 1024 * 1024,
-                )?)?;
-            let selected = descriptor::project_toolchain_images(
-                measured.into_iter().map(|image| (image.path, image.sha256)),
-            )
-            .map_err(CiError::Message)?;
-            let toolchain = input.descriptor.toolchain.as_ref().ok_or_else(|| {
-                CiError::Message("native compiler descriptor inventory absent".into())
-            })?;
-            super::validate_toolchain_inventory(toolchain, &selected)?;
-            for image in selected {
-                if crate::windows_causal_acceptance::sha256(&read(&image.path, 512 * 1024 * 1024)?)
-                    != image.sha256
-                {
-                    return Err(CiError::Message("native compiler observer input image is unmeasured or exceeds finite closure".into()));
-                }
-                toolchain_images.push(image);
-            }
-            if toolchain_images.is_empty() {
-                return Err(CiError::Message(
-                    "native compiler observer has no measured compiler/linker images".into(),
-                ));
-            }
-        }
         let cohort_event = input
             .descriptor
             .cohort_gate
@@ -6077,6 +9114,8 @@ pub(crate) mod native {
         let held_association = Arc::clone(&association);
         let frontend = Arc::new(Mutex::new(None::<WindowsImageProcess>));
         let held_frontend = Arc::clone(&frontend);
+        let scoped_peer_spawn_diagnostic = super::private_provider_listener_refusal_scope(input)
+            && input.expected_token.restricted;
         let capture_frontend_identity = input.descriptor.matched_control.is_some()
             || expected_status(&input.key) != 0
             || matches!(
@@ -6143,6 +9182,9 @@ pub(crate) mod native {
             .open(&input.descriptor_path)?;
         descriptor_owner.write_all(&descriptor_bytes)?;
         descriptor_owner.sync_all()?;
+        let reduced_compiler_control = reduced_compiler_toolchain(&input.key)
+            .then(|| CompilerAuthorityControl::observe(config, input, work_deadline))
+            .transpose()?;
         let matched_plan = if let Some(pair) = &clocks.matched {
             let direct = pair
                 .plan
@@ -6361,8 +9403,21 @@ pub(crate) mod native {
         });
         let expected_provider = config.provider.clone();
         let start_transport = input.descriptor.start_transport.clone();
+        let standalone_toolchain_stdin = input.descriptor.case == descriptor::Case::Toolchain
+            && matches!(
+                start_transport,
+                descriptor::StartTransport::ControllerStdin { .. }
+            );
+        let scoped_toolchain_application_end = standalone_toolchain_stdin
+            && input.key.family == "W-TOOLCHAIN"
+            && input.key.scenario == "restricted"
+            && input.descriptor.matched_control.is_none()
+            && !input.descriptor.provider_input_experiment;
         let start_challenge = input.descriptor.challenge.clone();
         let start_descriptor = input.descriptor.clone();
+        let wait_for_guardian_release = clocks
+            .guardian_release_wait
+            .waits_for_original_release(&input.key);
         let matched_listener_prefix =
             input
                 .descriptor
@@ -6395,9 +9450,9 @@ pub(crate) mod native {
             .as_ref()
             .filter(|_| matched_provider_root)
             .map(|pair| pair.plan.clone());
-        let start_descriptor_case_is_joint = matches!(
+        let start_requires_observer_release = matches!(
             input.descriptor.case,
-            descriptor::Case::Joint | descriptor::Case::Churn
+            descriptor::Case::Joint | descriptor::Case::Churn | descriptor::Case::Toolchain
         ) && !matched_listener_prefix
             && !matched_provider_root;
         let barrier_report = public_report.clone();
@@ -6410,7 +9465,8 @@ pub(crate) mod native {
         ) && !matched_listener_prefix
             && !matched_provider_root;
         let released_listener_prefix = input.descriptor.case == descriptor::Case::Joint
-            && !input.descriptor.provider_input_experiment
+            && (!input.descriptor.provider_input_experiment
+                || super::private_provider_listener_refusal_scope(input))
             && input.descriptor.completion_gate.is_none()
             && input.descriptor.descendant_gate.is_none();
         let prefix_token = input.expected_token.clone();
@@ -6439,6 +9495,19 @@ pub(crate) mod native {
         let callback_fileio = Arc::clone(&fileio_state);
         let fileio_owner: crate::windows_loader_fileio::OwnedCapture = Arc::new(Mutex::new(None));
         let callback_fileio_owner = Arc::clone(&fileio_owner);
+        let original_lookup = Arc::new(Mutex::new(None));
+        let callback_original_lookup = Arc::clone(&original_lookup);
+        let original_lookup_compiler_sha256 = input
+            .descriptor
+            .toolchain
+            .as_ref()
+            .and_then(|toolchain| {
+                toolchain
+                    .selected_images
+                    .iter()
+                    .find(|image| image.path == toolchain.rustc)
+            })
+            .map(|image| image.sha256.clone());
         let cleanup_deadline = clocks.cleanup.unwrap_or(work_deadline);
         let work_budget = work_budget.min(work_deadline.saturating_duration_since(Instant::now()));
         if work_budget.is_zero() {
@@ -6457,6 +9526,8 @@ pub(crate) mod native {
         let broker_observation = Arc::new(Mutex::new(None::<io::Result<(u32, u64)>>));
         let spawn_observation = Arc::clone(&broker_observation);
         let callback_broker = Arc::clone(&broker_observation);
+        let reduced_startup_begin =
+            reduced_compiler_toolchain(&input.key).then(native_uptime_millis);
         let output = memcordon_testkit::run_until_owned_spawn_with_io_output_limit_outcome(
             command,
             work_deadline,
@@ -6641,25 +9712,11 @@ pub(crate) mod native {
                         .lock()
                         .map_err(|_| io::Error::other("fixture ownership poisoned"))? = held;
                     if capture_frontend_identity {
-                        let mut selected = Vec::new();
-                        for process in
-                            memcordon_testkit::windows_processes_for_image_until(&cli, deadline)?
-                        {
-                            if process.native_parent_process_id()? == wrapper_pid
-                                && !process.has_exited()?
-                            {
-                                selected.push(process);
-                            }
-                        }
-                        if selected.len() != 1 {
-                            return Err(io::Error::other(
-                                "status fixture lacks one original held frontend child",
-                            ));
-                        }
+                        let original = hold_original_frontend_child(&cli, wrapper_pid, deadline)?;
                         *held_frontend
                             .lock()
                             .map_err(|_| io::Error::other("frontend ownership poisoned"))? =
-                            selected.pop();
+                            Some(original);
                     }
                     let guardian = baseline
                         .hold_new_guardian_excluding(&excluded)
@@ -6683,14 +9740,26 @@ pub(crate) mod native {
                             "original Windows work deadline exhausted before association query",
                         ));
                     }
-                    let mut query = CommandSpec::new(&cli, &directory, query_budget)
-                        .args([
-                            OsString::from("__observe-windows-guardian"),
-                            guardian_identity.process_id.to_string().into(),
-                            guardian_identity.creation_time_100ns.to_string().into(),
+                    let query = CommandSpec::new(&cli, &directory, query_budget).args([
+                        OsString::from("__observe-windows-guardian"),
+                        guardian_identity.process_id.to_string().into(),
+                        guardian_identity.creation_time_100ns.to_string().into(),
+                    ]);
+                    let query = if wait_for_guardian_release {
+                        let (cutoff, frequency) =
+                            memcordon_testkit::windows_native_work_cutoff(query_cutoff)?;
+                        query.args([
+                            root_identity.pid.to_string(),
+                            u64::try_from(root_identity.birth)
+                                .map_err(io::Error::other)?
+                                .to_string(),
+                            cutoff.to_string(),
+                            frequency.to_string(),
                         ])
-                        .materialize()
-                        .map_err(io::Error::other)?;
+                    } else {
+                        query
+                    };
+                    let mut query = query.materialize().map_err(io::Error::other)?;
                     let query_budget = query_cutoff
                         .saturating_duration_since(Instant::now())
                         .min(work_deadline.saturating_duration_since(Instant::now()));
@@ -6722,7 +9791,19 @@ pub(crate) mod native {
                         trace.stage("association-parse")
                     });
                     let observed: memcordon_core::WindowsGuardianAttemptObservation =
-                        serde_json::from_slice(&observed_stdout).map_err(io::Error::other)?;
+                        if wait_for_guardian_release {
+                            if Instant::now() >= query_cutoff {
+                                return Err(io::Error::other(
+                                    "original guardian release query cutoff elapsed",
+                                ));
+                            }
+                            memcordon_core::WindowsGuardianAttemptObservation::from_wire_json(
+                                &observed_stdout,
+                            )
+                            .map_err(io::Error::other)?
+                        } else {
+                            serde_json::from_slice(&observed_stdout).map_err(io::Error::other)?
+                        };
                     super::guardian_query::update(&callback_guardian_query, |trace| {
                         trace.stage("association-validation")
                     });
@@ -6736,15 +9817,23 @@ pub(crate) mod native {
                             "positive native guardian association differs",
                         ));
                     }
-                    if matches!(
-                        start_transport,
-                        descriptor::StartTransport::ControllerStdin { .. }
-                    ) && observed.live_target_identity.as_ref().is_none_or(|target| {
-                        target.process_id != root_identity.pid
-                            || u128::from(target.creation_time_100ns) != root_identity.birth
-                    }) {
+                    if (wait_for_guardian_release
+                        || matches!(
+                            start_transport,
+                            descriptor::StartTransport::ControllerStdin { .. }
+                        ))
+                        && observed.live_target_identity.as_ref().is_none_or(|target| {
+                            target.process_id != root_identity.pid
+                                || u128::from(target.creation_time_100ns) != root_identity.birth
+                        })
+                    {
                         return Err(io::Error::other(
-                            "START guardian association does not name the original held target",
+                            "guardian association does not name the original held target",
+                        ));
+                    }
+                    if wait_for_guardian_release && Instant::now() >= query_cutoff {
+                        return Err(io::Error::other(
+                            "original guardian release query cutoff elapsed",
                         ));
                     }
                     let expected = memcordon_core::execution_facts::ProviderAttemptAssociationV1 {
@@ -6789,6 +9878,11 @@ pub(crate) mod native {
                     super::guardian_query::update(&callback_guardian_query, |trace| {
                         trace.stage("association-admitted")
                     });
+                    if wait_for_guardian_release && Instant::now() >= work_deadline {
+                        return Err(io::Error::other(
+                            "original Windows work deadline exhausted before START",
+                        ));
+                    }
                     match start_transport {
                         descriptor::StartTransport::NamedEvent => {
                             signal(callback_gate.as_deref().ok_or_else(|| {
@@ -6831,7 +9925,7 @@ pub(crate) mod native {
                                 birth: u64::try_from(root_identity.birth)
                                     .map_err(io::Error::other)?,
                             };
-                            let joint = start_descriptor_case_is_joint;
+                            let observer_release = start_requires_observer_release;
                             let sender = if let Some(owner) = &registry_recipient {
                                 let mut owner = owner.lock().map_err(|_| {
                                     io::Error::other("registry input ownership poisoned")
@@ -6854,7 +9948,7 @@ pub(crate) mod native {
                                         handle,
                                         manifest_sha256: owner.declaration().sha256,
                                     },
-                                    joint,
+                                    observer_release,
                                 );
                                 if let Some(custody) = &callback_private_custody {
                                     sender.with_directories(
@@ -6869,7 +9963,7 @@ pub(crate) mod native {
                                 } else {
                                     sender
                                 }
-                            } else if joint {
+                            } else if observer_release {
                                 descriptor::controller_start::Sender::joint()
                             } else {
                                 descriptor::controller_start::Sender::default()
@@ -6932,14 +10026,6 @@ pub(crate) mod native {
                                         &callback_fileio,
                                         error,
                                     ),
-                                }
-                            }
-                            if let Some(custody) = &callback_private_custody {
-                                // Releasing this root permits its later original
-                                // spawn. Missing/partial transcript publication or
-                                // root exit cannot erase that interval's debt.
-                                if !matched_provider_root {
-                                    custody.note_spawn_uncertainty().map_err(io::Error::other)?;
                                 }
                             }
                             if matched_provider_root {
@@ -7229,60 +10315,134 @@ pub(crate) mod native {
                             let port = match port {
                                 Ok(port) => port,
                                 Err(error) => {
-                                    if released_listener_prefix
-                                        && callback_private_custody.is_none()
-                                        && Instant::now() < work_deadline
-                                    {
-                                        if let Some(failure @ crate::windows_listener_wait::Failure::Retired { .. }) =
-                                        error.get_ref().and_then(|source| source.downcast_ref::<crate::windows_listener_wait::Failure>())
-                                    {
-                                        let held = held_family.lock().map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                    let mut qualify = || -> io::Result<bool> {
+                                        if !released_listener_prefix
+                                            || Instant::now() >= work_deadline
+                                        {
+                                            return Ok(false);
+                                        }
+                                        let Some(failure @ crate::windows_listener_wait::Failure::Retired { .. }) =
+                                            error.get_ref().and_then(|source| source.downcast_ref::<crate::windows_listener_wait::Failure>())
+                                        else {
+                                            return Ok(false);
+                                        };
+                                        let held = held_family.lock().map_err(|_| {
+                                            io::Error::other("fixture ownership poisoned")
+                                        })?;
                                         if held.len() != 1 {
-                                            return Err(io::Error::other("retired listener root ownership differs"));
+                                            return Err(io::Error::other(
+                                                "retired listener root ownership differs",
+                                            ));
                                         }
                                         let root = held[0].clone();
                                         drop(held);
-                                        let owner = Owner { identity: Identity { pid: root.identity.pid, birth: root.identity.birth }, exit_status: root.native_exit_status()? };
-                                        // The retired original Joint prefix cannot create a peer or
-                                        // compiler before listener publication. A complete transcript
-                                        // excludes later phases; no missing record supplies that proof.
-                                        let bytes = read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?;
-                                        let events = super::events(&bytes).map_err(io::Error::other)?;
-                                        let stages: Vec<_> = events.iter().map(|event| event.stage.as_str()).collect();
-                                        let bound_start = control_session.as_ref().is_some_and(|session| {
-                                            session.binding.pid == root_identity.pid
-                                                && u128::from(session.binding.birth) == root_identity.birth
-                                                && events.iter().all(|event| event.pid == root_identity.pid)
-                                                && events.first().is_some_and(|event| event.value == session.binding.challenge)
-                                                && events.last().is_some_and(|event| event.value == session.binding.challenge)
-                                        });
-                                        let eligible = crate::windows_listener_wait::application_end(
-                                            Identity { pid: root_identity.pid, birth: root_identity.birth },
-                                            owner, failure, bound_start, &stages, Some(0), Some(false),
-                                        ).is_some();
+                                        let owner = Owner {
+                                            identity: Identity {
+                                                pid: root.identity.pid,
+                                                birth: root.identity.birth,
+                                            },
+                                            exit_status: root.native_exit_status()?,
+                                        };
+                                        // The ordinary prefix cannot spawn before listener
+                                        // publication. A private root additionally cannot spawn
+                                        // before the controller's sole grant, which is reachable
+                                        // only after this wait has succeeded.
+                                        let bytes = read(&transcript, 16 * 1024 * 1024)
+                                            .map_err(io::Error::other)?;
+                                        let events =
+                                            super::events(&bytes).map_err(io::Error::other)?;
+                                        let stages: Vec<_> = events
+                                            .iter()
+                                            .map(|event| event.stage.as_str())
+                                            .collect();
+                                        let bound_start =
+                                            control_session.as_ref().is_some_and(|session| {
+                                                session.binding.pid == root_identity.pid
+                                                    && u128::from(session.binding.birth)
+                                                        == root_identity.birth
+                                                    && events
+                                                        .iter()
+                                                        .all(|event| event.pid == root_identity.pid)
+                                                    && events.first().is_some_and(|event| {
+                                                        event.value == session.binding.challenge
+                                                    })
+                                                    && events.last().is_some_and(|event| {
+                                                        event.value == session.binding.challenge
+                                                    })
+                                            });
+                                        let eligible =
+                                            crate::windows_listener_wait::application_end(
+                                                Identity {
+                                                    pid: root_identity.pid,
+                                                    birth: root_identity.birth,
+                                                },
+                                                owner,
+                                                failure,
+                                                bound_start,
+                                                &stages,
+                                                Some(0),
+                                                Some(false),
+                                            )
+                                            .is_some();
                                         if eligible {
                                             use std::io::{Read, Seek, SeekFrom};
-                                            let session = control_session.as_ref().expect("eligible bound START");
+                                            let session = control_session
+                                                .as_ref()
+                                                .expect("eligible bound START");
                                             descriptor_owner.seek(SeekFrom::Start(0))?;
                                             let mut original = Vec::new();
-                                            Read::by_ref(&mut descriptor_owner).take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64).read_to_end(&mut original)?;
-                                            if descriptor::controller_start::descriptor_digest(&original) != session.binding.descriptor_sha256 {
-                                                return Err(io::Error::other("retired listener START descriptor bytes changed"));
+                                            Read::by_ref(&mut descriptor_owner)
+                                                .take((descriptor::MAX_DESCRIPTOR_BYTES + 1) as u64)
+                                                .read_to_end(&mut original)?;
+                                            if descriptor::controller_start::descriptor_digest(
+                                                &original,
+                                            ) != session.binding.descriptor_sha256
+                                            {
+                                                return Err(io::Error::other(
+                                                    "retired listener START descriptor bytes changed",
+                                                ));
                                             }
-                                            let declared = descriptor::Descriptor::parse(&original).map_err(io::Error::other)?;
-                                            let payload = |stage| events.iter().find(|event| event.stage == stage).expect("eligible complete prefix").value.as_slice();
+                                            let declared = descriptor::Descriptor::parse(&original)
+                                                .map_err(io::Error::other)?;
+                                            let payload = |stage| {
+                                                events
+                                                    .iter()
+                                                    .find(|event| event.stage == stage)
+                                                    .expect("eligible complete prefix")
+                                                    .value
+                                                    .as_slice()
+                                            };
                                             let argv = serde_json::to_vec(&serde_json::json!({"encoding":"windows_utf16","values":declared.arguments.iter().map(|argument|argument.encode_utf16().collect::<Vec<_>>()).collect::<Vec<_>>()})).map_err(io::Error::other)?;
-                                            let token: TokenObservation = serde_json::from_slice(payload("token-envelope")).map_err(io::Error::other)?;
+                                            let token: TokenObservation =
+                                                serde_json::from_slice(payload("token-envelope"))
+                                                    .map_err(io::Error::other)?;
                                             if payload("native-argv-observed") != argv
-                                                || payload("sentinel-handles-excluded") != u32::try_from(declared.sentinel_handles.len()).map_err(io::Error::other)?.to_le_bytes()
+                                                || payload("sentinel-handles-excluded")
+                                                    != u32::try_from(
+                                                        declared.sentinel_handles.len(),
+                                                    )
+                                                    .map_err(io::Error::other)?
+                                                    .to_le_bytes()
                                                 || token != prefix_token
                                             {
-                                                return Err(io::Error::other("retired listener prefix argv, sentinel or token readback differs"));
+                                                return Err(io::Error::other(
+                                                    "retired listener prefix argv, sentinel or token readback differs",
+                                                ));
                                             }
                                         }
-                                        provision_budget(work_deadline).map_err(io::Error::other)?;
-                                        application_ended = eligible;
-                                    }
+                                        provision_budget(work_deadline)
+                                            .map_err(io::Error::other)?;
+                                        Ok(eligible)
+                                    };
+                                    match qualify() {
+                                        Ok(eligible) => application_ended = eligible,
+                                        Err(secondary) => {
+                                            let kind = error.kind();
+                                            return Err(io::Error::new(kind, CiError::LaneFailures {
+                                                primary: Box::new(CiError::Io(error)),
+                                                secondary: Box::new(CiError::Io(secondary).context("original listener prefix qualification")),
+                                            }));
+                                        }
                                     }
                                     return Err(error);
                                 }
@@ -7304,10 +10464,11 @@ pub(crate) mod native {
                             }
                             held[0].clone()
                         };
-                        let mut ended_after_listener = |status,
+                        let mut ended_after_listener = |session: Option<&ControlSession>,
+                                                        status,
                                                         stage: super::post_listener_end::Stage|
                          -> io::Result<
-                            Option<super::post_listener_end::Failure>,
+                            Option<(super::post_listener_end::Failure, [u8; 32])>,
                         > {
                             use crate::windows_listener_wait::{Identity, Owner};
                             use std::io::{Read, Seek, SeekFrom};
@@ -7318,7 +10479,7 @@ pub(crate) mod native {
                             {
                                 return Ok(None);
                             }
-                            let session = control_session.as_ref().ok_or_else(|| {
+                            let session = session.ok_or_else(|| {
                                 io::Error::other("post-listener START session absent")
                             })?;
                             let custody = callback_private_custody.as_ref().ok_or_else(|| {
@@ -7424,13 +10585,20 @@ pub(crate) mod native {
                                 stage,
                                 Instant::now(),
                                 work_deadline,
-                            ))
+                            )
+                            .map(|ended| {
+                                (
+                                    ended,
+                                    descriptor::controller_start::descriptor_digest(&bytes),
+                                )
+                            }))
                         };
                         if let Some(status) = root_owner.native_exit_status()? {
                             let stage = super::post_listener_end::Stage::BeforeOwnerCheck;
-                            let ended = ended_after_listener(status, stage)
-                                .map_err(|error| stage.abort(error))?;
-                            if let Some(ended) = ended {
+                            let ended =
+                                ended_after_listener(control_session.as_ref(), status, stage)
+                                    .map_err(|error| stage.abort(error))?;
+                            if let Some((ended, _)) = ended {
                                 application_ended = true;
                                 return Err(io::Error::other(ended));
                             }
@@ -7454,9 +10622,10 @@ pub(crate) mod native {
                         native_listener_owner(root_pid, port)?;
                         if let Some(status) = root_owner.native_exit_status()? {
                             let stage = super::post_listener_end::Stage::AfterOwnerCheck;
-                            let ended = ended_after_listener(status, stage)
-                                .map_err(|error| stage.abort(error))?;
-                            if let Some(ended) = ended {
+                            let ended =
+                                ended_after_listener(control_session.as_ref(), status, stage)
+                                    .map_err(|error| stage.abort(error))?;
+                            if let Some((ended, _)) = ended {
                                 application_ended = true;
                                 return Err(io::Error::other(ended));
                             }
@@ -7492,6 +10661,7 @@ pub(crate) mod native {
                             signal(&endpoint_event)?;
                         } else {
                             if let Some(custody) = &callback_private_custody {
+                                use descriptor::original_peer_spawn_observation::Grant;
                                 let start_binding = control_session
                                     .as_ref()
                                     .ok_or_else(|| {
@@ -7511,6 +10681,8 @@ pub(crate) mod native {
                                     .ok_or_else(|| {
                                         io::Error::other("private original root absent")
                                     })?;
+                                let mut authorized_intent: Option<Grant> = None;
+                                let mut frontend_capture_error = None;
                                 let pending = loop {
                                     let events = super::live_events(
                                         &read(&transcript, 16 * 1024 * 1024)
@@ -7531,10 +10703,13 @@ pub(crate) mod native {
                                             "private peer admission marker replay",
                                         ));
                                     }
+                                    if !pending.is_empty() && authorized_intent.is_none() {
+                                        custody.mark_unknown_spawn();
+                                        return Err(io::Error::other(
+                                            "private pending peer preceded controller spawn authorization",
+                                        ));
+                                    }
                                     if let Some(intent) = intent.first() {
-                                        custody
-                                            .note_spawn_uncertainty()
-                                            .map_err(io::Error::other)?;
                                         if intent.pid != root_pid || intent.value.len() > 1024 {
                                             return Err(io::Error::other(
                                                 "private peer spawn-intent binding extent differs",
@@ -7542,20 +10717,33 @@ pub(crate) mod native {
                                         }
                                         let observed:descriptor::controller_start::PeerAdmissionBinding = serde_json::from_slice(&intent.value).map_err(io::Error::other)?;
                                         if observed != descriptor::controller_start::PeerAdmissionBinding::from_start(&start_binding) {
-                                        return Err(io::Error::other("private peer spawn-intent binding differs"));
+                                            return Err(io::Error::other("private peer spawn-intent binding differs"));
+                                        }
                                     }
+                                    let intent_grant = intent.first().map(|intent| Grant {
+                                        intent_sequence: intent.sequence,
+                                        intent_sha256:
+                                            descriptor::controller_start::descriptor_digest(
+                                                &intent.value,
+                                            ),
+                                    });
+                                    if authorized_intent.is_some()
+                                        && authorized_intent != intent_grant
+                                    {
+                                        custody.mark_unknown_spawn();
+                                        return Err(io::Error::other(
+                                            "private peer spawn intent changed after authorization",
+                                        ));
                                     }
                                     if let Some(pending) = pending.first() {
-                                        custody
-                                            .note_spawn_uncertainty()
-                                            .map_err(io::Error::other)?;
                                         if intent.len() != 1
                                             || pending.sequence <= intent[0].sequence
                                             || pending.pid != root_pid
                                             || pending.value.len() > 1024
                                         {
+                                            custody.mark_unknown_spawn();
                                             return Err(io::Error::other(
-                                                "private pending peer lacks bound prior spawn intent",
+                                                "private pending peer lacks bound prior spawn authorization",
                                             ));
                                         }
                                         let pending:descriptor::controller_start::PeerPendingAdmission = serde_json::from_slice(&pending.value).map_err(io::Error::other)?;
@@ -7565,9 +10753,45 @@ pub(crate) mod native {
                                     if let Some(status) = root.native_exit_status()? {
                                         let stage =
                                             super::post_listener_end::Stage::BeforePeerAdmission;
-                                        let ended = ended_after_listener(status, stage)
-                                            .map_err(|error| stage.abort(error))?;
-                                        if let Some(ended) = ended {
+                                        let ended = ended_after_listener(
+                                            control_session.as_ref(),
+                                            status,
+                                            stage,
+                                        )
+                                        .map_err(|error| stage.abort(error))?;
+                                        if let Some((ended, transcript_sha256)) = ended {
+                                            if scoped_peer_spawn_diagnostic
+                                                && status == 2
+                                                && Instant::now() < deadline
+                                                && let Some(grant) = authorized_intent
+                                            {
+                                                if let Some(error) = frontend_capture_error.take() {
+                                                    return Err(stage.abort(error));
+                                                }
+                                                custody
+                                                    .require_unadmitted_grant(grant.identity())
+                                                    .map_err(|error| stage.abort(error))?;
+                                                let live_nonce = observed
+                                                    .live_nonce
+                                                    .clone()
+                                                    .filter(|nonce| !nonce.is_empty())
+                                                    .ok_or_else(|| {
+                                                        stage.abort(
+                                                            "original live attempt nonce absent",
+                                                        )
+                                                    })?;
+                                                provision_budget(deadline)
+                                                    .map_err(|error| stage.abort(error))?;
+                                                application_ended = true;
+                                                return Err(io::Error::other(
+                                                    PeerSpawnApplicationEnd {
+                                                        original: ended,
+                                                        grant,
+                                                        transcript_sha256,
+                                                        live_nonce,
+                                                    },
+                                                ));
+                                            }
                                             application_ended = true;
                                             return Err(io::Error::other(ended));
                                         }
@@ -7578,6 +10802,40 @@ pub(crate) mod native {
                                             io::ErrorKind::TimedOut,
                                             "original peer admission deadline exhausted",
                                         ));
+                                    }
+                                    if authorized_intent.is_none()
+                                        && let Some(grant) = intent_grant
+                                    {
+                                        if scoped_peer_spawn_diagnostic {
+                                            let capture = hold_original_frontend_child(
+                                                &cli,
+                                                wrapper_pid,
+                                                deadline,
+                                            )
+                                            .and_then(|original| {
+                                                *held_frontend.lock().map_err(|_| {
+                                                    io::Error::other(
+                                                        "peer spawn frontend ownership poisoned",
+                                                    )
+                                                })? = Some(original);
+                                                Ok(())
+                                            });
+                                            frontend_capture_error = capture.err();
+                                        }
+                                        provision_budget(deadline).map_err(io::Error::other)?;
+                                        // Charge before the attempted write. A failed or partial
+                                        // transfer cannot establish that the root stayed gated.
+                                        custody
+                                            .begin_peer_grant(grant.identity())
+                                            .map_err(io::Error::other)?;
+                                        control_session
+                                            .as_mut()
+                                            .expect("bound private peer START")
+                                            .release_before(descriptor::controller_start::Phase::PrivatePeerSpawnRelease, deadline)?;
+                                        custody
+                                            .complete_peer_grant(grant.identity(), deadline)
+                                            .map_err(io::Error::other)?;
+                                        authorized_intent = Some(grant);
                                     }
                                     std::thread::sleep(Duration::from_millis(10));
                                 };
@@ -7795,6 +11053,67 @@ pub(crate) mod native {
                         })?)?;
                     }
                     if needs_toolchain_observer {
+                        if standalone_toolchain_stdin {
+                            let session = control_session.as_ref().ok_or_else(|| {
+                                io::Error::other("original toolchain control session absent")
+                            })?;
+                            let root = {
+                                let held = held_family.lock().map_err(|_| {
+                                    io::Error::other("toolchain observer family ownership poisoned")
+                                })?;
+                                if held.len() != 1 || held[0].identity != root_identity {
+                                    return Err(io::Error::other(
+                                        "original standalone toolchain observer root differs",
+                                    ));
+                                }
+                                held[0].clone()
+                            };
+                            loop {
+                                provision_budget(work_deadline).map_err(io::Error::other)?;
+                                let bytes = read(&transcript, 16 * 1024 * 1024)
+                                    .map_err(io::Error::other)?;
+                                if let Some(status) = root.native_exit_status()? {
+                                    return Err(io::Error::other(format!(
+                                        "original standalone toolchain root retired before observer release; native-exit-status={status}"
+                                    )));
+                                }
+                                if super::standalone_toolchain_observer_ready(
+                                    &bytes,
+                                    &session.binding,
+                                    callback_compiler_custody
+                                        .as_ref()
+                                        .map(|custody| custody.root),
+                                )
+                                .map_err(io::Error::other)?
+                                {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            if let Some(custody) = &callback_compiler_custody {
+                                custody.verify(work_deadline)?;
+                                if root.has_exited()? {
+                                    return Err(io::Error::other(
+                                        "original compiler fixture retired before bound observer release",
+                                    ));
+                                }
+                                custody.release_started();
+                            }
+                        }
+                        let lookup_stop = if original_lookup_requested {
+                            let (capture, request) = start_original_lookup(work_deadline);
+                            *callback_original_lookup
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(capture);
+                            request.zip(original_lookup_compiler_sha256.as_deref()).map(
+                                |(request, compiler_sha256)| OriginalLookupStop {
+                                    compiler_sha256,
+                                    request,
+                                },
+                            )
+                        } else {
+                            None
+                        };
                         match start_transport {
                             descriptor::StartTransport::NamedEvent => {
                                 signal(toolchain_event.as_ref().ok_or_else(|| {
@@ -7804,12 +11123,26 @@ pub(crate) mod native {
                             descriptor::StartTransport::ControllerStdin { .. } => control_session
                                 .as_mut()
                                 .ok_or_else(|| {
-                                    io::Error::other("original Joint control session absent")
+                                    io::Error::other("original toolchain control session absent")
                                 })?
                                 .release(
                                     descriptor::controller_start::Phase::ToolchainObserverRelease,
                                 )?,
                         }
+                        let application_end = scoped_toolchain_application_end
+                            .then(|| {
+                                let session = control_session.as_ref()?;
+                                let nonce = observed
+                                    .live_nonce
+                                    .as_deref()
+                                    .filter(|nonce| !nonce.is_empty())?;
+                                Some(ToolchainEndBinding {
+                                    start: &session.binding,
+                                    root: callback_compiler_custody.as_ref()?.root,
+                                    live_nonce: nonce,
+                                })
+                            })
+                            .flatten();
                         observe_toolchain_descendants(
                             &directory,
                             &toolchain_output_root,
@@ -7822,6 +11155,8 @@ pub(crate) mod native {
                                 clock: toolchain_clock.ok_or_else(|| {
                                     io::Error::other("toolchain diagnostic original clock absent")
                                 })?,
+                                end: application_end,
+                                lookup_stop,
                             },
                             work_deadline,
                         )?;
@@ -8408,13 +11743,21 @@ pub(crate) mod native {
                 })();
                 match callback {
                     Ok(()) => memcordon_testkit::OwnedCallbackOutcome::Completed,
-                    Err(error) if application_ended => {
+                    Err(error)
+                        if application_ended
+                            || error
+                                .get_ref()
+                                .and_then(|source| source.downcast_ref::<ToolchainApplicationEnd>())
+                                .is_some() =>
+                    {
                         memcordon_testkit::OwnedCallbackOutcome::ApplicationEnded(error)
                     }
                     Err(error) => memcordon_testkit::OwnedCallbackOutcome::Abort(error),
                 }
             },
         );
+        let reduced_startup_window =
+            reduced_startup_begin.map(|start| [start, native_uptime_millis()]);
         // Mandatory child/callback outcome is frozen before optional consumer
         // drain. The owner still stops on every callback exit and joins once.
         crate::windows_loader_fileio::finish(&fileio_owner);
@@ -8617,10 +11960,15 @@ pub(crate) mod native {
         let failure_case = serde_json::to_value(input.descriptor.case).ok();
         let failure_challenge =
             crate::windows_causal_acceptance::sha256(&input.descriptor.challenge);
-        let failure_name = input.descriptor.start_gate.as_ref().map(|name| {
-            let bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            crate::windows_causal_acceptance::sha256(&bytes)
-        });
+        let failure_name = input
+            .descriptor
+            .start_gate
+            .as_ref()
+            .filter(|_| !standalone_toolchain_stdin)
+            .map(|name| {
+                let bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                crate::windows_causal_acceptance::sha256(&bytes)
+            });
         let failure_fixture = family.lock().ok().and_then(|held| {
             held.first()
                 .map(|process| (process.identity.pid, process.identity.birth))
@@ -8705,6 +12053,14 @@ pub(crate) mod native {
         };
         let mut terminal_settled = false;
         let mut intrinsic_listener = None;
+        let mut original_compiler_refusal_candidate = false;
+        let mut intrinsic_peer_spawn = None;
+        let peer_spawn_end = application_end_error
+            .as_ref()
+            .and_then(|error| error.get_ref()?.downcast_ref::<PeerSpawnApplicationEnd>());
+        let toolchain_end = application_end_error
+            .as_ref()
+            .and_then(|error| error.get_ref()?.downcast_ref::<ToolchainApplicationEnd>());
         let mut execution_evidence = None;
         let collection = (|| -> Result<()> {
             let retain_calls = || {
@@ -8836,6 +12192,49 @@ pub(crate) mod native {
                             retention.context("callback diagnostic retention failed"),
                         ),
                     });
+                }
+                if let Some(window) =
+                    reduced_startup_window.filter(|_| *capture_complete && cleanup.is_ok())
+                {
+                    let original_frontend = ReducedStartupFrontend::OriginalCallback {
+                        observed_status: observed_status.and_then(|status| status.code()),
+                        cleanup_status: termination.and_then(|status| status.code()),
+                    };
+                    let comparison = reduced_startup_comparison(
+                        config,
+                        input,
+                        &public_report,
+                        original_frontend,
+                        window,
+                        work_deadline,
+                    );
+                    let evidence = match comparison {
+                        Ok(value) => value,
+                        Err(error) => Some(serde_json::json!({
+                            "state":"unavailable",
+                            "diagnostic_only":true,
+                            "original_frontend":original_frontend,
+                            "original_boot_window_ms":window,
+                            "reason": crate::command::bounded_excerpt(error.to_string().as_bytes()),
+                        })),
+                    };
+                    if let Some(evidence) = evidence {
+                        let publication = serde_json::to_vec(&evidence)
+                            .map_err(CiError::from)
+                            .and_then(|bytes| {
+                                crate::windows_native_files::publish_owned_file(
+                                    &report.with_extension("reduced-startup-comparison.json"),
+                                    &bytes,
+                                )
+                                .map(drop)
+                                .map_err(CiError::from)
+                            });
+                        if let Err(error) = publication {
+                            eprintln!(
+                                "installed reduced startup comparison publication failed: {error}"
+                            );
+                        }
+                    }
                 }
                 if *capture_complete
                     && cleanup.is_ok()
@@ -9094,30 +12493,55 @@ pub(crate) mod native {
                 validate_ended_application_settlement(&result_bytes, status, ended, held)?;
             }
             if let Some(error) = application_end_error.as_ref() {
-                let ended = match error.get_ref().and_then(|source| {
-                    source.downcast_ref::<crate::windows_listener_wait::Failure>()
-                }) {
-                    Some(crate::windows_listener_wait::Failure::Retired { identity, status }) => {
-                        crate::windows_listener_wait::ApplicationEnd {
+                let ended = if let Some(peer_end) = peer_spawn_end {
+                    peer_end.original.ended
+                } else if let Some(toolchain_end) = toolchain_end {
+                    if descriptor::controller_start::descriptor_digest(&transcript)
+                        != toolchain_end.transcript_sha256
+                        || descriptor::controller_start::descriptor_digest(&final_descriptor_bytes)
+                            != toolchain_end.descriptor_sha256
+                    {
+                        return Err(CiError::Message(
+                            "original ended Toolchain transcript changed after native exit".into(),
+                        ));
+                    }
+                    crate::windows_listener_wait::ApplicationEnd {
+                        identity: crate::windows_listener_wait::Identity {
+                            pid: toolchain_end.root.process_id,
+                            birth: u128::from(toolchain_end.root.creation_time_100ns),
+                        },
+                        status: toolchain_end.status,
+                    }
+                } else {
+                    match error.get_ref().and_then(|source| {
+                        source.downcast_ref::<crate::windows_listener_wait::Failure>()
+                    }) {
+                        Some(crate::windows_listener_wait::Failure::Retired {
+                            identity,
+                            status,
+                        }) => crate::windows_listener_wait::ApplicationEnd {
                             identity: *identity,
                             status: *status,
-                        }
-                    }
-                    _ if error
-                        .get_ref()
-                        .and_then(|source| source.downcast_ref::<post_listener_end::Failure>())
-                        .is_some() =>
-                    {
-                        error
+                        },
+                        _ if error
                             .get_ref()
                             .and_then(|source| source.downcast_ref::<post_listener_end::Failure>())
-                            .expect("matched typed post-listener failure")
-                            .ended
-                    }
-                    _ => {
-                        return Err(CiError::Message(
-                            "application-ended callback omitted its typed held-root exit".into(),
-                        ));
+                            .is_some() =>
+                        {
+                            error
+                                .get_ref()
+                                .and_then(|source| {
+                                    source.downcast_ref::<post_listener_end::Failure>()
+                                })
+                                .expect("matched typed post-listener failure")
+                                .ended
+                        }
+                        _ => {
+                            return Err(CiError::Message(
+                                "application-ended callback omitted its typed held-root exit"
+                                    .into(),
+                            ));
+                        }
                     }
                 };
                 validate_ended_application_settlement(
@@ -9182,9 +12606,95 @@ pub(crate) mod native {
                     }
                 },
             };
-            let assessment = if !matched_listener_prefix
+            let assessment = if let Some(peer_end) = peer_spawn_end {
+                (|| -> Result<()> {
+                    use descriptor::original_peer_spawn_observation as observation;
+                    provision_budget(work_deadline)?;
+                    if !scoped_peer_spawn_diagnostic
+                        || frontend_exit.status != 2
+                        || !output.stdout.is_empty()
+                        || output.stderr.len() > matched_control_report::MAX_BYTES
+                        || descriptor::controller_start::descriptor_digest(&transcript)
+                            != peer_end.transcript_sha256
+                    {
+                        return Err(CiError::Message(
+                            "original peer spawn capture or private scope differs".into(),
+                        ));
+                    }
+                    let frontend = frontend.lock().map_err(|_| {
+                        CiError::Message("original peer spawn frontend ownership poisoned".into())
+                    })?;
+                    let front = frontend.as_ref().ok_or_else(|| {
+                        CiError::Message("original peer spawn frontend owner absent".into())
+                    })?;
+                    if frontend_exit.original_pid != Some(front.identity.pid)
+                        || front.native_exit_status()? != Some(2)
+                        || !matches!(ResultV3::parse(&result_bytes).map_err(CiError::Message)?.delivery,
+                            memcordon_core::result_v3::DeliveryStateV3::PreparedBy { writer_pid }
+                                if writer_pid.get() == front.identity.pid)
+                    {
+                        return Err(CiError::Message("original peer spawn held frontend did not exit with the captured status".into()));
+                    }
+                    drop(frontend);
+                    let ended = peer_end.original.ended;
+                    let events = super::events(&transcript)?;
+                    let token = events
+                        .iter()
+                        .find(|event| event.stage == "token-envelope")
+                        .ok_or_else(|| {
+                            CiError::Message("original peer spawn token envelope absent".into())
+                        })?;
+                    let clock = final_descriptor.control_clock.as_ref().ok_or_else(|| {
+                        CiError::Message("original peer spawn control clock absent".into())
+                    })?;
+                    let custody = private_custody.as_ref().ok_or_else(|| {
+                        CiError::Message("original peer spawn custody absent".into())
+                    })?;
+                    custody.require_unadmitted_grant(peer_end.grant.identity())?;
+                    let witness = crate::windows_native_files::hold_artifact(
+                        &input.descriptor.output_root.join(observation::LEAF),
+                        None,
+                        observation::MAX_BYTES as u64,
+                    )?;
+                    let observed = observation::decode(
+                        &witness.bytes,
+                        &descriptor::original_listener_observation::Expected {
+                            pid: ended.identity.pid,
+                            birth: u64::try_from(ended.identity.birth).map_err(|_| {
+                                CiError::Message(
+                                    "original peer spawn birth outside native width".into(),
+                                )
+                            })?,
+                            descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                                &final_descriptor_bytes,
+                            ),
+                            challenge_sha256: descriptor::controller_start::descriptor_digest(
+                                &final_descriptor.challenge,
+                            ),
+                            token_sha256: descriptor::controller_start::descriptor_digest(
+                                &token.value,
+                            ),
+                            cutoff_qpc: clock.work_cutoff_qpc,
+                            frequency: clock.qpc_frequency,
+                        },
+                        peer_end.grant,
+                    )?;
+                    drop(crate::windows_native_files::publish_owned_file(
+                        &report.with_extension(observation::LEAF),
+                        &witness.bytes,
+                    )?);
+                    provision_budget(work_deadline)?;
+                    intrinsic_peer_spawn = Some(observed);
+                    Ok(())
+                })()
+            } else if !matched_listener_prefix
                 && !matched_provider_root
                 && crate::windows_readiness_policy::supports_listener_refusal(&input.key)
+                && application_end_error.as_ref().is_some_and(|error| {
+                    error
+                        .get_ref()
+                        .is_some_and(|source| source.is::<crate::windows_listener_wait::Failure>())
+                })
                 && let Some(ended) = original_ended.filter(|ended| ended.status == 2)
             {
                 use descriptor::original_listener_observation as observation;
@@ -9218,6 +12728,61 @@ pub(crate) mod native {
                     intrinsic_listener = Some(observed);
                     Ok(())
                 })
+            } else if (original_lookup_requested || original_x64_refusal_requested)
+                && input.key.scenario == "restricted"
+                && toolchain_end.is_some()
+                && let Some(ended) = original_ended.filter(|ended| ended.status == 2)
+            {
+                (|| -> Result<()> {
+                    let events = super::events(&transcript)?;
+                    let envelope = events
+                        .iter()
+                        .find(|event| {
+                            event.stage == "token-envelope" && event.pid == ended.identity.pid
+                        })
+                        .ok_or_else(|| {
+                            CiError::Message("ended original compiler token envelope absent".into())
+                        })?;
+                    let token: TokenObservation = serde_json::from_slice(&envelope.value)?;
+                    let callback = crate::windows_native_files::hold_artifact(
+                        &report.with_extension("callback-failure.json"),
+                        None,
+                        64 * 1024,
+                    )?;
+                    let failure = super::redacted_toolchain_failure_summary(|leaf| {
+                        Ok(match leaf {
+                            "result.callback-failure.json" => Some(callback.bytes.clone()),
+                            "result.stderr.bin" => Some(output.stderr.clone()),
+                            _ => None,
+                        })
+                    });
+                    let source = &failure["sources"][1];
+                    let observation = &source["observation"];
+                    let precise_refusal = if original_x64_refusal_requested {
+                        observation["compiler_operation"] == "compiler-spawn"
+                            && observation["raw_os_error"] == 5
+                    } else {
+                        observation["compiler_operation"] == "child-status"
+                            && observation["raw_os_error"].is_null()
+                    };
+                    if token != input.expected_token
+                        || !token.restricted
+                        || token.restricting_sids != vec![vec![1, 1, 0, 0, 0, 0, 0, 5, 12, 0, 0, 0]]
+                        || frontend_exit.status != 2
+                        || !output.stdout.is_empty()
+                        || failure["sources"][0]["observation"]["cleanup"] != "ok"
+                        || source["state"] != "complete"
+                        || observation["operation"] != "compile-library"
+                        || observation["resource_role"] != "compiler"
+                        || !precise_refusal
+                    {
+                        return Err(CiError::Message(
+                            "original restricted compiler refusal evidence differs".into(),
+                        ));
+                    }
+                    original_compiler_refusal_candidate = true;
+                    Ok(())
+                })()
             } else {
                 assess_case(
                     input,
@@ -9268,9 +12833,71 @@ pub(crate) mod native {
             {
                 return Err(CiError::Message("exact observed launch request differs from held binding, declared contract or native system prerequisite environment".into()));
             }
+            if let Some(toolchain_end) = toolchain_end {
+                let owned_result = crate::windows_native_files::hold_artifact(
+                    &public_report,
+                    None,
+                    crate::windows_causal_acceptance::MAX_REPORT_BYTES as u64,
+                )?;
+                let owned_terminal = crate::windows_native_files::hold_artifact(
+                    &public_report.with_extension("terminal-observation.json"),
+                    None,
+                    memcordon_platform::MAX_TERMINAL_OBSERVATION_BYTES as u64,
+                )?;
+                if owned_result.bytes != result_bytes || owned_terminal.bytes != terminal_bytes {
+                    return Err(CiError::Message(
+                        "original Toolchain frontend and terminal named custody differs".into(),
+                    ));
+                }
+                let parsed_result = ResultV3::parse(&result_bytes).map_err(CiError::Message)?;
+                super::validate_held_application_job_retirement(
+                    &parsed_result,
+                    &terminal.terminal,
+                    &terminal.frontend_delivery,
+                    &terminal.terminal_authority_json,
+                    held,
+                    &toolchain_end.live_nonce,
+                    &toolchain_end.root,
+                    2,
+                    "original Toolchain Job retirement evidence differs",
+                )?;
+            }
             terminal_settled = true;
             if let Some(assessment) = deferred_assessment {
                 assessment?;
+            }
+            let parsed = ResultV3::parse(&result_bytes).map_err(CiError::Message)?;
+            if let Some(peer_end) = peer_spawn_end {
+                let observed = intrinsic_peer_spawn.as_ref().ok_or_else(|| {
+                    CiError::Message("validated original peer spawn observation absent".into())
+                })?;
+                let owned_result = crate::windows_native_files::hold_artifact(
+                    &public_report,
+                    None,
+                    crate::windows_causal_acceptance::MAX_REPORT_BYTES as u64,
+                )?;
+                let owned_terminal = crate::windows_native_files::hold_artifact(
+                    &public_report.with_extension("terminal-observation.json"),
+                    None,
+                    memcordon_platform::MAX_TERMINAL_OBSERVATION_BYTES as u64,
+                )?;
+                if owned_result.bytes != result_bytes || owned_terminal.bytes != terminal_bytes {
+                    return Err(CiError::Message(
+                        "original frontend and terminal named custody differs".into(),
+                    ));
+                }
+                validate_peer_spawn_job_retirement(
+                    &parsed,
+                    &terminal.terminal,
+                    &terminal.frontend_delivery,
+                    &terminal.terminal_authority_json,
+                    held,
+                    &peer_end.live_nonce,
+                    &memcordon_core::WindowsProcessIdentityV1 {
+                        process_id: observed.binding.pid,
+                        creation_time_100ns: observed.binding.birth,
+                    },
+                )?;
             }
             if input.descriptor.case == descriptor::Case::Churn && intrinsic_listener.is_none() {
                 let observation = &terminal.terminal.process_observation;
@@ -9330,10 +12957,17 @@ pub(crate) mod native {
                     return Err(CiError::Message("successful churn did not exercise the selected sample capacity/eviction policy".into()));
                 }
             }
-            if !matched_listener_prefix && !matched_provider_root && intrinsic_listener.is_none() {
+            if !matched_listener_prefix
+                && !matched_provider_root
+                && intrinsic_listener.is_none()
+                && intrinsic_peer_spawn.is_none()
+                && !original_compiler_refusal_candidate
+            {
                 fixture_products(input)?;
+                if let Some(control) = &reduced_compiler_control {
+                    control.verify(input, &transcript, &report, work_deadline)?;
+                }
             }
-            let parsed = ResultV3::parse(&result_bytes).map_err(CiError::Message)?;
             let root = {
                 let held = family
                     .lock()
@@ -9350,6 +12984,25 @@ pub(crate) mod native {
                     },
                 )?
             };
+            if let Some(custody) = &compiler_custody {
+                let binding = descriptor::controller_start::Binding {
+                    challenge: input.descriptor.challenge.clone(),
+                    descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                        &final_descriptor_bytes,
+                    ),
+                    pid: root.pid,
+                    birth: u64::try_from(root.birth).map_err(io::Error::other)?,
+                };
+                if !super::standalone_toolchain_observer_ready(
+                    &transcript,
+                    &binding,
+                    Some(custody.root),
+                )? {
+                    return Err(CiError::Message(
+                        "final compiler transcript omitted original held input root".into(),
+                    ));
+                }
+            }
             if let Some((_owner, cwd_identity)) = &invocation_cwd {
                 provision_budget(work_deadline)?;
                 if request.current_directory.is_empty()
@@ -9570,6 +13223,16 @@ pub(crate) mod native {
                 )?;
             }
             if let Some(custody) = &private_custody {
+                if let Some(peer_end) = peer_spawn_end
+                    && collection.is_ok()
+                    && terminal_settled
+                {
+                    custody.settle_extinct_peer_job(
+                        peer_end.grant.identity(),
+                        root,
+                        cleanup_deadline,
+                    )?;
+                }
                 custody.prove_retired(work_deadline)?;
             }
             let association = association
@@ -9611,6 +13274,12 @@ pub(crate) mod native {
             Ok(())
         })();
         let retirement = retirement.and_then(|()| {
+            if let Some(custody) = &compiler_custody {
+                if terminal_settled {
+                    custody.retired();
+                }
+                custody.verify(clocks.cleanup.unwrap_or(work_deadline))?;
+            }
             if let Some(pair) = &provider_pair {
                 let broker = pair
                     .broker
@@ -9678,12 +13347,21 @@ pub(crate) mod native {
         // A known application result is not a failed intrinsic contract once
         // its original typed observation, terminal/request and every actual
         // owner have settled. Otherwise retain the original error tree.
-        let intrinsic_settled = intrinsic_listener.is_some()
+        let intrinsic_settled = (intrinsic_listener.is_some() || intrinsic_peer_spawn.is_some())
             && terminal_settled
             && collection.is_ok()
             && retirement.is_ok();
-        let collection = match (application_end_error, collection) {
+        let mut pending_original_compiler_error = None;
+        let mut collection = match (application_end_error, collection) {
             (Some(_), Ok(())) if intrinsic_settled => Ok(()),
+            (Some(original), Ok(()))
+                if original_compiler_refusal_candidate
+                    && terminal_settled
+                    && retirement.is_ok() =>
+            {
+                pending_original_compiler_error = Some(original);
+                Ok(())
+            }
             (Some(primary), Ok(())) => Err(CiError::Io(primary)),
             (Some(primary), Err(secondary)) => Err(CiError::LaneFailures {
                 primary: Box::new(CiError::Io(primary)),
@@ -9705,6 +13383,8 @@ pub(crate) mod native {
         if let Err(error) = gate_retention {
             eprintln!("optional native gate diagnostics unavailable: {error}");
         }
+        let mut original_lookup_loads = Vec::new();
+        let mut matched_original_compiler_refusal = None;
         if super::start_gate_policy::capture_toolchain_held_gate(
             &input.key.family,
             &input.key.scenario,
@@ -9713,22 +13393,36 @@ pub(crate) mod native {
                 let deadline = clocks.cleanup.unwrap_or(work_deadline);
                 if let Some(observation) = prepared.toolchain_held_gate.as_ref() {
                     provision_budget(deadline)?;
-                    let name_bytes: Vec<_> = gate_name
-                        .encode_utf16()
-                        .flat_map(u16::to_le_bytes)
-                        .collect();
+                    let name_sha256 = gate.as_ref().map(|_| {
+                        let bytes: Vec<_> = gate_name
+                            .encode_utf16()
+                            .flat_map(u16::to_le_bytes)
+                            .collect();
+                        crate::windows_causal_acceptance::sha256(&bytes)
+                    });
+                    let (provenance, reason, timing) = if gate.is_some() {
+                        (
+                            Some("same original held event before fixture launch"),
+                            "not-queried-by-held-only-diagnostic",
+                            Some(
+                                "setup charged to original work cutoff; OS queries not cancellable",
+                            ),
+                        )
+                    } else {
+                        (None, "no-original-named-event-for-controller-stdin", None)
+                    };
                     let diagnostic = serde_json::json!({
                         "format":"memcordon.toolchain-held-gate-observation","revision":1,
                         "diagnostic_only":true,"acceptance_authority":false,
-                        "provenance":"same original held event before fixture launch",
+                        "provenance":provenance,
                         "case":input.key,"source_commit":config.source_commit,"target":config.target,
                         "descriptor_sha256":record.descriptor_sha256,
                         "challenge_sha256":crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
-                        "name_utf16_sha256":crate::windows_causal_acceptance::sha256(&name_bytes),
+                        "name_utf16_sha256":name_sha256,
                         "selected_token_sha256":crate::windows_causal_acceptance::sha256(&serde_json::to_vec(&input.expected_token)?),
                         "observation":observation,
-                        "original_fixture":{"state":"unavailable","reason":"not-queried-by-held-only-diagnostic"},
-                        "timing":"setup charged to original work cutoff; OS queries not cancellable",
+                        "original_fixture":{"state":"unavailable","reason":reason},
+                        "timing":timing,
                     });
                     let bytes = serde_json::to_vec(&diagnostic)?;
                     if bytes.len() > 8 * super::gate_security::BYTE_BOUND {
@@ -9742,7 +13436,8 @@ pub(crate) mod native {
                     )?);
                     provision_budget(deadline)?;
                 }
-                let summary = super::redacted_toolchain_failure_summary(|leaf| {
+                let mut spawn_stderr = None;
+                let mut summary = super::redacted_toolchain_failure_summary(|leaf| {
                     provision_budget(deadline).map_err(|_| ())?;
                     let path = report.parent().ok_or(())?.join(leaf);
                     let source =
@@ -9754,8 +13449,216 @@ pub(crate) mod native {
                             Err(_) => Err(()),
                         };
                     provision_budget(deadline).map_err(|_| ())?;
+                    if leaf == "result.stderr.bin" {
+                        spawn_stderr = source.as_ref().ok().and_then(|bytes| bytes.clone());
+                    }
                     source
                 });
+                if summary["sources"][1]["state"] == "complete"
+                    && summary["sources"][1]["observation"]["compiler_operation"]
+                        == "compiler-spawn"
+                {
+                    let mut comparison = None;
+                    let routes = (|| {
+                        let stderr = spawn_stderr.as_deref()?;
+                        let toolchain = input.descriptor.toolchain.as_ref()?;
+                        let clock = input.descriptor.control_clock.as_ref()?;
+                        let root = family.lock().ok()?.first()?.identity;
+                        let binding = descriptor::controller_start::Binding {
+                            challenge: input.descriptor.challenge.clone(),
+                            descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                                &descriptor_bytes,
+                            ),
+                            pid: root.pid,
+                            birth: u64::try_from(root.birth).ok()?,
+                        };
+                        let cutoff = clock
+                            .work_cutoff_qpc
+                            .min(toolchain.native_work_cutoff_ticks);
+                        let routes = super::redacted_compiler_spawn_routes(
+                            &summary,
+                            stderr,
+                            &binding,
+                            cutoff,
+                            clock.qpc_frequency,
+                        );
+                        if config.target == "x86_64-pc-windows-msvc" {
+                            let selected_digest = |path: &Path| {
+                                toolchain
+                                    .selected_images
+                                    .iter()
+                                    .find(|image| image.path == path)
+                                    .map(|image| image.sha256.as_str())
+                            };
+                            if let (Some(compiler), Some(linker)) = (
+                                selected_digest(&toolchain.rustc),
+                                selected_digest(&toolchain.native_linker),
+                            ) {
+                                comparison = super::redacted_compiler_no_debug_comparison(
+                                    &summary,
+                                    stderr,
+                                    &input.key,
+                                    &binding,
+                                    (cutoff, clock.qpc_frequency),
+                                    (compiler, linker),
+                                );
+                            }
+                        }
+                        routes
+                    })();
+                    summary["original_compiler_spawn_routes"] = routes.unwrap_or_else(|| serde_json::json!({
+                        "state":"unavailable","global_route_coverage":false,"denied_object_proved":false,"acceptance_authority":false,
+                    }));
+                    if config.target == "x86_64-pc-windows-msvc" {
+                        summary["compiler_no_debug_comparison"] = comparison.unwrap_or_else(|| {
+                            serde_json::json!({
+                                "state":"unavailable","acceptance_authority":false,
+                            })
+                        });
+                        summary["original_final_settlement"] = serde_json::json!({
+                            "terminal_settled":terminal_settled,
+                            "retirement_verified":retirement.is_ok(),
+                        });
+                        let witness_marker = spawn_stderr
+                            .as_deref()
+                            .and_then(super::compiler_pre_creation_marker);
+                        let direct = (|| -> Option<Result<serde_json::Value>> {
+                            if !terminal_settled
+                                || retirement.is_err()
+                                || summary["compiler_no_debug_comparison"]["state"]
+                                    != "both-create-process-access-denied"
+                            {
+                                return None;
+                            }
+                            let direct_deadline = work_deadline
+                                .min(deadline)
+                                .checked_sub(Duration::from_millis(500))
+                                .filter(|cutoff| Instant::now() < *cutoff)?;
+                            let witness_sha256 = witness_marker?.ok()?;
+                            let witness = crate::windows_native_files::hold_artifact(
+                                &input
+                                    .descriptor
+                                    .output_root
+                                    .join("compiled")
+                                    .join("native-first-compiler-pre-creation.json"),
+                                Some(witness_sha256),
+                                16 * 1024,
+                            )
+                            .ok()?;
+                            let witness: serde_json::Value =
+                                serde_json::from_slice(&witness.bytes).ok()?;
+                            let original = &summary["compiler_no_debug_comparison"];
+                            let held_root = family.lock().ok()?.first()?.identity;
+                            if witness["pid"] != held_root.pid
+                                || witness["birth"] != u64::try_from(held_root.birth).ok()?
+                            {
+                                return None;
+                            }
+                            Some(observe_direct_compiler(
+                                config, input, &record.descriptor_sha256, witness_sha256,
+                                DirectCompilerOriginal::X64 {
+                                    native_flags: original["original"]["returned_create_process"]["native_flags"].as_u64()?,
+                                    stderr_sha256: original["stderr_sha256"].as_str()?,
+                                },
+                                direct_deadline,
+                            ))
+                        })();
+                        summary["direct_restricted_baseline"] = match direct {
+                            Some(Ok(evidence)) => evidence,
+                            Some(Err(_)) => {
+                                serde_json::json!({"state":"incomplete","reason":"baseline-readback-unavailable"})
+                            }
+                            None if summary["compiler_no_debug_comparison"]["state"]
+                                != "unavailable"
+                                && witness_marker.is_some_and(|marker| marker.is_err()) =>
+                            {
+                                serde_json::json!({"state":"unavailable","reason":"original-pre-creation-witness-unavailable",
+                                    "witness_failure_stage":witness_marker.and_then(|marker| marker.err())})
+                            }
+                            None => {
+                                serde_json::json!({"state":"unavailable","reason":"original-refusal-pair-witness-or-settlement-not-qualified"})
+                            }
+                        };
+                    }
+                }
+                let child_status = summary["sources"][1]["state"] == "complete"
+                    && summary["sources"][1]["observation"]["compiler_operation"] == "child-status";
+                let original_loads = (|| {
+                    let toolchain = input.descriptor.toolchain.as_ref()?;
+                    if !child_status || toolchain.compiler_import_siblings.is_empty() {
+                        return None;
+                    }
+                    provision_budget(deadline).ok()?;
+                    let receipt = crate::windows_native_files::hold_artifact(
+                        &input
+                            .descriptor
+                            .output_root
+                            .join("compiled")
+                            .join("native-child-readiness.rlib.retired.json"),
+                        None,
+                        16 * 1024,
+                    )
+                    .ok()?;
+                    provision_budget(deadline).ok()?;
+                    let compiler = toolchain
+                        .selected_images
+                        .iter()
+                        .find(|image| image.path == toolchain.rustc)?;
+                    let family = family.lock().ok()?;
+                    let actual_root = &family.first()?.identity;
+                    let root = memcordon_core::WindowsProcessIdentityV1 {
+                        process_id: actual_root.pid,
+                        creation_time_100ns: u64::try_from(actual_root.birth).ok()?,
+                    };
+                    super::redacted_original_compiler_loads(
+                        &summary,
+                        &receipt.bytes,
+                        &input.descriptor.challenge,
+                        &root,
+                        &compiler.sha256,
+                        &toolchain.compiler_import_siblings,
+                        |child| {
+                            let original = family.iter().find(|candidate| {
+                                candidate.identity.pid == child.process_id
+                                    && candidate.identity.birth
+                                        == u128::from(child.creation_time_100ns)
+                            })?;
+                            if original.native_parent_process_id().ok()? != root.process_id {
+                                return None;
+                            }
+                            let status = original.native_exit_status().ok().flatten()?;
+                            provision_budget(deadline).ok()?;
+                            let ack_path = input.descriptor.output_root.join(format!(
+                                "native-toolchain-{}-{}.ack.json",
+                                child.process_id, child.creation_time_100ns
+                            ));
+                            let ack = crate::windows_native_files::hold_artifact(
+                                &ack_path,
+                                None,
+                                16 * 1024,
+                            )
+                            .ok()?;
+                            provision_budget(deadline).ok()?;
+                            Some((status, ack.bytes))
+                        },
+                    )
+                })();
+                if original_lookup_requested
+                    && let Some(hashes) = original_loads
+                        .as_ref()
+                        .and_then(|value| value["matched_staged_sha256"].as_array())
+                {
+                    original_lookup_loads.extend(
+                        hashes
+                            .iter()
+                            .filter_map(|hash| hash.as_str().map(str::to_owned)),
+                    );
+                }
+                if child_status {
+                    summary["original_compiler_loads"] = original_loads.unwrap_or_else(|| serde_json::json!({
+                        "state":"unavailable", "unobserved_loads":"unknown", "acceptance_authority":false,
+                    }));
+                }
                 provision_budget(deadline)?;
                 let bytes = serde_json::to_vec(&summary)?;
                 if bytes.len() > 16 * 1024 {
@@ -9766,11 +13669,153 @@ pub(crate) mod native {
                     &bytes,
                 )?);
                 provision_budget(deadline)?;
+                if original_x64_refusal_requested
+                    && pending_original_compiler_error.is_some()
+                    && record.stderr_sha256.as_deref().is_some_and(|digest| {
+                        super::matches_settled_x64_compiler_refusal(&summary, digest)
+                    })
+                {
+                    matched_original_compiler_refusal = Some(
+                        crate::windows_readiness_policy::ExecutionDisposition::OriginalCompilerSpawnRefusal {
+                            raw_os_error: 5,
+                            evidence_sha256: descriptor::controller_start::descriptor_digest(&bytes),
+                        },
+                    );
+                }
                 Ok(())
             })();
             if let Err(error) = summary_retention {
                 eprintln!("optional redacted toolchain summary unavailable: {error}");
             }
+        }
+        if original_lookup_requested {
+            use crate::windows_toolchain_lookup_record::{REPORT_BYTES, REPORT_EXTENSION};
+            let retained = (|| -> Result<()> {
+                let start = original_lookup
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                let compiler = input.descriptor.toolchain.as_ref().and_then(|toolchain| {
+                    toolchain
+                        .selected_images
+                        .iter()
+                        .find(|image| image.path == toolchain.rustc)
+                });
+                let target = compiler.and_then(|compiler| {
+                    original_lookup_target(&input.descriptor, compiler, &family)
+                });
+                // The stop worker owns the original capture. Establish that it
+                // cannot observe a direct compiler before spending time on decoding.
+                let (capture, trace_unavailable, baseline_clear) = match start {
+                    Some(Ok(worker)) => match join_original_lookup(worker, cleanup_deadline) {
+                        Ok((capture, reason)) => {
+                            let stopped = capture.is_stopped();
+                            (Some((capture, reason)), serde_json::Value::Null, stopped)
+                        }
+                        Err(error) => (None, error, false),
+                    },
+                    Some(Err(error)) => {
+                        // A start rejection created no owned capture. A worker
+                        // creation failure does not confirm the capture retired.
+                        let clear = error["reason"] != "stop-worker-spawn";
+                        (None, error, clear)
+                    }
+                    None => (
+                        None,
+                        serde_json::json!({
+                            "state":"unavailable","reason":"original-compiler-observer-gate-not-reached"
+                        }),
+                        true,
+                    ),
+                };
+                let mut value = serde_json::json!({
+                    "format":"memcordon.windows-original-compiler-loader-lookup","revision":1,
+                    "case":input.key,"channel":config.channel,"source_commit":config.source_commit,
+                    "target":config.target,"fixture_sha256":config.fixture.sha256,
+                    "descriptor_sha256":record.descriptor_sha256,
+                    "challenge_sha256":crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
+                    "compiler_sha256":compiler.map(|image| &image.sha256),"role":"readiness.rlib",
+                    "diagnostic_only":true,"acceptance_authority":false,"causality_proved":false,
+                });
+                if input.key.scenario == "restricted" {
+                    value["direct_restricted_baseline"] = match &target {
+                        _ if !baseline_clear => serde_json::json!({
+                            "state":"unavailable","reason":"original-capture-stop-unproved"
+                        }),
+                        Some(target) if target.0.native_status == 0xc000_0135 && retirement.is_ok() && terminal_settled
+                            && Instant::now() < work_deadline.min(cleanup_deadline) => {
+                            observe_direct_compiler(
+                                config, input, &record.descriptor_sha256, &target.1,
+                                DirectCompilerOriginal::Arm64 { native_status: target.0.native_status },
+                                work_deadline.min(cleanup_deadline),
+                            ).unwrap_or_else(|_| serde_json::json!({"state":"incomplete","reason":"baseline-readback-unavailable"}))
+                        }
+                        _ => serde_json::json!({"state":"unavailable","reason":"original-loader-failure-or-retirement-not-qualified"}),
+                    };
+                }
+                value["trace"] = match capture {
+                    Some((capture, reason)) => {
+                        let mut trace = capture
+                            .finish(target.as_ref().map(|(target, _)| *target), cleanup_deadline);
+                        trace["stop_trigger"] = reason.into();
+                        trace
+                    }
+                    None => trace_unavailable,
+                };
+                value["static_import_candidates"] = if original_lookup_staged_truncated {
+                    serde_json::json!({"state":"incomplete","reason":"staged-inventory-bound-exceeded"})
+                } else if let Some(compiler) = compiler {
+                    original_lookup_static_imports(
+                        compiler,
+                        &original_lookup_staged,
+                        &original_lookup_loads,
+                        cleanup_deadline.min(Instant::now() + Duration::from_secs(2)),
+                    )
+                } else {
+                    serde_json::json!({"state":"incomplete","reason":"measured-compiler-unavailable"})
+                };
+                let mut bytes = serde_json::to_vec(&value)?;
+                if bytes.len() > REPORT_BYTES {
+                    value["static_import_candidates"] = serde_json::json!({
+                        "state":"incomplete","reason":"combined-carrier-byte-bound",
+                    });
+                    bytes = serde_json::to_vec(&value)?;
+                }
+                if bytes.len() > REPORT_BYTES {
+                    value["trace"] = serde_json::json!({
+                        "state":"incomplete","reason":"trace-carrier-byte-bound",
+                    });
+                    bytes = serde_json::to_vec(&value)?;
+                }
+                drop(crate::windows_native_files::publish_owned_file(
+                    &report.with_extension(REPORT_EXTENSION),
+                    &bytes,
+                )?);
+                if pending_original_compiler_error.is_some()
+                    && value["direct_restricted_baseline"]["state"]
+                        == "direct-compiler-reproduced-original-native-status"
+                    && value["direct_restricted_baseline"]["evidence"]["outcome"]["native_status"]
+                        == 0xc000_0135_u32
+                {
+                    matched_original_compiler_refusal = Some(
+                        crate::windows_readiness_policy::ExecutionDisposition::OriginalCompilerLoaderRefusal {
+                            native_status: 0xc000_0135,
+                            evidence_sha256: descriptor::controller_start::descriptor_digest(&bytes),
+                        },
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = retained {
+                eprintln!("optional toolchain loader lookup unavailable: {error}");
+            }
+        }
+        if let Some(original) = pending_original_compiler_error
+            && matched_original_compiler_refusal.is_none()
+        {
+            record.collection = Err(original.to_string());
+            record.behavior = Err(original.to_string());
+            collection = Err(CiError::Io(original));
         }
         let matched_observation = (|| -> Result<Option<descriptor::matched::Comparison>> {
             let Some(pair) = clocks.matched.as_ref() else {
@@ -9994,12 +14039,26 @@ pub(crate) mod native {
             };
             record.contract = CaseContract {
                 intrinsic: IntrinsicContract::Validated,
-                comparison: ComparisonStatus::NotMeasured,
-                execution: match intrinsic_listener {
-                    Some(observed) => ExecutionDisposition::OriginalListenerRefusal {
+                comparison: if matched_original_compiler_refusal.is_some() {
+                    ComparisonStatus::MatchedRefusal
+                } else {
+                    ComparisonStatus::NotMeasured
+                },
+                execution: match (intrinsic_listener, intrinsic_peer_spawn) {
+                    (Some(observed), None) => ExecutionDisposition::OriginalListenerRefusal {
                         raw_os_error: observed.raw_os_error,
                     },
-                    None => ExecutionDisposition::Completed,
+                    (None, Some(observed)) => ExecutionDisposition::OriginalPeerSpawnRefusal {
+                        raw_os_error: observed.raw_os_error,
+                    },
+                    (None, None) => {
+                        matched_original_compiler_refusal.unwrap_or(ExecutionDisposition::Completed)
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(CiError::Message(
+                            "conflicting original application outcomes".into(),
+                        ));
+                    }
                 },
                 evidence: Some(evidence),
             };
@@ -10180,6 +14239,7 @@ pub(crate) mod native {
             None,
             ExecutionClocks {
                 work,
+                guardian_release_wait: super::GuardianReleaseWaitScope::ExistingCaseSelection,
                 cleanup: Some(cleanup),
                 registry: Some(registry),
                 registry_lifetime: RegistryProjectionLifetime::ExperimentBorrowed,
@@ -10322,7 +14382,7 @@ pub(crate) mod native {
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
         dot_local_file: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ProviderExperimentOutcome> {
         use crate::windows_provider_projection::native::Deployment;
         use crate::windows_provider_projection_record::{self as facts, BindingExpectation};
         use sha2::{Digest, Sha256};
@@ -10366,9 +14426,40 @@ pub(crate) mod native {
                 (Ok(()), other) => other,
             }
         }
+        #[derive(Clone, Copy)]
+        enum Refusal {
+            Listener,
+            PeerSpawn,
+        }
+        impl Refusal {
+            fn phase(self) -> &'static str {
+                match self {
+                    Self::Listener => "original-listener-refusal",
+                    Self::PeerSpawn => "original-peer-spawn-refusal",
+                }
+            }
+            fn availability_scope(self) -> &'static str {
+                match self {
+                    Self::Listener => {
+                        "restricted original listener refused before peer authorization; restricted private selection, peer and full Joint workload unmeasured"
+                    }
+                    Self::PeerSpawn => {
+                        "restricted original peer spawn failed after authorization; restricted private selection, peer execution and full Joint workload unmeasured"
+                    }
+                }
+            }
+        }
         let mut attempts = Vec::new();
         let mut settled_selections = Vec::new();
+        let mut restricted_refusal = None;
         for scenario in ["ordinary", "restricted"] {
+            let stage = |phase: &'static str| {
+                move |error: CiError| {
+                    error.context(format!(
+                        "provider experiment scenario={scenario}; phase={phase}"
+                    ))
+                }
+            };
             provision_budget(deadlines.work)?;
             let attempt_directory = config
                 .output_directory
@@ -10381,31 +14472,34 @@ pub(crate) mod native {
                 &attempt_directory,
                 deadlines.work,
                 dot_local_file,
-            )?;
+            )
+            .map_err(stage("fixture-deployment"))?;
             let mut selected = config.clone();
             selected.fixture = deployment.fixture.clone();
             selected.output_directory = deployment.output_root.clone();
-            provision(root, &selected, deadlines.work)?;
-            let suite: SuiteInput = serde_json::from_slice(&read(
-                &selected
-                    .output_directory
-                    .join("windows-readiness-input.json"),
-                4 * 1024 * 1024,
-            )?)?;
-            validate_suite(&suite)?;
-            let mut input = suite
-                .cases
-                .iter()
-                .find(|case| case.key.family == "W-JOINT" && case.key.scenario == scenario)
-                .cloned()
-                .ok_or_else(|| CiError::Message("declared original Joint input absent".into()))?;
+            let key = CaseKey {
+                family: "W-JOINT".into(),
+                scenario: scenario.into(),
+            };
+            let mut input = (|| -> Result<CaseInput> {
+                provision_for(root, &selected, deadlines.work, Some(&key))?;
+                let bytes = read(
+                    &selected
+                        .output_directory
+                        .join("windows-readiness-input.json"),
+                    4 * 1024 * 1024,
+                )?;
+                provider_joint_input(serde_json::from_slice(&bytes)?, scenario)
+            })()
+            .map_err(stage("readiness-provisioning"))?;
             let sid = sid_text(&input.expected_token.user_sid)?;
             let projection = Arc::new(Mutex::new(
                 memcordon_testkit::WindowsWinsockRegistryProjection::create(
                     &crate::windows_causal_acceptance::sha256(&input.descriptor.challenge),
                     deadlines.work,
                     deadlines.cleanup,
-                )?,
+                )
+                .map_err(|error| stage("registry-projection")(CiError::from(error)))?,
             ));
             let mut phase = "catalog-preparation";
             let mut assessment = CaseAssessment {
@@ -10426,6 +14520,7 @@ pub(crate) mod native {
             };
             let mut selected_images = serde_json::Value::Null;
             let mut scenario_selection = None;
+            let mut refusal = None;
             let mut root_selection = None;
             let held_observation = Arc::new(Mutex::new(ProjectionObservation::default()));
             let mut probe_created = false;
@@ -10517,6 +14612,8 @@ pub(crate) mod native {
                             None,
                             ExecutionClocks {
                                 work: deadlines.work,
+                                guardian_release_wait:
+                                    super::GuardianReleaseWaitScope::ExistingCaseSelection,
                                 matched: None,
                                 cleanup: Some(deadlines.cleanup),
                                 registry: Some(Arc::clone(&projection)),
@@ -10549,6 +14646,23 @@ pub(crate) mod native {
                         "provider experiment phase={phase}; deployment custody verification"
                     ))
                 })?;
+                use crate::windows_readiness_policy::ExecutionDisposition;
+                refusal = match assessment.contract.execution {
+                    ExecutionDisposition::OriginalListenerRefusal { .. } => Some(Refusal::Listener),
+                    ExecutionDisposition::OriginalPeerSpawnRefusal { .. } => {
+                        Some(Refusal::PeerSpawn)
+                    }
+                    _ => None,
+                };
+                if let Some(refusal) = refusal {
+                    if !super::private_provider_listener_refusal_scope(&input) {
+                        return Err(CiError::Message(
+                            "original application refusal outside the restricted private Joint scope".into(),
+                        ));
+                    }
+                    phase = refusal.phase();
+                    return Ok(());
+                }
                 let root_observation = json_file(
                     &ProviderExperimentRecord::NativeListener.source_path(
                         &selected.output_directory,
@@ -10698,7 +14812,10 @@ pub(crate) mod native {
                 .lock()
                 .map_err(|_| CiError::Message("experiment registry owner poisoned".into()))
                 .and_then(|mut owner| owner.retire_if_safe().map_err(CiError::from));
-            let attempted = match (attempted, registry_retired) {
+            let attempted = match (
+                attempted.map_err(stage(phase)),
+                registry_retired.map_err(stage("registry-retirement")),
+            ) {
                 (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
                     primary: Box::new(primary),
                     secondary: Box::new(secondary),
@@ -10746,20 +14863,61 @@ pub(crate) mod native {
                 ))
             };
             let namespace = deployment.finish(deadlines.cleanup);
-            let result = serde_json::json!({"scenario":scenario,"phase":phase,"execution_completed":attempted.is_ok()&&cleanup.is_ok()&&namespace.is_ok()&&retained.is_ok(),"private_availability":scenario_selection.as_ref().map(|selection|selection.private_availability()),"availability_scope":"invoked original root and peer provider rows; configured uninvoked inputs unmeasured","feasibility_established":attempted.is_ok()&&cleanup.is_ok()&&namespace.is_ok()&&retained.is_ok()&&scenario_selection.as_ref().is_some_and(|selection|selection.private_availability()==facts::PrivateAvailability::Available),"workload":assessment,"selected_images":selected_images,"changed_private_file_identities":true,"acceptance_authority":false,"private_namespace_cleanup_verified":namespace.is_ok(),"private_namespace_cleanup_error":namespace.as_ref().err().map(ToString::to_string),"error":attempted.as_ref().err().map(ToString::to_string)});
+            let diagnostic_completed =
+                attempted.is_ok() && cleanup.is_ok() && namespace.is_ok() && retained.is_ok();
+            let execution_completed = diagnostic_completed && refusal.is_none();
+            let availability_scope = refusal.map_or(
+                "invoked original root and peer provider rows; configured uninvoked inputs unmeasured",
+                Refusal::availability_scope,
+            );
+            let result = serde_json::json!({
+                "scenario":scenario,"phase":phase,
+                "diagnostic_completed":diagnostic_completed,"execution_completed":execution_completed,
+                "private_availability":scenario_selection.as_ref().map(|selection|selection.private_availability()),
+                "availability_scope":availability_scope,
+                "feasibility_established":execution_completed&&scenario_selection.as_ref().is_some_and(|selection|selection.private_availability()==facts::PrivateAvailability::Available),
+                "workload":assessment,"selected_images":selected_images,"changed_private_file_identities":true,
+                "acceptance_authority":false,"private_namespace_cleanup_verified":namespace.is_ok(),
+                "private_namespace_cleanup_error":namespace.as_ref().err().map(ToString::to_string),
+                "error":attempted.as_ref().err().map(ToString::to_string),
+            });
             let published = publish(&attempt_directory.join("result.json"), &result);
             attempts.push(result);
             let settled = combine(
                 combine(combine(combine(attempted, retained), cleanup), namespace),
                 published,
             );
-            settled_selections.push(settle_provider_scenario(scenario_selection, settled)?);
+            if let Some(refusal) = refusal {
+                settled?;
+                restricted_refusal = Some(refusal);
+            } else {
+                settled_selections.push(settle_provider_scenario(scenario_selection, settled)?);
+            }
+        }
+        if let Some(refusal) = restricted_refusal {
+            let report = serde_json::json!({
+                "format":"memcordon.declared-provider-input-experiment","revision":1,
+                "diagnostic_only":true,"acceptance_authority":false,
+                "diagnostic_completed":true,"execution_completed":false,
+                "private_availability":null,"selection_assessment":null,"feasibility_established":false,
+                "availability_scope":refusal.availability_scope(),
+                "source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,
+                "attempts":attempts,"mandatory_unprojected_case_replaced":false,"historical_host_access_repaired":false,
+            });
+            return Ok(match refusal {
+                Refusal::Listener => ProviderExperimentOutcome::OriginalListenerRefusal { report },
+                Refusal::PeerSpawn => {
+                    ProviderExperimentOutcome::OriginalPeerSpawnRefusal { report }
+                }
+            });
         }
         let selection = facts::ExperimentSelectionAssessment::assess(settled_selections)
             .map_err(CiError::Message)?;
-        Ok(
-            serde_json::json!({"format":"memcordon.declared-provider-input-experiment","revision":1,"diagnostic_only":true,"acceptance_authority":false,"execution_completed":true,"private_availability":selection.private_availability(),"selection_assessment":selection,"availability_scope":"invoked original root and peer provider rows; configured uninvoked inputs unmeasured","feasibility_established":selection.private_availability()==facts::PrivateAvailability::Available,"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"attempts":attempts,"mandatory_unprojected_case_replaced":false,"historical_host_access_repaired":false}),
-        )
+        let private_availability = selection.private_availability();
+        Ok(ProviderExperimentOutcome::Full {
+            private_availability,
+            report: serde_json::json!({"format":"memcordon.declared-provider-input-experiment","revision":1,"diagnostic_only":true,"acceptance_authority":false,"diagnostic_completed":true,"execution_completed":true,"private_availability":private_availability,"selection_assessment":selection,"availability_scope":"invoked original root and peer provider rows; configured uninvoked inputs unmeasured","feasibility_established":private_availability==facts::PrivateAvailability::Available,"source_commit":config.source_commit,"target":config.target,"fixture_sha256":config.fixture.sha256,"attempts":attempts,"mandatory_unprojected_case_replaced":false,"historical_host_access_repaired":false}),
+        })
     }
 
     pub fn run(
@@ -10795,7 +14953,8 @@ pub(crate) mod native {
         )?
         .join("denied-write.bin");
         if input.cases.iter().any(|case| {
-            !case.descriptor.denied_write_paths.is_empty()
+            !reduced_compiler_toolchain(&case.key)
+                && !case.descriptor.denied_write_paths.is_empty()
                 && case.descriptor.denied_write_paths.get(1) != Some(&expected_probe)
         }) {
             return Err(CiError::Message(
@@ -10851,6 +15010,7 @@ pub(crate) mod native {
                 assessment,
                 work_deadline,
                 diagnostic_deadlines.map(|deadlines| deadlines.cleanup),
+                super::GuardianReleaseWaitScope::MandatoryPositiveSuite,
             ) {
                 let error = error.context(format!(
                     "Windows required case {}/{} failed after original case cleanup",
@@ -11202,6 +15362,8 @@ pub(crate) mod native {
                         None,
                         ExecutionClocks {
                             work,
+                            guardian_release_wait:
+                                super::GuardianReleaseWaitScope::ExistingCaseSelection,
                             cleanup: Some(cleanup),
                             matched: Some(MatchedExecution {
                                 provider: None,

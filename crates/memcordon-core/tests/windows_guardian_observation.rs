@@ -49,8 +49,15 @@ fn authenticated_owner_query_roundtrip_keeps_public_facts_and_private_frame_boun
         schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
         challenge: expected.challenge.clone(),
         guardian_identity: expected.guardian_identity.clone(),
+        release_wait: None,
     };
     let bytes = serde_json::to_vec(&request).unwrap();
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("release_wait")
+            .is_none()
+    );
     assert_eq!(
         serde_json::from_slice::<WindowsLauncherRequestV4>(&bytes).unwrap(),
         request
@@ -99,6 +106,47 @@ fn authenticated_owner_query_roundtrip_keeps_public_facts_and_private_frame_boun
         .unwrap(),
         expected
     );
+}
+
+#[test]
+fn release_wait_is_opt_in_and_keeps_the_same_absolute_native_cutoff() {
+    use memcordon_core::{WindowsGuardianReleaseWaitV1, WindowsLauncherRequestV4};
+    use std::time::Duration;
+    let expected = observation();
+    let wait = WindowsGuardianReleaseWaitV1 {
+        target_identity: WindowsProcessIdentityV1 {
+            process_id: 81,
+            creation_time_100ns: 5678,
+        },
+        cutoff_qpc: 31_000,
+        qpc_frequency: 1_000,
+    };
+    let request = WindowsLauncherRequestV4::ObserveGuardianAttempt {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+        challenge: expected.challenge,
+        guardian_identity: expected.guardian_identity,
+        release_wait: Some(wait.clone()),
+    };
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        serde_json::from_value::<WindowsLauncherRequestV4>(wire.clone()).unwrap(),
+        request
+    );
+    let mut malformed = wire;
+    malformed["release_wait"]["relative_timeout_ms"] = serde_json::json!(100);
+    assert!(serde_json::from_value::<WindowsLauncherRequestV4>(malformed).is_err());
+    assert_eq!(wait.remaining_at(1_000, 1_000), Ok(Duration::from_secs(30)));
+    assert_eq!(
+        wait.remaining_at(30_999, 1_000),
+        Ok(Duration::from_millis(1))
+    );
+    assert!(wait.remaining_at(999, 1_000).is_err());
+    assert!(wait.remaining_at(31_000, 1_000).is_err());
+    assert!(wait.remaining_at(31_001, 1_000).is_err());
+    assert!(wait.remaining_at(1_000, 999).is_err());
+    let mut invalid = wait;
+    invalid.target_identity.creation_time_100ns = 0;
+    assert!(invalid.remaining_at(1_000, 1_000).is_err());
 }
 
 #[test]

@@ -261,6 +261,7 @@ pub enum Phase {
     ToolchainObserverRelease = 2,
     PeerRecipientHeld = 3,
     ProviderPreludeRelease = 4,
+    PrivatePeerSpawnRelease = 5,
 }
 
 pub const MAX_PROVIDER_READY_BYTES: usize = 8 * 1024;
@@ -826,10 +827,12 @@ impl Progress {
             Some(Phase::ProviderPreludeRelease)
         } else if self.joint && phase == Phase::Start {
             Some(if self.private_peer {
-                Phase::PeerRecipientHeld
+                Phase::PrivatePeerSpawnRelease
             } else {
                 Phase::ToolchainObserverRelease
             })
+        } else if self.private_peer && phase == Phase::PrivatePeerSpawnRelease {
+            Some(Phase::PeerRecipientHeld)
         } else if self.private_peer && phase == Phase::PeerRecipientHeld {
             Some(Phase::ToolchainObserverRelease)
         } else {
@@ -962,6 +965,12 @@ fn send_bound(
                 "private transfer requires distinct registry ownership",
             ));
         }
+    }
+    if phase == Phase::PrivatePeerSpawnRelease && directories.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "peer spawn release requires private START",
+        ));
     }
     if (phase == Phase::PeerRecipientHeld) != peer.is_some()
         || (peer.is_some() && directories.is_none())

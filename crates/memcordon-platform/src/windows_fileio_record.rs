@@ -47,6 +47,12 @@ pub enum FieldId {
     CreateOptions,
     FileAttributes,
     ShareAccess,
+    ProcessId,
+    ParentId,
+    UniqueProcessKey,
+    ExitStatus,
+    TThreadId,
+    FileName,
 }
 impl FieldId {
     pub fn name(self) -> &'static str {
@@ -60,6 +66,12 @@ impl FieldId {
             Self::CreateOptions => "CreateOptions",
             Self::FileAttributes => "FileAttributes",
             Self::ShareAccess => "ShareAccess",
+            Self::ProcessId => "ProcessId",
+            Self::ParentId => "ParentId",
+            Self::UniqueProcessKey => "UniqueProcessKey",
+            Self::ExitStatus => "ExitStatus",
+            Self::TThreadId => "TThreadId",
+            Self::FileName => "FileName",
         }
     }
 }

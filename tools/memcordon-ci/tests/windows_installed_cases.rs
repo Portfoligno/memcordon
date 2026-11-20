@@ -992,8 +992,13 @@ fn actual_job_error_constructor_inventory_has_only_reviewed_operations() {
 }
 #[test]
 fn provider_private_unavailability_does_not_hide_operation_or_uninstall_failure() {
+    use memcordon_ci::windows_consumer_readiness::ProviderExperimentOutcome;
     use memcordon_ci::windows_installed_cases::provider_experiment_execution_status;
-    let observed = Ok(serde_json::json!({"private_availability":"unavailable"}));
+    use memcordon_ci::windows_provider_projection_record::PrivateAvailability;
+    let observed = Ok(ProviderExperimentOutcome::Full {
+        report: serde_json::json!({"private_availability":"unavailable"}),
+        private_availability: PrivateAvailability::Unavailable,
+    });
     let complete = provider_experiment_execution_status(&observed, &Ok(()));
     assert_eq!(complete["execution_completed"], true);
     assert_eq!(complete["private_availability"], "unavailable");
@@ -1002,6 +1007,25 @@ fn provider_private_unavailability_does_not_hide_operation_or_uninstall_failure(
     assert_eq!(failed["execution_completed"], true);
     assert_eq!(failed["completed"], false);
     assert_eq!(failed["private_availability"], "unavailable");
+    let report = serde_json::json!({"private_availability":null,"execution_completed":false});
+    for refused in [
+        ProviderExperimentOutcome::OriginalListenerRefusal {
+            report: report.clone(),
+        },
+        ProviderExperimentOutcome::OriginalPeerSpawnRefusal { report },
+    ] {
+        let refused = Ok(refused);
+        let settled_refusal = provider_experiment_execution_status(&refused, &Ok(()));
+        assert_eq!(settled_refusal["diagnostic_completed"], true);
+        assert_eq!(settled_refusal["execution_completed"], false);
+        assert_eq!(settled_refusal["completed"], true);
+        assert!(settled_refusal["private_availability"].is_null());
+        let failed_refusal = provider_experiment_execution_status(&refused, &cleanup);
+        assert_eq!(failed_refusal["diagnostic_completed"], false);
+        assert_eq!(failed_refusal["execution_completed"], false);
+        assert_eq!(failed_refusal["completed"], false);
+        assert_eq!(failed_refusal["installation_cleanup_verified"], false);
+    }
     assert!(
         failed["installation_cleanup_error"]
             .as_str()

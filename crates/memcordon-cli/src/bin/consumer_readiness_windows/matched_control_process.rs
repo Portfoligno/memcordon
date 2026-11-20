@@ -312,6 +312,7 @@ pub(super) struct Process {
     references: Option<ProcessReferences>,
     pub pid: u32,
     pub birth: u64,
+    pub creation_flags: u32,
     pub input_observation: memcordon_core::NativeInputStageV1,
 }
 pub(super) struct Launch<'a> {
@@ -335,18 +336,30 @@ impl Drop for Process {
 impl Process {
     /// Borrow only while this original Process owner retains the native slot.
     pub fn original_process_reference(&self, cutoff: Instant) -> io::Result<u64> {
+        self.with_live_process(
+            cutoff,
+            |process| Ok(process.as_raw_handle() as usize as u64),
+        )
+    }
+
+    pub fn with_live_process<T>(
+        &self,
+        cutoff: Instant,
+        observe: impl FnOnce(&OwnedHandle) -> io::Result<T>,
+    ) -> io::Result<T> {
         live(cutoff)?;
+        let held = self
+            .references
+            .as_ref()
+            .ok_or_else(|| io::Error::other("direct original recipient reference absent"))?;
         if self.status(cutoff)?.is_some() {
             return Err(io::Error::other(
                 "direct original recipient already retired",
             ));
         }
-        Ok(self
-            .references
-            .as_ref()
-            .ok_or_else(|| io::Error::other("direct original recipient reference absent"))?
-            .process
-            .as_raw_handle() as usize as u64)
+        let observation = observe(&held.process)?;
+        live(cutoff)?;
+        Ok(observation)
     }
     /// Borrow one broker-owned exact KEY_READ reference and transfer a distinct
     /// noninheritable reference into this original held direct process.
@@ -383,6 +396,19 @@ impl Process {
         self.references.is_some()
     }
     pub fn create(caller: Arc<Caller>, launch: Launch<'_>) -> io::Result<Self> {
+        Self::create_with_console(caller, launch, None)
+    }
+
+    pub fn create_with_console(
+        caller: Arc<Caller>,
+        launch: Launch<'_>,
+        console: Option<(&[u16], bool)>,
+    ) -> io::Result<Self> {
+        if console.is_some_and(|(desktop, _)| {
+            desktop.is_empty() || desktop.contains(&0) || launch.job.is_none()
+        }) {
+            return Err(io::Error::other("calibration desktop or Job is missing"));
+        }
         let Launch {
             image_role,
             image,
@@ -418,6 +444,15 @@ impl Process {
             return Err(io::Error::other("matched cwd contains NUL"));
         }
         cwd.push(0);
+        let mut creation_flags =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        let mut desktop = console.map(|(desktop, detached)| {
+            creation_flags |= CREATE_NEW_PROCESS_GROUP;
+            if detached {
+                creation_flags |= DETACHED_PROCESS;
+            }
+            desktop.iter().copied().chain(Some(0)).collect::<Vec<_>>()
+        });
         for handle in stdio {
             use windows_sys::Win32::Foundation::{
                 GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
@@ -495,6 +530,9 @@ impl Process {
             let mut startup = STARTUPINFOEXW::default();
             startup.StartupInfo.cb = std::mem::size_of_val(&startup) as u32;
             startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            if let Some(desktop) = &mut desktop {
+                startup.StartupInfo.lpDesktop = desktop.as_mut_ptr();
+            }
             startup.StartupInfo.hStdInput = stdio[0];
             startup.StartupInfo.hStdOutput = stdio[1];
             startup.StartupInfo.hStdError = stdio[2];
@@ -509,7 +547,7 @@ impl Process {
                     std::ptr::null(),
                     std::ptr::null(),
                     1,
-                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                    creation_flags,
                     environment.as_ptr().cast(),
                     cwd.as_ptr(),
                     &startup.StartupInfo,
@@ -528,6 +566,7 @@ impl Process {
                 }),
                 pid: created.dwProcessId,
                 birth: 0,
+                creation_flags,
                 input_observation: memcordon_core::NativeInputStageV1::NotReached,
             };
             let validate = (|| {

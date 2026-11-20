@@ -2882,6 +2882,11 @@ jobs:
             target/ci/reports/installed/raw/windows-installed/C-IO/native-argv/result.stderr.bin
             target/ci/reports/installed/raw/windows-installed/W-TOOLCHAIN/restricted/result.toolchain-held-gate-summary.json
             target/ci/reports/installed/raw/windows-installed/W-TOOLCHAIN/restricted/result.toolchain-failure-summary.json
+            target/ci/reports/installed/raw/windows-installed/W-TOOLCHAIN/ordinary/result.toolchain-loader-lookup.json
+            target/ci/reports/installed/raw/windows-installed/W-TOOLCHAIN/restricted/result.toolchain-loader-lookup.json
+            target/ci/reports/installed/raw/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json
+            target/ci/reports/installed/raw/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json
+            target/ci/reports/installed/raw/windows-installed/windows-reduced-compiler-qualification.json
             target/ci/reports/installed/raw/windows-installed/package-uninstall.stdout.bin
             target/ci/reports/installed/raw/windows-installed/package-uninstall.stderr.bin
             target/ci/reports/installed/raw/windows-installed/package-uninstall.capture.json

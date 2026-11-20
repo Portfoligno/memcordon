@@ -1,5 +1,9 @@
-//! Observe exactly the existing original peer spawn; Rust retains every result.
+//! Observe the existing original fixture spawn; Rust retains every result.
 use super::{
+    descriptor::{
+        ControlClock, controller_start, original_listener_observation,
+        original_peer_spawn_observation,
+    },
     listener_trace::ErrorPair,
     listener_trace_record::{Outcome, Request},
     spawn_trace_record as record,
@@ -109,18 +113,178 @@ fn retain(
     super::listener_trace::live(context.clock)
 }
 
-pub fn spawn(command: &mut Command, context: Option<&Context<'_>>) -> io::Result<Child> {
+fn retain_original_failure(
+    context: &Context<'_>,
+    packet: &record::Packet,
+    invocation: &Invocation<'_>,
+    grant: original_peer_spawn_observation::Grant,
+    thread: u32,
+) -> io::Result<()> {
+    use original_peer_spawn_observation as observation;
+    if !context.provider_input_experiment || context.peer {
+        return Err(io::Error::other(
+            "original peer spawn grant differs from private root",
+        ));
+    }
+    let token: super::descriptor::gate_precondition::TokenObservation =
+        serde_json::from_slice(context.token_envelope).map_err(io::Error::other)?;
+    if !token.restricted || !invocation.invoked || invocation.panic.is_some() {
+        return Ok(());
+    }
+    let actual = invocation
+        .result
+        .as_ref()
+        .and_then(|result| result.as_ref().err());
+    let callback = (invocation.outcome.kind == 2 && invocation.outcome.raw_error_present == 1)
+        .then_some(invocation.outcome.raw_error);
+    let Some(raw_os_error) = observation::original_raw_error(actual, callback) else {
+        return Ok(());
+    };
+    if packet.version != 2
+        || packet.packet_bytes as usize != record::PACKET_BYTES
+        || packet.scope_attempted != 1
+        || packet.scope_returned != 1
+        || packet.scope_reentry != 0
+        || packet.unmatched_scope != 0
+        || packet.original_thread != thread
+        || packet.cutoff_qpc != context.clock.work_cutoff_qpc
+        || packet.frequency != context.clock.qpc_frequency
+    {
+        return Err(io::Error::other(
+            "original peer spawn callback or clock differs",
+        ));
+    }
+    let value = observation::Observation {
+        format: observation::FORMAT.into(),
+        revision: 1,
+        operation: observation::Operation::CommandSpawn,
+        domain: observation::ErrorDomain::RustIoRawOsErrorOnWindows,
+        raw_os_error,
+        binding: original_listener_observation::Binding {
+            pid: context.binding.pid,
+            birth: context.binding.birth,
+            descriptor_sha256: context.binding.descriptor_sha256,
+            challenge_sha256: controller_start::descriptor_digest(&context.binding.challenge),
+            token_sha256: controller_start::descriptor_digest(context.token_envelope),
+            thread,
+            started_qpc: packet.started_qpc,
+            finished_qpc: packet.finished_qpc,
+            cutoff_qpc: packet.cutoff_qpc,
+            frequency: packet.frequency,
+        },
+        grant,
+    };
+    super::listener_trace::publish_original_observation(
+        context.output_root,
+        context.clock,
+        observation::LEAF,
+        observation::MAX_BYTES,
+        &observation::encode(&value)?,
+    )
+}
+
+pub fn spawn(
+    command: &mut Command,
+    context: Option<&Context<'_>>,
+    grant: Option<original_peer_spawn_observation::Grant>,
+) -> io::Result<Child> {
     let Some(context) = context else {
         return command.spawn();
     };
+    let (invocation, packet, thread, outgoing) = capture(
+        command,
+        context.clock,
+        u32::from(context.provider_input_experiment),
+    );
+    let observation =
+        grant.map(|grant| retain_original_failure(context, &packet, &invocation, grant, thread));
+    if let Some(Err(error)) = observation {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "original peer spawn observation unavailable: {error}"
+        );
+    }
+    let retained = retain(context, &packet, &invocation);
+    if let Err(error) = retained {
+        // A diagnostic publication failure never replaces an original io::Error
+        // or drops an original successful Child before the existing owner flow.
+        let _ = writeln!(
+            io::stderr().lock(),
+            "peer spawn trace retention unavailable (diagnostic only): {error}"
+        );
+    }
+    finish(invocation, outgoing)
+}
+
+pub(super) fn compiler_spawn(
+    command: &mut Command,
+    binding: &controller_start::Binding,
+    clock: &ControlClock,
+) -> (io::Result<Child>, Option<u32>) {
+    let (mut invocation, packet, thread, outgoing) = capture(command, clock, 0);
+    let mut denied_at_flags = None;
+    if let Some(Err(error)) = invocation.result.as_mut() {
+        if let Some(raw) = error.raw_os_error() {
+            let recorded = (invocation.outcome.kind == 2
+                && invocation.outcome.raw_error_present == 1
+                && invocation.outcome.raw_error == raw)
+                .then(|| {
+                    record::compiler_routes(
+                        &packet,
+                        thread,
+                        clock.work_cutoff_qpc,
+                        clock.qpc_frequency,
+                    )
+                })
+                .flatten();
+            let (routes, returned) = recorded.unzip();
+            denied_at_flags = returned
+                .flatten()
+                .filter(|row| raw == 5 && row.win32_error == Some(5))
+                .map(|row| row.flags);
+            let marker = serde_json::json!({
+                "pid":binding.pid,"birth":binding.birth,
+                "descriptor_sha256":binding.descriptor_sha256,
+                "challenge_sha256":controller_start::descriptor_digest(&binding.challenge),
+                "cutoff_qpc":clock.work_cutoff_qpc,"frequency":clock.qpc_frequency,
+                "raw_os_error":raw,"routes":routes,
+            });
+            let original = std::mem::replace(error, io::ErrorKind::Other.into());
+            *error = super::operation_context::with_secondary(
+                original,
+                format!("\ncompiler-spawn-routes-v1 {marker}\n"),
+            );
+        }
+    }
+    (finish(invocation, outgoing), denied_at_flags)
+}
+
+pub(super) fn comparison_compiler_spawn(
+    command: &mut Command,
+    clock: &ControlClock,
+) -> (io::Result<Child>, Option<record::CompilerCreateReturn>) {
+    let (invocation, packet, thread, outgoing) = capture(command, clock, 0);
+    let returned =
+        record::compiler_routes(&packet, thread, clock.work_cutoff_qpc, clock.qpc_frequency)
+            .and_then(|(_, returned)| returned);
+    (finish(invocation, outgoing), returned)
+}
+
+fn capture<'a>(
+    command: &'a mut Command,
+    clock: &ControlClock,
+    experiment_flags: u32,
+) -> (Invocation<'a>, record::Packet, u32, ErrorPair) {
     // Save before allocation, setup or hashing, as for the listener observer.
     let incoming = ErrorPair::capture();
+    // SAFETY: no parameters and only observes the calling thread's identity.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     let request = Request {
-        cutoff_qpc: context.clock.work_cutoff_qpc,
-        frequency: context.clock.qpc_frequency,
+        cutoff_qpc: clock.work_cutoff_qpc,
+        frequency: clock.qpc_frequency,
         incoming_win32: incoming.win32,
         incoming_wsa: incoming.wsa,
-        experiment_flags: u32::from(context.provider_input_experiment),
+        experiment_flags,
         reserved: 0,
     };
     let mut packet = record::Packet::default();
@@ -141,16 +305,10 @@ pub fn spawn(command: &mut Command, context: Option<&Context<'_>>) -> io::Result
             (&mut invocation as *mut Invocation<'_>).cast(),
         );
     }
-    let outgoing = ErrorPair::capture();
-    let retained = retain(context, &packet, &invocation);
-    if let Err(error) = retained {
-        // A diagnostic publication failure never replaces an original io::Error
-        // or drops an original successful Child before the existing owner flow.
-        let _ = writeln!(
-            io::stderr().lock(),
-            "peer spawn trace retention unavailable (diagnostic only): {error}"
-        );
-    }
+    (invocation, packet, thread, ErrorPair::capture())
+}
+
+fn finish(mut invocation: Invocation<'_>, outgoing: ErrorPair) -> io::Result<Child> {
     if let Some(payload) = invocation.panic.take() {
         outgoing.restore();
         resume_unwind(payload);

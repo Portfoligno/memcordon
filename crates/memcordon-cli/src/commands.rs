@@ -6,24 +6,42 @@ mod result_frame;
 pub(crate) use application::{clean, doctor, execute, plan};
 
 #[cfg(windows)]
-pub(crate) fn windows_guardian_observation(pid: &std::ffi::OsStr, birth: &std::ffi::OsStr) -> i32 {
+pub(crate) fn windows_guardian_observation(
+    pid: &std::ffi::OsStr,
+    birth: &std::ffi::OsStr,
+    release_wait: Option<[&std::ffi::OsStr; 4]>,
+) -> i32 {
+    fn scalar<T: std::str::FromStr>(input: &std::ffi::OsStr) -> Result<T, String>
+    where
+        T::Err: std::fmt::Display,
+    {
+        input
+            .to_str()
+            .ok_or("guardian query scalar is not Unicode")?
+            .parse::<T>()
+            .map_err(|error| error.to_string())
+    }
+    let identity = |pid, birth| -> Result<memcordon_core::WindowsProcessIdentityV1, String> {
+        Ok(memcordon_core::WindowsProcessIdentityV1 {
+            process_id: scalar(pid)?,
+            creation_time_100ns: scalar(birth)?,
+        })
+    };
     let operation = (|| -> Result<_, String> {
-        let process_id = pid
-            .to_str()
-            .ok_or("guardian PID is not Unicode")?
-            .parse::<u32>()
-            .map_err(|error| error.to_string())?;
-        let creation_time_100ns = birth
-            .to_str()
-            .ok_or("guardian birth is not Unicode")?
-            .parse::<u64>()
-            .map_err(|error| error.to_string())?;
-        let observation = memcordon_platform::observe_windows_guardian_attempt(
-            memcordon_core::WindowsProcessIdentityV1 {
-                process_id,
-                creation_time_100ns,
-            },
-        )?;
+        let guardian = identity(pid, birth)?;
+        let observation = match release_wait {
+            Some([target, target_birth, cutoff, frequency]) => {
+                memcordon_platform::observe_windows_guardian_release(
+                    guardian,
+                    memcordon_core::WindowsGuardianReleaseWaitV1 {
+                        target_identity: identity(target, target_birth)?,
+                        cutoff_qpc: scalar(cutoff)?,
+                        qpc_frequency: scalar(frequency)?,
+                    },
+                )
+            }
+            None => memcordon_platform::observe_windows_guardian_attempt(guardian),
+        }?;
         serde_json::to_string(&observation).map_err(|error| error.to_string())
     })();
     match operation {

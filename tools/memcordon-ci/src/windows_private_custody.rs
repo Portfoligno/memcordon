@@ -58,13 +58,52 @@ impl PrivateFixtureCustody {
         &self.binding
     }
 
-    pub fn note_spawn_uncertainty(&self) -> Result<()> {
+    fn update_peer_debt(
+        &self,
+        update: impl FnOnce(&mut PeerDebt) -> std::result::Result<(), String>,
+    ) -> Result<()> {
         let mut debt = self
             .debt
             .lock()
             .map_err(|_| CiError::Message("private peer ownership poisoned".into()))?;
-        debt.note_spawn();
-        Ok(())
+        update(&mut debt).map_err(CiError::Message)
+    }
+    pub fn begin_peer_grant(&self, grant: [u8; 32]) -> Result<()> {
+        self.update_peer_debt(|debt| debt.begin_grant(grant))
+    }
+    pub fn complete_peer_grant(&self, grant: [u8; 32], cutoff: Instant) -> Result<()> {
+        self.update_peer_debt(|debt| debt.complete_grant(grant, Instant::now(), cutoff))
+    }
+    pub fn require_unadmitted_grant(&self, grant: [u8; 32]) -> Result<()> {
+        self.update_peer_debt(|debt| debt.require_unadmitted_grant(grant))
+    }
+    pub fn settle_extinct_peer_job(
+        &self,
+        grant: [u8; 32],
+        root: ProcessIdentity,
+        cleanup: Instant,
+    ) -> Result<()> {
+        let family = self
+            .family
+            .lock()
+            .map_err(|_| CiError::Message("private Job retirement family poisoned".into()))?;
+        let pending = self
+            .cleanup
+            .lock()
+            .map_err(|_| CiError::Message("private Job cleanup owners poisoned".into()))?;
+        if Instant::now() >= cleanup
+            || !pending.is_empty()
+            || family.len() != 1
+            || family[0].identity != root
+            || !family[0].has_exited()?
+            || Instant::now() >= cleanup
+        {
+            return Err(CiError::Message(
+                "private Job retirement lacks exact retired root and zero pending recipients"
+                    .into(),
+            ));
+        }
+        self.update_peer_debt(|debt| debt.settle_extinct_job(grant))
     }
     pub fn mark_unknown_spawn(&self) {
         // Recovery can retain/quarantine ownership; it never authorizes release.
@@ -179,14 +218,7 @@ impl PrivateFixtureCustody {
         fixture: &Path,
         work: Instant,
     ) -> Result<WindowsImageProcess> {
-        self.note_spawn_uncertainty()?;
-        {
-            let mut debt = self
-                .debt
-                .lock()
-                .map_err(|_| CiError::Message("private peer debt poisoned".into()))?;
-            debt.begin_admission().map_err(CiError::Message)?;
-        }
+        self.update_peer_debt(PeerDebt::begin_admission)?;
         let pending = Arc::new(root.duplicate_pending_child(root_local_handle, work)?);
         // This actual native owner is retained BEFORE any identity/image/token
         // query or post-duplication cutoff can reject admission.

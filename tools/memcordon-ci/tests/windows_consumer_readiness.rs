@@ -366,7 +366,9 @@ fn intrinsic_listener_result_needs_its_own_bound_prefix_without_inventing_a_refe
             },
             ended,
             association: &association,
-            descriptor_sha256,
+            descriptor_sha256: descriptor::controller_start::descriptor_digest(
+                &serde_json::to_vec(&case.descriptor).unwrap(),
+            ),
             observation,
         })
     };
@@ -427,6 +429,22 @@ fn intrinsic_listener_result_needs_its_own_bound_prefix_without_inventing_a_refe
         )
         .is_err()
     );
+    let mut private = case.clone();
+    private.descriptor = experiment_descriptor();
+    private.descriptor.control_clock = case.descriptor.control_clock.clone();
+    let mut private_observed = observed;
+    private_observed.binding.descriptor_sha256 = descriptor::controller_start::descriptor_digest(
+        &serde_json::to_vec(&private.descriptor).unwrap(),
+    );
+    let private_wire = observation::encode(&private_observed).unwrap();
+    assert_eq!(
+        assess(&private, &bytes, &transcript, &private_wire)
+            .unwrap()
+            .raw_os_error,
+        12345
+    );
+    private.key.scenario = "ordinary".into();
+    assert!(assess(&private, &bytes, &transcript, &private_wire).is_err());
     let mut wrong_scope = case;
     wrong_scope.key = CaseKey {
         family: "W-ENVELOPE".into(),
@@ -442,6 +460,373 @@ fn intrinsic_listener_result_needs_its_own_bound_prefix_without_inventing_a_refe
         )
         .is_err()
     );
+}
+
+#[test]
+fn original_peer_spawn_codec_binds_the_exact_rust_error_and_completed_grant() {
+    use descriptor::original_listener_observation::{Binding, Expected};
+    use descriptor::original_peer_spawn_observation::{
+        self as obs, ErrorDomain, Grant, Observation, Operation,
+    };
+    use std::io::Error;
+    let original = Error::from_raw_os_error(5);
+    assert_eq!(obs::original_raw_error(Some(&original), Some(5)), Some(5));
+    for (actual, reported) in [
+        (None, Some(5)),
+        (Some(&original), None),
+        (Some(&original), Some(6)),
+    ] {
+        assert_eq!(obs::original_raw_error(actual, reported), None);
+    }
+    assert_eq!(
+        obs::original_raw_error(Some(&Error::other("Win32 error 5")), Some(5)),
+        None
+    );
+    let grant = Grant {
+        intent_sequence: 7,
+        intent_sha256: [6; 32],
+    };
+    let binding = Binding {
+        pid: 13,
+        birth: 27,
+        descriptor_sha256: [1; 32],
+        challenge_sha256: [2; 32],
+        token_sha256: [3; 32],
+        thread: 4,
+        started_qpc: 200,
+        finished_qpc: 210,
+        cutoff_qpc: 220,
+        frequency: 10,
+    };
+    let expected = Expected {
+        pid: binding.pid,
+        birth: binding.birth,
+        descriptor_sha256: binding.descriptor_sha256,
+        challenge_sha256: binding.challenge_sha256,
+        token_sha256: binding.token_sha256,
+        cutoff_qpc: binding.cutoff_qpc,
+        frequency: binding.frequency,
+    };
+    let value = Observation {
+        format: obs::FORMAT.to_owned(),
+        revision: 1,
+        operation: Operation::CommandSpawn,
+        domain: ErrorDomain::RustIoRawOsErrorOnWindows,
+        raw_os_error: 5,
+        binding,
+        grant,
+    };
+    let bytes = obs::encode(&value).unwrap();
+    assert_eq!(obs::decode(&bytes, &expected, grant).unwrap(), value);
+    assert!(
+        obs::decode(
+            &bytes,
+            &expected,
+            Grant {
+                intent_sequence: 8,
+                ..grant
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        obs::decode(
+            &bytes,
+            &Expected {
+                birth: 28,
+                ..expected.clone()
+            },
+            grant
+        )
+        .is_err()
+    );
+    assert!(obs::decode(&vec![b' '; obs::MAX_BYTES + 1], &expected, grant).is_err());
+    let mut changed = value.clone();
+    changed.binding.finished_qpc = changed.binding.cutoff_qpc;
+    assert!(obs::encode(&changed).is_err());
+    let mut wrong_operation = serde_json::to_value(value).unwrap();
+    wrong_operation["operation"] = "tcp-listener-bind".into();
+    assert!(
+        obs::decode(
+            &serde_json::to_vec(&wrong_operation).unwrap(),
+            &expected,
+            grant
+        )
+        .is_err()
+    );
+}
+
+fn settled_application_receipt(
+    result: &mut memcordon_core::result_v3::ResultV3,
+) -> (
+    memcordon_core::WindowsTerminalReceiptV3,
+    memcordon_core::WindowsFrontendDeliveryV3,
+    String,
+) {
+    use memcordon_core::{self as core, result_v3::RuntimeExecutionV3};
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut result.runtime else {
+        panic!("Windows native evidence expected");
+    };
+    let root = native.target_identity.clone().unwrap();
+    let mut observer = core::ProcessObserver::without_sample_storage();
+    observer.observe_accounting(3, 0, true);
+    let observation = observer.freeze(Some(root.clone()), None);
+    native.process_observation = Some(Box::new(observation.clone()));
+    let proof = native.retirement.as_deref().unwrap().clone();
+    let nonce = proof.nonce.clone();
+    let mut boundary = native.clone();
+    boundary.retirement = None;
+    boundary.frontend_delivery = None;
+    boundary.frontend_provider_association = None;
+    let terminal = core::WindowsTerminalReceiptV3 {
+        schema_version: 3,
+        attempt_id: proof.attempt_id.clone(),
+        nonce: nonce.clone(),
+        request_sha256: proof.request_sha256.clone(),
+        payload: core::WindowsTerminalPayloadV3::Execution {
+            child_pid: root.process_id,
+            duration_millis: 2,
+            authorization_offset_millis: 1,
+            outcome: core::RunOutcome::Exited {
+                child: result.outcome.native_termination.clone().unwrap(),
+                peak: None,
+                cleanup: core::CleanupSummary {
+                    direct_child_reaped: true,
+                    workload_empty: Some(true),
+                    ..Default::default()
+                },
+            },
+            boundary_detail: Box::new(core::BoundaryMechanismEvidence::WindowsJobObjectV3(
+                boundary,
+            )),
+        },
+        process_observation: observation,
+        cleanup_process_creation: None,
+        restart_safety: core::RestartSafetyProof {
+            direct_child_reaped: true,
+            workload_empty: Some(true),
+            helpers_reaped: true,
+            containment_removed: true,
+            containment_incapable_of_live_members: true,
+            sealed_boundary_retired: true,
+            errors: Vec::new(),
+        },
+        retirement_proof: proof,
+    };
+    let authority = core::WindowsProviderResponseV4::Terminal(terminal.clone())
+        .terminal_authority_json()
+        .unwrap();
+    let delivery = native.frontend_delivery.as_mut().unwrap();
+    delivery.terminal_sha256 =
+        memcordon_ci::windows_causal_acceptance::sha256(authority.as_bytes());
+    (terminal, delivery.clone(), authority)
+}
+
+#[test]
+fn post_grant_refusal_needs_the_same_native_job_owner_and_terminal_retirement() {
+    use memcordon_ci::windows_consumer_readiness::{
+        current_association, current_native, validate_peer_spawn_job_retirement,
+    };
+    use memcordon_core::{self as core, result_v3::RuntimeExecutionV3};
+    let mut result = current_fixture::completed_loader_failure();
+    result.outcome.wrapper_status = 2;
+    result.outcome.native_termination = Some(core::ChildTermination::ExitCode { code: 2 });
+    let (terminal, delivery, authority) = settled_application_receipt(&mut result);
+    let live = current_association(&result).unwrap().clone();
+    let root = current_native(&result)
+        .unwrap()
+        .target_identity
+        .clone()
+        .unwrap();
+    let nonce = terminal.nonce.clone();
+    validate_peer_spawn_job_retirement(
+        &result, &terminal, &delivery, &authority, &live, &nonce, &root,
+    )
+    .unwrap();
+    let wrong_root = core::WindowsProcessIdentityV1 {
+        creation_time_100ns: root.creation_time_100ns + 1,
+        ..root.clone()
+    };
+    assert!(
+        validate_peer_spawn_job_retirement(
+            &result,
+            &terminal,
+            &delivery,
+            &authority,
+            &live,
+            &nonce,
+            &wrong_root
+        )
+        .is_err()
+    );
+    let mut wrong_provider = live.clone();
+    wrong_provider.provider.generation = core::BoundedText::new("foreign-generation").unwrap();
+    assert!(
+        validate_peer_spawn_job_retirement(
+            &result,
+            &terminal,
+            &delivery,
+            &authority,
+            &wrong_provider,
+            &nonce,
+            &root
+        )
+        .is_err()
+    );
+    let mut missing_ack = delivery.clone();
+    missing_ack.acknowledgement_observed = false;
+    assert!(
+        validate_peer_spawn_job_retirement(
+            &result,
+            &terminal,
+            &missing_ack,
+            &authority,
+            &live,
+            &nonce,
+            &root
+        )
+        .is_err()
+    );
+    assert!(
+        validate_peer_spawn_job_retirement(
+            &result,
+            &terminal,
+            &delivery,
+            &authority,
+            &live,
+            "other-live-nonce",
+            &root
+        )
+        .is_err()
+    );
+    let mut wrong = result.clone();
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut wrong.runtime else {
+        unreachable!()
+    };
+    native.retirement.as_mut().unwrap().job_identity = "cd".repeat(32);
+    assert!(
+        validate_peer_spawn_job_retirement(
+            &wrong, &terminal, &delivery, &authority, &live, &nonce, &root
+        )
+        .is_err()
+    );
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut wrong.runtime else {
+        unreachable!()
+    };
+    native.retirement = None;
+    assert!(
+        validate_peer_spawn_job_retirement(
+            &wrong, &terminal, &delivery, &authority, &live, &nonce, &root
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn console_calibration_needs_owned_settled_processes_and_exact_detachment() {
+    use memcordon_ci::windows_consumer_readiness::classify_reduced_console_pair;
+    use serde_json::json;
+    let mut record = json!({
+        "state":"complete","desktop_closed":true,
+        "same_held_inputs":{"reduced_primary":true,"desktop":true,"stdio_endpoints":true,"creation_job":true},
+        "baseline":{"flags":0x80604,"pid":41,"birth":100,
+            "natural_exit":true,"suspended_token_and_image_verified":true,
+            "job_empty_verified":true,"native_status":0xc000_0142u32,"snapshot_matches":false,
+            "stdout_bytes":0},
+        "detached":{"flags":0x8060c,"pid":42,"birth":101,
+            "natural_exit":true,"suspended_token_and_image_verified":true,
+            "job_empty_verified":true,"native_status":0,"snapshot_matches":true},
+    });
+    assert_eq!(
+        classify_reduced_console_pair(&record),
+        Some("detachment-changed-fixture-startup"),
+    );
+    for (field, value) in [
+        ("/state", json!("unavailable")),
+        ("/desktop_closed", json!(false)),
+        ("/same_held_inputs/creation_job", json!(false)),
+        ("/baseline/job_empty_verified", json!(false)),
+        ("/detached/natural_exit", json!(false)),
+        ("/detached/suspended_token_and_image_verified", json!(false)),
+        ("/detached/flags", json!(0x8040c)),
+        ("/baseline/pid", json!(0)),
+    ] {
+        let mut wrong = record.clone();
+        *wrong.pointer_mut(field).unwrap() = value;
+        assert_eq!(classify_reduced_console_pair(&wrong), None, "{field}");
+    }
+    record["detached"]["snapshot_matches"] = json!(false);
+    assert_eq!(classify_reduced_console_pair(&record), Some("inconclusive"));
+    record["detached"]["native_status"] = json!(0xc000_0142u32);
+    assert_eq!(
+        classify_reduced_console_pair(&record),
+        Some("detachment-did-not-resolve-fixture-startup"),
+    );
+}
+
+#[test]
+fn reduced_startup_keeps_cleanup_exit_separate_from_authenticated_product_status() {
+    use memcordon_ci::windows_consumer_readiness::{
+        ReducedStartupFrontend, validate_reduced_startup_settlement,
+    };
+    use memcordon_core::result_v3::RuntimeExecutionV3;
+
+    let mut result = current_fixture::completed_loader_failure();
+    let (terminal, delivery, authority) = settled_application_receipt(&mut result);
+    result.outcome.wrapper_status = 125;
+    let original = ReducedStartupFrontend::OriginalCallback {
+        observed_status: None,
+        cleanup_status: Some(1),
+    };
+    assert_eq!(
+        serde_json::to_value(original).unwrap(),
+        serde_json::json!({
+            "source":"original-callback","observed_status":null,"cleanup_status":1,
+        })
+    );
+    let validate = |result: &_, frontend| {
+        validate_reduced_startup_settlement(result, &terminal, &delivery, &authority, frontend)
+    };
+    validate(&result, original).unwrap();
+    assert!(
+        validate(
+            &result,
+            ReducedStartupFrontend::OriginalCallback {
+                observed_status: Some(1),
+                cleanup_status: Some(125),
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        validate(
+            &result,
+            ReducedStartupFrontend::Comparison {
+                observed_status: None
+            }
+        )
+        .is_err()
+    );
+    validate(
+        &result,
+        ReducedStartupFrontend::Comparison {
+            observed_status: Some(125),
+        },
+    )
+    .unwrap();
+
+    let mut mismatch = result.clone();
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut mismatch.runtime else {
+        unreachable!()
+    };
+    native.initial_target_token_matches_caller = false;
+    assert!(validate(&mismatch, original).is_err());
+    let mut mismatch = result;
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut mismatch.runtime else {
+        unreachable!()
+    };
+    native.retirement.as_mut().unwrap().job_identity = "cd".repeat(32);
+    assert!(validate(&mismatch, original).is_err());
 }
 
 #[test]
@@ -488,7 +873,7 @@ fn readiness_schedule_preserves_every_case_and_places_prepared_core_first() {
     let mut keys: Vec<_> = positive_keys().into_iter().collect();
     keys.reverse();
     let order = readiness_execution_order(&keys).unwrap();
-    assert_eq!(order.len(), 62);
+    assert_eq!(order.len(), 63);
     let classes: Vec<_> = order
         .iter()
         .map(|index| requirement_class(&keys[*index]).unwrap())
@@ -502,6 +887,16 @@ fn readiness_schedule_preserves_every_case_and_places_prepared_core_first() {
         classes[53..]
             .iter()
             .all(|class| *class == RequirementClass::ContextualWorkload)
+    );
+    let toolchain_scenarios: Vec<_> = order
+        .iter()
+        .map(|index| &keys[*index])
+        .filter(|case| case.family == "W-TOOLCHAIN")
+        .map(|case| case.scenario.as_str())
+        .collect();
+    assert_eq!(
+        toolchain_scenarios,
+        ["ordinary", "restricted", "group-privilege-reduced"]
     );
     let mut missing = keys.clone();
     missing.pop();
@@ -830,7 +1225,9 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
     for record in Record::ALL {
         assert!(leaves.insert(record.leaf()));
         let (producer, decoy, expected) = match record {
-            Record::NativeListener
+            Record::OriginalListenerObservation
+            | Record::OriginalPeerSpawnObservation
+            | Record::NativeListener
             | Record::NativeTcpPeer
             | Record::LoaderFileIo
             | Record::CallbackFailure
@@ -843,10 +1240,16 @@ fn provider_facts_follow_physical_producer_roots_and_ignore_writable_decoys() {
             | Record::GuardianStderr => (&native, &fixture, b"controller".as_slice()),
             _ => (&fixture, &native, b"fixture".as_slice()),
         };
-        fs::write(producer.join(record.leaf()), expected).unwrap();
         fs::write(decoy.join(record.leaf()), b"wrong trust domain").unwrap();
         let selected = record.source_path(&controller, &key, &fixture);
         assert_eq!(selected.parent().unwrap(), producer);
+        let expected_leaf = match record {
+            Record::OriginalListenerObservation => "result.original-listener-observation.json",
+            Record::OriginalPeerSpawnObservation => "result.original-peer-spawn-observation.json",
+            _ => record.leaf(),
+        };
+        assert_eq!(selected.file_name().unwrap(), expected_leaf);
+        fs::write(producer.join(expected_leaf), expected).unwrap();
         assert_eq!(fs::read(selected).unwrap(), expected);
     }
     assert!(leaves.contains("winsock-startup-trace.json"));
@@ -1121,6 +1524,8 @@ fn descriptor() -> Descriptor {
             native_work_frequency: 1,
             linker_mode: descriptor::LinkerMode::BundledLldLink,
             input_root: inputs.clone(),
+            controller_input_root: None,
+            compiler_import_siblings: Vec::new(),
             rustc: rustc.clone(),
             native_linker: linker.clone(),
             selected_images: descriptor::project_toolchain_images([rustc, linker].into_iter().map(
@@ -2620,6 +3025,314 @@ fn restricted_joint_keeps_native_compiler_observation_with_a_separate_control_cl
 }
 
 #[test]
+fn reduced_compiler_toolchain_keeps_its_sentinel_under_authenticated_stdin() {
+    use descriptor::{StartTransport, ToolchainInputRoot, controller_start};
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, expected_start_transport, needs_descriptor_toolchain_observer, validate_descriptor,
+    };
+    let key = CaseKey {
+        family: "W-TOOLCHAIN".into(),
+        scenario: "group-privilege-reduced".into(),
+    };
+    let ordinary = CaseKey {
+        family: key.family.clone(),
+        scenario: "ordinary".into(),
+    };
+    let restricted = CaseKey {
+        family: key.family.clone(),
+        scenario: "restricted".into(),
+    };
+    let stdin = StartTransport::ControllerStdin {
+        version: controller_start::VERSION,
+    };
+    assert_eq!(expected_start_transport(&key), stdin);
+    assert_eq!(expected_start_transport(&restricted), stdin);
+    assert_eq!(
+        expected_start_transport(&ordinary),
+        StartTransport::NamedEvent
+    );
+
+    let mut input = descriptor();
+    input.case = Case::Toolchain;
+    input.cohort_gate = None;
+    input.generation_gate = None;
+    let sentinel = input
+        .output_root
+        .parent()
+        .unwrap()
+        .join(descriptor::gate_precondition::REDUCED_COMPILER_SENTINEL);
+    input.denied_write_paths = vec![sentinel.clone()];
+    assert!(input.validate().is_err());
+
+    input.start_transport = stdin;
+    validate_descriptor(&key, &input).unwrap();
+    assert!(Descriptor::parse(&serde_json::to_vec(&input).unwrap()).is_err());
+    input.control_clock = Some(descriptor::ControlClock {
+        revision: 1,
+        work_cutoff_qpc: 999,
+        qpc_frequency: 10,
+    });
+    let parsed = Descriptor::parse(&serde_json::to_vec(&input).unwrap()).unwrap();
+    assert_eq!(parsed.reduced_compiler_sentinel(), Some(sentinel.as_path()));
+    assert!(needs_descriptor_toolchain_observer(&parsed).unwrap());
+    assert!(validate_descriptor(&restricted, &parsed).is_err());
+
+    let mut omitted = parsed.clone();
+    omitted.denied_write_paths.clear();
+    assert!(validate_descriptor(&key, &omitted).is_err());
+    let mut replaced = parsed.clone();
+    replaced.denied_write_paths[0] = sentinel.with_file_name("other.bin");
+    assert!(replaced.validate().is_err());
+    input.toolchain.as_mut().unwrap().controller_input_root = Some(ToolchainInputRoot {
+        volume_serial: 2,
+        file_index: 3,
+    });
+    assert!(input.validate().is_err());
+}
+
+#[test]
+fn restricted_standalone_toolchain_requires_bound_stdin_start_and_observer_release() {
+    use descriptor::StartTransport;
+    use descriptor::controller_start::{Binding, Phase, Receiver, Sender};
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, expected_start_transport, needs_descriptor_toolchain_observer,
+        standalone_toolchain_ended_transcript, standalone_toolchain_observer_ready,
+        validate_descriptor,
+    };
+    let mut key = CaseKey {
+        family: "W-TOOLCHAIN".into(),
+        scenario: "restricted".into(),
+    };
+    let mut input = descriptor();
+    input.case = Case::Toolchain;
+    input.cohort_gate = None;
+    input.generation_gate = None;
+    assert!(validate_descriptor(&key, &input).is_err());
+    input.start_transport = expected_start_transport(&key);
+    assert_eq!(
+        input.start_transport,
+        StartTransport::ControllerStdin {
+            version: descriptor::controller_start::VERSION,
+        }
+    );
+    assert!(Descriptor::parse(&serde_json::to_vec(&input).unwrap()).is_err());
+    input.control_clock = Some(descriptor::ControlClock {
+        revision: 1,
+        work_cutoff_qpc: 999,
+        qpc_frequency: 10,
+    });
+    let bytes = serde_json::to_vec(&input).unwrap();
+    validate_descriptor(&key, &input).unwrap();
+    assert!(needs_descriptor_toolchain_observer(&Descriptor::parse(&bytes).unwrap()).unwrap());
+    let controller_root = descriptor::ToolchainInputRoot {
+        volume_serial: 123,
+        file_index: 456,
+    };
+    let mut scoped = input.clone();
+    scoped.toolchain.as_mut().unwrap().controller_input_root = Some(controller_root);
+    validate_descriptor(&key, &scoped).unwrap();
+    let scoped_bytes = serde_json::to_vec(&scoped).unwrap();
+    assert_eq!(
+        Descriptor::parse(&scoped_bytes)
+            .unwrap()
+            .toolchain
+            .unwrap()
+            .controller_input_root,
+        Some(controller_root)
+    );
+    key.scenario = "ordinary".into();
+    assert!(validate_descriptor(&key, &input).is_err());
+    assert!(validate_descriptor(&key, &scoped).is_err());
+    assert_eq!(expected_start_transport(&key), StartTransport::NamedEvent);
+    scoped.start_transport = StartTransport::NamedEvent;
+    scoped.control_clock = None;
+    assert!(scoped.validate().is_err());
+    input.start_transport = StartTransport::NamedEvent;
+    input.control_clock = None;
+    validate_descriptor(&key, &input).unwrap();
+
+    let binding = Binding {
+        challenge: input.challenge,
+        descriptor_sha256: descriptor::controller_start::descriptor_digest(&bytes),
+        pid: 123,
+        birth: 456,
+    };
+    let event = |sequence, stage, pid, value: &[u8]| {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sequence":sequence,"stage":stage,"pid":pid,"ordinal":null,"value":value,
+        }))
+        .unwrap();
+        let mut frame = u32::try_from(bytes.len()).unwrap().to_le_bytes().to_vec();
+        frame.extend(bytes);
+        frame
+    };
+    let start_event = event(0, "controller-released", binding.pid, &binding.challenge);
+    let mut transcript = start_event.clone();
+    assert!(!standalone_toolchain_observer_ready(&transcript, &binding, None).unwrap());
+    let mut bad = transcript.clone();
+    bad.extend(event(
+        1,
+        "toolchain-ready-for-native-observer",
+        binding.pid + 1,
+        &binding.challenge,
+    ));
+    assert!(standalone_toolchain_observer_ready(&bad, &binding, None).is_err());
+    transcript.extend(event(
+        1,
+        "toolchain-ready-for-native-observer",
+        binding.pid,
+        &binding.challenge,
+    ));
+    assert!(
+        !standalone_toolchain_observer_ready(&transcript[..transcript.len() - 1], &binding, None)
+            .unwrap()
+    );
+    assert!(standalone_toolchain_observer_ready(&transcript, &binding, None).unwrap());
+    assert!(
+        standalone_toolchain_observer_ready(&transcript, &binding, Some(controller_root)).is_err()
+    );
+    transcript.extend(event(
+        2,
+        "toolchain-ready-for-native-observer",
+        binding.pid,
+        &binding.challenge,
+    ));
+    assert!(standalone_toolchain_observer_ready(&transcript, &binding, None).is_err());
+    let scoped_binding = Binding {
+        challenge: binding.challenge.clone(),
+        descriptor_sha256: descriptor::controller_start::descriptor_digest(&scoped_bytes),
+        pid: binding.pid,
+        birth: binding.birth,
+    };
+    let bound_event = |value: &descriptor::ToolchainRootReady| {
+        let mut transcript = start_event.clone();
+        transcript.extend(event(
+            1,
+            "toolchain-ready-for-native-observer",
+            binding.pid,
+            &serde_json::to_vec(value).unwrap(),
+        ));
+        transcript
+    };
+    let ready = descriptor::ToolchainRootReady::from_start(controller_root, &scoped_binding);
+    let ready_bytes = serde_json::to_vec(&ready).unwrap();
+    let ended_frames = [
+        event(0, "started", binding.pid, &binding.challenge),
+        event(1, "native-argv-observed", binding.pid, b"argv"),
+        event(2, "sentinel-handles-excluded", binding.pid, &[0; 4]),
+        event(3, "token-envelope", binding.pid, b"token"),
+        event(4, "controller-released", binding.pid, &binding.challenge),
+        event(
+            5,
+            "toolchain-ready-for-native-observer",
+            binding.pid,
+            &ready_bytes,
+        ),
+    ];
+    let ended = ended_frames.concat();
+    let validate_end = |bytes: &[u8]| {
+        standalone_toolchain_ended_transcript(bytes, &scoped_binding, controller_root)
+    };
+    assert!(validate_end(&ended).unwrap());
+    assert!(validate_end(&ended[..ended.len() - 1]).is_err());
+    assert!(!validate_end(&ended_frames[..5].concat()).unwrap());
+    let mut changed = ended_frames.clone();
+    changed[0] = event(0, "started", binding.pid, b"other challenge");
+    assert!(!validate_end(&changed.concat()).unwrap());
+    changed[0] = ended_frames[0].clone();
+    changed[3] = event(3, "token-envelope", binding.pid + 1, b"token");
+    assert!(!validate_end(&changed.concat()).unwrap());
+    let mut completed = ended.clone();
+    completed.extend(event(
+        6,
+        "toolchain-test-child-dll-complete",
+        binding.pid,
+        &binding.challenge,
+    ));
+    assert!(!validate_end(&completed).unwrap());
+    let mut duplicate = ended;
+    duplicate.extend(event(
+        6,
+        "toolchain-ready-for-native-observer",
+        binding.pid,
+        &ready_bytes,
+    ));
+    assert!(!validate_end(&duplicate).unwrap());
+    let transcript = bound_event(&ready);
+    assert!(
+        standalone_toolchain_observer_ready(&transcript, &scoped_binding, Some(controller_root))
+            .unwrap()
+    );
+    assert!(
+        standalone_toolchain_observer_ready(&transcript, &binding, Some(controller_root)).is_err()
+    );
+    assert!(standalone_toolchain_observer_ready(&transcript, &binding, None).is_err());
+    let mismatches: [fn(&mut descriptor::ToolchainRootReady); 6] = [
+        |proof| proof.input_root.volume_serial ^= 1,
+        |proof| proof.input_root.file_index ^= 1,
+        |proof| proof.descriptor_sha256[0] ^= 1,
+        |proof| proof.challenge_sha256[0] ^= 1,
+        |proof| proof.pid ^= 1,
+        |proof| proof.birth ^= 1,
+    ];
+    for mismatch in mismatches {
+        let mut proof =
+            descriptor::ToolchainRootReady::from_start(controller_root, &scoped_binding);
+        mismatch(&mut proof);
+        let mut changed = ended_frames.clone();
+        changed[5] = event(
+            5,
+            "toolchain-ready-for-native-observer",
+            binding.pid,
+            &serde_json::to_vec(&proof).unwrap(),
+        );
+        assert!(validate_end(&changed.concat()).is_err());
+        assert!(
+            standalone_toolchain_observer_ready(
+                &bound_event(&proof),
+                &scoped_binding,
+                Some(controller_root)
+            )
+            .is_err()
+        );
+    }
+
+    let mut sender = Sender::joint();
+    let mut start = Vec::new();
+    sender
+        .send(&mut start, &binding, Phase::Start, || Ok(()))
+        .unwrap();
+    assert!(!sender.completed());
+    let mut release = Vec::new();
+    sender
+        .send(
+            &mut release,
+            &binding,
+            Phase::ToolchainObserverRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    assert!(sender.completed());
+    for (frame, expected) in [(release.as_slice(), true), (&[][..], false)] {
+        let mut receiver = Receiver::joint();
+        receiver
+            .receive(&mut std::io::Cursor::new(&start), &binding, || Ok(()))
+            .unwrap();
+        assert_eq!(
+            receiver
+                .receive_phase(
+                    &mut std::io::Cursor::new(frame),
+                    &binding,
+                    Phase::ToolchainObserverRelease,
+                    || Ok(())
+                )
+                .is_ok(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn explicit_listener_prefix_omits_compiler_observation_without_relaxing_joint_inputs() {
     use memcordon_ci::windows_consumer_readiness::needs_descriptor_toolchain_observer;
     let (_, mut input) = matched_clock_input();
@@ -2964,6 +3677,17 @@ fn production_fixture_vectors_fit_the_private_wire_bound_and_round_trip_exactly(
         if matches!(input.case, Case::RootFirst | Case::IntermediateFirst) {
             input.descendant_gate = Some("Local\\memcordon-readiness-portable-descendant".into());
         }
+        if (key.family.as_str(), key.scenario.as_str())
+            == ("W-TOOLCHAIN", "group-privilege-reduced")
+        {
+            input.denied_write_paths = vec![
+                input
+                    .output_root
+                    .parent()
+                    .unwrap()
+                    .join(descriptor::gate_precondition::REDUCED_COMPILER_SENTINEL),
+            ];
+        }
         validate_descriptor(&key, &input).unwrap();
         let bytes = serde_json::to_vec(&input).unwrap();
         assert!(bytes.len() <= descriptor::MAX_DESCRIPTOR_BYTES, "{key:?}");
@@ -3150,6 +3874,72 @@ fn required_windows_rows_and_terminal_custody_cannot_be_omitted() {
     records[0].terminal_observation_sha256 = Some("a".repeat(64));
     records.pop();
     assert!(!accepted(&records));
+}
+
+#[test]
+fn provider_provisioning_accepts_only_its_requested_full_joint_row() {
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseInput, CaseKey, TokenObservation, expected_start_transport, fixture_parameters,
+        provider_joint_input,
+    };
+    for scenario in ["ordinary", "restricted"] {
+        let key = CaseKey {
+            family: "W-JOINT".into(),
+            scenario: scenario.into(),
+        };
+        let expected = fixture_parameters(&key).unwrap();
+        let mut descriptor = descriptor();
+        descriptor.case = expected.case;
+        descriptor.start_transport = expected_start_transport(&key);
+        descriptor.stdout = expected.stdout;
+        descriptor.stderr = expected.stderr;
+        descriptor.arguments = expected.arguments;
+        descriptor.application_status = expected.application_status;
+        descriptor.cohort_gate = None;
+        descriptor.generation_gate = None;
+        if scenario == "restricted" {
+            descriptor.denied_write_paths = ["driver", "provider"]
+                .map(|name| descriptor.output_root.join(name))
+                .to_vec();
+        }
+        let case = CaseInput {
+            descriptor_path: descriptor.output_root.join("input.json"),
+            workload_request: descriptor.output_root.join("request.json"),
+            descriptor,
+            key: key.clone(),
+            expected_token: TokenObservation {
+                user_sid: vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
+                restricted: scenario == "restricted",
+                integrity_rid: 8192,
+                elevated: false,
+                restricting_sids: if scenario == "restricted" {
+                    vec![vec![1, 1, 0, 0, 0, 0, 0, 5, 12, 0, 0, 0]]
+                } else {
+                    Vec::new()
+                },
+            },
+        };
+        let suite = SuiteInput {
+            format: "memcordon.windows-readiness-input".into(),
+            revision: 2,
+            cases: vec![case.clone()],
+        };
+        assert_eq!(
+            provider_joint_input(suite.clone(), scenario).unwrap().key,
+            key
+        );
+        assert!(validate_suite(&suite).is_err());
+        assert!(provider_joint_input(suite.clone(), "endpoint-mismatch").is_err());
+        let mut invalid = suite.clone();
+        invalid.cases.push(case.clone());
+        assert!(provider_joint_input(invalid, scenario).is_err());
+        let mut invalid = suite.clone();
+        invalid.cases[0].descriptor.toolchain = None;
+        assert!(provider_joint_input(invalid, scenario).is_err());
+        let mut invalid = suite;
+        invalid.cases[0].expected_token.restricted = scenario != "restricted";
+        assert!(provider_joint_input(invalid, scenario).is_err());
+    }
 }
 
 #[test]
@@ -3437,6 +4227,14 @@ fn held_gate_projection_retains_only_bounded_metadata_and_drops_legacy_secrets()
         digest
     );
     assert_eq!(output["same_held_event_mandatory_label"]["raw_os_error"], 5);
+    assert_eq!(
+        output["same_held_event_mandatory_label"]["kind"],
+        "PermissionDenied"
+    );
+    let mut untrusted = unavailable.clone();
+    untrusted["kind"] = serde_json::json!(secret);
+    let output = project(&security, &untrusted);
+    assert_eq!(output["same_held_event_mandatory_label"]["kind"], "Unknown");
     assert!(!output.to_string().contains(secret));
     let legacy = serde_json::json!({"format":"memcordon.windows-controller-gate-diagnostic",
         "requested_name_utf16":secret,"requested_sddl":secret,"controller":secret});
@@ -3590,5 +4388,690 @@ fn toolchain_summary_exports_reported_scalars_without_capability_payloads_or_pre
         let output = summarize(|_| Ok(Some(bytes.clone())));
         assert_eq!(output["sources"][0]["state"], "unavailable");
         assert!(output["sources"][0].get("sha256").is_none());
+    }
+}
+
+#[test]
+fn toolchain_stderr_projects_only_one_complete_bounded_fixture_stage() {
+    use memcordon_ci::windows_consumer_readiness::redacted_toolchain_failure_summary as summarize;
+    let project = |stderr: &str, capture_complete: bool| {
+        let callback = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.windows-positive-callback-failure","revision":1,
+            "observed_status":null,"termination":1,"capture_complete":capture_complete,
+            "cleanup":{"Ok":null}
+        }))
+        .unwrap();
+        summarize(|leaf| {
+            Ok(match leaf {
+                "result.callback-failure.json" => Some(callback.clone()),
+                "result.stderr.bin" => Some(stderr.as_bytes().to_vec()),
+                _ => None,
+            })
+        })["sources"][1]
+            .clone()
+    };
+    let marker = |operation, role, code| {
+        format!(
+            "memcordon-test-fixture: toolchain-failure-v1; operation={operation}; source-role={role}; raw-os-error={code}; end\n"
+        )
+    };
+    const SECRET: &str = "DO_NOT_PROJECT_ORIGINAL_PATH_AND_ERROR_DETAIL";
+    for (operation, role, code, expected) in [
+        ("observer-frame-read", "none", "127", serde_json::json!(127)),
+        (
+            "observer-deadline-settle",
+            "none",
+            "none",
+            serde_json::Value::Null,
+        ),
+        ("copy-source", "library", "-127", serde_json::json!(-127)),
+    ] {
+        let stderr = format!("{}{SECRET}\n", marker(operation, role, code));
+        let source = project(&stderr, true);
+        assert_eq!(source["observation"]["operation"], operation);
+        assert_eq!(
+            source["observation"]["source_role"].as_str(),
+            (role != "none").then_some(role)
+        );
+        assert_eq!(source["observation"]["raw_os_error"], expected);
+        assert_eq!(source["observation"]["acceptance_authority"], false);
+        assert_eq!(
+            source["sha256"],
+            memcordon_ci::windows_causal_acceptance::sha256(stderr.as_bytes())
+        );
+        assert!(!source.to_string().contains(SECRET));
+        assert!(project(&stderr, false).get("observation").is_none());
+    }
+    let valid = marker("observer-frame-read", "none", "127");
+    let compiler_marker = |stage, role| {
+        format!(
+            "memcordon-test-fixture: toolchain-failure-v2; operation=compile-library; source-role=none; compiler-operation={stage}; resource-role={role}; raw-os-error=5; end\n"
+        )
+    };
+    for (stage, role) in [
+        ("directory-open", "outside-input-root"),
+        ("directory-named-metadata", "input-root"),
+        ("linker-read", "linker"),
+        ("compiler-spawn", "compiler"),
+        ("checkpoint-publish", "fixture"),
+        ("child-retirement", "compiler"),
+    ] {
+        let stderr = format!("{}{SECRET}\n", compiler_marker(stage, role));
+        let source = project(&stderr, true);
+        assert_eq!(source["observation"]["operation"], "compile-library");
+        assert!(source["observation"]["source_role"].is_null());
+        assert_eq!(source["observation"]["compiler_operation"], stage);
+        assert_eq!(source["observation"]["resource_role"], role);
+        assert_eq!(source["observation"]["raw_os_error"], 5);
+        assert_eq!(source["observation"]["acceptance_authority"], false);
+        assert!(!source.to_string().contains(SECRET));
+        assert!(project(&stderr, false).get("observation").is_none());
+    }
+    let compiler = compiler_marker("compiler-spawn", "compiler");
+    for invalid in [
+        valid.clone(),
+        format!("{valid}{SECRET}"),
+        format!("{SECRET}\n{valid}{SECRET}\n"),
+        format!("{valid}{valid}{SECRET}\n"),
+        format!("{valid}memcordon-test-fixture: unrelated fixture diagnostic\n"),
+        format!("{}{SECRET}\n", marker("copy-source", "none", "127")),
+        format!(
+            "{}{SECRET}\n",
+            marker("observer-deadline-arm", "library", "127")
+        ),
+        format!("{}{SECRET}\n", marker("unknown", "none", "127")),
+        format!(
+            "{}{SECRET}\n",
+            marker("compile-library", "none", "2147483648")
+        ),
+        format!("{valid}{SECRET}\n").replace("; end\n", "; extra\n"),
+        format!("{compiler}{SECRET}"),
+        format!("{compiler}{valid}{SECRET}\n"),
+        format!(
+            "{}{SECRET}\n",
+            compiler_marker("directory-open", "compiler")
+        ),
+        format!(
+            "{}{SECRET}\n",
+            compiler_marker("compiler-spawn", "outside-input-root")
+        ),
+        format!("{}{SECRET}\n", compiler_marker("unknown-stage", "fixture")),
+        format!("{}{SECRET}\n", compiler_marker("directory-open", SECRET)),
+        format!("{compiler}{SECRET}\n").replace("source-role=none", "source-role=library"),
+        format!("{compiler}{SECRET}\n")
+            .replace("operation=compile-library", "operation=copy-source"),
+    ] {
+        let source = project(&invalid, true);
+        assert_eq!(source["state"], "unavailable", "{invalid}");
+        assert!(source.get("observation").is_none());
+        assert!(source.get("sha256").is_none());
+    }
+}
+
+#[test]
+fn original_compiler_loads_require_complete_bound_original_child_and_selected_identity() {
+    use memcordon_ci::windows_consumer_readiness::{
+        redacted_original_compiler_loads as project,
+        redacted_toolchain_failure_summary as summarize,
+    };
+    use memcordon_core::{DiagnosticSha256, WindowsProcessIdentityV1};
+    use serde_json::json;
+    let callback = serde_json::to_vec(&json!({
+        "format":"memcordon.windows-positive-callback-failure","revision":1,
+        "observed_status":null,"termination":1,"capture_complete":true,"cleanup":{"Ok":null}
+    }))
+    .unwrap();
+    let stderr = b"memcordon-test-fixture: toolchain-failure-v2; operation=compile-library; source-role=none; compiler-operation=child-status; resource-role=compiler; raw-os-error=none; end\noriginal detail\n";
+    let summary = summarize(|leaf| {
+        Ok(match leaf {
+            "result.callback-failure.json" => Some(callback.clone()),
+            "result.stderr.bin" => Some(stderr.to_vec()),
+            _ => None,
+        })
+    });
+    let compiler = "a1".repeat(32);
+    let root = WindowsProcessIdentityV1 {
+        process_id: 12,
+        creation_time_100ns: 30,
+    };
+    let child = WindowsProcessIdentityV1 {
+        process_id: 14,
+        creation_time_100ns: 33,
+    };
+    let selected = [descriptor::CompilerImportSibling {
+        staged_sha256: DiagnosticSha256::from_bytes([3; 32]),
+        volume_serial: 7,
+        file_index: 23,
+        byte_length: 100,
+        last_write_100ns: 20,
+    }];
+    let challenge = [7, 19, 21];
+    for (identity, length, write_time, expected) in [
+        ((7, 23), 100, 20, Some(true)),
+        ((8, 23), 100, 20, None),
+        ((7, 24), 100, 20, None),
+        ((7, 23), 101, 20, Some(false)),
+        ((7, 23), 100, 21, Some(false)),
+    ] {
+        assert_eq!(
+            selected[0].observed_metadata_matches(identity, length, write_time),
+            expected
+        );
+    }
+    let code = 0xc000_0135u32;
+    let receipt = json!({
+        "format":"memcordon.windows-fixture-owned-child-retired", "revision":1,
+        "role":"readiness.rlib", "challenge":challenge,
+        "parent":root, "child":child, "image_sha256":compiler,
+        "compiler_inputs":{"private":"must-not-project"},
+        "held_from_process_creation":true,"held_live_before_wait":true,
+        "native_parent_edge_observed":true,"native_wait_completed":true,
+        "native_status":code as i32,
+        "original_compiler_loads": {
+            "compiler_stderr_bytes":0,
+            "loads":{"matched_staged_sha256":[selected[0].staged_sha256],
+                "bounded_events":2,"unavailable_file_identity":1,"events_after_bound":0}
+        }
+    });
+    let ack = json!({
+        "format":"memcordon.windows-toolchain-creation-ack","revision":1,"challenge":challenge,
+        "descendant":{
+            "format":"memcordon.windows-native-toolchain-descendant","revision":1,"ordinal":1,
+            "root_pid":root.process_id,"pid":child.process_id,"birth":child.creation_time_100ns,
+            "parent_pid":root.process_id,"parent_birth":root.creation_time_100ns,
+            "image_sha256":compiler,"native_parent_edge_observed":true,"parent_and_child_held_live":true
+        }
+    });
+    let observe_with_ack =
+        |summary: &serde_json::Value, receipt: &serde_json::Value, ack: &serde_json::Value| {
+            project(
+                summary,
+                &serde_json::to_vec(receipt).unwrap(),
+                &challenge,
+                &root,
+                &compiler,
+                &selected,
+                |actual| (actual == &child).then(|| (code, serde_json::to_vec(ack).unwrap())),
+            )
+        };
+    let observe = |summary: &serde_json::Value, receipt: &serde_json::Value| {
+        observe_with_ack(summary, receipt, &ack)
+    };
+    let result = observe(&summary, &receipt).unwrap();
+    assert_eq!(result["native_child_status"], code);
+    assert_eq!(
+        result["matched_staged_sha256"],
+        json!([selected[0].staged_sha256])
+    );
+    assert_eq!(result["event_metadata_incomplete"], true);
+    assert_eq!(result["unobserved_loads"], "unknown");
+    assert_eq!(result["acceptance_authority"], false);
+    assert!(!result.to_string().contains("must-not-project"));
+    let mut other_image = ack.clone();
+    other_image["descendant"]["image_sha256"] = json!("ff".repeat(32));
+    assert!(observe_with_ack(&summary, &receipt, &other_image).is_none());
+    for (field, value) in [
+        ("challenge", json!([7, 19, 22])),
+        ("role", json!("tests.exe")),
+        ("native_status", json!(-5)),
+        ("image_sha256", json!("ff".repeat(32))),
+        (
+            "child",
+            json!({"process_id":child.process_id,"creation_time_100ns":child.creation_time_100ns + 1}),
+        ),
+        ("native_wait_completed", json!(false)),
+    ] {
+        let mut wrong = receipt.clone();
+        wrong[field] = value;
+        assert!(observe(&summary, &wrong).is_none(), "{field}");
+    }
+    let mut wrong = receipt.clone();
+    wrong["original_compiler_loads"]["loads"]["matched_staged_sha256"] = json!(["ff".repeat(32)]);
+    assert!(observe(&summary, &wrong).is_none());
+    wrong = receipt.clone();
+    wrong["original_compiler_loads"]["loads"]["events_after_bound"] = json!(1);
+    assert!(observe(&summary, &wrong).is_none());
+    let mut incomplete = summary.clone();
+    incomplete["sources"][1]["state"] = json!("unavailable");
+    assert!(observe(&incomplete, &receipt).is_none());
+}
+
+#[test]
+fn installed_positive_suite_and_other_callers_scope_the_original_guardian_release_wait() {
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, GuardianReleaseWaitScope, expected_start_transport, positive_keys,
+    };
+    for (family, scenario, expected) in [
+        ("W-IO", "empty-message", true),
+        ("C-STATUS", "deadline", true),
+        ("W-TOOLCHAIN", "restricted", true),
+        ("C-STATUS", "memory", false),
+        ("W-STATUS", "deadline", false),
+        ("W-IO", "empty-stdout-stderr", false),
+        ("W-TOOLCHAIN", "ordinary", false),
+        ("W-TOOLCHAIN", "deadline", false),
+        ("W-JOINT", "restricted", false),
+    ] {
+        assert_eq!(
+            GuardianReleaseWaitScope::ExistingCaseSelection.waits_for_original_release(&CaseKey {
+                family: family.into(),
+                scenario: scenario.into()
+            }),
+            expected
+        );
+    }
+    for key in positive_keys() {
+        assert!(GuardianReleaseWaitScope::MandatoryPositiveSuite.waits_for_original_release(&key));
+    }
+    let joint = CaseKey {
+        family: "W-JOINT".into(),
+        scenario: "restricted".into(),
+    };
+    let ordinary_toolchain = CaseKey {
+        family: "W-TOOLCHAIN".into(),
+        scenario: "ordinary".into(),
+    };
+    assert!(matches!(
+        expected_start_transport(&joint),
+        descriptor::StartTransport::ControllerStdin { .. }
+    ));
+    assert_eq!(
+        expected_start_transport(&ordinary_toolchain),
+        descriptor::StartTransport::NamedEvent
+    );
+    for key in [joint, ordinary_toolchain] {
+        assert!(GuardianReleaseWaitScope::MandatoryPositiveSuite.waits_for_original_release(&key));
+        assert!(!GuardianReleaseWaitScope::ExistingCaseSelection.waits_for_original_release(&key));
+    }
+}
+
+#[test]
+fn compiler_spawn_routes_expose_only_bound_returned_facts() {
+    use memcordon_ci::windows_consumer_readiness::{
+        redacted_compiler_spawn_routes as project, redacted_toolchain_failure_summary as summarize,
+    };
+    use serde_json::json;
+    let binding = descriptor::controller_start::Binding {
+        challenge: vec![3, 2, 1],
+        descriptor_sha256: [4; 32],
+        pid: 8,
+        birth: 23,
+    };
+    let clock = (100, 10);
+    let callback = serde_json::to_vec(&json!({
+        "format":"memcordon.windows-positive-callback-failure","revision":1,
+        "observed_status":null,"termination":1,"capture_complete":true,"cleanup":{"Ok":null}
+    }))
+    .unwrap();
+    let witness = json!({
+        "pid":binding.pid,"birth":binding.birth,"descriptor_sha256":binding.descriptor_sha256,
+        "challenge_sha256":descriptor::controller_start::descriptor_digest(&binding.challenge),
+        "cutoff_qpc":clock.0,"frequency":clock.1,"raw_os_error":5,
+        "routes":{"covered":["NtCreateNamedPipeFile","CreateProcessW"],"returns":[
+            {"api":"NtCreateNamedPipeFile","failed":false,"ntstatus":0,"win32_error":null},
+            {"api":"CreateProcessW","failed":true,"ntstatus":null,"win32_error":5},
+        ]}
+    });
+    let observe = |value: &serde_json::Value, with_duplicate: bool| {
+        let mut stderr = format!(
+            "memcordon-test-fixture: toolchain-failure-v2; operation=compile-library; source-role=none; compiler-operation=compiler-spawn; resource-role=compiler; raw-os-error=5; end\nprivate original text\ncompiler-spawn-routes-v1 {value}\n"
+        );
+        if with_duplicate {
+            stderr.push_str(&format!("compiler-spawn-routes-v1 {value}\n"));
+        }
+        let summary = summarize(|leaf| {
+            Ok(match leaf {
+                "result.callback-failure.json" => Some(callback.clone()),
+                "result.stderr.bin" => Some(stderr.as_bytes().to_vec()),
+                _ => None,
+            })
+        });
+        project(&summary, stderr.as_bytes(), &binding, clock.0, clock.1)
+    };
+    let observed = observe(&witness, false).unwrap();
+    assert_eq!(observed["routes"]["returns"], witness["routes"]["returns"]);
+    assert_eq!(observed["global_route_coverage"], false);
+    assert_eq!(observed["denied_object_proved"], false);
+    assert_eq!(observed["acceptance_authority"], false);
+    assert!(!observed.to_string().contains("private original"));
+    assert!(observe(&witness, true).is_none());
+    for (field, other) in [
+        ("birth", json!(0)),
+        ("descriptor_sha256", json!(vec![7; 32])),
+        ("cutoff_qpc", json!(101)),
+        ("raw_os_error", json!(127)),
+        ("routes", serde_json::Value::Null),
+    ] {
+        let mut changed = witness.clone();
+        changed[field] = other;
+        assert!(observe(&changed, false).is_none(), "{field}");
+    }
+    let mut wrong_route = witness.clone();
+    wrong_route["routes"]["returns"][1]["api"] = json!("CreateProcessInternalW");
+    assert!(observe(&wrong_route, false).is_none());
+    let mut wrong_domain = witness.clone();
+    wrong_domain["routes"]["returns"][1]["ntstatus"] = json!(-5);
+    assert!(observe(&wrong_domain, false).is_none());
+    let mut raw_name = witness;
+    raw_name["routes"]["returns"][1]["path"] = json!("a private path");
+    assert!(observe(&raw_name, false).is_none());
+}
+
+#[test]
+fn compiler_no_debug_comparison_is_bound_and_has_no_acceptance_authority() {
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseKey, redacted_compiler_no_debug_comparison as project,
+        redacted_toolchain_failure_summary as summarize,
+    };
+    use serde_json::json;
+    let key = CaseKey {
+        family: "W-TOOLCHAIN".into(),
+        scenario: "restricted".into(),
+    };
+    let binding = descriptor::controller_start::Binding {
+        challenge: vec![3, 2, 1],
+        descriptor_sha256: [4; 32],
+        pid: 8,
+        birth: 23,
+    };
+    let clock = (100, 10);
+    let callback = serde_json::to_vec(&json!({
+        "format":"memcordon.windows-positive-callback-failure","revision":1,
+        "observed_status":null,"termination":1,"capture_complete":true,"cleanup":{"Ok":null},
+    }))
+    .unwrap();
+    let compiler = "12".repeat(32);
+    let linker = "34".repeat(32);
+    let base = json!({
+        "pid":binding.pid,"birth":binding.birth,"descriptor_sha256":binding.descriptor_sha256,
+        "challenge_sha256":descriptor::controller_start::descriptor_digest(&binding.challenge),
+        "cutoff_qpc":clock.0,"frequency":clock.1,
+    });
+    let mut original = base.clone();
+    original["raw_os_error"] = json!(5);
+    original["routes"] = json!({"covered":["CreateProcessW"],"returns":[
+        {"api":"CreateProcessW","failed":true,"ntstatus":null,"win32_error":5},
+    ]});
+    let mut witness = base;
+    witness.as_object_mut().unwrap().extend(
+        json!({
+            "compiler_sha256":compiler,"linker_sha256":linker,"role":"readiness.rlib",
+            "original_ordinal":1,"original_flags":1,"comparison_ordinal":2,"comparison_flags":0,
+            "original_native_flags":1025,
+            "outcome":{"state":"spawn-error","raw_os_error":5,
+                "returned":{"state":"failure","win32_error":5,"native_flags":1024}},
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let observe = |original: &serde_json::Value, marker: &str, suffix: &str, same_digest: bool| {
+        let stderr = format!(
+            "memcordon-test-fixture: toolchain-failure-v2; operation=compile-library; source-role=none; compiler-operation=compiler-spawn; resource-role=compiler; raw-os-error=5; end\ncompiler-spawn-routes-v1 {original}\n; \ncompiler-no-debug-comparison-v1 {marker}\n{suffix}"
+        );
+        let summary = summarize(|leaf| {
+            Ok(match leaf {
+                "result.callback-failure.json" => Some(callback.clone()),
+                "result.stderr.bin" => Some(stderr.as_bytes().to_vec()),
+                _ => None,
+            })
+        });
+        let mut changed = stderr.into_bytes();
+        if !same_digest {
+            changed.push(b'\n');
+        }
+        project(
+            &summary,
+            &changed,
+            &key,
+            &binding,
+            clock,
+            (&compiler, &linker),
+        )
+    };
+    let both = observe(&original, &witness.to_string(), "", true).unwrap();
+    assert_eq!(both["state"], "both-create-process-access-denied");
+    assert_eq!(both["acceptance_authority"], false);
+    assert_eq!(both["original"]["raw_os_error"], 5);
+    let mut wrong_flags = witness.clone();
+    wrong_flags["outcome"]["returned"]["native_flags"] = json!(2048);
+    assert_eq!(
+        observe(&original, &wrong_flags.to_string(), "", true).unwrap()["state"],
+        "inconclusive",
+    );
+    assert!(
+        observe(
+            &original,
+            &witness.to_string(),
+            "compiler-no-debug-comparison-v1\n",
+            true
+        )
+        .is_none()
+    );
+    assert!(observe(&original, "{", "", true).is_none());
+    assert!(observe(&original, &witness.to_string(), "", false).is_none());
+
+    for (field, value) in [
+        ("birth", json!(24)),
+        ("frequency", json!(9)),
+        ("compiler_sha256", json!("56".repeat(32))),
+        ("linker_sha256", json!("78".repeat(32))),
+        ("comparison_flags", json!(1)),
+    ] {
+        let mut other = witness.clone();
+        other[field] = value;
+        assert!(
+            observe(&original, &other.to_string(), "", true).is_none(),
+            "{field}"
+        );
+    }
+    let mut no_create_process = original.clone();
+    no_create_process["routes"] = json!({"covered":["CreateFileW"],"returns":[
+        {"api":"CreateFileW","failed":true,"ntstatus":null,"win32_error":5},
+    ]});
+    assert!(observe(&no_create_process, &witness.to_string(), "", true).is_none());
+
+    witness["outcome"] = json!({
+        "state":"child-complete","returned":{"state":"success","win32_error":null,
+            "native_flags":1024,"process_id":34},
+        "identity":{"process_id":34,"creation_time_100ns":25},
+        "retired":true,"native_status":1,"operation_failed":false,"cleanup_failed":false,
+    });
+    let child = observe(&original, &witness.to_string(), "", true).unwrap();
+    assert_eq!(child["state"], "no-debug-child-verified");
+    assert_eq!(child["comparison"]["outcome"]["native_status"], 1);
+    witness["outcome"]["retired"] = json!(false);
+    assert!(observe(&original, &witness.to_string(), "", true).is_none());
+    witness["outcome"] = json!({
+        "state":"child-incomplete","returned":{"state":"success","win32_error":null,
+            "native_flags":1024,"process_id":34},
+        "identity":null,"retired":false,"native_status":null,
+        "operation_failed":true,"cleanup_failed":true,
+    });
+    let incomplete = observe(&original, &witness.to_string(), "", true).unwrap();
+    assert_eq!(incomplete["state"], "inconclusive");
+    assert_eq!(incomplete["comparison"]["outcome"]["cleanup_failed"], true);
+    witness["outcome"]["cleanup_failed"] = json!(false);
+    assert!(observe(&original, &witness.to_string(), "", true).is_none());
+}
+
+#[test]
+fn direct_compiler_baseline_requires_a_unique_witness_and_matching_native_return() {
+    use memcordon_ci::windows_consumer_readiness::{
+        compiler_pre_creation_marker, direct_x64_compiler_disposition,
+    };
+    use serde_json::json;
+    let hash = "ab".repeat(32);
+    let marker = format!("compiler-pre-creation-v1 {hash}\n");
+    assert_eq!(
+        compiler_pre_creation_marker(marker.as_bytes()),
+        Some(Ok(hash.as_str()))
+    );
+    assert!(compiler_pre_creation_marker(marker.repeat(2).as_bytes()).is_none());
+    assert!(compiler_pre_creation_marker(marker.to_uppercase().as_bytes()).is_none());
+    let failure = b"compiler-pre-creation-v1 unavailable source-read\n";
+    assert_eq!(
+        compiler_pre_creation_marker(failure),
+        Some(Err("source-read"))
+    );
+    assert!(
+        compiler_pre_creation_marker(b"compiler-pre-creation-v1 unavailable local/path\n")
+            .is_none()
+    );
+    assert!(
+        compiler_pre_creation_marker([marker.as_bytes(), failure].concat().as_slice()).is_none()
+    );
+    let mut refusal = json!({
+        "state":"spawn-error","raw_os_error":5,
+        "returned_create_process":{"native_flags":1025,"win32_error":5,"pid":null},
+    });
+    assert_eq!(
+        direct_x64_compiler_disposition(&refusal, 1025),
+        "direct-create-process-access-denied"
+    );
+    assert_eq!(
+        direct_x64_compiler_disposition(&refusal, 1024),
+        "inconclusive"
+    );
+    refusal["raw_os_error"] = json!(87);
+    assert_eq!(
+        direct_x64_compiler_disposition(&refusal, 1025),
+        "inconclusive"
+    );
+    let mut retired = json!({
+        "state":"retired","child_pid":41,"native_status":0xc0000135_u32,
+        "returned_create_process":{"native_flags":1025,"win32_error":null,"pid":41},
+    });
+    assert_eq!(
+        direct_x64_compiler_disposition(&retired, 1025),
+        "direct-child-retired"
+    );
+    retired["returned_create_process"]["pid"] = json!(42);
+    assert_eq!(
+        direct_x64_compiler_disposition(&retired, 1025),
+        "inconclusive"
+    );
+}
+
+#[test]
+fn exact_x64_compiler_refusal_requires_the_original_and_direct_settlements() {
+    use memcordon_ci::windows_consumer_readiness::matches_settled_x64_compiler_refusal;
+    use serde_json::json;
+    let stderr = "12".repeat(32);
+    let proof = json!({
+        "sources":[null, {"state":"complete","sha256":stderr}],
+        "compiler_no_debug_comparison":{
+            "state":"both-create-process-access-denied","stderr_sha256":stderr,
+            "compiler_sha256":"compiler","linker_sha256":"linker",
+            "original":{"rust":"error","raw_os_error":5,"returned_create_process":{
+                "state":"failure","native_flags":1025,"win32_error":5,
+            }},
+            "comparison":{"rust":"error","outcome":{"state":"spawn-error","raw_os_error":5,
+                "returned":{"state":"failure","native_flags":1024,"win32_error":5}}},
+        },
+        "original_final_settlement":{"terminal_settled":true,"retirement_verified":true},
+        "direct_restricted_baseline":{"state":"direct-create-process-access-denied",
+            "scratch_retired":true,"diagnostic_job_empty_verified":true,
+            "installed_original":{"stderr_sha256":stderr,"native_flags":1025},
+            "evidence":{"original_witness_sha256":"ab".repeat(32),
+                "compiler_sha256":"compiler","linker_sha256":"linker",
+                "outcome":{"state":"spawn-error","raw_os_error":5,
+                    "returned_create_process":{"native_flags":1025,"win32_error":5,"pid":null}}},
+        },
+    });
+    assert!(matches_settled_x64_compiler_refusal(&proof, &stderr));
+    assert!(!matches_settled_x64_compiler_refusal(&proof, "other"));
+    for (path, invalid) in [
+        ("/original_final_settlement/terminal_settled", json!(false)),
+        (
+            "/original_final_settlement/retirement_verified",
+            json!(false),
+        ),
+        ("/direct_restricted_baseline/scratch_retired", json!(false)),
+        (
+            "/direct_restricted_baseline/diagnostic_job_empty_verified",
+            json!(false),
+        ),
+        (
+            "/direct_restricted_baseline/evidence/original_witness_sha256",
+            json!(null),
+        ),
+        (
+            "/direct_restricted_baseline/evidence/outcome/returned_create_process/pid",
+            json!(42),
+        ),
+        (
+            "/direct_restricted_baseline/evidence/outcome/returned_create_process/native_flags",
+            json!(1024),
+        ),
+        (
+            "/compiler_no_debug_comparison/comparison/outcome/raw_os_error",
+            json!(87),
+        ),
+    ] {
+        let mut invalid_proof = proof.clone();
+        *invalid_proof.pointer_mut(path).unwrap() = invalid;
+        assert!(
+            !matches_settled_x64_compiler_refusal(&invalid_proof, &stderr),
+            "{path}"
+        );
+    }
+}
+#[test]
+fn reduced_compiler_receipt_binds_token_challenge_and_both_access_results() {
+    use descriptor::gate_precondition::sha256;
+    use memcordon_ci::windows_consumer_readiness::validate_reduced_compiler_probes;
+    let challenge = b"case challenge";
+    let token = serde_json::json!({
+        "user_sid":[1,1,0,0,0,0,0,5,21,0,0,0],"restricted":false,
+        "integrity_rid":12288,"elevated":false,"restricting_sids":[],
+    });
+    let token_bytes = serde_json::to_vec(&token).unwrap();
+    let authority = serde_json::json!({
+        "token": token, "authentication_id":[10,0], "session_id":1,
+        "primary":true, "administrators_attributes":16,
+        "groups":[{"sid":descriptor::gate_precondition::COMPILER_ADMINISTRATORS_SID,"attributes":16}],
+        "privileges":[{"luid":[23,0],"attributes":3}],"traversal_luid":[23,0],
+    });
+    let mut enabled_admin = authority.clone();
+    enabled_admin["administrators_attributes"] = serde_json::json!(4);
+    enabled_admin["groups"][0]["attributes"] = serde_json::json!(4);
+    let valid = serde_json::json!({
+        "challenge_sha256":sha256(challenge),"effective_token_sha256":sha256(&token_bytes),
+        "protected":{"volume_serial":11,"file_index":12},
+        "protected_write_win32":5,"output_write_verified":true,"authority":authority,
+    });
+    assert!(
+        validate_reduced_compiler_probes(
+            &serde_json::to_vec(&valid).unwrap(),
+            challenge,
+            &token_bytes
+        )
+        .is_ok()
+    );
+    for (field, different) in [
+        ("challenge_sha256", serde_json::json!(sha256(b"other case"))),
+        (
+            "effective_token_sha256",
+            serde_json::json!(sha256(b"ordinary token")),
+        ),
+        (
+            "protected",
+            serde_json::json!({"volume_serial":11,"file_index":0}),
+        ),
+        ("protected_write_win32", serde_json::json!(32)),
+        ("output_write_verified", serde_json::json!(false)),
+        ("authority", enabled_admin),
+    ] {
+        let mut receipt = valid.clone();
+        receipt[field] = different;
+        assert!(
+            validate_reduced_compiler_probes(
+                &serde_json::to_vec(&receipt).unwrap(),
+                challenge,
+                &token_bytes
+            )
+            .is_err()
+        );
     }
 }

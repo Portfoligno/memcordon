@@ -66,6 +66,7 @@ fn observation_precedes_callback_settlement_and_preserves_original_status() {
                 cancelled: None,
                 external_stop: None,
                 progress: None,
+                verify_job_empty: false,
                 failure: Some(Arc::new(move |notice| {
                     assert_eq!(notice.cause, NativeFailureCause::ObservedFailureStatus);
                     assert_eq!(notice.status.and_then(|status| status.code()), Some(23));

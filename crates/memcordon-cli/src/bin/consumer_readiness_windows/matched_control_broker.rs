@@ -88,7 +88,7 @@ fn input_owner_context(mut value: Value, owners: [&Process; 2]) -> Value {
     });
     value
 }
-fn hold_image(path: &Path, expected: &str, cutoff: Instant) -> io::Result<File> {
+pub(super) fn hold_image(path: &Path, expected: &str, cutoff: Instant) -> io::Result<File> {
     use sha2::{Digest, Sha256};
     native::live(cutoff)?;
     let mut file = OpenOptions::new()

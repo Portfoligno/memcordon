@@ -16,7 +16,7 @@ fn expired_guardian_causal_projection_never_reads_or_exports_native_receipt() {
 }
 
 #[path = "windows_v3_fixture.rs"]
-mod terminal_fixture;
+pub(super) mod terminal_fixture;
 
 fn snapshot_predicate_fixture() -> WindowsAttemptRecordV1 {
     let mut record = observed_record();

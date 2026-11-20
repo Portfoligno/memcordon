@@ -102,6 +102,7 @@ struct ProcessControl {
     progress: Option<ProgressOutput>,
     failure: Option<Arc<dyn Fn(NativeFailureNotice) + Send + Sync>>,
     external_stop: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    verify_job_empty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,6 +505,7 @@ pub fn run_with_deadline_external_stop_output_limit(
             progress,
             failure,
             external_stop,
+            ..ProcessControl::default()
         },
     )
 }
@@ -569,7 +571,7 @@ pub fn run_until_owned_spawn_with_io_output_limit(
 
 /// The cancellation flag requests settlement of this exact owned child only.
 pub fn run_until_owned_spawn_with_io_controlled_output_limit(
-    mut command: Command,
+    command: Command,
     cutoff: Instant,
     limit: usize,
     cancelled: Option<Arc<AtomicBool>>,
@@ -577,6 +579,50 @@ pub fn run_until_owned_spawn_with_io_controlled_output_limit(
     after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
     + Send
     + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_until_owned_spawn_with_control(
+        command,
+        cutoff,
+        limit,
+        spawn,
+        after_spawn,
+        ProcessControl {
+            cancelled,
+            ..ProcessControl::default()
+        },
+    )
+}
+
+/// Require zero active processes in the original Windows Job before reporting
+/// a completed command, in addition to waiting for the exact wrapper child.
+#[cfg(windows)]
+pub fn run_until_owned_windows_job_output_limit(
+    command: Command,
+    cutoff: Instant,
+    limit: usize,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_until_owned_spawn_with_control(
+        command,
+        cutoff,
+        limit,
+        |mut command| command.spawn(),
+        |_, _, _| Ok(()),
+        ProcessControl {
+            verify_job_empty: true,
+            ..ProcessControl::default()
+        },
+    )
+}
+
+fn run_until_owned_spawn_with_control(
+    mut command: Command,
+    cutoff: Instant,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
+    control: ProcessControl,
 ) -> Result<ObservedOutput, ProcessTestError> {
     let started = Instant::now();
     let deadline = cutoff
@@ -605,10 +651,7 @@ pub fn run_until_owned_spawn_with_io_controlled_output_limit(
         deadline,
         after_spawn,
         Some(limit),
-        ProcessControl {
-            cancelled,
-            ..ProcessControl::default()
-        },
+        control,
     )
 }
 
@@ -705,6 +748,7 @@ fn observe_deadline_child(
         progress,
         failure,
         external_stop,
+        verify_job_empty,
     } = control;
     let notified = std::cell::Cell::new(false);
     let notify = |cause, status| {
@@ -1027,6 +1071,14 @@ fn observe_deadline_child(
     if let Err(error) = boundary.terminate() {
         return Err(ProcessTestError::Wait(error));
     }
+    #[cfg(windows)]
+    if verify_job_empty {
+        boundary
+            .wait_empty_until(started + deadline)
+            .map_err(ProcessTestError::Wait)?;
+    }
+    #[cfg(not(windows))]
+    let _ = verify_job_empty;
     let stdout = stdout_reader
         .join()
         .map_err(|_| ProcessTestError::Output(io::Error::other("stdout reader panicked")))?

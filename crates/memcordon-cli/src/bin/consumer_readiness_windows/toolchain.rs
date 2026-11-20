@@ -1,23 +1,44 @@
-use super::{Descriptor, Transcript};
+use super::{
+    Descriptor, Transcript,
+    operation_context::{
+        CompilerOperation as CompilerStage, compiler_context, compiler_error, with_secondary,
+    },
+    toolchain_process_wait::{terminate_failed_child, wait_retired},
+};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+#[path = "toolchain_direct_baseline.rs"]
+pub(super) mod direct_baseline;
 #[path = "toolchain_inputs.rs"]
 mod qualified_inputs;
+#[path = "toolchain_source_staging.rs"]
+mod source_staging;
+
+#[derive(Clone, Copy)]
+struct Compilation<'a> {
+    inputs: &'a super::descriptor::Toolchain,
+    publication: &'a super::toolchain_diagnostics::PublicationOwner,
+    input_root: Option<&'a qualified_inputs::HeldRoot>,
+    compare_spawn: bool,
+    spawn_trace: Option<&'a (
+        super::descriptor::controller_start::Binding,
+        super::descriptor::ControlClock,
+    )>,
+}
 
 fn observed_output(
     command: &mut Command,
     root: &Path,
     role: &str,
     challenge: &[u8],
-    creation: Option<(
-        &super::descriptor::Toolchain,
-        &super::toolchain_diagnostics::PublicationOwner,
-    )>,
+    creation: Option<Compilation<'_>>,
 ) -> io::Result<Output> {
     let qualified = creation
-        .map(|(inputs, _)| qualified_inputs::Qualified::new(inputs, command))
+        .map(|creation| {
+            qualified_inputs::Qualified::new(creation.inputs, command, creation.input_root)
+        })
         .transpose()?;
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -25,47 +46,59 @@ fn observed_output(
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
     };
-    let image = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
-        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(command.get_program())
-        .map_err(|error| {
-            super::toolchain_debug::operation_error("original-image-open", None, error)
-        })?;
-    let metadata = image.metadata().map_err(|error| {
-        super::toolchain_debug::operation_error("original-image-metadata", None, error)
-    })?;
+    let image = compiler_context(
+        CompilerStage::CompilerOpen,
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(command.get_program()),
+    )?;
+    let metadata = compiler_context(CompilerStage::CompilerMetadata, image.metadata())?;
     if !metadata.is_file()
         || metadata.len() > 512 * 1024 * 1024
         || metadata.file_attributes()
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
             != 0
     {
-        return Err(io::Error::other(
-            "owned toolchain image is not bounded regular code",
-        ));
+        return compiler_context(
+            CompilerStage::CompilerMetadata,
+            Err(io::Error::other(
+                "owned toolchain image is not bounded regular code",
+            )),
+        );
     }
     let mut code = Vec::new();
-    (&image)
-        .take(512 * 1024 * 1024 + 1)
-        .read_to_end(&mut code)
-        .map_err(|error| {
-            super::toolchain_debug::operation_error("original-image-read", None, error)
-        })?;
+    compiler_context(
+        CompilerStage::CompilerRead,
+        (&image).take(512 * 1024 * 1024 + 1).read_to_end(&mut code),
+    )?;
     if code.len() > 512 * 1024 * 1024 {
-        return Err(io::Error::other("owned toolchain code exceeds bound"));
+        return compiler_context(
+            CompilerStage::CompilerRead,
+            Err(io::Error::other("owned toolchain code exceeds bound")),
+        );
     }
     let image_sha256 = String::from(memcordon_core::DiagnosticSha256::from_bytes(
         Sha256::digest(&code).into(),
     ));
-    let parent = super::native::current_identity()?;
+    let parent = compiler_context(
+        CompilerStage::ParentIdentity,
+        super::native::current_identity(),
+    )?;
     let program: Vec<_> = command.get_program().encode_wide().collect();
     let arguments: Vec<Vec<u16>> = command
         .get_args()
         .map(|argument| argument.encode_wide().collect())
         .collect();
-    if let Some((inputs, publication)) = creation {
+    if let Some(Compilation {
+        inputs,
+        publication,
+        compare_spawn,
+        spawn_trace,
+        ..
+    }) = creation
+    {
         let qualified = qualified
             .as_ref()
             .expect("compiler inputs qualified before native launch");
@@ -84,6 +117,8 @@ fn observed_output(
                 program: &program,
                 arguments: &arguments,
                 qualified,
+                compare_spawn,
+                spawn_trace,
             },
         );
     }
@@ -187,7 +222,12 @@ struct CreationInput<'a> {
     parent: memcordon_core::WindowsProcessIdentityV1,
     program: &'a [u16],
     arguments: &'a [Vec<u16>],
-    qualified: &'a qualified_inputs::Qualified,
+    qualified: &'a qualified_inputs::Qualified<'a>,
+    compare_spawn: bool,
+    spawn_trace: Option<&'a (
+        super::descriptor::controller_start::Binding,
+        super::descriptor::ControlClock,
+    )>,
 }
 
 fn unselected_creation_error(
@@ -239,7 +279,281 @@ fn unselected_creation_error(
     }
 }
 
+type Capture = std::sync::mpsc::Receiver<io::Result<Vec<u8>>>;
+
+fn capture_compiler_pipe(pipe: impl Read + Send + 'static) -> io::Result<Capture> {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    compiler_context(
+        CompilerStage::CaptureStart,
+        std::thread::Builder::new().spawn(move || {
+            const LIMIT: usize = 16 * 1024 * 1024;
+            let mut bytes = Vec::new();
+            let result = pipe
+                .take((LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .and_then(|_| {
+                    if bytes.len() <= LIMIT {
+                        Ok(bytes)
+                    } else {
+                        Err(io::Error::other("compiler output exceeds bound"))
+                    }
+                });
+            let _ = send.send(result);
+        }),
+    )?;
+    Ok(receive)
+}
+
+fn capture_compiler_pipes(child: &mut Child) -> io::Result<(Capture, Capture)> {
+    let stdout = capture_compiler_pipe(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("compiler stdout pipe absent"))?,
+    )?;
+    let stderr = capture_compiler_pipe(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("compiler stderr pipe absent"))?,
+    )?;
+    Ok((stdout, stderr))
+}
+
+fn native_x64() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{
+        IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_UNKNOWN,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+    if !cfg!(target_arch = "x86_64") {
+        return false;
+    }
+    let mut process = 0;
+    let mut native = 0;
+    // SAFETY: pseudo process handle and writable machine types.
+    (unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) }) != 0
+        && process == IMAGE_FILE_MACHINE_UNKNOWN
+        && native == IMAGE_FILE_MACHINE_AMD64
+}
+
+fn compare_compiler_creation(
+    command: &mut Command,
+    input: &CreationInput<'_>,
+    binding: &super::descriptor::controller_start::Binding,
+    clock: &super::descriptor::ControlClock,
+    compiler_inputs: &serde_json::Value,
+    original_native_flags: u32,
+) -> String {
+    use serde_json::json;
+    use windows_sys::Win32::System::Threading::DEBUG_PROCESS;
+    let digest = super::descriptor::controller_start::descriptor_digest;
+    let remaining =
+        || super::toolchain_debug::remaining(clock.work_cutoff_qpc, clock.qpc_frequency);
+    let product = input.root.join(input.role);
+    let prepare = || -> io::Result<()> {
+        super::toolchain_debug::validate_clock(clock.work_cutoff_qpc, clock.qpc_frequency)?;
+        input.qualified.verify(input.inputs, command)?;
+        if input.parent.process_id != binding.pid
+            || input.parent.creation_time_100ns != binding.birth
+            || !input.inputs.selected_images.iter().any(|selected| {
+                selected.path == input.inputs.rustc && selected.sha256 == input.image_sha256
+            })
+        {
+            return Err(io::Error::other("comparison compiler binding differs"));
+        }
+        match product.symlink_metadata() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "comparison requires a fresh compiler output",
+                ));
+            }
+        }
+        remaining()?;
+        let mut hint = fs::OpenOptions::new().write(true).create_new(true).open(
+            input
+                .root
+                .join("native-compiler-no-debug-comparison.started"),
+        )?;
+        hint.write_all(&binding.descriptor_sha256)?;
+        hint.sync_all()?;
+        remaining()?;
+        Ok(())
+    };
+    let outcome = match prepare() {
+        Err(error) => json!({"state":"preparation-error","raw_os_error":error.raw_os_error()}),
+        Ok(()) => {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0);
+            let (result, route) = super::spawn_trace::comparison_compiler_spawn(command, clock);
+            let returned = route.map_or_else(
+                || json!({"state":"unobserved","win32_error":null}),
+                |row| match row.win32_error {
+                    Some(code) => json!({
+                        "state":"failure","win32_error":code,"native_flags":row.flags,
+                    }),
+                    None => json!({
+                        "state":"success","win32_error":null,"native_flags":row.flags,
+                        "process_id":row.process_id,
+                    }),
+                },
+            );
+            match result {
+                Err(error) => json!({
+                    "state":"spawn-error","raw_os_error":error.raw_os_error(),"returned":returned,
+                }),
+                Ok(mut child) => {
+                    // The Child is the original creation handle owner, including
+                    // on setup failure. Use it directly without duplicating rights.
+                    let mut identity = None;
+                    let mut retired = false;
+                    let mut native_status = None;
+                    let operation = (|| -> io::Result<()> {
+                        use std::os::windows::io::AsRawHandle;
+                        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+                        let mut in_job = 0;
+                        // SAFETY: the creation handle and output scalar are retained.
+                        if unsafe {
+                            IsProcessInJob(child.as_raw_handle(), std::ptr::null_mut(), &mut in_job)
+                        } == 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if in_job == 0 {
+                            return Err(io::Error::other(
+                                "comparison compiler Job membership absent",
+                            ));
+                        }
+                        super::native::verify_child_image(&child, input.image)?;
+                        let child_identity = super::native::child_identity(&child)?;
+                        let (parent, _) = super::native::child_parent_and_liveness(&child)?;
+                        if parent != input.parent.process_id
+                            || child_identity.process_id == 0
+                            || child_identity.process_id == parent
+                            || child_identity.creation_time_100ns < input.parent.creation_time_100ns
+                        {
+                            return Err(io::Error::other(
+                                "comparison compiler parent identity differs",
+                            ));
+                        }
+                        identity = Some(child_identity);
+                        let (stdout, stderr) = capture_compiler_pipes(&mut child)?;
+                        wait_retired(&child, remaining()?)?;
+                        retired = true;
+                        native_status = child.wait()?.code();
+                        for capture in [stdout, stderr] {
+                            capture
+                                .recv_timeout(std::time::Duration::from_millis(u64::from(
+                                    remaining()?,
+                                )))
+                                .map_err(io::Error::other)??;
+                        }
+                        input.qualified.verify(input.inputs, command)?;
+                        remaining()?;
+                        Ok(())
+                    })();
+                    let cleanup = if retired {
+                        Ok(())
+                    } else {
+                        let (signaled, status) = terminate_failed_child(&mut child, remaining);
+                        retired = signaled;
+                        status.map(|status| native_status = status)
+                    };
+                    let state = if operation.is_ok() {
+                        "child-complete"
+                    } else {
+                        "child-incomplete"
+                    };
+                    json!({
+                        "state":state,"returned":returned,"identity":identity,"retired":retired,
+                        "native_status":native_status,"operation_failed":operation.is_err(),
+                        "cleanup_failed":cleanup.is_err(),
+                    })
+                }
+            }
+        }
+    };
+    let marker = json!({
+        "pid":binding.pid,"birth":binding.birth,"descriptor_sha256":binding.descriptor_sha256,
+        "challenge_sha256":digest(&binding.challenge),
+        "cutoff_qpc":clock.work_cutoff_qpc,"frequency":clock.qpc_frequency,
+        "compiler_sha256":input.image_sha256,"role":input.role,
+        "linker_sha256":compiler_inputs["selected_linker_sha256"],
+        "original_ordinal":1,"original_flags":DEBUG_PROCESS,
+        "original_native_flags":original_native_flags,
+        "comparison_ordinal":2,"comparison_flags":0,
+        "outcome":outcome,
+    });
+    format!("\ncompiler-no-debug-comparison-v1 {marker}\n")
+}
+
 fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Result<Output> {
+    use std::os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        process::CommandExt,
+    };
+    compiler_context(
+        CompilerStage::QualifyClock,
+        super::toolchain_debug::validate_clock(
+            input.inputs.native_work_cutoff_ticks,
+            input.inputs.native_work_frequency,
+        ),
+    )?;
+    let output_root = input
+        .root
+        .parent()
+        .ok_or_else(|| io::Error::other("compiler acknowledgment root absent"))?;
+    command
+        .creation_flags(windows_sys::Win32::System::Threading::DEBUG_PROCESS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    input.qualified.verify(input.inputs, command)?;
+    let compiler_inputs = input.qualified.receipt(input.inputs)?;
+    let spawned = match input.spawn_trace {
+        Some((binding, clock)) => {
+            let compare = input.compare_spawn && input.role == "readiness.rlib" && native_x64();
+            let witness = compare.then(|| {
+                direct_baseline::retain_pre_creation(
+                    command,
+                    &input,
+                    binding,
+                    clock,
+                    &compiler_inputs,
+                )
+            });
+            let (result, denied_at_flags) =
+                super::spawn_trace::compiler_spawn(command, binding, clock);
+            result.map_err(|original| {
+                if let Some(flags) = denied_at_flags.filter(|flags| {
+                    flags & windows_sys::Win32::System::Threading::DEBUG_PROCESS != 0 && compare
+                }) {
+                    let detail = compare_compiler_creation(
+                        command,
+                        &input,
+                        binding,
+                        clock,
+                        &compiler_inputs,
+                        flags,
+                    );
+                    let detail = match witness {
+                        Some(Ok(digest)) => {
+                            format!("{detail}compiler-pre-creation-v1 {digest}\n")
+                        }
+                        Some(Err(stage)) => {
+                            format!("{detail}compiler-pre-creation-v1 unavailable {stage}\n")
+                        }
+                        None => detail,
+                    };
+                    with_secondary(original, detail)
+                } else {
+                    original
+                }
+            })
+        }
+        None => command.spawn(),
+    };
+    let mut child = compiler_context(CompilerStage::CompilerSpawn, spawned)?;
     let CreationInput {
         root,
         role,
@@ -252,72 +566,45 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         program,
         arguments,
         qualified,
+        compare_spawn: _,
+        spawn_trace: _,
     } = input;
-    use std::io::Read;
-    use std::os::windows::{
-        fs::{MetadataExt, OpenOptionsExt},
-        process::CommandExt,
-    };
-    super::toolchain_debug::validate_clock(
-        inputs.native_work_cutoff_ticks,
-        inputs.native_work_frequency,
-    )?;
-    let output_root = root
-        .parent()
-        .ok_or_else(|| io::Error::other("compiler acknowledgment root absent"))?;
-    command
-        .creation_flags(windows_sys::Win32::System::Threading::DEBUG_PROCESS)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    qualified.verify(inputs, command)?;
-    let compiler_inputs = qualified.receipt(inputs)?;
-    let mut child = command.spawn()?;
     let mut debug_started = false;
     let operation = (|| {
-        let capture = |pipe: Box<dyn Read + Send>| {
-            let (send, receive) = std::sync::mpsc::sync_channel(1);
-            std::thread::Builder::new().spawn(move || {
-                let mut bytes = Vec::new();
-                let result = pipe
-                    .take(16 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .and_then(|_| {
-                        if bytes.len() <= 16 * 1024 * 1024 {
-                            Ok(bytes)
-                        } else {
-                            Err(io::Error::other("compiler output exceeds bound"))
-                        }
-                    });
-                let _ = send.send(result);
-            })?;
-            Ok::<_, io::Error>(receive)
-        };
-        let stdout =
-            capture(Box::new(child.stdout.take().ok_or_else(|| {
-                io::Error::other("compiler stdout pipe absent")
-            })?))?;
-        let stderr =
-            capture(Box::new(child.stderr.take().ok_or_else(|| {
-                io::Error::other("compiler stderr pipe absent")
-            })?))?;
-        let held = super::native::retain_child_handle(&child)?;
-        let original_identity = super::native::child_identity(&child)?;
-        let diagnostics = super::toolchain_diagnostics::Publisher::new(
-            publication,
-            serde_json::json!({
-                "role":role,"challenge":challenge,"parent":parent,"original_child":original_identity,
-                "selected_image_sha256":image_sha256,
-                "native_work_cutoff_ticks":inputs.native_work_cutoff_ticks,
-                "native_work_frequency":inputs.native_work_frequency
-                ,"compiler_inputs":compiler_inputs
-            }),
+        let (stdout, stderr) = capture_compiler_pipes(&mut child)?;
+        let held = compiler_context(
+            CompilerStage::ChildRetain,
+            super::native::retain_child_handle(&child),
         )?;
-        diagnostics.publish(
-            false,
-            "before-debug-run",
-            &serde_json::json!({"original_process_owner_retained":true}),
+        let original_identity = compiler_context(
+            CompilerStage::ChildIdentity,
+            super::native::child_identity(&child),
+        )?;
+        let diagnostics = compiler_context(
+            CompilerStage::CheckpointInitialize,
+            super::toolchain_diagnostics::Publisher::new(
+                publication,
+                serde_json::json!({
+                    "role":role,"challenge":challenge,"parent":parent,"original_child":original_identity,
+                    "selected_image_sha256":image_sha256,
+                    "native_work_cutoff_ticks":inputs.native_work_cutoff_ticks,
+                    "native_work_frequency":inputs.native_work_frequency
+                    ,"compiler_inputs":compiler_inputs
+                }),
+            ),
+        )?;
+        compiler_context(
+            CompilerStage::CheckpointPublish,
+            diagnostics.publish(
+                false,
+                "before-debug-run",
+                &serde_json::json!({"original_process_owner_retained":true}),
+            ),
         )?;
         let mut original = None;
+        let mut original_loads = (role == "readiness.rlib"
+            && !inputs.compiler_import_siblings.is_empty())
+        .then(super::descriptor::OriginalCompilerLoads::default);
         debug_started = true;
         super::toolchain_debug::run(
             inputs.native_work_cutoff_ticks,
@@ -461,26 +748,24 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                 }
             },
             |phase, state| diagnostics.publish(true, phase, &state),
-        )?;
+            original_loads.as_mut().map(|loads| (inputs.compiler_import_siblings.as_slice(), loads)),
+        )
+        .map_err(|error| compiler_error(CompilerStage::DebugObservation, error))?;
         diagnostics.publish(
             false,
             "after-debug-run-before-wait-retired",
             &serde_json::json!({"debug_active_inventory_empty":true}),
         )?;
-        super::toolchain_debug::wait_retired(
-            &held,
-            super::toolchain_debug::remaining(
-                inputs.native_work_cutoff_ticks,
-                inputs.native_work_frequency,
-            )?,
-        )
-        .map_err(|error| {
-            super::toolchain_debug::operation_error(
-                "wait-original-retired",
-                Some(child.id()),
-                error,
-            )
-        })?;
+        compiler_context(
+            CompilerStage::ChildRetirement,
+            wait_retired(
+                &held,
+                super::toolchain_debug::remaining(
+                    inputs.native_work_cutoff_ticks,
+                    inputs.native_work_frequency,
+                )?,
+            ),
+        )?;
         diagnostics.publish(
             false,
             "after-wait-retired-before-child-wait",
@@ -490,13 +775,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
             inputs.native_work_cutoff_ticks,
             inputs.native_work_frequency,
         )?;
-        let status = child.wait().map_err(|error| {
-            super::toolchain_debug::operation_error(
-                "original-child-wait",
-                Some(original_identity.process_id),
-                error,
-            )
-        })?;
+        let status = compiler_context(CompilerStage::ChildWait, child.wait())?;
         diagnostics.publish(
             false,
             "after-child-wait",
@@ -508,20 +787,14 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                 inputs.native_work_cutoff_ticks,
                 inputs.native_work_frequency,
             )?;
-            capture
+            compiler_context(CompilerStage::CaptureReceive, capture
                 .recv_timeout(std::time::Duration::from_millis(u64::from(milliseconds)))
                 .map_err(|error| {
                     io::Error::other(format!(
                         "{error}; toolchain-operation={phase}; original-child={original_identity:?}"
                     ))
-                })?
-                .map_err(|error| {
-                    super::toolchain_debug::operation_error(
-                        phase,
-                        Some(original_identity.process_id),
-                        error,
-                    )
                 })
+                .and_then(|result| result))
         };
         let output = Output {
             status,
@@ -531,14 +804,23 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         diagnostics.publish(false, "output-capture-complete", &serde_json::json!({"stdout_bytes":output.stdout.len(),"stderr_bytes":output.stderr.len(),"native_status":output.status.code()}))?;
         let (identity, live) =
             original.ok_or_else(|| io::Error::other("compiler creation receipt absent"))?;
-        let retired = serde_json::json!({"format":"memcordon.windows-fixture-owned-child-retired","revision":1,
+        let mut retired = serde_json::json!({"format":"memcordon.windows-fixture-owned-child-retired","revision":1,
             "role":role,"challenge":challenge,"parent":parent,"child":identity,"image_sha256":image_sha256,
             "compiler_inputs":compiler_inputs,
             "held_from_process_creation":true,"held_live_before_wait":live,"native_parent_edge_observed":true,
             "native_wait_completed":true,"native_status":output.status.code()});
-        fs::write(
-            root.join(format!("native-child-{role}.retired.json")),
-            serde_json::to_vec(&retired).map_err(io::Error::other)?,
+        if let Some(loads) = original_loads.filter(|_| !output.status.success()) {
+            retired["original_compiler_loads"] = serde_json::json!({
+                "loads": loads,
+                "compiler_stderr_bytes": output.stderr.len(),
+            });
+        }
+        compiler_context(
+            CompilerStage::RetirementReceipt,
+            fs::write(
+                root.join(format!("native-child-{role}.retired.json")),
+                serde_json::to_vec(&retired).map_err(io::Error::other)?,
+            ),
         )?;
         Ok(output)
     })();
@@ -551,18 +833,21 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                 &child,
                 |_| Err(io::Error::other("compiler setup failed before release")),
                 |_, _| Ok(()),
+                None,
             );
-            Err(io::Error::other(format!(
-                "{original}; creation-owner cleanup={cleanup:?}"
-            )))
+            Err(with_secondary(
+                original,
+                format!("creation-owner cleanup={cleanup:?}"),
+            ))
         }
         other => other,
     };
     let named = qualified.verify(inputs, command);
     match (operation, named) {
-        (Err(original), Err(secondary)) => Err(io::Error::other(format!(
-            "{original}; secondary compiler input custody={secondary}"
-        ))),
+        (Err(original), Err(secondary)) => Err(with_secondary(
+            original,
+            format!("secondary compiler input custody={secondary}"),
+        )),
         (Err(original), _) => Err(original),
         (Ok(_), Err(error)) => Err(error),
         (Ok(output), Ok(())) => Ok(output),
@@ -574,18 +859,18 @@ fn checked(
     root: &Path,
     role: &str,
     challenge: &[u8],
-    creation: Option<(
-        &super::descriptor::Toolchain,
-        &super::toolchain_diagnostics::PublicationOwner,
-    )>,
+    creation: Option<Compilation<'_>>,
 ) -> io::Result<()> {
     let output = observed_output(command, root, role, challenge, creation)?;
     if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "owned toolchain command failed with native status {:?}, stderr bytes {:?}",
-            output.status.code(),
-            output.stderr
-        )));
+        return compiler_context(
+            CompilerStage::ChildStatus,
+            Err(io::Error::other(format!(
+                "owned toolchain command failed with native status {:?}, stderr bytes {:?}",
+                output.status.code(),
+                output.stderr
+            ))),
+        );
     }
     if !output.stdout.is_empty() {
         return Err(io::Error::other("unexpected toolchain stdout"));
@@ -594,16 +879,22 @@ fn checked(
 }
 
 fn compile(
-    inputs: &super::descriptor::Toolchain,
-    publication: &super::toolchain_diagnostics::PublicationOwner,
+    creation: Compilation<'_>,
     source: &Path,
     output: &Path,
     flags: &[&str],
     challenge: &[u8],
 ) -> io::Result<()> {
-    let mut command =
-        super::descriptor::toolchain_command::compile_command(inputs, source, output, flags)
-            .map_err(io::Error::other)?;
+    let mut command = compiler_context(
+        CompilerStage::QualifyCommand,
+        super::descriptor::toolchain_command::compile_command(
+            creation.inputs,
+            source,
+            output,
+            flags,
+        )
+        .map_err(io::Error::other),
+    )?;
     checked(
         &mut command,
         output
@@ -614,7 +905,7 @@ fn compile(
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::other("owned compiler output role invalid"))?,
         challenge,
-        Some((inputs, publication)),
+        Some(creation),
     )
 }
 
@@ -623,22 +914,84 @@ pub(super) fn execute(
     transcript: &mut Transcript,
     control: Option<&mut super::controller_start_input::Session>,
 ) -> io::Result<()> {
+    use super::operation_context::{
+        Operation::Toolchain as Stage, SourceRole, ToolchainOperation as Op, context, wrap,
+    };
     let start = descriptor
         .start_gate
         .as_ref()
         .ok_or_else(|| io::Error::other("owned toolchain execution lacks native observer gate"))?;
+    let inputs = descriptor
+        .toolchain
+        .as_ref()
+        .ok_or_else(|| io::Error::other("toolchain inputs missing"))?;
+    let candidate_root = match inputs.controller_input_root {
+        Some(expected) => {
+            let session = control.as_deref().ok_or_else(|| {
+                io::Error::other("compiler root custody lacks original stdin session")
+            })?;
+            if std::time::Instant::now() >= session.original_deadline() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original compiler root custody cutoff expired",
+                ));
+            }
+            let token: serde_json::Value =
+                serde_json::from_slice(&super::native::token_observation()?)
+                    .map_err(io::Error::other)?;
+            if token["restricted"].as_bool() != Some(true) {
+                return Err(io::Error::other(
+                    "compiler root custody requires the original restricted fixture token",
+                ));
+            }
+            Some(qualified_inputs::HeldRoot::acquire(inputs, expected)?)
+        }
+        None => None,
+    };
+    let bound_ready = candidate_root
+        .as_ref()
+        .map(|root| {
+            let session = control
+                .as_deref()
+                .expect("root observation requires the original session");
+            serde_json::to_vec(&super::descriptor::ToolchainRootReady::from_start(
+                root.identity,
+                session.original_binding(),
+            ))
+            .map_err(io::Error::other)
+        })
+        .transpose()?;
     transcript.event(
         "toolchain-ready-for-native-observer",
         None,
-        &descriptor.challenge,
+        bound_ready.as_deref().unwrap_or(&descriptor.challenge),
     )?;
+    let spawn_trace = candidate_root.as_ref().and_then(|_| {
+        let session = control.as_deref()?;
+        let mut clock = descriptor.control_clock.clone()?;
+        if clock.qpc_frequency != inputs.native_work_frequency {
+            return None;
+        }
+        clock.work_cutoff_qpc = clock.work_cutoff_qpc.min(inputs.native_work_cutoff_ticks);
+        Some((session.original_binding().clone(), clock))
+    });
     match descriptor.start_transport {
         super::descriptor::StartTransport::ControllerStdin { .. } => {
             control
-                .ok_or_else(|| io::Error::other("original Joint control session unavailable"))?
+                .ok_or_else(|| {
+                    wrap(
+                        Stage(Op::ObserverSession),
+                        io::Error::other("original toolchain control session unavailable"),
+                    )
+                })?
                 .receive(super::descriptor::controller_start::Phase::ToolchainObserverRelease)?;
         }
         super::descriptor::StartTransport::NamedEvent => {
+            if candidate_root.is_some() {
+                return Err(io::Error::other(
+                    "compiler root custody requires bound stdin observer release",
+                ));
+            }
             let observer_name = format!("{start}-toolchain-observer");
             super::native::wait_controller_gate(std::ffi::OsStr::new(&observer_name), || Ok(()))
                 .map_err(|error| {
@@ -646,49 +999,81 @@ pub(super) fn execute(
                 })?;
         }
     }
-    let inputs = descriptor
-        .toolchain
-        .as_ref()
-        .ok_or_else(|| io::Error::other("toolchain inputs missing"))?;
+    // Only the original second stdin frame enables use of the independently
+    // observed root in place of reopening controller-owned ambient ancestors.
+    if let Some(root) = &candidate_root {
+        root.verify(inputs)?;
+    }
     let root = descriptor.output_root.join("compiled");
-    fs::create_dir(&root)?;
-    super::toolchain_debug::validate_clock(
-        inputs.native_work_cutoff_ticks,
-        inputs.native_work_frequency,
+    context(Stage(Op::CreateCompiledDirectory), fs::create_dir(&root))?;
+    context(
+        Stage(Op::ValidateClock),
+        super::toolchain_debug::validate_clock(
+            inputs.native_work_cutoff_ticks,
+            inputs.native_work_frequency,
+        ),
     )?;
     // Convert the original absolute QPC deadline once, conservatively. Sampling
     // Instant before QPC prevents conversion work from extending the budget.
     let sampled = std::time::Instant::now();
-    let remaining = super::toolchain_debug::remaining(
-        inputs.native_work_cutoff_ticks,
-        inputs.native_work_frequency,
+    let remaining = context(
+        Stage(Op::SampleDeadline),
+        super::toolchain_debug::remaining(
+            inputs.native_work_cutoff_ticks,
+            inputs.native_work_frequency,
+        ),
     )?;
     let deadline = sampled
         .checked_add(std::time::Duration::from_millis(u64::from(remaining)))
-        .ok_or_else(|| io::Error::other("toolchain publication cutoff overflow"))?;
-    let publication = super::toolchain_diagnostics::PublicationOwner::new(&root, deadline)?;
-    for (input, name) in [
-        (&inputs.library_source, "library.rs"),
-        (&inputs.test_source, "tests.rs"),
-        (&inputs.child_source, "child.rs"),
-        (&inputs.dll_source, "dll.rs"),
-        (&inputs.loader_source, "loader.rs"),
+        .ok_or_else(|| {
+            wrap(
+                Stage(Op::PublicationDeadline),
+                io::Error::other("toolchain publication cutoff overflow"),
+            )
+        })?;
+    let publication = context(
+        Stage(Op::RetainPublicationParent),
+        super::toolchain_diagnostics::PublicationOwner::new(&root, deadline),
+    )?;
+    for (input, name, role) in [
+        (&inputs.library_source, "library.rs", SourceRole::Library),
+        (&inputs.test_source, "tests.rs", SourceRole::Tests),
+        (&inputs.child_source, "child.rs", SourceRole::Child),
+        (&inputs.dll_source, "dll.rs", SourceRole::Dll),
+        (&inputs.loader_source, "loader.rs", SourceRole::Loader),
     ] {
-        fs::copy(input, root.join(name))?;
+        context(
+            Stage(Op::CopySource(role)),
+            source_staging::stage(input, &root.join(name), deadline),
+        )?;
     }
     let library = root.join("readiness.rlib");
-    compile(
+    let creation = Compilation {
         inputs,
-        &publication,
-        &root.join("library.rs"),
-        &library,
-        &["--crate-type=rlib"],
-        &descriptor.challenge,
+        publication: &publication,
+        input_root: candidate_root.as_ref(),
+        compare_spawn: descriptor.case == super::descriptor::Case::Toolchain
+            && !descriptor.provider_input_experiment
+            && descriptor.matched_control.is_none()
+            && inputs.target == "x86_64-pc-windows-msvc",
+        spawn_trace: None,
+    };
+    context(
+        Stage(Op::CompileLibrary),
+        compile(
+            Compilation {
+                spawn_trace: spawn_trace.as_ref(),
+                ..creation
+            },
+            &root.join("library.rs"),
+            &library,
+            &["--crate-type=rlib"],
+            &descriptor.challenge,
+        ),
     )?;
     let child = root.join("child.exe");
     compile(
-        inputs,
-        &publication,
+        creation,
         &root.join("child.rs"),
         &child,
         &[],
@@ -696,8 +1081,7 @@ pub(super) fn execute(
     )?;
     let tests = root.join("tests.exe");
     compile(
-        inputs,
-        &publication,
+        creation,
         &root.join("tests.rs"),
         &tests,
         &["--test"],
@@ -705,8 +1089,7 @@ pub(super) fn execute(
     )?;
     let dll = root.join("readiness.dll");
     compile(
-        inputs,
-        &publication,
+        creation,
         &root.join("dll.rs"),
         &dll,
         &["--crate-type=cdylib"],
@@ -714,8 +1097,7 @@ pub(super) fn execute(
     )?;
     let loader = root.join("loader.exe");
     compile(
-        inputs,
-        &publication,
+        creation,
         &root.join("loader.rs"),
         &loader,
         &[],

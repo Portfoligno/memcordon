@@ -440,6 +440,7 @@ fn original_direct_reference_broker() {
     )
     .unwrap();
     // Process::create uses the actual suspended, creation-time Job-list path.
+    assert_eq!(direct.creation_flags, 0x0008_0404);
     let broker = controller_start::BrokerIdentity {
         pid: std::process::id(),
         birth: native_birth(unsafe { GetCurrentProcess() }),

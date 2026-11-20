@@ -35,6 +35,92 @@ fn packet() -> Packet {
     }
     packet
 }
+
+#[test]
+fn compiler_route_projection_requires_retained_original_thread_and_clock() {
+    let mut packet = packet();
+    packet.owners[0].complete = 1;
+    packet.record_count = 2;
+    packet.total_calls = 2;
+    packet.rows[0] = row(2, 1);
+    packet.rows[1] = row(5, 2);
+    packet.rows[1].started_qpc = 30;
+    packet.rows[1].finished_qpc = 31;
+    packet.rows[1].win32_result = 0;
+    packet.rows[1].outgoing_win32 = 5;
+    packet.rows[1].name.fill(0x61);
+    packet.rows[1].copied_name_units = 128;
+    packet.rows[1].name_flags = 4;
+    packet.rows[1].flags &= !16;
+    packet.total_failures = 1;
+    packet.first_failure_present = 1;
+    packet.first_failure = packet.rows[1];
+    let (projection, created) = record::compiler_routes(&packet, 7, 1000, 1000).unwrap();
+    assert_eq!(projection["returns"][0]["ntstatus"], 0);
+    assert_eq!(projection["returns"][1]["api"], "CreateProcessW");
+    assert_eq!(projection["returns"][1]["win32_error"], 5);
+    let created = created.unwrap();
+    assert_eq!(created.win32_error, Some(5));
+    assert_eq!(created.flags, 0);
+    assert_eq!(created.process_id, None);
+    assert!(
+        projection["returns"][1]
+            .get("requested_name_utf16")
+            .is_none()
+    );
+    assert!(record::compiler_routes(&packet, 8, 1000, 1000).is_none());
+    assert!(record::compiler_routes(&packet, 7, 999, 1000).is_none());
+    packet.rows[1].started_qpc = 20;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+    packet.rows[1].started_qpc = 30;
+    packet.dropped = 1;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+    packet.dropped = 0;
+    packet.late = 1;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+}
+
+#[test]
+fn compiler_route_projection_accepts_truncated_owner_name_with_complete_route_proof() {
+    let mut packet = packet();
+    packet.owners[0].complete = 1;
+    packet.owners[0].flags = 4;
+    packet.owners[0].identity.module_name[..63].fill(u16::from(b'x'));
+    packet.record_count = 1;
+    packet.total_calls = 1;
+    packet.rows[0] = row(5, 1);
+    packet.rows[0].creation_flags = 0x0008_0400;
+    packet.rows[0].output_pid = 99;
+    let (projection, created) = record::compiler_routes(&packet, 7, 1000, 1000).unwrap();
+    assert_eq!(
+        projection["returns"],
+        serde_json::json!([{"api":"CreateProcessW","failed":false,"ntstatus":null,"win32_error":null}])
+    );
+    let created = created.unwrap();
+    assert_eq!(created.win32_error, None);
+    assert_eq!(created.flags, 0x0008_0400);
+    assert_eq!(created.process_id, None);
+    packet.rows[0].output_flags = 64;
+    let (_, created) = record::compiler_routes(&packet, 7, 1000, 1000).unwrap();
+    assert_eq!(created.unwrap().process_id, Some(99));
+    packet.rows[0].output_pid = 0;
+    let (_, created) = record::compiler_routes(&packet, 7, 1000, 1000).unwrap();
+    assert_eq!(created.unwrap().process_id, None);
+
+    packet.owners[0].complete = 0;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+    packet.owners[0].complete = 1;
+    packet.route_failures = 1;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+    packet.route_failures = 0;
+    packet.refusal.present = 1;
+    packet.refusal.reason = 24;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+    packet.refusal.present = 0;
+    packet.refusal.reason = 0;
+    packet.routes[4].postvalidated = 0;
+    assert!(record::compiler_routes(&packet, 7, 1000, 1000).is_none());
+}
 fn row(operation: u32, sequence: u64) -> Row {
     Row {
         sequence,

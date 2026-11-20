@@ -139,6 +139,28 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
         ));
     }
     for name in [
+        "result.toolchain-held-gate-summary.json",
+        "result.toolchain-failure-summary.json",
+    ] {
+        paths.push(format!(
+            "{prefix}/windows-installed/W-TOOLCHAIN/restricted/{name}"
+        ));
+    }
+    for scenario in ["ordinary", "restricted"] {
+        paths.push(format!(
+            "{prefix}/windows-installed/W-TOOLCHAIN/{scenario}/result.toolchain-loader-lookup.json"
+        ));
+    }
+    paths.push(format!(
+        "{prefix}/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json"
+    ));
+    paths.push(format!(
+        "{prefix}/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json"
+    ));
+    paths.push(format!(
+        "{prefix}/windows-installed/windows-reduced-compiler-qualification.json"
+    ));
+    for name in [
         "package-uninstall.stdout.bin",
         "package-uninstall.stderr.bin",
         "package-uninstall.capture.json",

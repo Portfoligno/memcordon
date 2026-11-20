@@ -580,6 +580,15 @@ fn private_start_binds_all129_metadata_references_and_requires_peer_owner_ack_be
     assert_eq!(bytes.len(), 6824);
     let first = bytes.len();
     sender
+        .send(
+            &mut bytes,
+            &binding,
+            start::Phase::PrivatePeerSpawnRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    let spawn_release = bytes.len();
+    sender
         .send_peer_held(&mut bytes, &binding, &peer, || Ok(()))
         .unwrap();
     let ack = bytes.len();
@@ -603,6 +612,15 @@ fn private_start_binds_all129_metadata_references_and_requires_peer_owner_ack_be
     receiver.receive(&mut reader, &binding, || Ok(())).unwrap();
     assert_eq!(reader.position(), first as u64);
     assert_eq!(receiver.directory_transfer(), Some(&directories));
+    receiver
+        .receive_phase(
+            &mut reader,
+            &binding,
+            start::Phase::PrivatePeerSpawnRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(reader.position(), spawn_release as u64);
     receiver
         .receive_peer_held(&mut reader, &binding, &peer, || Ok(()))
         .unwrap();
@@ -639,6 +657,89 @@ fn private_start_binds_all129_metadata_references_and_requires_peer_owner_ack_be
 }
 
 #[test]
+fn private_peer_spawn_release_is_required_once_and_fails_closed() {
+    use start::Phase::PrivatePeerSpawnRelease as SpawnRelease;
+
+    let binding = binding();
+    let registry = registry();
+    let (expected, directories) = directories(1, 1);
+    let peer = start::PeerRecipient {
+        handle: 0x400,
+        pid: 9002,
+        birth: binding.birth + 1,
+    };
+    let mut sender = start::Sender::with_registry(registry, true)
+        .with_directories(directories, expected.clone())
+        .unwrap();
+    let mut initial = Vec::new();
+    sender
+        .send(&mut initial, &binding, start::Phase::Start, || Ok(()))
+        .unwrap();
+    let mut grant = Vec::new();
+    sender
+        .send(&mut grant, &binding, SpawnRelease, || Ok(()))
+        .unwrap();
+    assert!(
+        sender
+            .send(&mut Vec::new(), &binding, SpawnRelease, || Ok(()))
+            .is_err()
+    );
+    assert!(start::send_phase(&mut Vec::new(), &binding, SpawnRelease, || Ok(())).is_err());
+
+    let make_receiver = || {
+        let mut receiver =
+            Receiver::with_directories(registry.manifest_sha256, expected.clone(), true).unwrap();
+        receiver
+            .receive(&mut Cursor::new(&initial), &binding, || Ok(()))
+            .unwrap();
+        receiver
+    };
+    assert!(
+        make_receiver()
+            .receive_peer_held(&mut Cursor::new([]), &binding, &peer, || Ok(()))
+            .is_err()
+    );
+    let mut malformed = grant.clone();
+    *malformed.last_mut().unwrap() ^= 1;
+    for incomplete_or_malformed in [&[][..], &grant[..grant.len() - 1], &malformed] {
+        let mut receiver = make_receiver();
+        assert!(
+            receiver
+                .receive_phase(
+                    &mut Cursor::new(incomplete_or_malformed),
+                    &binding,
+                    SpawnRelease,
+                    || Ok(())
+                )
+                .is_err()
+        );
+        assert!(
+            receiver
+                .receive_phase(&mut Cursor::new(&grant), &binding, SpawnRelease, || Ok(()))
+                .is_err()
+        );
+    }
+    let mut late = make_receiver();
+    assert_eq!(
+        late.receive_phase(&mut Cursor::new(&grant), &binding, SpawnRelease, || Err(
+            io::ErrorKind::TimedOut.into()
+        ))
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::TimedOut
+    );
+    let mut repeated = make_receiver();
+    repeated
+        .receive_phase(&mut Cursor::new(&grant), &binding, SpawnRelease, || Ok(()))
+        .unwrap();
+    assert!(
+        repeated
+            .receive_phase(&mut Cursor::new(grant), &binding, SpawnRelease, || Ok(()))
+            .is_err()
+    );
+}
+
+#[test]
 fn marker_start5_authenticates_role4_without_directory_downgrade_or_new_frame_capacity() {
     let mut binding = binding();
     binding.challenge = vec![0xff; start::MAX_CHALLENGE];
@@ -669,6 +770,23 @@ fn marker_start5_authenticates_role4_without_directory_downgrade_or_new_frame_ca
         .receive(&mut Cursor::new(&bytes), &binding, || Ok(()))
         .unwrap();
     assert_eq!(receiver.directory_transfer(), Some(&metadata));
+    let mut spawn_release = Vec::new();
+    sender
+        .send(
+            &mut spawn_release,
+            &binding,
+            start::Phase::PrivatePeerSpawnRelease,
+            || Ok(()),
+        )
+        .unwrap();
+    receiver
+        .receive_phase(
+            &mut Cursor::new(spawn_release),
+            &binding,
+            start::Phase::PrivatePeerSpawnRelease,
+            || Ok(()),
+        )
+        .unwrap();
     let peer = start::PeerRecipient {
         handle: 0x400,
         pid: 9002,
@@ -805,6 +923,15 @@ fn held_peer_ack_and_pending_admission_require_exact_original_context_and_child(
         sender
             .send(&mut initial, &binding, start::Phase::Start, || Ok(()))
             .unwrap();
+        let mut spawn_release = Vec::new();
+        sender
+            .send(
+                &mut spawn_release,
+                &binding,
+                start::Phase::PrivatePeerSpawnRelease,
+                || Ok(()),
+            )
+            .unwrap();
         let mut ack = Vec::new();
         sender
             .send_peer_held(&mut ack, &binding, &peer, || Ok(()))
@@ -814,6 +941,14 @@ fn held_peer_ack_and_pending_admission_require_exact_original_context_and_child(
                 .unwrap();
         receiver
             .receive(&mut Cursor::new(initial), &binding, || Ok(()))
+            .unwrap();
+        receiver
+            .receive_phase(
+                &mut Cursor::new(spawn_release),
+                &binding,
+                start::Phase::PrivatePeerSpawnRelease,
+                || Ok(()),
+            )
             .unwrap();
         let mut wanted = peer;
         match case {

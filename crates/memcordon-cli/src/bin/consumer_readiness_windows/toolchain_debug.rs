@@ -16,6 +16,60 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+fn observe_original_load(
+    file: windows_sys::Win32::Foundation::HANDLE,
+    selected: &[super::descriptor::CompilerImportSibling],
+    observation: &mut super::descriptor::OriginalCompilerLoads,
+) {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    if observation.bounded_events == super::descriptor::MAX_COMPILER_LOAD_METADATA {
+        observation.events_after_bound += 1;
+        return;
+    }
+    observation.bounded_events += 1;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the original LOAD_DLL event owns the live file handle until this
+    // branch closes it. Only bounded metadata is written to the stack buffer.
+    if file.is_null()
+        || unsafe { GetFileInformationByHandle(file, &mut info) } == 0
+        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || info.nNumberOfLinks != 1
+    {
+        observation.unavailable_file_identity += 1;
+        return;
+    }
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let length = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    let write_time = (u64::from(info.ftLastWriteTime.dwHighDateTime) << 32)
+        | u64::from(info.ftLastWriteTime.dwLowDateTime);
+    if file_index == 0 || length == 0 || write_time == 0 {
+        observation.unavailable_file_identity += 1;
+        return;
+    }
+    let Some((sibling, metadata_matches)) = selected.iter().find_map(|candidate| {
+        candidate
+            .observed_metadata_matches((info.dwVolumeSerialNumber, file_index), length, write_time)
+            .map(|matches| (candidate, matches))
+    }) else {
+        return;
+    };
+    if !metadata_matches {
+        observation.unavailable_file_identity += 1;
+        return;
+    }
+    if !observation
+        .matched_staged_sha256
+        .contains(&sibling.staged_sha256)
+    {
+        observation
+            .matched_staged_sha256
+            .push(sibling.staged_sha256.clone());
+    }
+}
+
 pub(super) fn operation_error(
     operation: &'static str,
     pid: Option<u32>,
@@ -37,17 +91,6 @@ pub(super) struct Created {
     pub image_sha256: String,
     pub parent_pid: u32,
     pub parent_birth: u64,
-}
-
-pub(super) fn wait_retired(owner: &OwnedHandle, milliseconds: u32) -> io::Result<()> {
-    // SAFETY: the borrowed owned process handle remains valid throughout the finite wait.
-    match unsafe { WaitForSingleObject(owner.as_raw_handle(), milliseconds) } {
-        0 => Ok(()),
-        u32::MAX => Err(io::Error::last_os_error()),
-        _ => Err(io::Error::other(
-            "compiler retirement not signaled before original cutoff",
-        )),
-    }
 }
 
 pub(super) fn validate_clock(cutoff: u64, frequency: u64) -> io::Result<()> {
@@ -90,6 +133,10 @@ pub(super) fn run(
     original_child: &std::process::Child,
     mut acknowledge: impl FnMut(&Created) -> io::Result<()>,
     mut observe: impl FnMut(&str, serde_json::Value) -> io::Result<()>,
+    mut original_loads: Option<(
+        &[super::descriptor::CompilerImportSibling],
+        &mut super::descriptor::OriginalCompilerLoads,
+    )>,
 ) -> io::Result<()> {
     let mut held = BTreeMap::<u32, OwnedHandle>::new();
     let mut breakpoints = BTreeSet::new();
@@ -312,6 +359,14 @@ pub(super) fn run(
                         held.contains_key(&event.dwProcessId)
                             && identities.get(&event.dwProcessId) == Some(&member.birth)
                     });
+                    if event.dwProcessId == original_child.id() && creation.is_some() {
+                        if let Some(initialization) = original_loads
+                            .as_mut()
+                            .and_then(|(_, loads)| loads.initialization.as_mut())
+                        {
+                            initialization.observed_exit_status = Some(native_exit_status);
+                        }
+                    }
                     let observation = exits.observe_exit(
                         event.dwProcessId,
                         event.dwThreadId,
@@ -326,12 +381,50 @@ pub(super) fn run(
                 }
                 LOAD_DLL_DEBUG_EVENT => {
                     let file = unsafe { event.u.LoadDll.hFile };
+                    if event.dwProcessId == original_child.id()
+                        && diagnostic_members
+                            .get(&event.dwProcessId)
+                            .is_some_and(|member| {
+                                held.contains_key(&event.dwProcessId)
+                                    && identities.get(&event.dwProcessId) == Some(&member.birth)
+                            })
+                    {
+                        if let Some((selected, observation)) = original_loads.as_mut() {
+                            observe_original_load(file, selected, observation);
+                        }
+                    }
                     if !file.is_null() {
                         unsafe { CloseHandle(file) };
                     }
                 }
                 EXCEPTION_DEBUG_EVENT => {
                     let exception = unsafe { event.u.Exception };
+                    if event.dwProcessId == original_child.id()
+                        && held.contains_key(&event.dwProcessId)
+                        && diagnostic_members
+                            .get(&event.dwProcessId)
+                            .is_some_and(|member| {
+                                identities.get(&event.dwProcessId) == Some(&member.birth)
+                            })
+                    {
+                        if let Some(initialization) = original_loads
+                            .as_mut()
+                            .and_then(|(_, loads)| loads.initialization.as_mut())
+                        {
+                            if initialization.exceptions.len()
+                                < super::descriptor::MAX_COMPILER_EXCEPTIONS
+                            {
+                                initialization.exceptions.push(
+                                    super::descriptor::OriginalCompilerException {
+                                        code: exception.ExceptionRecord.ExceptionCode as u32,
+                                        first_chance: exception.dwFirstChance != 0,
+                                    },
+                                );
+                            } else {
+                                initialization.exceptions_after_bound += 1;
+                            }
+                        }
+                    }
                     // Only the debugger's initial breakpoint is consumed. Every
                     // other exception keeps its original application disposition.
                     if exception.dwFirstChance == 0

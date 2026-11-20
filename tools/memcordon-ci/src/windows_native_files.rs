@@ -603,10 +603,6 @@ pub(crate) fn native_file_identity(
 
 #[cfg(windows)]
 pub(crate) fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
-    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
     if path.components().any(|part| {
         matches!(
             part,
@@ -622,15 +618,105 @@ pub(crate) fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>>
         if ancestor.as_os_str().is_empty() {
             continue;
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(ancestor)?;
+        let file = open_ancestor(ancestor)?;
         native_file_identity(&file, true, ancestor)?;
         held.push(file);
     }
     Ok(held)
+}
+
+#[cfg(windows)]
+fn open_ancestor(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(windows)]
+pub(crate) struct HeldCompilerDirectories {
+    entries: std::collections::BTreeMap<std::path::PathBuf, (std::fs::File, (u32, u64))>,
+}
+
+#[cfg(windows)]
+impl HeldCompilerDirectories {
+    pub(crate) fn acquire<'a>(
+        leaves: impl IntoIterator<Item = &'a Path>,
+        mut live: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        use std::{io, path::Component};
+        let mut entries = std::collections::BTreeMap::new();
+        for leaf in leaves {
+            if !leaf.is_absolute()
+                || leaf
+                    .components()
+                    .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+            {
+                return Err(io::Error::other(
+                    "compiler custody requires absolute normalized directories",
+                ));
+            }
+            let ancestors: Vec<_> = leaf.ancestors().take(65).collect();
+            if ancestors.len() > 64 {
+                return Err(io::Error::other(
+                    "compiler directory custody exceeds its bound",
+                ));
+            }
+            for ancestor in ancestors.into_iter().rev() {
+                live()?;
+                if entries.contains_key(ancestor) {
+                    continue;
+                }
+                if entries.len() == 64 {
+                    return Err(io::Error::other(
+                        "compiler directory custody exceeds its bound",
+                    ));
+                }
+                let file = open_ancestor(ancestor)?;
+                let identity = native_file_identity(&file, true, Path::new("compiler-directory"))?;
+                if identity.1 == 0 {
+                    return Err(io::Error::other(
+                        "compiler directory native identity unavailable",
+                    ));
+                }
+                entries.insert(ancestor.to_owned(), (file, identity));
+            }
+        }
+        let owner = Self { entries };
+        owner.verify(live)?;
+        Ok(owner)
+    }
+
+    pub(crate) fn identity(&self, path: &Path) -> std::io::Result<(u32, u64)> {
+        self.entries
+            .get(path)
+            .map(|(_, identity)| *identity)
+            .ok_or_else(|| std::io::Error::other("compiler input root owner absent"))
+    }
+
+    pub(crate) fn verify(
+        &self,
+        mut live: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        for (path, (held, identity)) in &self.entries {
+            live()?;
+            let named = open_ancestor(path)?;
+            let resource = Path::new("compiler-directory");
+            if native_file_identity(held, true, resource)? != *identity
+                || native_file_identity(&named, true, resource)? != *identity
+            {
+                return Err(std::io::Error::other(
+                    "compiler directory named identity changed",
+                ));
+            }
+        }
+        live()
+    }
 }
 
 #[cfg(windows)]

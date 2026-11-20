@@ -101,8 +101,8 @@ pub use sealed::client::{
 pub use sealed::windows::{
     AuthenticatedWindowsTerminalObservation, MAX_TERMINAL_OBSERVATION_BYTES,
     WindowsPreparedObservationScope, WindowsTerminalObservationScope, converge_windows_recovery,
-    observe_windows_guardian_attempt, recover_windows_attempt,
-    recover_windows_attempt_with_request,
+    observe_windows_guardian_attempt, observe_windows_guardian_release, recover_windows_attempt,
+    recover_windows_attempt_with_request, windows_guardian_release_cutoff,
 };
 mod signal;
 #[cfg(all(target_os = "windows", feature = "test-support"))]

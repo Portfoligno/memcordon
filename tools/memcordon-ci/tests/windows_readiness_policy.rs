@@ -79,7 +79,7 @@ fn complete_suite() -> Vec<memcordon_ci::windows_consumer_readiness::CaseAssessm
 #[test]
 fn finite_catalogue_classifies_real_validation_obligations_not_a_blanket_zero_exit() {
     let keys = required_case_keys();
-    assert_eq!(keys.len(), 62);
+    assert_eq!(keys.len(), 63);
     assert_eq!(
         keys,
         memcordon_ci::windows_consumer_readiness::positive_keys()
@@ -88,7 +88,7 @@ fn finite_catalogue_classifies_real_validation_obligations_not_a_blanket_zero_ex
         keys.iter()
             .filter(|key| requirement_class(key) == Some(RequirementClass::ContextualWorkload))
             .count(),
-        9
+        10
     );
     assert_eq!(
         keys.iter()
@@ -402,6 +402,103 @@ fn listener_refusal_support_is_closed_and_a_measured_comparison_must_agree() {
         .find(|r| r.key == key("W-JOINT", "restricted"))
         .unwrap();
     row.contract.comparison = ComparisonStatus::MatchedSuccess;
+    assert!(!assess_suite(&records).is_validated());
+}
+
+#[test]
+fn matched_restricted_compiler_refusal_does_not_replace_the_limited_positive() {
+    let mut records = complete_suite();
+    let restricted = key("W-TOOLCHAIN", "restricted");
+    let limited = key("W-TOOLCHAIN", "group-privilege-reduced");
+    let row = records
+        .iter_mut()
+        .find(|row| row.key == restricted)
+        .unwrap();
+    row.contract.execution = ExecutionDisposition::OriginalCompilerLoaderRefusal {
+        native_status: 0xc000_0135,
+        evidence_sha256: [11; 32],
+    };
+    assert!(!assess_suite(&records).is_validated());
+    records
+        .iter_mut()
+        .find(|row| row.key == restricted)
+        .unwrap()
+        .contract
+        .comparison = ComparisonStatus::MatchedRefusal;
+    let decision = assess_suite(&records);
+    let SuiteDecision::Validated {
+        coverage,
+        unavailable_cases,
+    } = decision
+    else {
+        panic!(
+            "matched original refusal and independently completed limited compiler must validate"
+        );
+    };
+    assert_eq!(unavailable_cases, vec![restricted.clone()]);
+    let refused = coverage.iter().find(|case| case.key == restricted).unwrap();
+    assert_eq!(refused.kind, CoverageKind::ObservedCompilerRefusal);
+    assert_eq!(
+        refused.capabilities.compiler,
+        CapabilityAvailability::Unavailable
+    );
+    let compiled = coverage.iter().find(|case| case.key == limited).unwrap();
+    assert_eq!(
+        compiled.capabilities.compiler,
+        CapabilityAvailability::Available
+    );
+    records.retain(|row| row.key != limited);
+    assert!(!assess_suite(&records).is_validated());
+}
+
+#[test]
+fn matched_x64_spawn_refusal_needs_exact_errno_evidence_and_limited_completion() {
+    let mut records = complete_suite();
+    let restricted = key("W-TOOLCHAIN", "restricted");
+    let limited = key("W-TOOLCHAIN", "group-privilege-reduced");
+    let index = records
+        .iter()
+        .position(|row| row.key == restricted)
+        .unwrap();
+    records[index].contract.execution = ExecutionDisposition::OriginalCompilerSpawnRefusal {
+        raw_os_error: 5,
+        evidence_sha256: [11; 32],
+    };
+    assert!(!assess_suite(&records).is_validated());
+    records[index].contract.comparison = ComparisonStatus::MatchedRefusal;
+    let SuiteDecision::Validated {
+        coverage,
+        unavailable_cases,
+    } = assess_suite(&records)
+    else {
+        panic!("exact x64 compiler refusal and independent limited compile should validate");
+    };
+    assert_eq!(unavailable_cases, vec![restricted.clone()]);
+    let refused = coverage.iter().find(|case| case.key == restricted).unwrap();
+    assert_eq!(refused.kind, CoverageKind::ObservedCompilerRefusal);
+    assert_eq!(
+        refused.capabilities.compiler,
+        CapabilityAvailability::Unavailable
+    );
+    assert!(
+        !assess_suite(
+            &records
+                .iter()
+                .filter(|row| row.key != limited)
+                .cloned()
+                .collect::<Vec<_>>()
+        )
+        .is_validated()
+    );
+    records[index].contract.execution = ExecutionDisposition::OriginalCompilerSpawnRefusal {
+        raw_os_error: 87,
+        evidence_sha256: [11; 32],
+    };
+    assert!(!assess_suite(&records).is_validated());
+    records[index].contract.execution = ExecutionDisposition::OriginalCompilerSpawnRefusal {
+        raw_os_error: 5,
+        evidence_sha256: [0; 32],
+    };
     assert!(!assess_suite(&records).is_validated());
 }
 

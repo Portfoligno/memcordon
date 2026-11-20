@@ -427,10 +427,25 @@ pub fn connect_with_fault(
     name: &str,
     certification_fault: Option<WindowsSealedFault>,
 ) -> Result<OwnedHandle, String> {
+    connect_private(name, certification_fault, None)
+}
+
+pub(super) fn connect_launcher_until(cutoff: std::time::Instant) -> Result<OwnedHandle, String> {
+    connect_private(memcordon_core::WINDOWS_LAUNCHER_PIPE, None, Some(cutoff))
+}
+
+fn connect_private(
+    name: &str,
+    certification_fault: Option<WindowsSealedFault>,
+    cutoff: Option<std::time::Instant>,
+) -> Result<OwnedHandle, String> {
     let endpoint = name;
     let name = wide_null(endpoint);
     let mut observation = connect_observation::ConnectObservation::default();
     for _ in 0..100 {
+        if cutoff.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+            return Err(observation.timeout_error());
+        }
         if certification_fault == Some(WindowsSealedFault::PrivatePipeConnect) {
             return Err(
                 "MCSEALED-WINDOWS-CERTIFICATION-FAULT: injected PrivatePipeConnect".to_owned(),
@@ -450,7 +465,11 @@ pub fn connect_with_fault(
             )
         };
         if handle != INVALID_HANDLE_VALUE {
-            return OwnedHandle::new(handle);
+            let owner = OwnedHandle::new(handle)?;
+            if cutoff.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+                return Err(observation.timeout_error());
+            }
+            return Ok(owner);
         }
         let error = io::Error::last_os_error();
         let code = error
@@ -465,11 +484,18 @@ pub fn connect_with_fault(
                 "MCSEALED-WINDOWS-PIPE-CONNECT: api=CreateFileW endpoint={endpoint} native_code={native_code} detail={error}",
             ));
         }
+        let remaining =
+            cutoff.map(|cutoff| cutoff.saturating_duration_since(std::time::Instant::now()));
         if code == Some(ERROR_FILE_NOT_FOUND) {
-            std::thread::sleep(Duration::from_millis(10));
+            let delay = Duration::from_millis(10);
+            std::thread::sleep(remaining.map_or(delay, |budget| delay.min(budget)));
         } else {
+            let millis = remaining.map_or(100, |budget| budget.as_millis().min(100) as u32);
+            if millis == 0 {
+                return Err(observation.timeout_error());
+            }
             // SAFETY: name remains NUL-terminated for the call.
-            let available = unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
+            let available = unsafe { WaitNamedPipeW(name.as_ptr(), millis) };
             // Last-error is meaningful only when this existing wait failed.
             let result = if available == 0 {
                 Err(io::Error::last_os_error()

@@ -1190,13 +1190,9 @@ fn native_spawn_context(
                 target: false,
             },
         );
-        if let Err(returned) = send.send(result) {
-            if let Ok(child) = returned.0 {
-                // This worker creates only an unconfigured helper; no target
-                // configuration has crossed its private lease yet.
-                let _ = child.kill();
-            }
-        }
+        // If the receiver has gone away, the returned Child's ticket hands
+        // scoped cancellation and retirement to the native reaper.
+        let _ = send.send(result);
     }))?;
     loop {
         if let Some(admission) = admission {

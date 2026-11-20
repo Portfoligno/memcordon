@@ -83,7 +83,7 @@ fn private_spawn_uncertainty_remains_charged_during_bounded_settlement() {
     let now = Instant::now();
     let cutoff = now + Duration::from_secs(1);
     let mut debt = debt::PeerDebt::default();
-    debt.note_spawn();
+    debt.begin_grant([1; 32]).unwrap();
     for (stage, primary) in [
         (
             Stage::BeforeOwnerCheck,

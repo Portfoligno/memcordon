@@ -5,18 +5,28 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::windows_causal_acceptance::{InstalledCaseResult, InstalledChannel};
+use crate::windows_consumer_readiness::ProviderExperimentOutcome;
 use crate::{CiError, Result};
 
 /// Execution and package retirement remain independent of measured private
 /// availability. Errors never become an unavailable/success verdict.
 pub fn provider_experiment_execution_status(
-    operation: &Result<serde_json::Value>,
+    operation: &Result<ProviderExperimentOutcome>,
     cleanup: &Result<()>,
 ) -> serde_json::Value {
+    let private_availability = match operation {
+        Ok(ProviderExperimentOutcome::Full {
+            private_availability,
+            ..
+        }) => Some(*private_availability),
+        _ => None,
+    };
+    let diagnostic_completed = operation.is_ok() && cleanup.is_ok();
     serde_json::json!({
-        "execution_completed": operation.is_ok(),
-        "completed": operation.is_ok() && cleanup.is_ok(),
-        "private_availability": operation.as_ref().ok().and_then(|value| value.get("private_availability")),
+        "diagnostic_completed": diagnostic_completed,
+        "execution_completed": private_availability.is_some(),
+        "completed": diagnostic_completed,
+        "private_availability": private_availability,
         "execution_error": operation.as_ref().err().map(ToString::to_string),
         "installation_cleanup_verified": cleanup.is_ok(),
         "installation_cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
@@ -1041,11 +1051,17 @@ mod native {
         fs::create_dir_all(&config.output_directory)?;
         let mut started = false;
         let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> Result<serde_json::Value> {
+            || -> Result<ProviderExperimentOutcome> {
                 started = true;
-                package(config, "install", deadlines.work).map_err(CiError::Message)?;
-                package(config, "verify", deadlines.work).map_err(CiError::Message)?;
-                drop(quiescent(config)?);
+                package(config, "install", deadlines.work).map_err(|error| {
+                    CiError::Message(error).context("provider experiment phase=package-install")
+                })?;
+                package(config, "verify", deadlines.work).map_err(|error| {
+                    CiError::Message(error).context("provider experiment phase=package-verify")
+                })?;
+                drop(quiescent(config).map_err(|error| {
+                    error.context("provider experiment phase=installed-quiescence")
+                })?);
                 crate::windows_consumer_readiness::run_provider_input_experiment_until(
                     root,
                     config,
@@ -1086,7 +1102,7 @@ mod native {
                 std::panic::resume_unwind(payload)
             }
         };
-        let report = serde_json::json!({"format":"memcordon.provider-input-experiment-execution","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target":config.target,"source_commit":config.source_commit,"fixture_sha256":config.fixture.sha256,"experiment":operation.as_ref().ok(),"execution_error":operation.as_ref().err().map(ToString::to_string),"installation_cleanup_verified":cleanup.is_ok(),"installation_cleanup_error":cleanup.as_ref().err().map(ToString::to_string),"root_control_scope":"paired listener/context and observed original provider selection only","root_control_records":"provider-input-experiment/*/facts/root-selection.json","peer_spawn_and_full_joint_acceptance":"not established by the root control","existing_joint_operations_retained":true});
+        let report = serde_json::json!({"format":"memcordon.provider-input-experiment-execution","revision":1,"diagnostic_only":true,"acceptance_authority":false,"target":config.target,"source_commit":config.source_commit,"fixture_sha256":config.fixture.sha256,"experiment":operation.as_ref().ok().map(ProviderExperimentOutcome::report),"execution_error":operation.as_ref().err().map(ToString::to_string),"installation_cleanup_verified":cleanup.is_ok(),"installation_cleanup_error":cleanup.as_ref().err().map(ToString::to_string),"root_control_scope":"paired listener/context and observed original provider selection only","root_control_records":"provider-input-experiment/*/facts/root-selection.json","peer_spawn_and_full_joint_acceptance":"not established by the root control","existing_joint_operations_retained":true});
         let retained = (|| -> Result<()> {
             let mut report = report;
             let status = provider_experiment_execution_status(&operation, &cleanup);

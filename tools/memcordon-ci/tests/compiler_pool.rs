@@ -8,6 +8,14 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+const GRAPH_SETUP: Duration = Duration::from_secs(30);
+const PRODUCT_WORK: Duration = Duration::from_secs(60);
+const BORROW_OBSERVATION: Duration = Duration::from_secs(20);
+const NATIVE_DRAIN: Duration = Duration::from_secs(60);
+// CommandSpec::bounded_until reserves this part of the outer deadline for
+// native retirement before admitting Cargo work.
+const COMMAND_RETIREMENT_RESERVE: Duration = Duration::from_secs(10);
+
 fn graph(root: &Path, members: usize, wrapper: &Path, cutoff: Instant) {
     std::fs::create_dir_all(root.join(".cargo")).unwrap();
     let config = toml::toml! {[build] rustc-wrapper = "placeholder"};
@@ -39,7 +47,7 @@ fn graph(root: &Path, members: usize, wrapper: &Path, cutoff: Instant) {
         .unwrap();
         std::fs::write(unit.join("src/lib.rs"), "pub fn value()->u32 { 1 }\n").unwrap();
     }
-    cargo(root)
+    cargo(root, GRAPH_SETUP)
         .arg("generate-lockfile")
         .arg("--offline")
         .bounded_until(cutoff)
@@ -47,8 +55,8 @@ fn graph(root: &Path, members: usize, wrapper: &Path, cutoff: Instant) {
         .unwrap();
 }
 
-fn cargo(root: &Path) -> CommandSpec {
-    CommandSpec::cargo("rustup", root, "1.97.1", Duration::from_secs(30))
+fn cargo(root: &Path, work: Duration) -> CommandSpec {
+    CommandSpec::cargo("rustup", root, "1.97.1", work)
 }
 
 #[test]
@@ -73,21 +81,14 @@ fn real_pinned_cargo_shares_reserved_roots_and_borrows_settled_capacity() {
     for budget in [1, 2, 4] {
         let base = temp.path().join(format!("budget{budget}"));
         std::fs::create_dir(&base).unwrap();
-        let cutoff = Instant::now() + Duration::from_secs(30);
-        let protocol = Protocol::create(
-            &base.join("control"),
-            budget,
-            SystemTime::now() + cutoff.saturating_duration_since(Instant::now()),
-        )
-        .unwrap();
-        let product_wrapper = base.join("control/product-wrapper");
-        let native_wrapper = base.join("control/native-wrapper");
-        std::fs::copy(&wrapper, &product_wrapper).unwrap();
-        std::fs::copy(&wrapper, &native_wrapper).unwrap();
+        let setup_cutoff = Instant::now() + GRAPH_SETUP;
+        let control = base.join("control");
+        let product_wrapper = control.join("product-wrapper");
+        let native_wrapper = control.join("native-wrapper");
         let first = base.join("product");
         let second = base.join("native");
-        graph(&first, 1, &product_wrapper, cutoff);
-        graph(&second, 8, &native_wrapper, cutoff);
+        graph(&first, 1, &product_wrapper, setup_cutoff);
+        graph(&second, 8, &native_wrapper, setup_cutoff);
         if budget == 2 {
             let path = second.join(".cargo/config.toml");
             let mut config: toml::Table =
@@ -100,12 +101,37 @@ fn real_pinned_cargo_shares_reserved_roots_and_borrows_settled_capacity() {
                 .insert("jobs".into(), toml::Value::Integer(99));
             std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
         }
+        std::fs::create_dir(&control).unwrap();
+        std::fs::copy(&wrapper, &product_wrapper).unwrap();
+        std::fs::copy(&wrapper, &native_wrapper).unwrap();
         let owners = compiler_pool::pair(budget, budget > 1).unwrap();
-        let product = cargo(&first)
+        let began = Instant::now();
+        let product_settled = began + PRODUCT_WORK + COMMAND_RETIREMENT_RESERVE;
+        // Allow the product to finish and donate before measuring the full
+        // native allocation. After releasing the native wrappers, leave a
+        // separate work window for Cargo to compile the whole graph.
+        let rendezvous_cutoff = product_settled + BORROW_OBSERVATION;
+        let native_work_cutoff = if budget == 1 {
+            product_settled
+        } else {
+            rendezvous_cutoff
+        } + NATIVE_DRAIN;
+        let protocol = Protocol::create_in(
+            &control,
+            budget,
+            SystemTime::now() + native_work_cutoff.saturating_duration_since(Instant::now()),
+        )
+        .unwrap();
+        let product = cargo(&first, PRODUCT_WORK)
             .args(["build", "--release", "--locked", "--offline"])
-            .bounded_until(cutoff)
+            .bounded_until(product_settled)
             .compiler_owner(owners[0].clone());
-        let native = cargo(&second)
+        let native_work_budget = if budget == 1 {
+            NATIVE_DRAIN
+        } else {
+            native_work_cutoff.duration_since(began)
+        };
+        let native = cargo(&second, native_work_budget)
             .args([
                 "test",
                 "--workspace",
@@ -116,7 +142,7 @@ fn real_pinned_cargo_shares_reserved_roots_and_borrows_settled_capacity() {
                 "--locked",
                 "--offline",
             ])
-            .bounded_until(cutoff)
+            .bounded_until(native_work_cutoff + COMMAND_RETIREMENT_RESERVE)
             .compiler_owner(owners[1].clone());
         let native = if budget == 4 {
             native.args(["--config", "build.jobs=99"])
@@ -136,7 +162,7 @@ fn real_pinned_cargo_shares_reserved_roots_and_borrows_settled_capacity() {
                 let second = scope.spawn(|| settled_command(native.run_owned()));
                 let phases = (|| -> Result<protocol::State, String> {
                     let initial = protocol
-                        .wait_roles(1, budget - 1, cutoff)
+                        .wait_roles(1, budget - 1, rendezvous_cutoff)
                         .map_err(|error| error.to_string())?;
                     if initial.total() != budget {
                         return Err("initial root sharing differs".into());
@@ -153,7 +179,7 @@ fn real_pinned_cargo_shares_reserved_roots_and_borrows_settled_capacity() {
                     // registered native wrappers count in this locked state;
                     // no subsequent event/late marker is required.
                     protocol
-                        .wait_roles(0, budget, cutoff)
+                        .wait_roles(0, budget, rendezvous_cutoff)
                         .map_err(|error| error.to_string())
                 })();
                 let released = protocol.release_all();
@@ -254,6 +280,7 @@ fn rendezvous_failure_guard_releases_both_roles_and_rejects_stale_gates() {
         std::io::ErrorKind::AlreadyExists
     );
     assert!(Protocol::create(&root, 2, deadline).is_err());
+    assert!(Protocol::create_in(&root, 2, deadline).is_err());
     // Dropping an admission on a callback/spawn error still unregisters it.
     {
         let _admission = protocol.admit(Role::Product).unwrap();
@@ -289,6 +316,14 @@ fn missing_or_extra_roles_and_expired_original_cutoff_fail_closed() {
     );
     product.finish().unwrap();
     native.finish().unwrap();
+    let root = temp.path().join("control");
+    let lock = root.join("lock");
+    std::fs::create_dir(&lock).unwrap();
+    let failure = protocol
+        .wait_roles(0, 0, Instant::now() + Duration::from_millis(20))
+        .unwrap_err();
+    std::fs::remove_dir(lock).unwrap();
+    assert_eq!(failure.to_string(), "original coordinator cutoff exhausted");
     let expired = Protocol::create(
         &temp.path().join("expired"),
         2,
@@ -313,7 +348,7 @@ fn missing_or_extra_roles_and_expired_original_cutoff_fail_closed() {
 fn uncertain_or_unsettled_roots_never_donate_or_admit_twice() {
     let [first, second] = compiler_pool::pair(1, false).unwrap();
     let materialize = |owner| {
-        cargo(Path::new("."))
+        cargo(Path::new("."), GRAPH_SETUP)
             .arg("check")
             .compiler_owner(owner)
             .materialize()
@@ -329,7 +364,7 @@ fn uncertain_or_unsettled_roots_never_donate_or_admit_twice() {
     assert!(second.settle(WriterSettlement::Settled).is_err());
     let owners = compiler_pool::pair(2, true).unwrap();
     assert!(
-        cargo(Path::new("."))
+        cargo(Path::new("."), GRAPH_SETUP)
             .arg("build")
             .arg("--jobs=2")
             .compiler_owner(owners[0].clone())

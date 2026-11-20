@@ -471,6 +471,9 @@ impl NativeRejection {
 }
 type Decoded<T> = Result<T, NativeRejection>;
 fn schema(event: &EVENT_RECORD) -> Decoded<Schema> {
+    event_schema(event, true)
+}
+fn event_schema(event: &EVENT_RECORD, flat: bool) -> Decoded<Schema> {
     let mut length = 0;
     let result =
         unsafe { TdhGetEventInformation(event, 0, ptr::null(), ptr::null_mut(), &mut length) };
@@ -527,19 +530,25 @@ fn schema(event: &EVENT_RECORD) -> Decoded<Schema> {
             NativeRejection::new(RejectStage::SchemaDescriptor, None).with_metadata(metadata)
         );
     }
-    if info.PropertyCount != info.TopLevelPropertyCount || info.PropertyCount > 32 {
+    if info.TopLevelPropertyCount > info.PropertyCount
+        || info.PropertyCount > 64
+        || (flat && (info.PropertyCount != info.TopLevelPropertyCount || info.PropertyCount > 32))
+    {
         return Err(
             NativeRejection::new(RejectStage::SchemaInventory, None).with_metadata(metadata)
         );
     }
     let mut fields = std::collections::BTreeMap::new();
-    for index in 0..info.PropertyCount as usize {
+    for index in 0..info.TopLevelPropertyCount as usize {
         let Some(property) = metadata.property(index) else {
             return Err(
                 NativeRejection::new(RejectStage::PropertyExtent, None).with_metadata(metadata)
             );
         };
         if property.Flags != 0 {
+            if !flat {
+                continue;
+            }
             return Err(
                 NativeRejection::new(RejectStage::PropertyFlags, None).with_metadata(metadata)
             );
@@ -628,7 +637,12 @@ fn scalar(event: &EVENT_RECORD, schema: &Schema, field: FieldId, pointer: bool) 
             &[TDH_INTYPE_UINT32, TDH_INTYPE_HEXINT32]
         },
     )?;
-    let width = if pointer {
+    let width = scalar_width(event, pointer, Some(field))?;
+    decode_scalar(&data, width, Some(field))
+}
+
+fn scalar_width(event: &EVENT_RECORD, pointer: bool, field: Option<FieldId>) -> Decoded<usize> {
+    Ok(if pointer {
         let flags = u32::from(event.EventHeader.Flags);
         if flags & EVENT_HEADER_FLAG_32_BIT_HEADER != 0
             && flags & EVENT_HEADER_FLAG_64_BIT_HEADER == 0
@@ -639,17 +653,77 @@ fn scalar(event: &EVENT_RECORD, schema: &Schema, field: FieldId, pointer: bool) 
         {
             8
         } else {
-            return Err(NativeRejection::new(RejectStage::PointerWidth, Some(field)));
+            return Err(NativeRejection::new(RejectStage::PointerWidth, field));
         }
     } else {
         4
-    };
-    crate::windows_fileio_record::pointer(&data, width).map_err(|_| {
-        let mut failure = NativeRejection::new(RejectStage::ScalarExtent, Some(field));
+    })
+}
+
+fn decode_scalar(data: &[u8], width: usize, field: Option<FieldId>) -> Decoded<u64> {
+    crate::windows_fileio_record::pointer(data, width).map_err(|_| {
+        let mut failure = NativeRejection::new(RejectStage::ScalarExtent, field);
         failure.detail.expected_width = Some(width as u8);
         failure.detail.actual_width = Some(data.len() as u32);
         failure
     })
+}
+
+/// A single borrowed ETW record with a TDH-validated metadata description.
+/// Consumers select the event providers and supported versions before decoding.
+pub struct EventFields<'a> {
+    event: &'a EVENT_RECORD,
+    schema: Schema,
+}
+
+impl<'a> EventFields<'a> {
+    /// # Safety
+    ///
+    /// The event must come from a live ETW callback. ETW must own any
+    /// descriptor and payload memory referenced by the record for its borrow.
+    pub unsafe fn new(event: &'a EVENT_RECORD) -> Result<Self, DecodeRejection> {
+        event_schema(event, false)
+            .map(|schema| Self { event, schema })
+            .map_err(|failure| failure.detail)
+    }
+
+    pub fn scalar(
+        &self,
+        field: FieldId,
+        accept_pointer: bool,
+        accept_dword: bool,
+    ) -> Result<u64, DecodeRejection> {
+        let dword = [TDH_INTYPE_UINT32, TDH_INTYPE_HEXINT32, TDH_INTYPE_INT32];
+        let is_pointer = accept_pointer
+            && self.schema.fields.get(field.name()).copied().map(i32::from)
+                == Some(TDH_INTYPE_POINTER);
+        let types: &[i32] = if is_pointer {
+            &[TDH_INTYPE_POINTER][..]
+        } else if accept_dword {
+            &dword
+        } else {
+            &[]
+        };
+        let read = || {
+            let bytes = property(self.event, &self.schema, field, types)?;
+            let width = scalar_width(self.event, is_pointer, Some(field))?;
+            decode_scalar(&bytes, width, Some(field))
+        };
+        read().map_err(|failure| failure.detail)
+    }
+
+    pub fn unicode(&self, field: FieldId) -> Result<String, DecodeRejection> {
+        let bytes = property(self.event, &self.schema, field, &[TDH_INTYPE_UNICODESTRING])
+            .map_err(|failure| failure.detail)?;
+        let invalid = || {
+            let mut rejection = DecodeRejection::new(RejectStage::PathEncoding);
+            rejection.field = Some(field);
+            rejection.returned_bytes = Some(bytes.len() as u32);
+            rejection
+        };
+        let units = path_units(&bytes).map_err(|_| invalid())?;
+        String::from_utf16(&units).map_err(|_| invalid())
+    }
 }
 struct Context {
     spec: ConsumerSpec,

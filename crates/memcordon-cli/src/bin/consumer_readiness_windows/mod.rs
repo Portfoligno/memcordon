@@ -1,4 +1,7 @@
 //! MemCordon-owned workload behavior; provider evidence remains independently checked.
+mod compiler_authority;
+mod console_calibration;
+mod console_calibration_desktop;
 mod controller_gate_access;
 mod controller_gate_control_publication;
 mod controller_gate_diagnostic;
@@ -45,11 +48,13 @@ mod provider_loader_context;
 mod provider_loader_context_native;
 mod provider_loader_policy;
 mod provider_loader_policy_native;
+mod reduced_compiler_probe;
 mod spawn_trace;
 mod spawn_trace_record;
 mod toolchain;
 mod toolchain_debug;
 mod toolchain_diagnostics;
+mod toolchain_process_wait;
 mod winsock_registry;
 mod winsock_startup;
 mod winsock_trace;
@@ -979,23 +984,31 @@ fn joint_mapped(
         }
         peer_command.arg(peer_input).stdin(Stdio::piped());
     }
-    if descriptor.provider_input_experiment {
+    let spawn_grant = if descriptor.provider_input_experiment {
         let binding = control
             .as_deref()
             .expect("checked private session")
             .peer_admission_binding();
+        let sequence = transcript.sequence;
+        let intent = serde_json::to_vec(&binding).map_err(io::Error::other)?;
         context(
             Operation::TranscriptSpawnIntent,
-            transcript.event(
-                "tcp-peer-spawn-intent",
-                None,
-                &serde_json::to_vec(&binding).map_err(io::Error::other)?,
-            ),
+            transcript.event("tcp-peer-spawn-intent", None, &intent),
         )?;
-    }
+        control
+            .as_deref_mut()
+            .expect("checked private session")
+            .receive(descriptor::controller_start::Phase::PrivatePeerSpawnRelease)?;
+        Some(descriptor::original_peer_spawn_observation::Grant {
+            intent_sequence: sequence,
+            intent_sha256: descriptor::controller_start::descriptor_digest(&intent),
+        })
+    } else {
+        None
+    };
     let mut peer = match context(
         Operation::PeerCommandSpawn,
-        spawn_trace::spawn(&mut peer_command, trace.as_ref()),
+        spawn_trace::spawn(&mut peer_command, trace.as_ref(), spawn_grant),
     ) {
         Ok(peer) => peer,
         Err(primary) => {
@@ -1468,6 +1481,77 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 return Err(io::Error::other("extra token snapshot arguments"));
             }
             io::stdout().write_all(&native::token_observation()?)?;
+            return Ok(0);
+        }
+        Some("reduced-compiler-console-calibration") => return console_calibration::run(args),
+        Some(which @ ("reduced-compiler-snapshot" | "reduced-compiler-source-snapshot")) => {
+            if args.next().is_some() {
+                return Err(io::Error::other(
+                    "extra reduced compiler token snapshot arguments",
+                ));
+            }
+            use descriptor::gate_precondition::CompilerQualificationStage::*;
+            let source = which == "reduced-compiler-source-snapshot";
+            let (snapshot_stage, validation_stage) = if source {
+                (SourceSnapshot, SourceValidation)
+            } else {
+                (EffectiveSnapshot, EffectiveValidation)
+            };
+            let result = compiler_authority::effective()
+                .map_err(|error| compiler_authority::qualification_stage(snapshot_stage, error))
+                .and_then(|snapshot| {
+                    if source {
+                        snapshot.validate_source()
+                    } else {
+                        snapshot.validate_reduced()
+                    }
+                    .map_err(|reason| {
+                        compiler_authority::qualification_premise(validation_stage, reason)
+                    })?;
+                    Ok(snapshot)
+                });
+            let (bytes, status) = match result {
+                Ok(snapshot) => (serde_json::to_vec(&snapshot), 0),
+                Err(error) => (
+                    serde_json::to_vec(&compiler_authority::qualification_failure(
+                        snapshot_stage,
+                        &error,
+                    )),
+                    2,
+                ),
+            };
+            io::stdout().write_all(&bytes.map_err(io::Error::other)?)?;
+            return Ok(status);
+        }
+        Some("system-reduced-compiler-frontend") => match native::reduced_compiler_frontend(args) {
+            Ok(status) => return Ok(status),
+            Err(error) => {
+                let failure = compiler_authority::qualification_failure(
+                    descriptor::gate_precondition::CompilerQualificationStage::FrontendSetup,
+                    &error,
+                );
+                io::stdout().write_all(&serde_json::to_vec(&failure).map_err(io::Error::other)?)?;
+                return Ok(2);
+            }
+        },
+        Some("reduced-compiler-ordinary-control") => {
+            let path = args
+                .next()
+                .ok_or_else(|| io::Error::other("ordinary control descriptor missing"))?;
+            if args.next().is_some() {
+                return Err(io::Error::other("extra ordinary control arguments"));
+            }
+            let descriptor = read_descriptor(Path::new(&path))?;
+            let evidence = reduced_compiler_probe::ordinary_control(&descriptor)?;
+            io::stdout().write_all(&serde_json::to_vec(&evidence).map_err(io::Error::other)?)?;
+            return Ok(0);
+        }
+        Some("direct-compiler-baseline") => {
+            if let Err(error) = toolchain::direct_baseline::execute(args) {
+                let record = toolchain::direct_baseline::failure_record(&error);
+                io::stdout().write_all(&serde_json::to_vec(&record).map_err(io::Error::other)?)?;
+                return Ok(2);
+            }
             return Ok(0);
         }
         Some("owner-request-probe") => {
@@ -2040,7 +2124,18 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 Path::new(&first),
                 None,
             )?,
-            Case::Toolchain => toolchain::execute(&descriptor, &mut transcript, None)?,
+            Case::Toolchain => {
+                if descriptor.reduced_compiler_sentinel().is_some() {
+                    let effective = native::effective_token_observation()?;
+                    if effective != envelope {
+                        return Err(io::Error::other(
+                            "reduced compiler effective token differs from process token",
+                        ));
+                    }
+                    reduced_compiler_probe::run(&descriptor, &mut transcript, &effective)?;
+                }
+                toolchain::execute(&descriptor, &mut transcript, control.as_mut())?;
+            }
             Case::BinaryFiles => binary_files(&descriptor, &mut transcript)?,
             Case::EmptyInput => {
                 let mut actual = Vec::new();

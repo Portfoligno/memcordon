@@ -1279,6 +1279,43 @@ impl ExpirableRejectionDiagnostics for WindowsProviderRejectionV3 {
 }
 terminal_authority_encoding!(WindowsProviderResponseV4);
 terminal_authority_encoding!(WindowsLauncherResponseV4);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsGuardianReleaseWaitV1 {
+    pub target_identity: WindowsProcessIdentityV1,
+    pub cutoff_qpc: u64,
+    pub qpc_frequency: u64,
+}
+
+impl WindowsGuardianReleaseWaitV1 {
+    pub fn remaining_at(
+        &self,
+        now_qpc: u64,
+        frequency: u64,
+    ) -> Result<std::time::Duration, &'static str> {
+        if !windows_process_identity_is_valid(&self.target_identity)
+            || now_qpc == 0
+            || frequency == 0
+            || frequency != self.qpc_frequency
+        {
+            return Err("guardian release wait target or native clock differs");
+        }
+        let remaining = self
+            .cutoff_qpc
+            .checked_sub(now_qpc)
+            .ok_or("original guardian release observation cutoff expired")?;
+        if u128::from(remaining) > u128::from(frequency) * 30 {
+            return Err("guardian release observation cutoff exceeds query bound");
+        }
+        let nanoseconds = u128::from(remaining) * 1_000_000_000 / u128::from(frequency);
+        if nanoseconds == 0 {
+            return Err("original guardian release observation cutoff expired");
+        }
+        Ok(std::time::Duration::from_nanos(nanoseconds as u64))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsProviderRequestV4 {
@@ -1318,6 +1355,8 @@ pub enum WindowsProviderRequestV4 {
         schema_version: u32,
         challenge: String,
         guardian_identity: WindowsProcessIdentityV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_wait: Option<WindowsGuardianReleaseWaitV1>,
     },
     RecoveryStatus {
         schema_version: u32,
@@ -1499,6 +1538,8 @@ pub enum WindowsLauncherRequestV4 {
         schema_version: u32,
         challenge: crate::BoundedText<128>,
         guardian_identity: WindowsProcessIdentityV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_wait: Option<WindowsGuardianReleaseWaitV1>,
     },
     CertificationMachineRestart {
         schema_version: u32,

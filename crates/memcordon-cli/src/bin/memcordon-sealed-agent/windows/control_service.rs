@@ -917,6 +917,13 @@ fn handle_read_only_query(public: HANDLE, request: WindowsProviderRequestV4) -> 
         return Err("read-only query challenge is empty".into());
     }
     let provider = super::package::installed_public_provider_binding()?;
+    let release_cutoff = match &request {
+        WindowsProviderRequestV4::ObserveGuardianAttempt {
+            release_wait: Some(wait),
+            ..
+        } => Some(memcordon_platform::windows_guardian_release_cutoff(wait)?),
+        _ => None,
+    };
     enum Reply {
         Guardian(memcordon_core::WindowsGuardianAttemptObservation),
         Recovery(memcordon_core::WindowsRecoveryInventoryV1),
@@ -927,25 +934,44 @@ fn handle_read_only_query(public: HANDLE, request: WindowsProviderRequestV4) -> 
         phase = Phase::QueryHandler;
         match request {
             WindowsProviderRequestV4::ObserveGuardianAttempt {
-                guardian_identity, ..
+                guardian_identity,
+                release_wait,
+                ..
             } => {
                 // The launcher owns the protected guardian process and records.
                 // LocalService relays facts without acquiring their native rights.
-                let (launcher, _process, _identity) = authenticated_launcher()?;
-                pipe::write_frame(
-                    launcher.raw(),
-                    &WindowsLauncherRequestV4::ObserveGuardianAttempt {
-                        schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
-                        challenge: challenge.clone(),
-                        guardian_identity: guardian_identity.clone(),
-                    },
-                )?;
+                let (launcher, _process, _identity) = authenticated_launcher_before(release_cutoff)
+                    .map_err(|error| error.to_string())?;
+                let request = WindowsLauncherRequestV4::ObserveGuardianAttempt {
+                    schema_version: WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION,
+                    challenge: challenge.clone(),
+                    guardian_identity: guardian_identity.clone(),
+                    release_wait: release_wait.clone(),
+                };
+                let response = match release_cutoff {
+                    Some(cutoff) => {
+                        pipe::write_frame_until(launcher.raw(), &request, cutoff)?;
+                        pipe::read_response_frame_until::<WindowsLauncherResponseV4>(
+                            launcher.raw(),
+                            cutoff,
+                        )?
+                    }
+                    None => {
+                        pipe::write_frame(launcher.raw(), &request)?;
+                        pipe::read_response_frame::<WindowsLauncherResponseV4>(launcher.raw())?
+                    }
+                };
                 let observation = memcordon_core::WindowsGuardianAttemptObservation::from_launcher_query_response(
-                    pipe::read_response_frame::<WindowsLauncherResponseV4>(launcher.raw())?,
+                    response,
                     challenge.as_str(),
                     &provider,
                     &guardian_identity,
                 )?;
+                if release_wait.as_ref().is_some_and(|wait| {
+                    observation.live_target_identity.as_ref() != Some(&wait.target_identity)
+                }) {
+                    return Err("launcher guardian release observation target differs".into());
+                }
                 Ok(Reply::Guardian(observation))
             }
             WindowsProviderRequestV4::ConvergeRecovery {
@@ -982,7 +1008,10 @@ fn handle_read_only_query(public: HANDLE, request: WindowsProviderRequestV4) -> 
     // No successful response has been written yet; a failed write cannot cause
     // a second frame to be appended after a partial success payload.
     match result {
-        Ok(Reply::Guardian(observation)) => pipe::write_frame(public, &observation),
+        Ok(Reply::Guardian(observation)) => match release_cutoff {
+            Some(cutoff) => pipe::write_frame_until(public, &observation, cutoff),
+            None => pipe::write_frame(public, &observation),
+        },
         Ok(Reply::Recovery(inventory)) => pipe::write_frame(
             public,
             &WindowsProviderResponseV4::RecoveryInventory(inventory),
@@ -992,7 +1021,10 @@ fn handle_read_only_query(public: HANDLE, request: WindowsProviderRequestV4) -> 
             let failure =
                 WindowsReadOnlyQueryFailure::new(operation, challenge, provider, phase, &error)?;
             let write = match operation {
-                Operation::GuardianObservation => pipe::write_frame(public, &failure),
+                Operation::GuardianObservation => match release_cutoff {
+                    Some(cutoff) => pipe::write_frame_until(public, &failure, cutoff),
+                    None => pipe::write_frame(public, &failure),
+                },
                 Operation::RecoveryConvergence => pipe::write_frame(
                     public,
                     &WindowsProviderResponseV4::ReadOnlyQueryFailure(failure),
@@ -1890,6 +1922,19 @@ fn authenticated_launcher_detailed() -> Result<
     ),
     LauncherAuthenticationError,
 > {
+    authenticated_launcher_before(None)
+}
+
+fn authenticated_launcher_before(
+    cutoff: Option<std::time::Instant>,
+) -> Result<
+    (
+        OwnedHandle,
+        OwnedHandle,
+        memcordon_core::WindowsProcessIdentityV1,
+    ),
+    LauncherAuthenticationError,
+> {
     let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
     let _ = LAST_AUTHENTICATED_LAUNCHER_TICK.compare_exchange(
         0,
@@ -1897,7 +1942,11 @@ fn authenticated_launcher_detailed() -> Result<
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     );
-    let launcher = pipe::connect(WINDOWS_LAUNCHER_PIPE).map_err(|error| {
+    let connected = match cutoff {
+        Some(cutoff) => pipe::connect_launcher_until(cutoff),
+        None => pipe::connect(WINDOWS_LAUNCHER_PIPE),
+    };
+    let launcher = connected.map_err(|error| {
         let observation = super::service_manager::launcher_startup_observation(
             LAST_AUTHENTICATED_LAUNCHER_TICK.load(std::sync::atomic::Ordering::Acquire),
         )

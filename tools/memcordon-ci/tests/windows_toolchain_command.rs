@@ -28,6 +28,8 @@ fn input(target: &str) -> Toolchain {
         native_work_frequency: 1,
         linker_mode: LinkerMode::BundledLldLink,
         input_root: root.clone(),
+        controller_input_root: None,
+        compiler_import_siblings: Vec::new(),
         rustc,
         native_linker: linker,
         selected_images: images,

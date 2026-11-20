@@ -151,6 +151,92 @@ fn failure(row: &Row) -> bool {
             row.flags & 256 != 0 && row.win32_result == 0
         }
 }
+
+#[derive(Clone, Copy)]
+pub(super) struct CompilerCreateReturn {
+    pub win32_error: Option<u32>,
+    pub flags: u32,
+    pub process_id: Option<u32>,
+}
+
+pub(super) fn compiler_routes(
+    packet: &Packet,
+    thread: u32,
+    cutoff: u64,
+    frequency: u64,
+) -> Option<(Value, Option<CompilerCreateReturn>)> {
+    validate(packet).ok()?;
+    // A complete, postvalidated owner can still have a truncated display name
+    // (owner flag 4). This projection uses the mapped routes, not the name.
+    if thread == 0
+        || frequency == 0
+        || packet.original_thread != thread
+        || packet.cutoff_qpc != cutoff
+        || packet.frequency != frequency
+        || packet.started_qpc == 0
+        || packet.started_qpc > packet.finished_qpc
+        || packet.finished_qpc >= cutoff
+        || packet.scope_attempted != 1
+        || packet.scope_returned != 1
+        || packet.scope_reentry != 0
+        || packet.unmatched_scope != 0
+        || packet.scope_unavailable != 0
+        || packet.late != 0
+        || packet.clock_failures != 0
+        || packet.route_failures != 0
+        || packet.overflow != 0
+        || packet.dropped != 0
+        || packet.refusal.present != 0
+        || packet.owner_count != 1
+        || packet.owners[0].complete != 1
+        || packet.record_count == 0
+        || packet.record_count != packet.total_calls
+    {
+        return None;
+    }
+    let routes = &packet.routes[..packet.route_count as usize];
+    if routes.iter().any(|route| {
+        route.slot.published != 1 || route.slot.restored != 0 || route.postvalidated != 1
+    }) {
+        return None;
+    }
+    let rows = &packet.rows[..packet.record_count as usize];
+    if rows.iter().enumerate().any(|(index, row)| {
+        row.sequence != index as u64 + 1
+            || row.thread_id != thread
+            || row.entered != 1
+            || row.returned != 1
+            || row.flags & 15 != 15
+            || row.flags & 64 != 0
+            || row.started_qpc < packet.started_qpc
+            || row.finished_qpc < row.started_qpc
+            || row.finished_qpc > packet.finished_qpc
+    }) || rows
+        .windows(2)
+        .any(|pair| pair[0].finished_qpc > pair[1].started_qpc)
+    {
+        return None;
+    }
+    let mut create_rows = rows.iter().filter(|row| row.operation == 5);
+    let created = create_rows
+        .next()
+        .filter(|_| create_rows.next().is_none())
+        .map(|row| CompilerCreateReturn {
+            win32_error: failure(row).then_some(row.outgoing_win32),
+            flags: row.creation_flags,
+            process_id: (row.output_flags & 64 != 0 && row.output_pid != 0)
+                .then_some(row.output_pid),
+        });
+    let routes = json!({
+        "covered":routes.iter().filter_map(|route| api(route.slot.operation)).collect::<Vec<_>>(),
+        "returns":rows.iter().map(|row| json!({
+            "api":api(row.operation),"failed":failure(row),
+            "ntstatus":(row.operation <= 2).then_some(row.native_status),
+            "win32_error":(row.operation > 2 && failure(row)).then_some(row.outgoing_win32),
+        })).collect::<Vec<_>>(),
+    });
+    Some((routes, created))
+}
 fn row_valid(row: &Row, packet: &Packet) -> bool {
     api(row.operation).is_some()
         && row.sequence != 0
