@@ -2922,6 +2922,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.invocation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stdout.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/windows-package-summary.md
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
@@ -3365,6 +3366,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.invocation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stdout.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/recovery.stderr.bin
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/windows-package-summary.md
           if-no-files-found: ignore
       - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact

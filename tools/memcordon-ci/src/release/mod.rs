@@ -404,7 +404,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             preparation::write_preparation_files(root, &selected)
         }
         ReleaseCommand::WorkingWindowsPrepare { destination } => {
-            windows_installed_consumer::prepare_working(root, &destination)
+            windows_installed_consumer::prepare_working_for_workflow(root, &destination)
         }
         ReleaseCommand::WorkingWindowsConsumer {
             prepared,

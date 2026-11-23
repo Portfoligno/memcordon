@@ -27,6 +27,7 @@ use crate::{
 
 /// Shared producer layout for the Windows installed-consumer output and carriers.
 pub const WINDOWS_CASE_DIRECTORY: &str = "windows-installed";
+pub(crate) const WINDOWS_PACKAGE_SUMMARY_FILE: &str = "windows-package-summary.md";
 
 pub fn windows_case_output_directory(output: &Path) -> PathBuf {
     output.join(WINDOWS_CASE_DIRECTORY)
@@ -1498,17 +1499,100 @@ pub(crate) fn run_materialized_channel_with_failure_subject(
         )?;
         fs::create_dir_all(&config.output_directory)?;
         let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;
+        let mut install_result = None;
         let assessment = crate::windows_installed_cases::run_from_source_with_failure_subject(
             root,
             &config,
-            &mut |_| Ok(()),
+            &mut |event| {
+                use crate::windows_installed_cases::WindowsLeasePhase;
+
+                if event.phase == WindowsLeasePhase::AfterFreshInstall {
+                    install_result = event.result.map(std::result::Result::is_ok);
+                }
+                Ok(())
+            },
             deadlines,
             failure_subject,
-        )?;
-        source::write_json(&output.join("windows-assessment.json"), &assessment)?;
-        if !assessment.accepted() {
-            return Err(CiError::Message(assessment.failure_summary()));
+        );
+        let finish_assessment = || -> std::result::Result<(), (&'static str, CiError)> {
+            let assessment = assessment.map_err(|error| ("assessment call failed", error))?;
+            source::write_json(&output.join("windows-assessment.json"), &assessment)
+                .map_err(|error| ("assessment artifact write failed", error))?;
+            if !assessment.accepted() {
+                return Err((
+                    "assessment rejected",
+                    CiError::Message(assessment.failure_summary()),
+                ));
+            }
+            Ok(())
+        };
+        if matches!(&payload.source, BuildSourceIdentity::Working { .. })
+            && let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+        {
+            let write_summary = |summary: &mut dyn std::io::Write| -> std::io::Result<()> {
+                writeln!(summary, "### Selected Windows package inputs\n")?;
+                writeln!(
+                    summary,
+                    "Commit `{}`, version `{}`, target `{}`, channel `{}`.\n",
+                    config.source_commit,
+                    config.version,
+                    config.target,
+                    config.channel.name(),
+                )?;
+                for artifact in &config.artifacts {
+                    if let Some(name) = artifact.path.file_name() {
+                        writeln!(
+                            summary,
+                            "- `{}` (SHA-256 `{}`)",
+                            name.to_string_lossy(),
+                            artifact.sha256,
+                        )?;
+                    }
+                }
+                let status = match install_result {
+                    Some(true) => "reported success",
+                    Some(false) => "returned an error",
+                    None => "no outcome was recorded",
+                };
+                writeln!(summary, "\nBounded fresh-install operation: {status}.\n")
+            };
+            let job_summary =
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut summary| {
+                        write_summary(&mut summary)?;
+                        Ok(summary)
+                    });
+            if let Err(error) = &job_summary {
+                eprintln!("Could not write Windows package job summary: {error}");
+            }
+            let result = finish_assessment();
+            if let Err((status, _)) = &result {
+                let write_outcome = |summary: &mut dyn std::io::Write| {
+                    writeln!(summary, "Windows installed assessment: {status}.\n")
+                };
+                if let Ok(mut summary) = job_summary {
+                    let _ = write_outcome(&mut summary);
+                }
+                let write_report = || -> std::io::Result<()> {
+                    let mut report = tempfile::NamedTempFile::new_in(&config.output_directory)?;
+                    write_summary(report.as_file_mut())?;
+                    write_outcome(report.as_file_mut())?;
+                    report
+                        .persist_noclobber(
+                            config.output_directory.join(WINDOWS_PACKAGE_SUMMARY_FILE),
+                        )
+                        .map_err(|error| error.error)?;
+                    Ok(())
+                };
+                if let Err(error) = write_report() {
+                    eprintln!("Could not write Windows package failure report: {error}");
+                }
+            }
+            return result.map_err(|(_, error)| error);
         }
+        finish_assessment().map_err(|(_, error)| error)?;
     } else if matches!(
         runtime,
         super::distribution::RuntimeSelection::LinuxBaseline

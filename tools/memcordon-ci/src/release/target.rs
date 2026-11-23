@@ -373,7 +373,24 @@ pub fn build_selected_with_components(
     destination: &Path,
     runtime_components: bool,
 ) -> Result<()> {
-    build_selected_with_failure(
+    build_selected_with_sizes(
+        root,
+        selected,
+        distribution,
+        destination,
+        runtime_components,
+    )
+    .map(|_| ())
+}
+
+pub(super) fn build_selected_with_sizes(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    runtime_components: bool,
+) -> Result<NativePayloadSizes> {
+    build_selected_inner(
         root,
         selected,
         distribution,
@@ -391,6 +408,30 @@ pub fn build_selected_with_failure(
     runtime_components: bool,
     failure_mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
+    build_selected_inner(
+        root,
+        selected,
+        distribution,
+        destination,
+        runtime_components,
+        failure_mode,
+    )
+    .map(|_| ())
+}
+
+pub(super) struct NativePayloadSizes {
+    pub archive_bytes: u64,
+    pub fixture_bytes: u64,
+}
+
+fn build_selected_inner(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    runtime_components: bool,
+    failure_mode: crate::failure_mode::FailureMode,
+) -> Result<NativePayloadSizes> {
     let mode = NativeCompileMode::Local;
     let outer = std::time::Instant::now() + Duration::from_secs(140 * 60);
     crate::preparation::with_operation(failure_mode, outer, || {
@@ -731,6 +772,7 @@ pub fn compile_product_only(
         crate::failure_mode::FailureMode::StopAfterFailure,
         NativeValidation::PackageOnly(deadline),
     )
+    .map(|_| ())
 }
 
 pub fn build_native_payload(
@@ -882,6 +924,7 @@ pub fn validate_selected(
             failure_mode,
             NativeValidation::RunTests(deadline),
         )
+        .map(|_| ())
     })
 }
 
@@ -898,7 +941,7 @@ fn validate_and_package_native(
     _runtime_components: bool,
     failure_mode: crate::failure_mode::FailureMode,
     validation: NativeValidation,
-) -> Result<()> {
+) -> Result<NativePayloadSizes> {
     let (operation_deadline, package_only) = match validation {
         NativeValidation::RunTests(deadline) => (deadline, false),
         NativeValidation::PackageOnly(deadline) => (deadline, true),
@@ -1105,13 +1148,16 @@ fn validate_and_package_native(
                 fixture,
             },
         )?;
-        TargetBundle::load(destination)?;
+        let (bundle, _) = TargetBundle::load(destination)?;
         if std::time::Instant::now() >= operation_deadline {
             return Err(CiError::Message(
                 "native operation deadline exhausted during archive assembly".into(),
             ));
         }
-        Ok(())
+        Ok(NativePayloadSizes {
+            archive_bytes: bundle.archive.byte_len,
+            fixture_bytes: bundle.fixture.byte_len,
+        })
     })();
     assembly.finish(result)
 }

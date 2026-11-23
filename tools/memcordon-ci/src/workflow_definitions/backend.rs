@@ -188,15 +188,21 @@ fn matched_owned_job(mut job: Value) -> Value {
 }
 
 fn installed_failure_carriers() -> Value {
+    use crate::release::installed_consumer::{
+        WINDOWS_CASE_DIRECTORY, WINDOWS_PACKAGE_SUMMARY_FILE,
+    };
+
     let mut inputs = serde_yaml::Mapping::new();
     inputs.insert(
         text("name"),
         text("windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}"),
     );
+    let prefix = "target/ci/windows-installed/${{ matrix.channel }}/cases";
+    let carriers = crate::installed_failure_carriers::paths(prefix);
     inputs.insert(
         text("path"),
-        text(&crate::installed_failure_carriers::paths(
-            "target/ci/windows-installed/${{ matrix.channel }}/cases",
+        text(&format!(
+            "{carriers}\n{prefix}/{WINDOWS_CASE_DIRECTORY}/{WINDOWS_PACKAGE_SUMMARY_FILE}"
         )),
     );
     inputs.insert(text("if-no-files-found"), text("ignore"));

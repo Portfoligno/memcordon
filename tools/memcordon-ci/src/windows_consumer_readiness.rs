@@ -2200,6 +2200,43 @@ fn decode_events(bytes: &[u8], live: bool) -> Result<Vec<Event>> {
     Ok(result)
 }
 
+/// Compact diagnostic projection of an already-associated original execution.
+pub fn reduced_startup_phase(
+    native: &memcordon_core::WindowsSealedEvidenceV3,
+) -> serde_json::Value {
+    use memcordon_core::{ProcessObservationCoverageV1, WindowsLoaderQualificationOutcomeV2};
+
+    // This is the pre-launch desktop-loader control, not the startup result of
+    // the actual target. Do not serialize the control's plan or failure detail.
+    let desktop_loader_control = match &native.loader_qualification {
+        Some(WindowsLoaderQualificationOutcomeV2::Ready(_)) => "ready",
+        Some(WindowsLoaderQualificationOutcomeV2::Failed(_)) => "failed",
+        None => "unavailable",
+    };
+    let process_observation = match native
+        .process_observation
+        .as_deref()
+        .map(|observation| &observation.coverage)
+    {
+        Some(ProcessObservationCoverageV1::Sampled { counters, .. }) => serde_json::json!({
+            "state": "sampling-configured",
+            "polls_attempted": counters.polls_attempted,
+            "snapshots_obtained": counters.snapshots_obtained,
+            "counter_saturated": counters.counter_saturated,
+        }),
+        _ => serde_json::json!({"state": "unavailable"}),
+    };
+    serde_json::json!({
+        "state": "associated",
+        "desktop_loader_control": desktop_loader_control,
+        "target_released": native.target_released,
+        "process_observation": process_observation,
+        "fixture_entry": "unknown",
+        "failing_initializer": "unknown",
+        "acceptance_authority": false,
+    })
+}
+
 /// A launch refusal or abnormal completion cannot satisfy the live positive-fixture barrier.
 /// This observation only rejects; it never supplies accepted workload authority.
 pub fn current_native(result: &ResultV3) -> Result<&memcordon_core::WindowsSealedEvidenceV3> {
@@ -2323,6 +2360,23 @@ pub fn retain_original_argv_observation(
     evidence["original_case_argv_path"] = observation;
     Some(evidence)
 }
+/// Keep the original phase only alongside the already-validated settlement.
+pub fn retain_original_startup_observation(
+    comparison: Option<serde_json::Value>,
+    original_argv: Option<serde_json::Value>,
+    phase: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let has_original_settlement = original_argv
+        .as_ref()
+        .and_then(|record| record.get("original_settlement"))
+        .is_some_and(serde_json::Value::is_object);
+    let mut evidence = retain_original_argv_observation(comparison, original_argv)?;
+    evidence["original_startup_phase"] = phase
+        .filter(|_| has_original_settlement)
+        .unwrap_or_else(|| serde_json::json!({"state": "unavailable"}));
+    Some(evidence)
+}
+
 pub fn released_target_loader_event_candidate(result: &ResultV3) -> bool {
     result.release == ReleaseKnowledgeV3::Released
         && result.outcome.kind == OutcomeKindV1::Completed
@@ -5913,6 +5967,12 @@ pub(crate) mod native {
         )
     }
 
+    #[derive(Default)]
+    struct ReducedStartupObservation {
+        argv: Option<serde_json::Value>,
+        phase: Option<serde_json::Value>,
+    }
+
     fn reduced_startup_comparison(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &CaseInput,
@@ -5920,7 +5980,7 @@ pub(crate) mod native {
         original_frontend: ReducedStartupFrontend,
         original_window: [u64; 2],
         argv_path_was_vacant: bool,
-        original_argv: &mut Option<serde_json::Value>,
+        original_observation: &mut ReducedStartupObservation,
         work_deadline: Instant,
     ) -> Result<Option<serde_json::Value>> {
         use descriptor::gate_precondition::CompilerAuthoritySnapshot;
@@ -5984,8 +6044,17 @@ pub(crate) mod native {
                         "installed startup request binding differs".into(),
                     ));
                 }
+                let phase = match observation.terminal.execution() {
+                    Some((
+                        _,
+                        _,
+                        memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV3(native),
+                    )) => Some(super::reduced_startup_phase(native)),
+                    _ => None,
+                };
                 Ok((
                     request,
+                    phase,
                     serde_json::json!({
                         "native_status":status(result),
                         "wrapper_status":result.outcome.wrapper_status,
@@ -5998,7 +6067,7 @@ pub(crate) mod native {
                     }),
                 ))
             };
-        let (mut expected, original_summary) =
+        let (mut expected, phase, original_summary) =
             settled(original_report, &original, original_frontend)
                 .map_err(|error| error.context("original installed startup settlement"))?;
         let original_deadline = reduced_startup_deadline(&expected, original_window)
@@ -6054,11 +6123,14 @@ pub(crate) mod native {
                 }
             },
         );
-        *original_argv = Some(serde_json::json!({
+        original_observation.argv = Some(serde_json::json!({
             "case":input.key, "original_settlement":original_summary,
             "fixture_sha256":config.fixture.sha256, "path_observation":path_observation,
             "process_identity_is_settlement_context_not_file_attribution":true,
         }));
+        // Publish the phase only with the validated original tuple and the
+        // retained original settlement, even if later comparison work fails.
+        original_observation.phase = phase;
         let comparison_report = original_report.with_extension("reduced-startup-snapshot.json");
         if comparison_report.try_exists()?
             || comparison_report
@@ -6092,7 +6164,7 @@ pub(crate) mod native {
         let comparison_window = [comparison_start, native_uptime_millis()];
         let comparison = load_result(&comparison_report)
             .map_err(|error| error.context("comparison product result readback"))?;
-        let (actual, comparison_summary) = settled(
+        let (actual, _, comparison_summary) = settled(
             &comparison_report,
             &comparison,
             ReducedStartupFrontend::Comparison {
@@ -12330,7 +12402,7 @@ pub(crate) mod native {
                         observed_status: observed_status.and_then(|status| status.code()),
                         cleanup_status: termination.and_then(|status| status.code()),
                     };
-                    let mut original_argv = None;
+                    let mut original_observation = ReducedStartupObservation::default();
                     let comparison = reduced_startup_comparison(
                         config,
                         input,
@@ -12338,7 +12410,7 @@ pub(crate) mod native {
                         original_frontend,
                         window,
                         argv_path_was_vacant,
-                        &mut original_argv,
+                        &mut original_observation,
                         work_deadline,
                     );
                     let evidence = match comparison {
@@ -12351,7 +12423,11 @@ pub(crate) mod native {
                             "reason": crate::command::bounded_excerpt(error.to_string().as_bytes()),
                         })),
                     };
-                    let evidence = super::retain_original_argv_observation(evidence, original_argv);
+                    let evidence = super::retain_original_startup_observation(
+                        evidence,
+                        original_observation.argv,
+                        original_observation.phase,
+                    );
                     if let Some(evidence) = evidence {
                         let publication = serde_json::to_vec(&evidence)
                             .map_err(CiError::from)

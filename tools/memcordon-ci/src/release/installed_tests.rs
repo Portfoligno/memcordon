@@ -1,6 +1,9 @@
 //! Direct tests of the selected delivered product. No result archive is consumed.
-use super::{distribution, installed_consumer, packages::PackageConsumer, target::TargetBundle};
-use crate::{CiError, Result};
+use super::{
+    distribution, installed_consumer, packages::PackageConsumer, source::BuildSourceIdentity,
+    target::TargetBundle,
+};
+use crate::{CiError, Result, installed_failure_carriers};
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -64,10 +67,18 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn retain_failure_output(source: &Path, diagnostics: &Path) -> Result<()> {
+fn retain_failure_output(
+    source: &Path,
+    diagnostics: &Path,
+    include_windows_package_summary: bool,
+) -> Result<()> {
     const FILE_BOUND: u64 = 16 * 1024 * 1024;
     const TOTAL_BOUND: u64 = 64 * 1024 * 1024;
-    let selected = crate::installed_failure_carriers::select(source)?;
+    let selected = if include_windows_package_summary {
+        installed_failure_carriers::select_with_windows_package_summary(source)?
+    } else {
+        installed_failure_carriers::select(source)?
+    };
     let mut retained = 0;
     for path in selected {
         let mut options = std::fs::OpenOptions::new();
@@ -309,10 +320,18 @@ fn run_inner(
     }) {
         eprintln!("optional installed diagnostics unavailable: {error}");
     }
-    if result.is_err()
-        && let Err(error) = retain_failure_output(&output, &args.diagnostics)
-    {
-        eprintln!("optional installed raw diagnostics unavailable: {error}");
+    if result.is_err() {
+        let include_windows_package_summary = cfg!(windows)
+            && matches!(
+                args.delivery,
+                Delivery::CandidateNative | Delivery::CandidateCargo
+            )
+            && matches!(&payload.source, BuildSourceIdentity::Working { .. });
+        if let Err(error) =
+            retain_failure_output(&output, &args.diagnostics, include_windows_package_summary)
+        {
+            eprintln!("optional installed raw diagnostics unavailable: {error}");
+        }
     }
     let result = cancellation.finish(result);
     if let Some(destination) = failure_subject

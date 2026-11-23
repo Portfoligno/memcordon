@@ -93,9 +93,11 @@ fn backend_original_failure_carriers_precede_the_full_installed_artifact() {
             assert_eq!(step["uses"], "./.github/actions/upload-artifact");
             assert_eq!(step["with"]["if-no-files-found"], "ignore");
             let paths: Vec<_> = step["with"]["path"].as_str().unwrap().lines().collect();
-            let expected = expected_listener_carriers(
-                "target/ci/windows-installed/${{ matrix.channel }}/cases",
-            );
+            let prefix = "target/ci/windows-installed/${{ matrix.channel }}/cases";
+            let mut expected = expected_listener_carriers(prefix);
+            expected.push(format!(
+                "{prefix}/windows-installed/windows-package-summary.md"
+            ));
             assert_eq!(paths, expected);
             let full = &steps[index + 1];
             assert_eq!(full["with"]["path"], "target/ci/windows-installed");
@@ -207,10 +209,14 @@ fn release_finite_listener_carriers_precede_general_retention_in_all_windows_del
                 .lines()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            assert_eq!(
-                paths,
-                expected_listener_carriers("target/ci/reports/installed/raw")
-            );
+            let prefix = "target/ci/reports/installed/raw";
+            let mut expected_paths = expected_listener_carriers(prefix);
+            if name.starts_with("candidate-windows-") {
+                expected_paths.push(format!(
+                    "{prefix}/windows-installed/windows-package-summary.md"
+                ));
+            }
+            assert_eq!(paths, expected_paths);
             let general = steps
                 .iter()
                 .position(|step| step["name"] == "Retain bounded installed diagnostics")

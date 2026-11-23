@@ -821,12 +821,127 @@ fn reduced_startup_keeps_cleanup_exit_separate_from_authenticated_product_status
     };
     native.initial_target_token_matches_caller = false;
     assert!(validate(&mismatch, original).is_err());
+
+    let mut unassociated = result.clone();
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut unassociated.runtime else {
+        unreachable!()
+    };
+    native.frontend_provider_association = None;
+    assert!(validate(&unassociated, original).is_err());
+
+    let mut wrong_birth = result.clone();
+    let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut wrong_birth.runtime else {
+        unreachable!()
+    };
+    native.target_identity.as_mut().unwrap().creation_time_100ns += 1;
+    assert!(validate(&wrong_birth, original).is_err());
+
     let mut mismatch = result;
     let RuntimeExecutionV3::WindowsSealed { native, .. } = &mut mismatch.runtime else {
         unreachable!()
     };
     native.retirement.as_mut().unwrap().job_identity = "cd".repeat(32);
     assert!(validate(&mismatch, original).is_err());
+}
+
+#[test]
+fn reduced_startup_phase_preserves_zero_coverage_without_disclosing_control_inputs() {
+    use memcordon_ci::windows_consumer_readiness::reduced_startup_phase;
+    use memcordon_core::{
+        ProcessObservationCoverageV1, ProcessObservationPolicyV1,
+        ProcessObservationUnavailableReasonV1, WindowsLoaderQualificationOutcomeV2,
+        WindowsLoaderReadyEvidenceV1, WindowsProcessObservationV2, WindowsSealedEvidenceV3,
+    };
+    use serde_json::json;
+
+    let mut observation = WindowsProcessObservationV2::unavailable(
+        ProcessObservationUnavailableReasonV1::LegacyObservationUnavailable,
+    );
+    observation.coverage = ProcessObservationCoverageV1::Sampled {
+        policy: ProcessObservationPolicyV1::SERVICE,
+        counters: Default::default(),
+        omissions: Default::default(),
+        sample: Default::default(),
+    };
+    let mut native = WindowsSealedEvidenceV3 {
+        target_released: true,
+        process_observation: Some(Box::new(observation)),
+        loader_qualification: Some(WindowsLoaderQualificationOutcomeV2::Ready(
+            WindowsLoaderReadyEvidenceV1 {
+                schema_version: 1,
+                launch_plan_sha256: "digest-canary".into(),
+                launch_plan_json: Some("session-and-path-canary".into()),
+                elapsed_millis: 15,
+            },
+        )),
+        service_identity: "service-identity-canary".into(),
+        ..Default::default()
+    };
+    let phase = reduced_startup_phase(&native);
+    assert_eq!(
+        phase,
+        json!({
+            "state": "associated",
+            "desktop_loader_control": "ready",
+            "target_released": true,
+            "process_observation": {
+                "state": "sampling-configured",
+                "polls_attempted": 0,
+                "snapshots_obtained": 0,
+                "counter_saturated": false,
+            },
+            "fixture_entry": "unknown",
+            "failing_initializer": "unknown",
+            "acceptance_authority": false,
+        }),
+    );
+    let mut largest = phase.clone();
+    largest["process_observation"]["polls_attempted"] = json!(u64::MAX);
+    largest["process_observation"]["snapshots_obtained"] = json!(u64::MAX);
+    assert!(serde_json::to_vec(&largest).unwrap().len() < 1024);
+
+    native.loader_qualification = None;
+    native.process_observation = None;
+    let absent = reduced_startup_phase(&native);
+    assert_eq!(absent["desktop_loader_control"], "unavailable");
+    assert_eq!(
+        absent["process_observation"],
+        json!({"state": "unavailable"})
+    );
+}
+
+#[test]
+fn reduced_startup_phase_survives_comparison_failure_only_with_original_settlement() {
+    use memcordon_ci::windows_consumer_readiness::retain_original_startup_observation;
+    use serde_json::json;
+
+    let comparison_error = json!({"state": "unavailable", "diagnostic_only": true});
+    let phase = json!({"state": "associated", "acceptance_authority": false});
+    let anchors = json!({"original_settlement": {"target": {"process_id": 37,
+        "creation_time_100ns": 51}}});
+    let retained = retain_original_startup_observation(
+        Some(comparison_error.clone()),
+        Some(anchors.clone()),
+        Some(phase.clone()),
+    )
+    .unwrap();
+    assert_eq!(retained["state"], comparison_error["state"]);
+    assert_eq!(retained["original_case_argv_path"], anchors);
+    assert_eq!(retained["original_startup_phase"], phase);
+
+    for unassociated in [None, Some(json!({"original_settlement": null}))] {
+        let unavailable = retain_original_startup_observation(
+            Some(comparison_error.clone()),
+            unassociated,
+            Some(phase.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            unavailable["original_startup_phase"],
+            json!({"state": "unavailable"})
+        );
+    }
+    assert!(retain_original_startup_observation(None, None, Some(phase)).is_none());
 }
 
 #[test]

@@ -35,22 +35,94 @@ pub fn selected_distribution(native: &str) -> Result<TargetDistribution> {
 /// Credential-free producer. The separately staged fixture remains outside the
 /// production archive; payloads are built from working source without a release tag.
 pub fn prepare_working(root: &Path, destination: &Path) -> Result<()> {
+    prepare_working_inner(root, destination, false)
+}
+
+/// Working-windows-prepare reports only its own preparation phases.
+pub fn prepare_working_for_workflow(root: &Path, destination: &Path) -> Result<()> {
+    prepare_working_inner(root, destination, true)
+}
+
+fn prepare_working_inner(root: &Path, destination: &Path, report_timing: bool) -> Result<()> {
     let distribution = selected_distribution(native_target()?)?;
     let source = BuildSourceIdentity::working(root)?;
     fs::create_dir(destination)?;
-    packages::prepare_build(
-        root,
-        &source,
-        &root.join("target/ci-build/windows-packages"),
-        &destination.join("cargo-payload"),
-    )?;
-    target::build_selected(
-        root,
-        &source,
-        &distribution,
-        &destination.join("native-payload"),
-    )?;
-    source.recheck(root)
+
+    let mut package_elapsed_ms = None;
+    let mut target_elapsed_ms = None;
+    let result = (|| {
+        let package_started = report_timing.then(std::time::Instant::now);
+        let package_result = packages::prepare_build_bundle(
+            root,
+            &source,
+            &root.join("target/ci-build/windows-packages"),
+            &destination.join("cargo-payload"),
+        );
+        if let Some(started) = package_started {
+            package_elapsed_ms = Some(started.elapsed().as_millis());
+        }
+        let package_bundle = package_result?;
+
+        let target_started = report_timing.then(std::time::Instant::now);
+        let target_result = target::build_selected_with_sizes(
+            root,
+            &source,
+            &distribution,
+            &destination.join("native-payload"),
+            false,
+        );
+        if let Some(started) = target_started {
+            target_elapsed_ms = Some(started.elapsed().as_millis());
+        }
+        let target_sizes = target_result?;
+
+        source.recheck(root)?;
+        Ok((package_bundle, target_sizes))
+    })();
+
+    if report_timing
+        && cfg!(all(windows, target_arch = "x86_64"))
+        && let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+    {
+        let mut rows = String::new();
+        if let Some(elapsed_ms) = package_elapsed_ms {
+            rows.push_str(&format!("| Cargo package preparation | {elapsed_ms} |\n"));
+        }
+        if let Some(elapsed_ms) = target_elapsed_ms {
+            rows.push_str(&format!("| Native target build | {elapsed_ms} |\n"));
+        }
+        if !rows.is_empty() {
+            use std::io::Write as _;
+            let mut block = format!(
+                "### Windows x64 working-windows-prepare timing\n\n| Phase | Elapsed (ms) |\n| --- | ---: |\n{rows}"
+            );
+            if let Ok((packages, target_sizes)) = &result
+                && let Some(product_bytes) =
+                    packages
+                        .files
+                        .iter()
+                        .try_fold(target_sizes.archive_bytes, |total, file| {
+                            let package = file.package.as_deref()?;
+                            // Count only the distinct filenames produced by the selected Cargo packages.
+                            if file.name != format!("{package}-{}.crate", source.version()) {
+                                return None;
+                            }
+                            total.checked_add(file.byte_len)
+                        })
+            {
+                block.push_str(&format!(
+                    "\n| Prepared output | Bytes |\n| --- | ---: |\n| Product archives | {product_bytes} |\n| Standalone fixture | {} |\n",
+                    target_sizes.fixture_bytes
+                ));
+            }
+            let _ = std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|mut file| writeln!(file, "{block}"));
+        }
+    }
+
+    result.map(|_| ())
 }
 
 /// A supplied producer output is mandatory. This never builds a missing native

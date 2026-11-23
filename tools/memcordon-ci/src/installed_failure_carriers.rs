@@ -77,6 +77,14 @@ fn installed_relative_paths() -> impl Iterator<Item = String> {
         }))
 }
 
+pub(crate) fn windows_package_summary_relative_path() -> String {
+    use crate::release::installed_consumer::{
+        WINDOWS_CASE_DIRECTORY, WINDOWS_PACKAGE_SUMMARY_FILE,
+    };
+
+    format!("{WINDOWS_CASE_DIRECTORY}/{WINDOWS_PACKAGE_SUMMARY_FILE}")
+}
+
 fn unlinked(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return false;
@@ -125,9 +133,23 @@ fn priority_file(source: &Path, relative: &str) -> io::Result<Option<PathBuf>> {
 /// Keep the established 4096-entry scan and 128-file selection bounds. Known
 /// carriers are found directly first, then charged to that same selected set.
 pub fn select(source: &Path) -> io::Result<Vec<PathBuf>> {
+    select_with_priority_paths(source, installed_relative_paths())
+}
+
+pub(crate) fn select_with_windows_package_summary(source: &Path) -> io::Result<Vec<PathBuf>> {
+    select_with_priority_paths(
+        source,
+        installed_relative_paths().chain(std::iter::once(windows_package_summary_relative_path())),
+    )
+}
+
+fn select_with_priority_paths(
+    source: &Path,
+    priority_paths: impl Iterator<Item = String>,
+) -> io::Result<Vec<PathBuf>> {
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
-    for relative in installed_relative_paths() {
+    for relative in priority_paths {
         if let Some(path) = priority_file(source, &relative)? {
             seen.insert(path.clone());
             selected.push(path);

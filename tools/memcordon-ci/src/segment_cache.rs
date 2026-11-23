@@ -2,7 +2,8 @@
 use crate::{
     CiError, Result,
     cache::{CacheEntry, OptionalCache},
-    cache_snapshot::{self, SnapshotKind, TransferSelection},
+    cache_restore::CompiledPartition,
+    cache_snapshot::{self, SnapshotKind, TransferImport, TransferSelection},
     download_cache::{self, DownloadFamily},
     work_outcome::{WorkOutcome, WriterSettlement},
 };
@@ -509,11 +510,39 @@ impl<'a> Session<'a> {
         retain_sources: bool,
         restore_inputs: bool,
     ) -> Result<Self> {
+        Self::begin_observing_imports(
+            root,
+            scopes,
+            family,
+            retain_sources,
+            restore_inputs,
+            |_, _| {},
+        )
+    }
+
+    /// Observe a compiled partition's import attempt. `None` means the attempt returned an error.
+    pub fn begin_observing_imports(
+        root: &Path,
+        scopes: Vec<CompiledScope<'a>>,
+        family: DownloadFamily,
+        retain_sources: bool,
+        restore_inputs: bool,
+        observe_import: impl FnMut(CompiledPartition, Option<TransferImport>),
+    ) -> Result<Self> {
         let started = Instant::now();
         let mut session = crate::preparation::with_operation(
             crate::failure_mode::FailureMode::CollectAll,
             started + OPTIONAL_CACHE_BUDGET,
-            || Self::begin_inner(root, scopes, family, retain_sources, restore_inputs),
+            || {
+                Self::begin_inner(
+                    root,
+                    scopes,
+                    family,
+                    retain_sources,
+                    restore_inputs,
+                    observe_import,
+                )
+            },
         )?;
         session.cache_remaining = OPTIONAL_CACHE_BUDGET.saturating_sub(started.elapsed());
         Ok(session)
@@ -525,6 +554,7 @@ impl<'a> Session<'a> {
         family: DownloadFamily,
         retain_sources: bool,
         restore_inputs: bool,
+        mut observe_import: impl FnMut(CompiledPartition, Option<TransferImport>),
     ) -> Result<Self> {
         let source = retain_sources.then(|| SourceSession::begin(root, family));
         let mut tool_sources = Vec::new();
@@ -576,7 +606,11 @@ impl<'a> Session<'a> {
                 }
                 let before = input(root, scope.selection)?;
                 if restore_inputs && before.is_some() {
-                    cache_snapshot::import_transfer(root, scope.selection)?;
+                    let imported = cache_snapshot::import_transfer_observed(root, scope.selection);
+                    if let Some(partition) = scope.selection.partition {
+                        observe_import(partition, imported.as_ref().ok().copied());
+                    }
+                    imported?;
                 }
                 selected.push((scope, before));
             }

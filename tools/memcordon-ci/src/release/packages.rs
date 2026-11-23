@@ -62,6 +62,15 @@ pub fn prepare_build(
     target: &Path,
     destination: &Path,
 ) -> Result<()> {
+    prepare_build_bundle(root, source, target, destination).map(|_| ())
+}
+
+pub(super) fn prepare_build_bundle(
+    root: &Path,
+    source: &BuildSourceIdentity,
+    target: &Path,
+    destination: &Path,
+) -> Result<PackageBundle> {
     source.recheck(root)?;
     let distribution = super::distribution::Distribution::read(root)?;
     let metadata = source::metadata(root)?;
@@ -132,15 +141,14 @@ pub fn prepare_build(
             .position(|name| Some(name) == record.package.as_ref())
             .expect("validated package order")
     });
-    source::write_json(
-        &destination.join("packages.json"),
-        &PackageBundle {
-            format: "memcordon.packages".into(),
-            revision: 1,
-            source: source.clone(),
-            files: records,
-        },
-    )
+    let bundle = PackageBundle {
+        format: "memcordon.packages".into(),
+        revision: 1,
+        source: source.clone(),
+        files: records,
+    };
+    source::write_json(&destination.join("packages.json"), &bundle)?;
+    Ok(bundle)
 }
 
 impl PackageBundle {

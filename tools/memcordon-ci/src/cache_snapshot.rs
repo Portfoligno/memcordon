@@ -425,8 +425,25 @@ fn finalize_copies<T: Send>(
     })
 }
 
+#[derive(Clone, Copy)]
+pub enum TransferImport {
+    NoSeed,
+    Rejected,
+    ImportedCompleteExact,
+    ImportedCompleteCompatible,
+    ImportedPartial,
+}
+
 /// Prefer complete bytes; neither class imports a current compilation fact.
 pub fn import_transfer(root: &Path, request: TransferSelection<'_>) -> Result<()> {
+    import_transfer_observed(root, request).map(|_| ())
+}
+
+pub(crate) fn import_transfer_observed(
+    root: &Path,
+    request: TransferSelection<'_>,
+) -> Result<TransferImport> {
+    let mut outcome = TransferImport::NoSeed;
     for complete in [true, false] {
         let stage = transfer_stage(root, request, complete)?;
         ordinary(&stage)?;
@@ -478,6 +495,7 @@ pub fn import_transfer(root: &Path, request: TransferSelection<'_>) -> Result<()
                 )?;
             }
             cleanup_selected(root, &selected)?;
+            outcome = TransferImport::Rejected;
             continue;
         }
         let sanitation = if request.kind == SnapshotKind::ToolBuild {
@@ -515,15 +533,20 @@ pub fn import_transfer(root: &Path, request: TransferSelection<'_>) -> Result<()
                 )?;
             }
             cleanup_selected(root, &selected)?;
+            outcome = TransferImport::Rejected;
             continue;
         }
         // Both restore slots belong to this transfer operation. Once the
         // preferred import and sanitation have settled, neither restored slot
         // may remain where the current operation will export fresh output.
         cleanup_transfers(root, request)?;
-        return Ok(());
+        return Ok(match (complete, restore_mode) {
+            (true, cache_restore::RestoreMode::Exact) => TransferImport::ImportedCompleteExact,
+            (true, _) => TransferImport::ImportedCompleteCompatible,
+            (false, _) => TransferImport::ImportedPartial,
+        });
     }
-    Ok(())
+    Ok(outcome)
 }
 
 pub fn cleanup_transfers(root: &Path, request: TransferSelection<'_>) -> Result<()> {
