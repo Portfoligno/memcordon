@@ -8,6 +8,64 @@ use crate::windows_causal_acceptance::{InstalledCaseResult, InstalledChannel};
 use crate::windows_consumer_readiness::ProviderExperimentOutcome;
 use crate::{CiError, Result};
 
+/// Invocation-local identity from a verified diagnostics publication.
+/// This is not a serialized assessment or an acceptance result.
+pub struct LaterFailureSubject {
+    process_id: u32,
+    creation_time_100ns: u64,
+}
+
+impl LaterFailureSubject {
+    pub fn process_identity(&self) -> (u32, u64) {
+        (self.process_id, self.creation_time_100ns)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) enum LaterFailureCapture {
+    #[default]
+    Absent,
+    Unique(LaterFailureSubject),
+    Ambiguous,
+}
+
+#[cfg(windows)]
+impl LaterFailureCapture {
+    pub(crate) fn record_published(&mut self, evidence: &serde_json::Value) {
+        let original = &evidence["original"];
+        let target = &original["target"];
+        let process_id = target["process_id"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .unwrap_or(0);
+        let creation_time_100ns = target["creation_time_100ns"].as_u64().unwrap_or(0);
+        if evidence["diagnostic_only"].as_bool() != Some(true)
+            || original["native_status"].as_u64() != Some(0xc0000142)
+            || original["native_job_retired"].as_bool() != Some(true)
+            || process_id == 0
+            || creation_time_100ns == 0
+        {
+            return;
+        }
+        *self = if matches!(self, Self::Absent) {
+            Self::Unique(LaterFailureSubject {
+                process_id,
+                creation_time_100ns,
+            })
+        } else {
+            Self::Ambiguous
+        };
+    }
+
+    pub(crate) fn into_subject(self) -> Option<LaterFailureSubject> {
+        match self {
+            Self::Unique(subject) => Some(subject),
+            Self::Absent | Self::Ambiguous => None,
+        }
+    }
+}
+
 /// Execution and package retirement remain independent of measured private
 /// availability. Errors never become an unavailable/success verdict.
 pub fn provider_experiment_execution_status(
@@ -731,6 +789,16 @@ pub struct InstalledWindowsAssessment {
 }
 
 impl InstalledWindowsAssessment {
+    pub fn failure_summary(&self) -> String {
+        format!(
+            "actual installed Windows case or retirement failed; positive readiness: {:?}; public smoke before: {:?}; upgrade: {:?}; uninstall: {:?}",
+            self.positive_suite,
+            self.public_smoke_before,
+            self.package_upgrade,
+            self.package_uninstall,
+        )
+    }
+
     /// This is only the finite readiness scope. Independent native suites and
     /// installation lifecycle remain mandatory in the shared final decision.
     pub fn readiness_validated(&self) -> bool {
@@ -1890,7 +1958,9 @@ mod native {
         observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
         deadlines: WindowsLeaseDeadlines,
         source_root: Option<&Path>,
+        mut failure_subject: Option<&mut Option<LaterFailureSubject>>,
     ) -> Result<InstalledWindowsAssessment> {
+        let mut retired_subject = None;
         if deadlines.work >= deadlines.cleanup {
             return Err(CiError::Message(
                 "Windows lease must reserve original cleanup time after work cutoff".into(),
@@ -1917,7 +1987,7 @@ mod native {
             source_commit: config.source_commit.clone(),
             version: config.version.clone(),
             artifacts: config.artifacts.clone(),
-            public_smoke_before: Err("installation did not complete".to_owned()),
+            public_smoke_before: Err("public smoke before was not executed".to_owned()),
             cases: Vec::new(),
             positive_cases: Vec::new(),
             positive_suite: Err("positive readiness suite was not executed".into()),
@@ -2013,11 +2083,12 @@ mod native {
                     .map_err(|error| error.to_string())?;
                 }
                 assessment.positive_suite =
-                    crate::windows_consumer_readiness::run_installed_with_deadlines(
+                    crate::windows_consumer_readiness::run_installed_with_failure_subject(
                         config,
                         &config.output_directory.join("windows-readiness-input.json"),
                         &mut assessment.positive_cases,
                         deadlines,
+                        failure_subject.as_ref().map(|_| &mut retired_subject),
                     )
                     .map_err(|error| error.to_string());
                 assessment.readiness =
@@ -2145,9 +2216,9 @@ mod native {
             Err(payload) => std::panic::resume_unwind(payload),
         };
         if let Err(error) = operation {
-            if assessment.public_smoke_before.is_err() {
-                assessment.public_smoke_before = Err(error);
-            }
+            // Some setup and quiescence checks have no dedicated assessment field.
+            // Report the operation error without borrowing another stage's result.
+            eprintln!("installed Windows operation stopped: {error}");
         }
         match serde_json::to_vec_pretty(&assessment) {
             Ok(bytes) if bytes.len() <= acceptance::MAX_SUMMARY_BYTES => {
@@ -2159,6 +2230,12 @@ mod native {
                 }
             }
             _ => eprintln!("optional installed-test diagnostics omitted: encoding or byte bound"),
+        }
+        if let Some(destination) = failure_subject.take()
+            && assessment.positive_suite.is_err()
+            && assessment.package_uninstall.is_ok()
+        {
+            *destination = retired_subject;
         }
         Ok(assessment)
     }
@@ -2182,6 +2259,7 @@ pub fn run_cases_for_installed_payload(
         &mut |_| Ok(()),
         WindowsLeaseDeadlines::finite_default(),
         None,
+        None,
     )
 }
 
@@ -2195,6 +2273,7 @@ pub fn run_with_observer(
         observer,
         WindowsLeaseDeadlines::finite_default(),
         None,
+        None,
     )
 }
 
@@ -2204,7 +2283,7 @@ pub fn run_with_observer_until(
     observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
     deadlines: WindowsLeaseDeadlines,
 ) -> Result<InstalledWindowsAssessment> {
-    native::run(config, observer, deadlines, None)
+    native::run(config, observer, deadlines, None, None)
 }
 
 /// Provision epoch-bound readiness only after the actual selected upgrade and
@@ -2217,13 +2296,24 @@ pub fn run_from_source_with_observer_until(
     observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
     deadlines: WindowsLeaseDeadlines,
 ) -> Result<InstalledWindowsAssessment> {
+    run_from_source_with_failure_subject(root, config, observer, deadlines, None)
+}
+
+#[cfg(windows)]
+pub(crate) fn run_from_source_with_failure_subject(
+    root: &Path,
+    config: &InstalledWindowsPayload,
+    observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+    deadlines: WindowsLeaseDeadlines,
+    failure_subject: Option<&mut Option<LaterFailureSubject>>,
+) -> Result<InstalledWindowsAssessment> {
     let source = crate::release::source::BuildSourceIdentity::working(root)?;
     if source.commit() != config.source_commit || source.version().to_string() != config.version {
         return Err(CiError::Message(
             "Windows provisioning source differs from selected installed runtime".into(),
         ));
     }
-    native::run(config, observer, deadlines, Some(root))
+    native::run(config, observer, deadlines, Some(root), failure_subject)
 }
 
 #[cfg(windows)]
@@ -2254,6 +2344,17 @@ pub fn run_from_source_with_observer_until(
     Err(CiError::Message(
         "source-provisioned Windows lease requires native Windows".into(),
     ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn run_from_source_with_failure_subject(
+    root: &Path,
+    config: &InstalledWindowsPayload,
+    observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+    deadlines: WindowsLeaseDeadlines,
+    _: Option<&mut Option<LaterFailureSubject>>,
+) -> Result<InstalledWindowsAssessment> {
+    run_from_source_with_observer_until(root, config, observer, deadlines)
 }
 
 #[cfg(not(windows))]

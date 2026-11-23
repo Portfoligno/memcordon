@@ -2245,6 +2245,17 @@ pub fn check_positive_barrier_result(
         {
             detail.push_str(&format!("; windows-status={status} (0x{status:08X})"));
         }
+        // This is the original abnormal frontend result, before controller
+        // retirement; package uninstall is owned and reported separately.
+        detail.push_str(&format!(
+            "; first-observed-failure-stage=post-install-positive-fixture-barrier; frontend-cleanup-state={:?}; controller-retirement-evidence=not-assessed-at-barrier; original-provider-failure-evidence={}",
+            result.cleanup.state,
+            if result.provider_failure.is_some() {
+                "reported"
+            } else {
+                "not-reported"
+            }
+        ));
         if let Some(rejection) = &result.windows_rejection {
             detail.push_str(&format!("; {}: {}", rejection.code, rejection.detail));
         }
@@ -2263,6 +2274,54 @@ pub fn check_positive_barrier_result(
         return Err(CiError::Message(detail));
     }
     Ok(())
+}
+/// Case-path observation only. The fixture writes this before creating its
+/// transcript, but the payload contains neither a process identity nor a nonce.
+pub fn original_argv_path_observation(
+    prelaunch_absence_verified: bool,
+    arguments: &[String],
+    read_product: impl FnOnce() -> std::io::Result<Option<Vec<u8>>>,
+) -> serde_json::Value {
+    let expected = serde_json::json!({
+        "encoding":"windows_utf16",
+        "values":arguments.iter().map(|arg| arg.encode_utf16().collect::<Vec<_>>()).collect::<Vec<_>>(),
+    });
+    let state = if !prelaunch_absence_verified {
+        "prelaunch-vacancy-unverified"
+    } else {
+        match read_product() {
+            Ok(Some(bytes)) if serde_json::to_vec(&expected).is_ok_and(|value| value == bytes) => {
+                "matching-bytes-at-previously-vacant-path"
+            }
+            Ok(Some(bytes)) if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() => {
+                "malformed-json"
+            }
+            Ok(Some(_)) => "different-bytes",
+            Ok(None) => "absent",
+            Err(_) => "unreadable-or-not-bounded-regular-file",
+        }
+    };
+    serde_json::json!({
+        "case_product":"native-argv.json", "state":state, "observation":"before-comparison",
+        "writer_identity":"unverified", "fixture_entry":"unknown",
+        "failing_initializer":"unknown", "acceptance_authority":false,
+    })
+}
+/// Once observed, a case-path result survives an unavailable or skipped comparator.
+pub fn retain_original_argv_observation(
+    comparison: Option<serde_json::Value>,
+    observation: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let Some(observation) = observation else {
+        return comparison;
+    };
+    let mut evidence = comparison.unwrap_or_else(|| {
+        serde_json::json!({
+            "state":"comparison-not-observed", "diagnostic_only":true,
+        })
+    });
+    evidence["original_case_argv_path"] = observation;
+    Some(evidence)
 }
 pub fn released_target_loader_event_candidate(result: &ResultV3) -> bool {
     result.release == ReleaseKnowledgeV3::Released
@@ -3105,7 +3164,7 @@ pub fn run_installed_until(
     assessments: &mut Vec<CaseAssessment>,
     work_deadline: std::time::Instant,
 ) -> Result<()> {
-    native::run(config, input_path, assessments, work_deadline, None)
+    native::run(config, input_path, assessments, work_deadline, None, None)
 }
 
 /// Selection is usable for experiment aggregation only after every independent
@@ -4200,12 +4259,24 @@ pub fn run_installed_with_deadlines(
     assessments: &mut Vec<CaseAssessment>,
     deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
 ) -> Result<()> {
+    run_installed_with_failure_subject(config, input_path, assessments, deadlines, None)
+}
+
+#[cfg(windows)]
+pub(crate) fn run_installed_with_failure_subject(
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    input_path: &Path,
+    assessments: &mut Vec<CaseAssessment>,
+    deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+    failure_subject: Option<&mut Option<crate::windows_installed_cases::LaterFailureSubject>>,
+) -> Result<()> {
     native::run(
         config,
         input_path,
         assessments,
         deadlines.work,
         Some(deadlines),
+        failure_subject,
     )
 }
 
@@ -5848,6 +5919,8 @@ pub(crate) mod native {
         original_report: &Path,
         original_frontend: ReducedStartupFrontend,
         original_window: [u64; 2],
+        argv_path_was_vacant: bool,
+        original_argv: &mut Option<serde_json::Value>,
         work_deadline: Instant,
     ) -> Result<Option<serde_json::Value>> {
         use descriptor::gate_precondition::CompilerAuthoritySnapshot;
@@ -5967,6 +6040,25 @@ pub(crate) mod native {
                 "installed startup original fixture or input tuple differs".into(),
             ));
         }
+        // Original result and launch tuple have been validated. Read only the
+        // case product now, before any comparison process can produce output.
+        let path_observation = super::original_argv_path_observation(
+            argv_path_was_vacant,
+            &input.descriptor.arguments,
+            || {
+                let path = input.descriptor.output_root.join("native-argv.json");
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                    Ok(_) => read(&path, 64 * 1024).map(Some).map_err(io::Error::other),
+                }
+            },
+        );
+        *original_argv = Some(serde_json::json!({
+            "case":input.key, "original_settlement":original_summary,
+            "fixture_sha256":config.fixture.sha256, "path_observation":path_observation,
+            "process_identity_is_settlement_context_not_file_attribution":true,
+        }));
         let comparison_report = original_report.with_extension("reduced-startup-snapshot.json");
         if comparison_report.try_exists()?
             || comparison_report
@@ -8596,6 +8688,7 @@ pub(crate) mod native {
             work_deadline,
             None,
             super::GuardianReleaseWaitScope::ExistingCaseSelection,
+            None,
         )
     }
 
@@ -8606,6 +8699,7 @@ pub(crate) mod native {
         work_deadline: Instant,
         cleanup: Option<Instant>,
         guardian_release_wait: super::GuardianReleaseWaitScope,
+        failure_capture: Option<&mut crate::windows_installed_cases::LaterFailureCapture>,
     ) -> Result<()> {
         let baseline = GuardianBaseline::quiescent(
             &config.installed_agent.path,
@@ -8613,7 +8707,7 @@ pub(crate) mod native {
             &config.installed_agent.sha256,
             &config.installed_manifest.sha256,
         )?;
-        execute_with_baseline_clocks(
+        execute_with_diagnostic_capture(
             config,
             input,
             record,
@@ -8630,6 +8724,7 @@ pub(crate) mod native {
                 projection_observation: None,
                 private_custody: None,
             },
+            failure_capture,
         )
     }
 
@@ -8776,7 +8871,33 @@ pub(crate) mod native {
         baseline: GuardianBaseline,
         excluded: Vec<GuardianAssociationIdentity>,
         excluded_fixture: Option<HeldFixtureExclusion>,
+        clocks: ExecutionClocks,
+    ) -> Result<()> {
+        execute_with_diagnostic_capture(
+            config,
+            input,
+            record,
+            baseline,
+            excluded,
+            excluded_fixture,
+            clocks,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "optional diagnostic sink is separate"
+    )]
+    fn execute_with_diagnostic_capture(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &CaseInput,
+        record: &mut CaseAssessment,
+        baseline: GuardianBaseline,
+        excluded: Vec<GuardianAssociationIdentity>,
+        excluded_fixture: Option<HeldFixtureExclusion>,
         mut clocks: ExecutionClocks,
+        failure_capture: Option<&mut crate::windows_installed_cases::LaterFailureCapture>,
     ) -> Result<()> {
         record.contract.execution =
             crate::windows_readiness_policy::ExecutionDisposition::Unvalidated;
@@ -8872,6 +8993,7 @@ pub(crate) mod native {
                 excluded,
                 excluded_fixture,
                 clocks,
+                failure_capture,
             );
             let finalized = match registry {
                 Some(owner) => match owner.lock() {
@@ -8896,6 +9018,10 @@ pub(crate) mod native {
         finalize_case_attempt(record, attempt)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "optional diagnostic sink is separate"
+    )]
     fn execute_with_registry(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &CaseInput,
@@ -8904,6 +9030,7 @@ pub(crate) mod native {
         excluded: Vec<GuardianAssociationIdentity>,
         excluded_fixture: Option<HeldFixtureExclusion>,
         mut clocks: ExecutionClocks,
+        mut failure_capture: Option<&mut crate::windows_installed_cases::LaterFailureCapture>,
     ) -> Result<()> {
         let work_deadline = clocks.work;
         let work_budget = work_deadline
@@ -9526,6 +9653,9 @@ pub(crate) mod native {
         let broker_observation = Arc::new(Mutex::new(None::<io::Result<(u32, u64)>>));
         let spawn_observation = Arc::clone(&broker_observation);
         let callback_broker = Arc::clone(&broker_observation);
+        let argv_path_was_vacant = reduced_compiler_toolchain(&input.key)
+            && fs::symlink_metadata(input.descriptor.output_root.join("native-argv.json"))
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
         let reduced_startup_begin =
             reduced_compiler_toolchain(&input.key).then(native_uptime_millis);
         let output = memcordon_testkit::run_until_owned_spawn_with_io_output_limit_outcome(
@@ -12200,12 +12330,15 @@ pub(crate) mod native {
                         observed_status: observed_status.and_then(|status| status.code()),
                         cleanup_status: termination.and_then(|status| status.code()),
                     };
+                    let mut original_argv = None;
                     let comparison = reduced_startup_comparison(
                         config,
                         input,
                         &public_report,
                         original_frontend,
                         window,
+                        argv_path_was_vacant,
+                        &mut original_argv,
                         work_deadline,
                     );
                     let evidence = match comparison {
@@ -12218,6 +12351,7 @@ pub(crate) mod native {
                             "reason": crate::command::bounded_excerpt(error.to_string().as_bytes()),
                         })),
                     };
+                    let evidence = super::retain_original_argv_observation(evidence, original_argv);
                     if let Some(evidence) = evidence {
                         let publication = serde_json::to_vec(&evidence)
                             .map_err(CiError::from)
@@ -12226,7 +12360,13 @@ pub(crate) mod native {
                                     &report.with_extension("reduced-startup-comparison.json"),
                                     &bytes,
                                 )
-                                .map(drop)
+                                .map(|protected| {
+                                    drop(protected);
+                                    // Use only the value just serialized and verified by publication.
+                                    if let Some(capture) = failure_capture.as_deref_mut() {
+                                        capture.record_published(&evidence);
+                                    }
+                                })
                                 .map_err(CiError::from)
                             });
                         if let Err(error) = publication {
@@ -14926,6 +15066,9 @@ pub(crate) mod native {
         assessments: &mut Vec<CaseAssessment>,
         work_deadline: Instant,
         diagnostic_deadlines: Option<crate::windows_installed_cases::WindowsLeaseDeadlines>,
+        mut failure_subject: Option<
+            &mut Option<crate::windows_installed_cases::LaterFailureSubject>,
+        >,
     ) -> Result<()> {
         let input: SuiteInput = serde_json::from_slice(&read(input_path, 4 * 1024 * 1024)?)?;
         validate_suite(&input)?;
@@ -15004,6 +15147,9 @@ pub(crate) mod native {
                     .digest()
                     .map_err(|error| CiError::Message(error.to_string()))?,
             ));
+            let mut capture = failure_subject
+                .as_ref()
+                .map(|_| crate::windows_installed_cases::LaterFailureCapture::default());
             if let Err(error) = execute_until_with_cleanup(
                 config,
                 &execution,
@@ -15011,7 +15157,16 @@ pub(crate) mod native {
                 work_deadline,
                 diagnostic_deadlines.map(|deadlines| deadlines.cleanup),
                 super::GuardianReleaseWaitScope::MandatoryPositiveSuite,
+                capture.as_mut(),
             ) {
+                if assessment.retirement.is_ok()
+                    && !crate::work_outcome::has_unresolved_owner(&error)
+                    && let Some(destination) = failure_subject.take()
+                {
+                    *destination = capture.and_then(
+                        crate::windows_installed_cases::LaterFailureCapture::into_subject,
+                    );
+                }
                 let error = error.context(format!(
                     "Windows required case {}/{} failed after original case cleanup",
                     case.key.family, case.key.scenario

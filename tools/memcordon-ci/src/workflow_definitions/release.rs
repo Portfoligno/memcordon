@@ -26209,10 +26209,7 @@ fn node_811() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-extract"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    values.insert(
-        text("run"),
-        text("tar -xzf .release/test-tools/test-tools.tar.gz"),
-    );
+    values.insert(text("run"), text("tar -xzf .release/test-tools/test-tools.tar.gz target/ci-runtime/current target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -26904,10 +26901,7 @@ fn node_760() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-extract"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    values.insert(
-        text("run"),
-        text("tar -xzf .release/test-tools/test-tools.tar.gz"),
-    );
+    values.insert(text("run"), text("tar -xzf .release/test-tools/test-tools.tar.gz target/ci-runtime/current target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -27599,10 +27593,7 @@ fn node_709() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-extract"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    values.insert(
-        text("run"),
-        text("tar -xzf .release/test-tools/test-tools.tar.gz"),
-    );
+    values.insert(text("run"), text("tar -xzf .release/test-tools/test-tools.tar.gz target/ci-runtime/current target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -28294,10 +28285,7 @@ fn node_658() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-extract"));
     values.insert(text("timeout-minutes"), Value::Number(15.into()));
-    values.insert(
-        text("run"),
-        text("tar -xzf .release/test-tools/test-tools.tar.gz"),
-    );
+    values.insert(text("run"), text("tar -xzf .release/test-tools/test-tools.tar.gz target/ci-runtime/current target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 

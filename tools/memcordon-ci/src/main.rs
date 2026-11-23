@@ -85,6 +85,8 @@ enum TopLevel {
 #[derive(Subcommand)]
 enum CiCommand {
     #[cfg(windows)]
+    ObserveWindowsApplicationError,
+    #[cfg(windows)]
     AccessFailureProbe {
         #[arg(long)]
         output: PathBuf,
@@ -270,6 +272,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     #[cfg(windows)]
     match &cli.command {
+        Some(TopLevel::Ci {
+            command: CiCommand::ObserveWindowsApplicationError,
+        }) => {
+            memcordon_ci::windows_application_error_observer::report_stdin();
+            return Ok(());
+        }
         Some(TopLevel::ProviderCatalogPreparation) => {
             return memcordon_ci::windows_provider_catalog::child().map_err(CiError::from);
         }
@@ -348,6 +356,8 @@ fn run() -> Result<()> {
             memcordon_ci::linux_snapshot_probe::run(&input, &output)
         }
         Some(TopLevel::Ci { command }) => match command {
+            #[cfg(windows)]
+            CiCommand::ObserveWindowsApplicationError => Ok(()),
             #[cfg(windows)]
             CiCommand::AccessFailureProbe { .. } => {
                 unreachable!("calibration dispatched before workflow setup")

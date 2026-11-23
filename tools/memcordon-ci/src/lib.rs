@@ -19,8 +19,11 @@ pub mod linux_source_substitution;
 pub mod linux_transaction_trace;
 pub mod snapshot_copy_contract;
 pub mod storage_observation;
+pub(crate) mod windows_application_error_status;
 
 pub mod windows_access_failure_probe;
+#[cfg(windows)]
+pub mod windows_application_error_observer;
 pub mod windows_component_diagnostics;
 pub mod windows_component_retention;
 pub mod windows_fixture_inventory;

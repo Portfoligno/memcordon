@@ -1,4 +1,7 @@
 //! Direct release operations selected by the maintainer's existing tag.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use std::io::Write;
+
 pub mod artifacts;
 pub mod bundle;
 pub mod compatibility;
@@ -353,7 +356,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::InstalledLinuxSetup(arguments) => {
             linux_installed_tests::run_privileged(root, &arguments)
         }
-        ReleaseCommand::TestInstalled(arguments) => installed_tests::run(root, &arguments),
+        ReleaseCommand::TestInstalled(arguments) => run_installed_test(root, &arguments),
         ReleaseCommand::TestComponents { diagnostics } => component_tests::run(root, &diagnostics),
         ReleaseCommand::BuildNativePayload {
             build_source,
@@ -827,4 +830,31 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_installed_test(root: &Path, arguments: &installed_tests::InstalledTestArgs) -> Result<()> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    if crate::windows_application_error_status::selected_candidate_native_x64_lane(
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+        std::env::var("GITHUB_WORKFLOW").ok().as_deref(),
+        std::env::var("GITHUB_REPOSITORY").ok().as_deref(),
+        std::env::var("GITHUB_JOB").ok().as_deref(),
+        arguments.delivery == installed_tests::Delivery::CandidateNative,
+    ) {
+        let mut subject = None;
+        let result = installed_tests::run_with_later_failure_subject(root, arguments, &mut subject);
+        if result.is_err() {
+            let status = subject.as_ref().map_or(
+                crate::windows_application_error_status::ObserverStatus::ReceiptAbsent,
+                crate::windows_application_error_observer::observe_after_cleanup,
+            );
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "windows-application-error-observer: status={}",
+                status.token()
+            );
+        }
+        return result;
+    }
+    installed_tests::run(root, arguments)
 }

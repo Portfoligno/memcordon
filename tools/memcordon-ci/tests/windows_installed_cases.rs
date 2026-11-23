@@ -782,6 +782,18 @@ fn complete_installed_assessment()
 }
 
 #[test]
+fn positive_barrier_error_and_unexecuted_smoke_are_reported_separately() {
+    let mut assessment = complete_installed_assessment();
+    assessment.positive_suite = Err("original callback failed".into());
+    assessment.public_smoke_before = Err("public smoke before was not executed".into());
+    assert!(!assessment.accepted());
+    assert_eq!(
+        assessment.failure_summary(),
+        r#"actual installed Windows case or retirement failed; positive readiness: Err("original callback failed"); public smoke before: Err("public smoke before was not executed"); upgrade: Ok(()); uninstall: Ok(())"#
+    );
+}
+
+#[test]
 fn scoped_unavailability_never_replaces_independent_installed_obligations() {
     use memcordon_ci::windows_installed_cases::InstalledWindowsAssessment;
     let assessment = complete_installed_assessment();

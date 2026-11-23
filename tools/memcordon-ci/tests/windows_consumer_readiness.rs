@@ -5075,3 +5075,49 @@ fn reduced_compiler_receipt_binds_token_challenge_and_both_access_results() {
         );
     }
 }
+
+#[test]
+fn original_argv_path_does_not_identify_the_writer_or_prove_entry() {
+    use memcordon_ci::windows_consumer_readiness::original_argv_path_observation as observe;
+    let expected = br#"{"encoding":"windows_utf16","values":[]}"#;
+    let matching = observe(true, &[], || Ok(Some(expected.to_vec())));
+    assert_eq!(
+        matching["state"],
+        "matching-bytes-at-previously-vacant-path"
+    );
+    let unverified = observe(false, &[], || panic!("must not credit a preexisting path"));
+    assert_eq!(unverified["state"], "prelaunch-vacancy-unverified");
+    let missing = observe(true, &[], || Ok(None));
+    assert_eq!(missing["state"], "absent");
+    let wrong = observe(true, &["other".into()], || Ok(Some(expected.to_vec())));
+    assert_eq!(wrong["state"], "different-bytes");
+    let malformed = observe(true, &[], || Ok(Some(b"{".to_vec())));
+    assert_eq!(malformed["state"], "malformed-json");
+    let unreadable = observe(true, &[], || Err(std::io::Error::other("unavailable")));
+    assert_eq!(
+        unreadable["state"],
+        "unreadable-or-not-bounded-regular-file"
+    );
+    for result in [matching, unverified, missing, wrong, malformed, unreadable] {
+        assert_eq!(result["writer_identity"], "unverified");
+        assert_eq!(result["fixture_entry"], "unknown");
+        assert_eq!(result["failing_initializer"], "unknown");
+        assert_eq!(result["acceptance_authority"], false);
+    }
+}
+
+#[test]
+fn original_argv_observation_survives_missing_or_failed_comparison() {
+    use memcordon_ci::windows_consumer_readiness::retain_original_argv_observation as retain;
+    use serde_json::json;
+    for comparison in [
+        None,
+        Some(json!({"state":"unavailable"})),
+        Some(json!({"state":"same-native-startup-status"})),
+    ] {
+        let observation = json!({"path_observation":{"fixture_entry":"unknown"}});
+        let report = retain(comparison.clone(), Some(observation.clone())).unwrap();
+        assert_eq!(report["original_case_argv_path"], observation);
+        assert_eq!(retain(comparison.clone(), None), comparison);
+    }
+}

@@ -1382,6 +1382,17 @@ pub fn run_materialized_channel_until(
     work: std::time::Instant,
     cleanup: std::time::Instant,
 ) -> Result<()> {
+    run_materialized_channel_with_failure_subject(root, payload, output, work, cleanup, None)
+}
+
+pub(crate) fn run_materialized_channel_with_failure_subject(
+    root: &Path,
+    payload: &MaterializedPayload,
+    output: &Path,
+    work: std::time::Instant,
+    cleanup: std::time::Instant,
+    failure_subject: Option<&mut Option<crate::windows_installed_cases::LaterFailureSubject>>,
+) -> Result<()> {
     require_current_runtime(payload)?;
     fs::create_dir(output)?;
     crate::preparation::with_operation(
@@ -1487,20 +1498,16 @@ pub fn run_materialized_channel_until(
         )?;
         fs::create_dir_all(&config.output_directory)?;
         let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::new(work, cleanup)?;
-        let assessment = crate::windows_installed_cases::run_from_source_with_observer_until(
+        let assessment = crate::windows_installed_cases::run_from_source_with_failure_subject(
             root,
             &config,
             &mut |_| Ok(()),
             deadlines,
+            failure_subject,
         )?;
         source::write_json(&output.join("windows-assessment.json"), &assessment)?;
         if !assessment.accepted() {
-            return Err(CiError::Message(format!(
-                "actual installed Windows case or retirement failed; install/smoke: {:?}; upgrade: {:?}; uninstall: {:?}",
-                assessment.public_smoke_before,
-                assessment.package_upgrade,
-                assessment.package_uninstall,
-            )));
+            return Err(CiError::Message(assessment.failure_summary()));
         }
     } else if matches!(
         runtime,

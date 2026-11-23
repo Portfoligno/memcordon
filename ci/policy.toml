@@ -321,6 +321,7 @@ allowed_run_commands = [
   "tar -xf target/ci/private-transfer/private-prepared.tar",
   "tar -xzf .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz -C .release/rehearsal-tool",
   "tar -xzf .release/test-tools/test-tools.tar.gz",
+  "tar -xzf .release/test-tools/test-tools.tar.gz target/ci-runtime/current target/ci-preparation/test-tools.json",
   "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool",
   "tar -xzf target/ci/fuzz-setup-download/fuzz-setup.tar.gz -C .",
   "tar -xzf target/ci/release-fuzz-download/release-fuzz-setup.tar.gz -C .",

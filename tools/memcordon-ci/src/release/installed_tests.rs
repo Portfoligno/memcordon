@@ -158,6 +158,24 @@ impl InstalledTestArgs {
 }
 
 pub fn run(root: &Path, args: &InstalledTestArgs) -> Result<()> {
+    run_inner(root, args, None)
+}
+
+/// Opt-in receipt for the selected Windows candidate, separate from the test result.
+pub fn run_with_later_failure_subject(
+    root: &Path,
+    args: &InstalledTestArgs,
+    subject: &mut Option<crate::windows_installed_cases::LaterFailureSubject>,
+) -> Result<()> {
+    *subject = None;
+    run_inner(root, args, Some(subject))
+}
+
+fn run_inner(
+    root: &Path,
+    args: &InstalledTestArgs,
+    failure_subject: Option<&mut Option<crate::windows_installed_cases::LaterFailureSubject>>,
+) -> Result<()> {
     args.validate()?;
     let cleanup = Instant::now() + Duration::from_secs(150 * 60);
     let work = cleanup - Duration::from_secs(15 * 60);
@@ -262,12 +280,21 @@ pub fn run(root: &Path, args: &InstalledTestArgs) -> Result<()> {
         payload.source.version()
     );
     let output = session.path().join("cases");
+    let mut observed_subject = None;
+    let observe = failure_subject.is_some()
+        && args.delivery == Delivery::CandidateNative
+        && payload.distribution.target == "x86_64-pc-windows-msvc";
     let result = crate::preparation::with_operation(
         crate::failure_mode::FailureMode::StopAfterFailure,
         cleanup,
         || {
-            installed_consumer::run_materialized_channel_until(
-                root, &payload, &output, work, cleanup,
+            installed_consumer::run_materialized_channel_with_failure_subject(
+                root,
+                &payload,
+                &output,
+                work,
+                cleanup,
+                observe.then_some(&mut observed_subject),
             )
         },
     );
@@ -287,5 +314,15 @@ pub fn run(root: &Path, args: &InstalledTestArgs) -> Result<()> {
     {
         eprintln!("optional installed raw diagnostics unavailable: {error}");
     }
-    cancellation.finish(result)
+    let result = cancellation.finish(result);
+    if let Some(destination) = failure_subject
+        && result.as_ref().is_err_and(|error| {
+            !matches!(error, CiError::SettledCancellation(_))
+                && !crate::work_outcome::has_unresolved_owner(error)
+        })
+        && crate::cancellation::observed().is_none()
+    {
+        *destination = observed_subject;
+    }
+    result
 }
