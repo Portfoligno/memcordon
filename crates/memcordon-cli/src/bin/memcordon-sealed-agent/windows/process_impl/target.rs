@@ -145,6 +145,13 @@ impl SuspendedTarget {
             .map(TargetDesktopLease::owner_binding)
     }
 
+    pub fn desktop_retirement_authority(&self) -> Result<Option<DesktopHolderRetirement>, String> {
+        self._desktop_lease
+            .as_ref()
+            .map(TargetDesktopLease::duplicate_retirement_authority)
+            .transpose()
+    }
+
     pub fn launch_gate_handle(&self) -> HANDLE {
         self.thread.raw()
     }

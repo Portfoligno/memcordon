@@ -1684,6 +1684,87 @@ fn desktop_holder_wait_error(stage: &str, result: u32) -> String {
 #[path = "../../../../../tests/sealed_agent/windows_desktop_retirement.rs"]
 mod desktop_retirement_tests;
 
+pub struct DesktopHolderRetirement {
+    job: OwnedHandle,
+    process: OwnedHandle,
+    identity: WindowsProcessIdentityV1,
+    binding_sha256: String,
+}
+
+impl DesktopHolderRetirement {
+    pub fn close_for_retirement(self) -> Result<(), String> {
+        let process_result = self.process.close_for_retirement();
+        let job_result = self.job.close_for_retirement();
+        process_result?;
+        job_result
+    }
+
+    pub fn retire_extinct(
+        &self,
+        expected_identity: &WindowsProcessIdentityV1,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if self.binding_sha256.is_empty() || &self.identity != expected_identity {
+            return Err("worker-retirement: desktop-holder-identity-mismatch".to_owned());
+        }
+        if process_identity(self.process.raw())? != self.identity {
+            return Err("worker-retirement: desktop-holder-handle-mismatch".to_owned());
+        }
+        // SAFETY: self.job is a live duplicated handle with JOB_OBJECT_TERMINATE
+        // rights to the extinct worker's desktop bootstrap holder Job.
+        if unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(
+                self.job.raw(),
+                TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "worker-retirement: desktop-holder-terminate-failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(5));
+        let wait_ms = u32::try_from(remaining.as_millis()).unwrap_or(5_000).max(1);
+        // SAFETY: self.process is a live duplicated handle with SYNCHRONIZE rights.
+        let wait = unsafe { WaitForSingleObject(self.process.raw(), wait_ms) };
+        if wait != WAIT_OBJECT_0 {
+            return Err("worker-retirement: desktop-holder-live".to_owned());
+        }
+        if process_identity(self.process.raw())? != self.identity {
+            return Err("worker-retirement: desktop-holder-post-exit-mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn duplicate_non_inheritable_with_access(
+    handle: HANDLE,
+    access: u32,
+) -> Result<OwnedHandle, String> {
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: source handle is live in the current process and output receives
+    // a non-inheritable duplicate with the requested rights.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &raw mut duplicate,
+            access,
+            0,
+            0,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error().to_string())
+    } else {
+        OwnedHandle::new(duplicate)
+    }
+}
+
 impl TargetDesktopLease {
     pub(super) fn owner_binding(&self) -> (WindowsProcessIdentityV1, String, u64, u64) {
         (
@@ -1692,6 +1773,27 @@ impl TargetDesktopLease {
             self.bootstrap_job.handle() as usize as u64,
             self.bootstrap_process.raw() as usize as u64,
         )
+    }
+
+    pub(super) fn duplicate_retirement_authority(&self) -> Result<DesktopHolderRetirement, String> {
+        use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+        let job = duplicate_non_inheritable_with_access(
+            self.bootstrap_job.handle(),
+            JOB_OBJECT_TERMINATE | JOB_OBJECT_QUERY,
+        )?;
+        let process = duplicate_non_inheritable_with_access(
+            self.bootstrap_process.raw(),
+            SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION,
+        )?;
+        if process_identity(process.raw())? != self.bootstrap_identity {
+            return Err("desktop bootstrap holder duplicate identity mismatch".to_owned());
+        }
+        Ok(DesktopHolderRetirement {
+            job,
+            process,
+            identity: self.bootstrap_identity.clone(),
+            binding_sha256: self.holder_binding.binding_sha256.clone(),
+        })
     }
 
     pub(super) fn close_checked(&mut self) -> Result<(), String> {

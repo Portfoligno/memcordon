@@ -499,6 +499,21 @@ pub(super) struct GuardianSlotLeaseV1 {
     phase: &'static str,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuardianSlotLeaseDiskV1 {
+    schema_version: u32,
+    slot_index: usize,
+    #[allow(dead_code)]
+    service_name: String,
+    attempt_id: String,
+    #[allow(dead_code)]
+    nonce_sha256: String,
+    launcher_identity: WindowsProcessIdentityV1,
+    #[allow(dead_code)]
+    phase: String,
+}
+
 impl GuardianSlotLease {
     fn bind(
         &mut self,
@@ -714,6 +729,77 @@ pub fn retire_handed_off_guardian(
     // outside the registry lock because the slot destructor removes its entry.
     drop(retired);
     Ok(())
+}
+
+/// Supervisor-owned retirement for a guardian slot whose owning worker thread
+/// exited abnormally without running `GuardianSlotLease::drop`. Fails closed
+/// unless a unique `None` slot entry matches the durable slot file's
+/// `attempt_id` and `launcher_identity`, the SCM slot service is `STOPPED` with
+/// PID 0, and the guardian process identity is no longer live.
+pub fn retire_orphaned_guardian_slot(
+    attempt_id: &str,
+    guardian: &WindowsProcessIdentityV1,
+    launcher: &WindowsProcessIdentityV1,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut slots = loop {
+        match LEASED_GUARDIAN_SLOTS.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("guardian-slot: registry-poisoned".to_owned());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err("guardian-slot: registry-unavailable".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    let mut matches = Vec::new();
+    for (&index, owner) in slots.iter() {
+        if owner.is_some() {
+            continue;
+        }
+        let path = super::package::state_root()
+            .join("guardian-slots")
+            .join(format!("{index:03}.json"));
+        let bytes = match super::record::read_record_bounded(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("guardian-slot: read-failed: {error}")),
+        };
+        let parsed: GuardianSlotLeaseDiskV1 = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("guardian-slot: parse-failed: {error}"))?;
+        if parsed.schema_version == 1
+            && parsed.slot_index == index
+            && parsed.attempt_id == attempt_id
+            && &parsed.launcher_identity == launcher
+        {
+            matches.push((index, path));
+        }
+    }
+    match matches.len() {
+        0 => Ok(()),
+        1 => {
+            let (index, path) = matches.remove(0);
+            let name = super::security::guardian_slot_name(index)?;
+            let manager = super::service_manager::manager_connect()?;
+            let service = super::service_manager::open(&manager, &name, SERVICE_QUERY_STATUS)?;
+            let status = super::service_manager::status_process(&service)?;
+            if status.dwCurrentState != SERVICE_STOPPED || status.dwProcessId != 0 {
+                return Err("guardian-slot: service-live".to_owned());
+            }
+            if super::record::process_identity_is_live(guardian.clone())? {
+                return Err("guardian-slot: guardian-live".to_owned());
+            }
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("guardian-slot: remove-failed: {error}"))?;
+            slots.remove(&index);
+            Ok(())
+        }
+        _ => Err("guardian-slot: multiple-matching-slots".to_owned()),
+    }
 }
 
 pub(super) fn acquire_guardian_slot() -> Result<GuardianSlotLease, String> {

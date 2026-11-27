@@ -722,6 +722,8 @@ struct ActiveJob {
     worker_thread: memcordon_core::WindowsWorkerThreadIdentityV1,
     job: JobView,
     authenticated_primary: OwnedHandle,
+    desktop_holder: Option<super::process::DesktopHolderRetirement>,
+    control_connection: Option<OwnedHandle>,
 }
 
 struct JobView(OwnedHandle);
@@ -918,38 +920,113 @@ pub(super) fn attempt_job_registration_is_absent(attempt_id: &str) -> Result<boo
     Ok(!jobs.iter().any(|active| active.attempt_id == attempt_id))
 }
 
-/// Supervisor-owned cleanup for an active Job registration whose owning worker
-/// thread exited abnormally without running stack destructors. Fails closed
-/// unless the exact registered worker thread is proved extinct and the Job has
-/// zero active processes.
-pub(super) fn retire_extinct_worker_job_registration(
+pub(super) enum ExtinctWorkerRetirement {
+    Retired,
+    AlreadyAbsent,
+}
+
+fn lock_active_jobs_until(
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'static, Vec<ActiveJob>>, String> {
+    loop {
+        match ACTIVE_JOBS.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("worker-retirement: registry-poisoned".to_owned());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err("worker-retirement: registry-unavailable".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn attach_worker_loss_authority(
     attempt_id: &str,
     expected_worker_thread: memcordon_core::WindowsWorkerThreadIdentityV1,
-) -> Result<bool, String> {
-    if !super::record::worker_thread_is_extinct(expected_worker_thread)? {
-        return Ok(false);
-    }
+    desktop_holder: Option<super::process::DesktopHolderRetirement>,
+    control_connection: OwnedHandle,
+) -> Result<(), String> {
     let mut jobs = ACTIVE_JOBS
         .lock()
         .map_err(|_| "active Job registry is poisoned".to_owned())?;
+    let active = jobs
+        .iter_mut()
+        .find(|active| {
+            active.attempt_id == attempt_id && active.worker_thread == expected_worker_thread
+        })
+        .ok_or_else(|| "active Job registration is missing for worker-loss authority".to_owned())?;
+    active.desktop_holder = desktop_holder;
+    active.control_connection = Some(control_connection);
+    Ok(())
+}
+
+/// Supervisor-owned cleanup for an active Job registration whose owning worker
+/// thread exited abnormally without running stack destructors. Fails closed
+/// unless the exact registered worker thread is proved extinct, the Job has
+/// zero active processes, and any desktop bootstrap holder recorded in the
+/// frozen manifest is independently retired and verified exited.
+pub(super) fn retire_extinct_worker_capabilities(
+    attempt_id: &str,
+    expected_worker_thread: memcordon_core::WindowsWorkerThreadIdentityV1,
+    manifest: &memcordon_core::WindowsCapabilityOwnerManifestV2,
+    deadline: Instant,
+) -> Result<ExtinctWorkerRetirement, String> {
+    if !super::record::worker_thread_is_extinct(expected_worker_thread)? {
+        return Err("worker-retirement: worker-thread-live".to_owned());
+    }
+    let mut jobs = lock_active_jobs_until(deadline)?;
     let Some(index) = jobs
         .iter()
         .position(|active| active.attempt_id == attempt_id)
     else {
-        return Ok(true);
+        return Ok(ExtinctWorkerRetirement::AlreadyAbsent);
     };
     if jobs[index].worker_thread != expected_worker_thread {
-        return Ok(false);
+        return Err("worker-retirement: thread-mismatch".to_owned());
     }
-    if jobs[index].job.active_processes()? != 0 {
-        return Ok(false);
+    let active_count = jobs[index].job.active_processes()?;
+    if active_count != 0 {
+        return Err(format!(
+            "worker-retirement: job-not-empty count={active_count}"
+        ));
+    }
+    let desktop_manifest_entry = manifest.entries.iter().find(|entry| {
+        entry.role == memcordon_core::WindowsCapabilityOwnerRoleV2::DesktopBootstrapProcess
+    });
+    if let Some(entry) = desktop_manifest_entry.filter(|entry| entry.present) {
+        let Some(expected_identity) = entry.process_identity.as_ref() else {
+            return Err("worker-retirement: desktop-holder-manifest-identity-missing".to_owned());
+        };
+        if entry.capability_binding_sha256.is_none() {
+            return Err("worker-retirement: desktop-holder-manifest-binding-missing".to_owned());
+        }
+        let Some(holder) = jobs[index].desktop_holder.as_ref() else {
+            return Err("worker-retirement: desktop-holder-unregistered".to_owned());
+        };
+        holder.retire_extinct(expected_identity, deadline)?;
+    }
+    if let Some(connection) = jobs[index].control_connection.as_ref() {
+        let _ = pipe::disconnect(connection.raw());
     }
     let active = jobs.remove(index);
     drop(jobs);
     let token_result = active.authenticated_primary.close_for_retirement();
     let job_result = active.job.0.close_for_retirement();
+    let holder_result = active.desktop_holder.map_or(
+        Ok(()),
+        super::process::DesktopHolderRetirement::close_for_retirement,
+    );
+    let connection_result = active
+        .control_connection
+        .map_or(Ok(()), OwnedHandle::close_for_retirement);
     token_result?;
-    job_result.map(|()| true)
+    job_result?;
+    holder_result?;
+    connection_result.map(|()| ExtinctWorkerRetirement::Retired)
 }
 
 fn enter_settlement_for_attempt(
@@ -2755,6 +2832,8 @@ fn launch_attempt(
             worker_thread,
             job: JobView(active_handle),
             authenticated_primary: active_primary,
+            desktop_holder: None,
+            control_connection: None,
         });
     let registration = ActiveRegistration(Some(request.attempt_id.clone()));
     let mut process_observer = match ProcessObserver::new(ProcessObservationPolicyV1::SERVICE) {
@@ -3606,6 +3685,26 @@ fn launch_attempt(
         memcordon_core::BoundarySetupPhase::Authorization,
     ) {
         retire_preauthorization_with_target!(failure);
+    }
+    let desktop_holder_authority = match target.desktop_retirement_authority() {
+        Ok(authority) => authority,
+        Err(detail) => {
+            retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
+        }
+    };
+    let control_connection_dup = match super::process::duplicate_owned(connection) {
+        Ok(dup) => dup,
+        Err(detail) => {
+            retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
+        }
+    };
+    if let Err(detail) = attach_worker_loss_authority(
+        &request.attempt_id,
+        worker_thread,
+        desktop_holder_authority,
+        control_connection_dup,
+    ) {
+        retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
     }
     let owner_manifest = build_live_owner_manifest(
         &cleanup_guard.record,
@@ -6230,8 +6329,17 @@ impl ActiveRegistration {
         drop(jobs);
         let token_result = active.authenticated_primary.close_for_retirement();
         let job_result = active.job.0.close_for_retirement();
+        let holder_result = active.desktop_holder.map_or(
+            Ok(()),
+            super::process::DesktopHolderRetirement::close_for_retirement,
+        );
+        let connection_result = active
+            .control_connection
+            .map_or(Ok(()), OwnedHandle::close_for_retirement);
         token_result?;
-        job_result
+        job_result?;
+        holder_result?;
+        connection_result
     }
 }
 

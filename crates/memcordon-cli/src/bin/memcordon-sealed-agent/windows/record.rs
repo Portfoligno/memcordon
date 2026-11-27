@@ -3514,7 +3514,7 @@ pub fn recover_attempt_for_caller(
                     if !guardian_receipt_binds_record(&guardian, &record)? {
                         return Err("exact recovery pending checked closure: guardian receipt does not bind original record".to_owned());
                     }
-                    if !reconcile_extinct_local_worker_before_recovery(
+                    match reconcile_extinct_local_worker_before_recovery(
                         &path,
                         attempt_id,
                         nonce,
@@ -3523,20 +3523,35 @@ pub fn recover_attempt_for_caller(
                         &guardian,
                         &mut record,
                     )? {
-                        if let Some(blocker) = frozen_manifest_owner_blocker(&record)? {
-                            return Err(format!(
-                                "exact recovery pending checked closure: {blocker}"
-                            ));
+                        ExtinctWorkerReconciliation::TerminalOutboxPresent => {}
+                        reconciliation => {
+                            if let Some(blocker) = frozen_manifest_owner_blocker(&record)? {
+                                return Err(format!(
+                                    "exact recovery pending checked closure: {blocker}"
+                                ));
+                            }
+                            super::process::retire_handed_off_guardian(
+                                attempt_id,
+                                &guardian.guardian_identity,
+                            )?;
+                            if let ExtinctWorkerReconciliation::ExtinctWorkerRetired {
+                                launcher_identity,
+                            } = reconciliation
+                            {
+                                super::process::retire_orphaned_guardian_slot(
+                                    attempt_id,
+                                    &guardian.guardian_identity,
+                                    &launcher_identity,
+                                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                                )?;
+                            }
+                            stage_recovered_closure(
+                                &mut record,
+                                &caller.current_boot_identity,
+                                Some(&guardian),
+                            )?;
+                            super::launcher_service::retire_relay_retirement_event(attempt_id)?;
                         }
-                        super::process::retire_handed_off_guardian(
-                            attempt_id,
-                            &guardian.guardian_identity,
-                        )?;
-                        stage_recovered_closure(
-                            &mut record,
-                            &caller.current_boot_identity,
-                            Some(&guardian),
-                        )?;
                     }
                 } else {
                     if record.job_closure_contract.is_some() {
@@ -3750,13 +3765,21 @@ fn frozen_manifest_owner_blocker(
     Ok(None)
 }
 
+enum ExtinctWorkerReconciliation {
+    NotLocalExtinctWorker,
+    TerminalOutboxPresent,
+    ExtinctWorkerRetired {
+        launcher_identity: WindowsProcessIdentityV1,
+    },
+}
+
 /// Supervisor-owned reconciliation for an extinct per-attempt worker thread in
 /// the current launcher process. Verifies exact worker identity extinction,
 /// drains any in-flight durable-state publication on the attempt's local writer
 /// lane and reloads the durable record, and only then retires the leaked active
-/// Job registration after proving the Job has zero active processes.
-/// Returns `Ok(true)` if the post-drain durable record already has a terminal
-/// outbox. Fails closed if any check is uncertain.
+/// Job registration, desktop bootstrap holder, and control pipe duplicate after
+/// proving the Job has zero active processes and the holder has exited. Fails
+/// closed if any check is uncertain.
 fn reconcile_extinct_local_worker_before_recovery(
     path: &Path,
     attempt_id: &str,
@@ -3765,19 +3788,19 @@ fn reconcile_extinct_local_worker_before_recovery(
     caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
     guardian: &memcordon_core::WindowsGuardianReceiptV2,
     record: &mut WindowsAttemptRecordV1,
-) -> Result<bool, String> {
+) -> Result<ExtinctWorkerReconciliation, String> {
     // SAFETY: GetCurrentProcess returns the current launcher service pseudo-handle.
     let current_process = super::process::process_identity(unsafe {
         windows_sys::Win32::System::Threading::GetCurrentProcess()
     })?;
     if record.worker_identity.as_ref() != Some(&current_process) {
-        return Ok(false);
+        return Ok(ExtinctWorkerReconciliation::NotLocalExtinctWorker);
     }
     let Some(worker_thread) = record.worker_thread_identity else {
-        return Ok(false);
+        return Ok(ExtinctWorkerReconciliation::NotLocalExtinctWorker);
     };
     if !worker_thread_is_extinct(worker_thread)? {
-        return Ok(false);
+        return Ok(ExtinctWorkerReconciliation::NotLocalExtinctWorker);
     }
     super::attempt_store::wait_for_pending(attempt_id)?;
     let refreshed_bytes = read_record_bounded(path).map_err(|error| error.to_string())?;
@@ -3795,11 +3818,24 @@ fn reconcile_extinct_local_worker_before_recovery(
     }
     *record = refreshed;
     if record.terminal_response_json.is_some() {
-        return Ok(true);
+        return Ok(ExtinctWorkerReconciliation::TerminalOutboxPresent);
     }
-    let _ =
-        super::launcher_service::retire_extinct_worker_job_registration(attempt_id, worker_thread)?;
-    Ok(false)
+    let manifest = record
+        .owner_manifest
+        .as_ref()
+        .ok_or_else(|| "live recovery has no frozen owner manifest".to_owned())?;
+    match super::launcher_service::retire_extinct_worker_capabilities(
+        attempt_id,
+        worker_thread,
+        manifest,
+        std::time::Instant::now() + std::time::Duration::from_secs(8),
+    )? {
+        super::launcher_service::ExtinctWorkerRetirement::Retired
+        | super::launcher_service::ExtinctWorkerRetirement::AlreadyAbsent => {}
+    }
+    Ok(ExtinctWorkerReconciliation::ExtinctWorkerRetired {
+        launcher_identity: current_process,
+    })
 }
 
 pub(super) fn worker_thread_is_extinct(
@@ -6724,7 +6760,7 @@ fn require_live_guardian(
     }
 }
 
-fn process_identity_is_live(expected: WindowsProcessIdentityV1) -> Result<bool, String> {
+pub(super) fn process_identity_is_live(expected: WindowsProcessIdentityV1) -> Result<bool, String> {
     observe_process_liveness(expected).map(|observation| observation == ProcessLiveness::Live)
 }
 
