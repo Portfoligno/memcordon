@@ -161,6 +161,17 @@ fn child_command() -> io::Result<Command> {
     Ok(command)
 }
 
+fn churn_child_command() -> io::Result<Command> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
+
+    // A detached parent does not pass on its creation flags. These fixture
+    // roles communicate through explicit handles and do not need a console.
+    let mut child = child_command()?;
+    child.creation_flags(DETACHED_PROCESS);
+    Ok(child)
+}
+
 fn frame_write(stream: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     stream.write_all(
         &u32::try_from(payload.len())
@@ -196,6 +207,8 @@ fn read_http_header(stream: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+const TCP_RELEASE: [u8; 1] = [0xA5];
+
 fn tcp_peer(
     port: u16,
     challenge: &[u8],
@@ -225,7 +238,7 @@ fn tcp_peer(
         None => TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
     }
     .map_err(|error| context("connect", error))?;
-    // The retained peer awaits server half-close through compiler/churn work;
+    // The retained peer awaits server release through compiler/churn work;
     // the independently owned public deadline bounds that whole operation.
     stream
         .set_read_timeout(Some(Duration::from_secs(600)))
@@ -251,6 +264,15 @@ fn tcp_peer(
         frame_write(&mut received, &actual)?;
     }
     fs::write(output_root.join("tcp-peer-received.bin"), &received)?;
+    // Keep the same connection established during the workload: an early
+    // half-close can expire in Windows FIN_WAIT_2 before churn completes.
+    let mut release = [0];
+    stream
+        .read_exact(&mut release)
+        .map_err(|error| context("wait-server-release", error))?;
+    if release != TCP_RELEASE {
+        return Err(io::Error::other("TCP completion signal differs"));
+    }
     stream
         .shutdown(Shutdown::Write)
         .map_err(|error| context("shutdown-write", error))?;
@@ -953,7 +975,11 @@ fn joint_mapped(
         Operation::PeerStdoutCreate,
         peer_stdout::Owned::create(&descriptor.output_root, cutoff),
     )?);
-    let mut peer_command = child_command()?;
+    let mut peer_command = if churn {
+        churn_child_command()?
+    } else {
+        child_command()?
+    };
     peer_command
         .arg("tcp-peer")
         .arg(address.port().to_string())
@@ -1131,6 +1157,7 @@ fn joint_mapped(
                 )
             })?;
         }
+        stream.write_all(&TCP_RELEASE)?;
         let mut byte = [0];
         if stream.read(&mut byte)? != 0 {
             return Err(io::Error::other("TCP peer did not half-close"));
@@ -1332,7 +1359,7 @@ fn process_churn(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Re
         for _ in 0..cohort {
             // Each ordinal creates one process. Extra depth probes are explicit
             // supplemental creations, never counted in the frozen 4096 units.
-            let child = child_command()?
+            let child = churn_child_command()?
                 .arg("cohort-leaf")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1388,7 +1415,7 @@ fn process_churn(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Re
             .generation_gate
             .as_ref()
             .expect("validated generation gate");
-        let mut generation = child_command()?
+        let mut generation = churn_child_command()?
             .arg("held-generation")
             .arg("2")
             .arg(gate)
@@ -1922,7 +1949,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                 io::stdout().flush()?;
                 native::wait_controller_gate_reset(&gate)?;
             } else {
-                let mut child = child_command()?
+                let mut child = churn_child_command()?
                     .arg("held-generation")
                     .arg((depth - 1).to_string())
                     .arg(&gate)
