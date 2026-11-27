@@ -112,6 +112,7 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
         "windows-lease-owner.json",
         "windows-original-deadlines.json",
         "windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/capture-failure.txt",
         "windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json",
         "windows-installed/W-RETIREMENT/frontend-loss/live-observation.json",
         "windows-installed/W-RETIREMENT/frontend-loss/native-exit.json",

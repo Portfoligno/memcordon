@@ -20,6 +20,7 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         "windows-lease-owner.json",
         "windows-original-deadlines.json",
         "windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/capture-failure.txt",
         "windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json",
         "windows-installed/W-RETIREMENT/frontend-loss/live-observation.json",
         "windows-installed/W-RETIREMENT/frontend-loss/native-exit.json",

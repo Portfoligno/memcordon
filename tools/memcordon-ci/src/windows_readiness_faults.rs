@@ -909,21 +909,34 @@ mod native {
             }
             _ => {}
         }
-        if let Err(error) = &output {
-            retain(
+        let output = output.map_err(|error| {
+            const CAPTURE_FAILURE_LIMIT: usize = 4096;
+            let mut description = error.to_string();
+            description.truncate(description.floor_char_boundary(CAPTURE_FAILURE_LIMIT));
+            description
+        });
+        if let Err(description) = &output
+            && let Err(retention_error) = retain(
                 &directory.join("capture-failure.txt"),
-                error.to_string().as_bytes(),
+                description.as_bytes(),
                 &mut record.artifacts,
-            )?;
+            )
+        {
+            return Err(CiError::Message(format!(
+                "{description}; could not retain capture-failure.txt: {retention_error}"
+            )));
         }
-        let output = output.map_err(|error| CiError::Message(error.to_string()));
+        let output = output.map_err(CiError::Message);
         let action = action
             .lock()
             .map_err(|_| CiError::Message("native loss action poisoned".into()))?;
         let action = action.as_ref().ok_or_else(|| {
-            CiError::Message(
-                "external native loss operation did not complete on the held subject".into(),
-            )
+            const MISSING_ACTION: &str =
+                "external native loss operation did not complete on the held subject";
+            match &output {
+                Ok(_) => CiError::Message(MISSING_ACTION.into()),
+                Err(error) => CiError::Message(format!("{MISSING_ACTION}: {error}")),
+            }
         })?;
         retain(
             &directory.join("native-loss-action.json"),

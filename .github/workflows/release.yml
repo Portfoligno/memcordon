@@ -2862,6 +2862,7 @@ jobs:
             target/ci/reports/installed/raw/windows-lease-owner.json
             target/ci/reports/installed/raw/windows-original-deadlines.json
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json
+            target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/capture-failure.txt
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/live-observation.json
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/native-exit.json
@@ -3707,6 +3708,7 @@ jobs:
             target/ci/reports/installed/raw/windows-lease-owner.json
             target/ci/reports/installed/raw/windows-original-deadlines.json
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json
+            target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/capture-failure.txt
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/live-observation.json
             target/ci/reports/installed/raw/windows-installed/W-RETIREMENT/frontend-loss/native-exit.json

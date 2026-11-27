@@ -2888,6 +2888,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-lease-owner.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-original-deadlines.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/capture-failure.txt
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/live-observation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-exit.json
@@ -3339,6 +3340,7 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-lease-owner.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-original-deadlines.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/capture-failure.txt
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/live-observation.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-exit.json
