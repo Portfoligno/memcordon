@@ -140,6 +140,118 @@ pub(crate) fn observe_launcher_service_status() -> std::io::Result<serde_json::V
     .map_err(std::io::Error::other)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessMember {
+    pid: u32,
+    birth: u64,
+    parent_pid: Option<u32>,
+    exited: bool,
+}
+
+fn select_demand_workload_indices(
+    census: &[ProcessMember],
+    wrapped_wrapper: Option<(u32, u64)>,
+    root: (u32, u64),
+    child: (u32, u64),
+    child_parent_pid: Option<u32>,
+) -> std::result::Result<(usize, usize), &'static str> {
+    if root.0 == 0 || root.1 == 0 || child.0 == 0 || child.1 == 0 || root.0 == child.0 {
+        return Err("invalid loss workload root/descendant identity");
+    }
+    if child.1 < root.1 {
+        return Err("loss descendant birth precedes root birth");
+    }
+    if child_parent_pid != Some(root.0) {
+        return Err("loss descendant native parent differs from root");
+    }
+    let excluded_wrapper_index = if let Some((wrapper_pid, wrapper_birth)) = wrapped_wrapper {
+        if wrapper_pid == 0 || wrapper_birth == 0 || wrapper_pid == root.0 || wrapper_pid == child.0
+        {
+            return Err("invalid wrapped loss fixture identity");
+        }
+        let mut matches = census.iter().enumerate().filter(|(_, member)| {
+            member.pid == wrapper_pid && member.birth == wrapper_birth && !member.exited
+        });
+        let Some((index, _)) = matches.next() else {
+            return Err("bound live loss fixture wrapper absent from image census");
+        };
+        if matches.next().is_some() {
+            return Err("duplicate bound loss fixture wrapper in image census");
+        }
+        Some(index)
+    } else {
+        None
+    };
+
+    let mut remaining = Vec::new();
+    for (index, member) in census.iter().enumerate() {
+        if Some(index) == excluded_wrapper_index {
+            continue;
+        }
+        remaining.push((index, *member));
+    }
+    if remaining.len() != 2 {
+        return Err("loss workload image census does not contain exact root/descendant pair");
+    }
+    if remaining.iter().any(|(_, member)| member.exited) {
+        return Err("loss workload member exited before external action");
+    }
+    let root_index = remaining
+        .iter()
+        .find(|(_, member)| member.pid == root.0 && member.birth == root.1)
+        .map(|(index, _)| *index)
+        .ok_or("loss workload census missing exact root identity")?;
+    let child_index = remaining
+        .iter()
+        .find(|(_, member)| member.pid == child.0 && member.birth == child.1)
+        .map(|(index, _)| *index)
+        .ok_or("loss workload census missing exact descendant identity")?;
+    if root_index == child_index {
+        return Err("loss workload root and descendant collapsed to one member");
+    }
+    Ok((root_index, child_index))
+}
+
+fn select_frontend_subject(
+    candidates: &[ProcessMember],
+    expected_parent_pid: Option<u32>,
+    accepted_frontend: Option<(u32, u64)>,
+) -> std::result::Result<usize, &'static str> {
+    let mut matching = Vec::new();
+    for (index, member) in candidates.iter().enumerate() {
+        if member.exited || member.pid == 0 || member.birth == 0 {
+            continue;
+        }
+        if expected_parent_pid.is_some() && member.parent_pid != expected_parent_pid {
+            continue;
+        }
+        matching.push((index, *member));
+    }
+    if matching.len() != 1 {
+        return Err("loss frontend subject selection is not uniquely bound");
+    }
+    let (index, selected) = matching[0];
+    if let Some((accepted_pid, accepted_birth)) = accepted_frontend
+        && (selected.pid != accepted_pid || selected.birth != accepted_birth)
+    {
+        return Err("loss frontend subject differs from accepted frontend identity");
+    }
+    Ok(index)
+}
+
+fn verify_frontend_loss_exit(
+    subject_status: u32,
+    wrapper_status: Option<i32>,
+) -> std::result::Result<(), &'static str> {
+    if subject_status != 126 {
+        return Err("held frontend subject did not exit with requested native status 126");
+    }
+    if wrapper_status != Some(126) {
+        return Err("captured wrapper exit status disagrees with held frontend subject status 126");
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod native {
     use super::*;
@@ -658,12 +770,15 @@ mod native {
             }))?,
             &mut record.artifacts,
         )?;
+        let wrapped_frontend = command.get_program() == config.fixture.path.as_os_str();
         let observation = Arc::new(Mutex::new(None));
         let captured = Arc::clone(&observation);
         let action = Arc::new(Mutex::new(None));
         let captured_action = Arc::clone(&action);
         let family = Arc::new(Mutex::new(Vec::new()));
         let captured_family = Arc::clone(&family);
+        let cli_subject_status = Arc::new(Mutex::new(None));
+        let captured_subject_status = Arc::clone(&cli_subject_status);
         let fixture = config.fixture.path.clone();
         let cli = config.cli.path.clone();
         let agent = config.installed_agent.path.clone();
@@ -671,6 +786,7 @@ mod native {
         let agent_sha256 = config.installed_agent.sha256.clone();
         let cwd = config.output_directory.clone();
         let transcript = input.descriptor.transcript.clone();
+        let report_for_callback = report.clone();
         let scenario = record.key.scenario.clone();
         let expected_provider = config.provider.clone();
         let budget = deadlines.work_budget(Duration::from_secs(120))?;
@@ -679,12 +795,52 @@ mod native {
             budget,
             4 * 1024 * 1024,
             |mut command| command.spawn(),
-            move |frontend_pid, _, _| {
+            move |spawned_pid, _, _| {
                 let deadline = deadlines.work.min(Instant::now() + Duration::from_secs(60));
+                let wrapped_wrapper = if wrapped_frontend {
+                    let wrapper =
+                        match memcordon_testkit::windows_process_candidate_for_image_until(
+                            &fixture,
+                            spawned_pid,
+                            deadline,
+                        )? {
+                            memcordon_testkit::WindowsProcessCandidate::Held(process) => process,
+                            memcordon_testkit::WindowsProcessCandidate::CandidateUnavailable {
+                                ..
+                            } => {
+                                return Err(io::Error::other(
+                                    "spawned loss fixture wrapper unavailable for original custody",
+                                ));
+                            }
+                        };
+                    if wrapper.identity.birth == 0 || wrapper.has_exited()? {
+                        return Err(io::Error::other(
+                            "spawned loss fixture wrapper lacks live native identity",
+                        ));
+                    }
+                    Some(wrapper)
+                } else {
+                    None
+                };
+                let wrapped_wrapper_id = wrapped_wrapper
+                    .as_ref()
+                    .map(|wrapper| {
+                        let birth = u64::try_from(wrapper.identity.birth).map_err(|_| {
+                            io::Error::other("loss fixture wrapper birth exceeds FILETIME width")
+                        })?;
+                        Ok::<(u32, u64), io::Error>((wrapper.identity.pid, birth))
+                    })
+                    .transpose()?;
                 loop {
                     let held =
                         memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?;
-                    if transcript.is_file() && !held.is_empty() {
+                    let has_workload = held.iter().any(|process| {
+                        wrapped_wrapper_id.is_none_or(|(wrapper_pid, wrapper_birth)| {
+                            process.identity.pid != wrapper_pid
+                                || process.identity.birth != u128::from(wrapper_birth)
+                        })
+                    });
+                    if transcript.is_file() && has_workload {
                         *captured_family
                             .lock()
                             .map_err(|_| io::Error::other("loss ownership poisoned"))? = held;
@@ -766,31 +922,56 @@ mod native {
                     )
                     .map_err(io::Error::other)?
                     {
+                        if wrapped_wrapper
+                            .as_ref()
+                            .is_some_and(|wrapper| wrapper.has_exited().unwrap_or(true))
+                        {
+                            return Err(io::Error::other(
+                                "wrapped loss fixture exited before demand phase",
+                            ));
+                        }
                         let held = memcordon_testkit::windows_processes_for_image_until(
                             &fixture, deadline,
                         )?;
-                        if held.len() == 2
-                            && held
-                                .iter()
-                                .all(|process| !process.has_exited().unwrap_or(true))
-                            && held.iter().any(|process| {
-                                process.identity.pid == target.process_id
-                                    && process.identity.birth
-                                        == u128::from(target.creation_time_100ns)
+                        let members = held
+                            .iter()
+                            .map(|process| {
+                                let birth =
+                                    u64::try_from(process.identity.birth).map_err(|_| {
+                                        io::Error::other(
+                                            "loss fixture process birth exceeds FILETIME width",
+                                        )
+                                    })?;
+                                Ok::<ProcessMember, io::Error>(ProcessMember {
+                                    pid: process.identity.pid,
+                                    birth,
+                                    parent_pid: None,
+                                    exited: process.has_exited().unwrap_or(true),
+                                })
                             })
-                            && held.iter().any(|process| {
-                                process.identity.pid == child.process_id
-                                    && process.identity.birth
-                                        == u128::from(child.creation_time_100ns)
-                            })
-                            && child.creation_time_100ns >= target.creation_time_100ns
-                            && crate::windows_consumer_readiness::native::process_parents()?
+                            .collect::<io::Result<Vec<_>>>()?;
+                        let child_parent =
+                            crate::windows_consumer_readiness::native::process_parents()?
                                 .get(&child.process_id)
-                                == Some(&target.process_id)
-                        {
+                                .copied();
+                        if let Ok((root_idx, child_idx)) = select_demand_workload_indices(
+                            &members,
+                            wrapped_wrapper_id,
+                            (target.process_id, target.creation_time_100ns),
+                            (child.process_id, child.creation_time_100ns),
+                            child_parent,
+                        ) {
+                            let workload_family: Vec<_> = held
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(index, process)| {
+                                    (index == root_idx || index == child_idx).then_some(process)
+                                })
+                                .collect();
                             *captured_family
                                 .lock()
-                                .map_err(|_| io::Error::other("loss ownership poisoned"))? = held;
+                                .map_err(|_| io::Error::other("loss ownership poisoned"))? =
+                                workload_family;
                             break;
                         }
                     }
@@ -803,13 +984,110 @@ mod native {
                 }
                 let native_action = match scenario.as_str() {
                     "frontend-loss" => {
-                        let subject = hold_process(frontend_pid, None, &cli)?;
+                        let accepted_terminal =
+                            report_for_callback.with_extension("terminal-observation.json");
+                        let accepted_path =
+                            accepted_terminal.with_extension("accepted-observation.json");
+                        let request_path = accepted_terminal.with_extension("provider-request.bin");
+                        let accepted_frontend = if accepted_path.is_file() && request_path.is_file()
+                        {
+                            let accepted_bytes = read(
+                                &accepted_path,
+                                memcordon_core::MAX_WINDOWS_ACCEPTED_OBSERVATION_BYTES,
+                            )
+                            .map_err(io::Error::other)?;
+                            let request_bytes =
+                                read(&request_path, memcordon_core::WINDOWS_MAX_FRAME_BYTES)
+                                    .map_err(io::Error::other)?;
+                            memcordon_core::canonical_json::reject_duplicate_json_keys(
+                                &accepted_bytes,
+                            )
+                            .map_err(io::Error::other)?;
+                            let accepted: memcordon_core::WindowsWorkloadAcceptedV1 =
+                                serde_json::from_slice(&accepted_bytes)
+                                    .map_err(io::Error::other)?;
+                            accepted.validate().map_err(io::Error::other)?;
+                            if accepted.provider != observed.association.provider
+                                || accepted.attempt_id
+                                    != String::from(observed.association.attempt_id.clone())
+                                || accepted.request_sha256
+                                    != String::from(observed.association.request_sha256.clone())
+                                || accepted.frontend.creation_time_100ns == 0
+                            {
+                                return Err(io::Error::other(
+                                    "accepted frontend observation differs from live loss association",
+                                ));
+                            }
+                            memcordon_core::validate_windows_accepted_observation(
+                                &accepted,
+                                &request_bytes,
+                                &observed.association.provider,
+                                &accepted.frontend,
+                            )
+                            .map_err(io::Error::other)?;
+                            Some(accepted.frontend)
+                        } else {
+                            None
+                        };
+                        let subject = if let Some(wrapper) = wrapped_wrapper.as_ref() {
+                            let action_deadline =
+                                deadlines.work.min(Instant::now() + Duration::from_secs(30));
+                            let direct_children =
+                                wrapper.direct_children_for_image_until(&cli, action_deadline)?;
+                            let candidates = direct_children
+                                .iter()
+                                .map(|process| {
+                                    let birth =
+                                        u64::try_from(process.identity.birth).map_err(|_| {
+                                            io::Error::other(
+                                                "loss frontend child birth exceeds FILETIME width",
+                                            )
+                                        })?;
+                                    Ok::<ProcessMember, io::Error>(ProcessMember {
+                                        pid: process.identity.pid,
+                                        birth,
+                                        parent_pid: Some(process.native_parent_process_id()?),
+                                        exited: process.has_exited()?,
+                                    })
+                                })
+                                .collect::<io::Result<Vec<_>>>()?;
+                            let selected_index = select_frontend_subject(
+                                &candidates,
+                                Some(wrapper.identity.pid),
+                                accepted_frontend
+                                    .as_ref()
+                                    .map(|id| (id.process_id, id.creation_time_100ns)),
+                            )
+                            .map_err(io::Error::other)?;
+                            let selected = &candidates[selected_index];
+                            let expected_frontend = WindowsProcessIdentityV1 {
+                                process_id: selected.pid,
+                                creation_time_100ns: selected.birth,
+                            };
+                            hold_process(
+                                expected_frontend.process_id,
+                                Some(&expected_frontend),
+                                &cli,
+                            )?
+                        } else {
+                            hold_process(spawned_pid, accepted_frontend.as_ref(), &cli)?
+                        };
                         if subject.image_sha256 != cli_sha256 {
                             return Err(io::Error::other(
                                 "held frontend image measurement changed",
                             ));
                         }
                         terminate(&subject)?;
+                        let subject_status = recovery_wait(&subject)?;
+                        if subject_status != 126 {
+                            return Err(io::Error::other(
+                                "held frontend subject did not exit with requested native status 126",
+                            ));
+                        }
+                        *captured_subject_status
+                            .lock()
+                            .map_err(|_| io::Error::other("frontend subject status poisoned"))? =
+                            Some(subject_status);
                         NativeLossAction {
                             format: "memcordon.windows-native-loss-action".into(),
                             revision: 1,
@@ -995,12 +1273,47 @@ mod native {
             &mut record.artifacts,
         )?;
         if let Ok(output) = &output {
+            let observed_native_status = if record.key.scenario == "frontend-loss" {
+                let subject_status = cli_subject_status
+                    .lock()
+                    .map_err(|_| CiError::Message("frontend subject status poisoned".into()))?
+                    .ok_or_else(|| {
+                        CiError::Message(
+                            "held frontend subject exit status was not observed".into(),
+                        )
+                    })?;
+                verify_frontend_loss_exit(subject_status, output.status.code())
+                    .map_err(|error| CiError::Message(error.into()))?;
+                Some(i32::try_from(subject_status).map_err(|_| {
+                    CiError::Message("held frontend subject exit status exceeds i32".into())
+                })?)
+            } else {
+                output.status.code()
+            };
+            let exit_record = if wrapped_frontend {
+                serde_json::json!({
+                    "format": "memcordon.windows-native-loss-exit",
+                    "revision": 1,
+                    "target": config.target,
+                    "executable_sha256": config.cli.sha256,
+                    "native_status": observed_native_status,
+                    "wrapper_executable_sha256": config.fixture.sha256,
+                    "wrapper_native_status": output.status.code(),
+                    "capture_complete": true
+                })
+            } else {
+                serde_json::json!({
+                    "format": "memcordon.windows-native-loss-exit",
+                    "revision": 1,
+                    "target": config.target,
+                    "executable_sha256": config.cli.sha256,
+                    "native_status": observed_native_status,
+                    "capture_complete": true
+                })
+            };
             retain(
                 &directory.join("native-exit.json"),
-                &serde_json::to_vec(&serde_json::json!({
-                    "format":"memcordon.windows-native-loss-exit","revision":1,"target":config.target,
-                    "executable_sha256":config.cli.sha256,"native_status":output.status.code(),"capture_complete":true
-                }))?,
+                &serde_json::to_vec(&exit_record)?,
                 &mut record.artifacts,
             )?;
             retain(
@@ -1389,5 +1702,139 @@ mod native {
         record.retirement = Ok(());
         output?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProcessMember, select_demand_workload_indices, select_frontend_subject,
+        verify_frontend_loss_exit,
+    };
+
+    fn member(pid: u32, birth: u64, parent_pid: Option<u32>, exited: bool) -> ProcessMember {
+        ProcessMember {
+            pid,
+            birth,
+            parent_pid,
+            exited,
+        }
+    }
+
+    #[test]
+    fn wrapped_four_role_census_excludes_only_bound_wrapper_and_keeps_strict_pair() {
+        let census = [
+            member(1000, 10, None, false),
+            member(2000, 20, None, false),
+            member(3000, 30, Some(2000), false),
+        ];
+        assert_eq!(
+            select_demand_workload_indices(
+                &census,
+                Some((1000, 10)),
+                (2000, 20),
+                (3000, 30),
+                Some(2000)
+            ),
+            Ok((1, 2))
+        );
+
+        let unwrapped = [
+            member(2000, 20, None, false),
+            member(3000, 30, Some(2000), false),
+        ];
+        assert_eq!(
+            select_demand_workload_indices(&unwrapped, None, (2000, 20), (3000, 30), Some(2000)),
+            Ok((0, 1))
+        );
+    }
+
+    #[test]
+    fn demand_census_rejects_wrong_wrapper_birth_extra_member_or_wrong_parent() {
+        let census = [
+            member(1000, 10, None, false),
+            member(2000, 20, None, false),
+            member(3000, 30, Some(2000), false),
+        ];
+        assert!(
+            select_demand_workload_indices(
+                &census,
+                Some((1000, 99)),
+                (2000, 20),
+                (3000, 30),
+                Some(2000)
+            )
+            .is_err()
+        );
+        assert!(
+            select_demand_workload_indices(
+                &census,
+                Some((1000, 10)),
+                (2000, 20),
+                (3000, 30),
+                Some(1000)
+            )
+            .is_err()
+        );
+
+        let extra_same_image = [
+            member(1000, 10, None, false),
+            member(2000, 20, None, false),
+            member(3000, 30, Some(2000), false),
+            member(4000, 40, None, false),
+        ];
+        assert!(
+            select_demand_workload_indices(
+                &extra_same_image,
+                Some((1000, 10)),
+                (2000, 20),
+                (3000, 30),
+                Some(2000)
+            )
+            .is_err()
+        );
+
+        let exited_wrapper = [
+            member(1000, 10, None, true),
+            member(2000, 20, None, false),
+            member(3000, 30, Some(2000), false),
+        ];
+        assert!(
+            select_demand_workload_indices(
+                &exited_wrapper,
+                Some((1000, 10)),
+                (2000, 20),
+                (3000, 30),
+                Some(2000)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn frontend_subject_selection_requires_unique_live_direct_child_and_accepted_match() {
+        let candidates = [member(1500, 15, Some(1000), false)];
+        assert_eq!(
+            select_frontend_subject(&candidates, Some(1000), Some((1500, 15))),
+            Ok(0)
+        );
+        assert!(select_frontend_subject(&candidates, Some(9999), Some((1500, 15))).is_err());
+        assert!(select_frontend_subject(&candidates, Some(1000), Some((1500, 99))).is_err());
+
+        let ambiguous = [
+            member(1500, 15, Some(1000), false),
+            member(1501, 16, Some(1000), false),
+        ];
+        assert!(select_frontend_subject(&ambiguous, Some(1000), Some((1500, 15))).is_err());
+        assert!(select_frontend_subject(&[], Some(1000), None).is_err());
+    }
+
+    #[test]
+    fn frontend_loss_exit_requires_subject_126_and_wrapper_agreement() {
+        assert_eq!(verify_frontend_loss_exit(126, Some(126)), Ok(()));
+        assert!(verify_frontend_loss_exit(126, Some(1)).is_err());
+        assert!(verify_frontend_loss_exit(126, Some(0)).is_err());
+        assert!(verify_frontend_loss_exit(126, None).is_err());
+        assert!(verify_frontend_loss_exit(1, Some(126)).is_err());
     }
 }
