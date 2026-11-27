@@ -5,7 +5,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RELATIVE_PATHS: [&str; 32] = [
+pub const RELATIVE_PATHS: [&str; 39] = [
+    // The retained assessment names the failing case family/scenario pair and
+    // each lease-bound loss phase; it is the first identity of the row.
+    "windows-assessment.json",
+    "windows-lease-owner.json",
+    "windows-original-deadlines.json",
+    "windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json",
+    "windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json",
+    "windows-installed/W-RETIREMENT/frontend-loss/live-observation.json",
+    "windows-installed/W-RETIREMENT/frontend-loss/native-exit.json",
     "windows-installed/C-IO/empty-message/result.callback-failure.json",
     "windows-installed/C-IO/empty-message/result.failed-frontend.json",
     "windows-installed/C-IO/empty-message/result.failed-terminal-observation.json",

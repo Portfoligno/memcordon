@@ -2094,6 +2094,8 @@ mod native {
                 assessment.readiness =
                     crate::windows_readiness_policy::assess_suite(&assessment.positive_cases);
                 assessment.positive_suite.clone()?;
+                crate::windows_readiness_faults::publish_original_lease(config, deadlines)
+                    .map_err(|error| error.to_string())?;
                 assessment.loss_suite = crate::windows_readiness_faults::run_until(
                     config,
                     &config.output_directory.join("windows-readiness-input.json"),

@@ -15,6 +15,28 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
     let producer_output = windows_case_output_directory(root.path());
     assert_eq!(producer_output, root.path().join("windows-installed"));
     let mut expected = Vec::new();
+    for leaf in [
+        "windows-assessment.json",
+        "windows-lease-owner.json",
+        "windows-original-deadlines.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/live-observation.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/native-exit.json",
+    ] {
+        let path = root.path().join(leaf);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"original row identity").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+        expected.push(path);
+    }
     for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
         for file in [
             "result.callback-failure.json",

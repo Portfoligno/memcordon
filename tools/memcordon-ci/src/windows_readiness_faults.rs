@@ -46,6 +46,44 @@ pub fn required_loss_keys() -> Vec<CaseKey> {
     .collect()
 }
 
+/// Publish the original installation lease handoff that the owned loss driver
+/// consumes, anchored to the deadlines this installation was started with. The
+/// loss driver refuses to renew cutoffs beyond these recorded values and
+/// verifies the recorded owner against the selected installation.
+#[cfg(windows)]
+pub(crate) fn publish_original_lease(
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+) -> Result<()> {
+    let lease_root = config
+        .output_directory
+        .parent()
+        .ok_or_else(|| CiError::Message("original Windows lease root absent".into()))?;
+    std::fs::create_dir_all(lease_root)?;
+    let owner = serde_json::json!({
+        "format": "memcordon.consumer-readiness.windows-lease-owner",
+        "revision": 2,
+        "current": serde_json::to_value(config)?,
+        "work_deadline_unix_millis": deadlines.work_deadline_unix_millis,
+        "cleanup_deadline_unix_millis": deadlines.cleanup_deadline_unix_millis,
+    });
+    let original_deadlines = serde_json::json!({
+        "format": "memcordon.consumer-readiness.windows-original-deadlines",
+        "revision": 1,
+        "work_deadline_unix_millis": deadlines.work_deadline_unix_millis,
+        "cleanup_deadline_unix_millis": deadlines.cleanup_deadline_unix_millis,
+    });
+    for (name, value) in [
+        ("windows-original-deadlines.json", &original_deadlines),
+        ("windows-lease-owner.json", &owner),
+    ] {
+        let mut bytes = serde_json::to_vec_pretty(value)?;
+        bytes.push(b'\n');
+        std::fs::write(lease_root.join(name), bytes)?;
+    }
+    Ok(())
+}
+
 pub fn accepted(records: &[LossAssessment]) -> bool {
     records.len() == required_loss_keys().len()
         && required_loss_keys()
@@ -512,7 +550,13 @@ mod native {
                 "original-windows-deadlines.json",
             ),
         ] {
-            let bytes = read(&lease_root.join(source), 16 * 1024 * 1024)?;
+            let lease_source = lease_root.join(source);
+            let bytes = read(&lease_source, 16 * 1024 * 1024).map_err(|error| {
+                CiError::Message(format!(
+                    "original Windows lease source {source} is unreadable at {}: {error}",
+                    lease_source.display()
+                ))
+            })?;
             let original: serde_json::Value = serde_json::from_slice(&bytes)?;
             if original["work_deadline_unix_millis"] != deadlines.work_deadline_unix_millis
                 || original["cleanup_deadline_unix_millis"]

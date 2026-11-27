@@ -2884,6 +2884,13 @@ jobs:
         with:
           name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
           path: |-
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-assessment.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-lease-owner.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-original-deadlines.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/live-observation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-exit.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.callback-failure.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-frontend.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-terminal-observation.json
@@ -3328,6 +3335,13 @@ jobs:
         with:
           name: windows-installed-failure-${{ matrix.id }}-${{ matrix.channel }}
           path: |-
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-assessment.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-lease-owner.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-original-deadlines.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/live-observation.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-RETIREMENT/frontend-loss/native-exit.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.callback-failure.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-frontend.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/C-IO/empty-message/result.failed-terminal-observation.json
