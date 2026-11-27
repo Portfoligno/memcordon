@@ -85,6 +85,7 @@ fn toolchain_marker_uses_only_the_declared_stage_role_and_native_code() {
         (ObserverDeadlineArm, "observer-deadline-arm", "none"),
         (ObserverFrameRead, "observer-frame-read", "none"),
         (ObserverDeadlineSettle, "observer-deadline-settle", "none"),
+        (CompilerConsole, "compiler-console", "none"),
         (CreateCompiledDirectory, "create-compiled-directory", "none"),
         (ValidateClock, "validate-clock", "none"),
         (SampleDeadline, "sample-deadline", "none"),
