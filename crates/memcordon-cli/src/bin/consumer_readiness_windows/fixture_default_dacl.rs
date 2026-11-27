@@ -26,6 +26,27 @@ fn invalid(reason: &'static str) -> io::Error {
 /// allow. The supported closed form is a packed revision-2 ACL containing
 /// basic allow/deny ACEs; null, opaque capacity and unknown semantics refuse.
 pub fn plan(existing: Option<&[u8]>) -> io::Result<Vec<u8>> {
+    append_grant(existing, RESTRICTED_CODE_SID, true)
+}
+
+/// Append only the existing token user's explicit allow for a disposable
+/// diagnostic token. Keep every original ACE and its order.
+#[cfg(any(windows, test))]
+pub(super) fn plan_console_user(existing: Option<&[u8]>, user: &[u8]) -> io::Result<Vec<u8>> {
+    if !exact_sid(user) {
+        return Err(invalid("console calibration user SID differs"));
+    }
+    append_grant(existing, user, false)
+}
+
+fn exact_sid(sid: &[u8]) -> bool {
+    sid.len() >= SID_HEADER_BYTES
+        && sid[0] == 1
+        && usize::from(sid[1]) <= MAX_SID_SUB_AUTHORITIES
+        && sid.len() == SID_HEADER_BYTES + usize::from(sid[1]) * MASK_BYTES
+}
+
+fn append_grant(existing: Option<&[u8]>, grantee: &[u8], rc_policy: bool) -> io::Result<Vec<u8>> {
     let raw = existing.ok_or_else(|| invalid("restricted fixture default ACL must be non-null"))?;
     if raw.len() < ACL_HEADER_BYTES || raw.len() > MAX_ACL_BYTES {
         return Err(invalid(
@@ -47,7 +68,7 @@ pub fn plan(existing: Option<&[u8]>) -> io::Result<Vec<u8>> {
         ));
     }
     let mut offset = ACL_HEADER_BYTES;
-    let mut exact_rc_present = false;
+    let mut exact_grant_present = false;
     for _ in 0..count {
         let header_end = offset
             .checked_add(ACE_HEADER_BYTES)
@@ -73,27 +94,24 @@ pub fn plan(existing: Option<&[u8]>) -> io::Result<Vec<u8>> {
             .get(offset..end)
             .ok_or_else(|| invalid("fixture ACE exceeds the original ACL"))?;
         let sid = &ace[sid_offset..];
-        let sub_authorities = usize::from(sid[1]);
-        if sid[0] != 1
-            || sub_authorities > MAX_SID_SUB_AUTHORITIES
-            || sid.len() != SID_HEADER_BYTES + sub_authorities * MASK_BYTES
-        {
+        if !exact_sid(sid) {
             return Err(invalid(
                 "fixture ACE SID is not an exact supported binary SID",
             ));
         }
-        if sid == RESTRICTED_CODE_SID {
+        if sid == grantee {
             let mask = u32::from_le_bytes(
                 ace[ACE_HEADER_BYTES..sid_offset]
                     .try_into()
                     .expect("checked ACE mask extent"),
             );
-            if exact_rc_present || kind != ACCESS_ALLOWED || flags != 0 || mask != GENERIC_ALL {
+            let exact = kind == ACCESS_ALLOWED && flags == 0 && mask == GENERIC_ALL;
+            if rc_policy && (exact_grant_present || !exact) {
                 return Err(invalid(
                     "fixture default ACL has conflicting Restricted Code ACEs",
                 ));
             }
-            exact_rc_present = true;
+            exact_grant_present |= exact;
         }
         offset = end;
     }
@@ -102,10 +120,10 @@ pub fn plan(existing: Option<&[u8]>) -> io::Result<Vec<u8>> {
             "fixture default ACL has unsupported unused or trailing bytes",
         ));
     }
-    if exact_rc_present {
+    if exact_grant_present {
         return Ok(raw.to_vec());
     }
-    let ace_size = ACE_HEADER_BYTES + MASK_BYTES + RESTRICTED_CODE_SID.len();
+    let ace_size = ACE_HEADER_BYTES + MASK_BYTES + grantee.len();
     let final_size = raw
         .len()
         .checked_add(ace_size)
@@ -125,8 +143,31 @@ pub fn plan(existing: Option<&[u8]>) -> io::Result<Vec<u8>> {
     result.extend_from_slice(&[ACCESS_ALLOWED, 0]);
     result.extend_from_slice(&ace_size.to_le_bytes());
     result.extend_from_slice(&GENERIC_ALL.to_le_bytes());
-    result.extend_from_slice(RESTRICTED_CODE_SID);
+    result.extend_from_slice(grantee);
     result[2..4].copy_from_slice(&final_size.to_le_bytes());
     result[4..6].copy_from_slice(&final_count.to_le_bytes());
     Ok(result)
+}
+
+#[cfg(test)]
+#[test]
+fn console_user_variant_preserves_all_previous_aces() {
+    const USER: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 19, 0, 0, 0];
+    let empty = [ACL_REVISION, 0, ACL_HEADER_BYTES as u8, 0, 0, 0, 0, 0];
+    let original = plan(Some(&empty)).unwrap();
+    let planned = plan_console_user(Some(&original), USER).unwrap();
+    assert_eq!(
+        &planned[ACL_HEADER_BYTES..original.len()],
+        &original[ACL_HEADER_BYTES..]
+    );
+    let ace = &planned[original.len()..];
+    assert_eq!(&ace[..2], &[ACCESS_ALLOWED, 0]);
+    assert_eq!(
+        &ace[ACE_HEADER_BYTES..ACE_HEADER_BYTES + MASK_BYTES],
+        &GENERIC_ALL.to_le_bytes()
+    );
+    assert_eq!(&ace[ACE_HEADER_BYTES + MASK_BYTES..], USER);
+    assert_eq!(plan_console_user(Some(&planned), USER).unwrap(), planned);
+    assert!(plan_console_user(Some(&original), &USER[..USER.len() - 1]).is_err());
+    assert!(plan_console_user(None, USER).is_err());
 }

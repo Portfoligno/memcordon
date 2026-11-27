@@ -312,36 +312,7 @@ pub(super) fn prepare(source: HANDLE, restricted: HANDLE) -> io::Result<()> {
     let expected = policy::plan(before.default_acl.as_deref())?;
     let changed = before.default_acl.as_deref() != Some(expected.as_slice());
     if changed {
-        // Native ACL storage must be aligned and live through synchronous copy.
-        let mut storage = vec![0usize; expected.len().div_ceil(size_of::<usize>())];
-        // SAFETY: checked planner bound fits the aligned backing allocation.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                expected.as_ptr(),
-                storage.as_mut_ptr().cast::<u8>(),
-                expected.len(),
-            )
-        };
-        let selected = TOKEN_DEFAULT_DACL {
-            DefaultDacl: storage.as_mut_ptr().cast(),
-        };
-        // SAFETY: only the newly derived fixture token is mutated, and both
-        // native header and ACL storage remain live until this call returns.
-        if unsafe {
-            SetTokenInformation(
-                restricted,
-                TokenDefaultDacl,
-                (&selected as *const TOKEN_DEFAULT_DACL).cast(),
-                size_of::<TOKEN_DEFAULT_DACL>() as u32,
-            )
-        } == 0
-        {
-            return Err(native_failure(
-                "SetTokenInformation-private-fixture",
-                TokenDefaultDacl,
-                io::Error::last_os_error(),
-            ));
-        }
+        set_private_default_acl(restricted, &expected)?;
     }
     let after = snapshot(restricted)?;
     let source_after = snapshot(source)?;
@@ -356,6 +327,40 @@ pub(super) fn prepare(source: HANDLE, restricted: HANDLE) -> io::Result<()> {
     if source_before != source_after {
         return Err(io::Error::other(
             "original fixture source token changed during private preparation",
+        ));
+    }
+    Ok(())
+}
+
+/// The caller owns an unshared, freshly derived token and checked ACL bytes.
+pub(super) fn set_private_default_acl(token: HANDLE, expected: &[u8]) -> io::Result<()> {
+    // Native ACL storage must be aligned and live through synchronous copy.
+    let mut storage = vec![0usize; expected.len().div_ceil(size_of::<usize>())];
+    // SAFETY: the planner's bytes fit the aligned backing allocation.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            expected.as_ptr(),
+            storage.as_mut_ptr().cast::<u8>(),
+            expected.len(),
+        )
+    };
+    let selected = TOKEN_DEFAULT_DACL {
+        DefaultDacl: storage.as_mut_ptr().cast(),
+    };
+    // SAFETY: the checked native ACL and header remain live until return.
+    if unsafe {
+        SetTokenInformation(
+            token,
+            TokenDefaultDacl,
+            (&selected as *const TOKEN_DEFAULT_DACL).cast(),
+            size_of::<TOKEN_DEFAULT_DACL>() as u32,
+        )
+    } == 0
+    {
+        return Err(native_failure(
+            "SetTokenInformation-private-fixture",
+            TokenDefaultDacl,
+            io::Error::last_os_error(),
         ));
     }
     Ok(())

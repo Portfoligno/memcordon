@@ -111,6 +111,37 @@ fn toolchain_marker_uses_only_the_declared_stage_role_and_native_code() {
 }
 
 #[test]
+fn compiler_console_api_detail_preserves_the_existing_marker() {
+    use context::ConsoleApi::*;
+    for (api, label) in [
+        (ProcessListBefore, "GetConsoleProcessList-before"),
+        (Allocate, "AllocConsole"),
+        (ProcessListAfter, "GetConsoleProcessList-after"),
+        (Free, "FreeConsole"),
+    ] {
+        let detail = format!("console-api={label}");
+        let error = context::console_error(api, io::Error::from_raw_os_error(5));
+        assert_eq!(
+            context::console_failure_detail(&error),
+            Some((label, Some(5)))
+        );
+        let rendered = context::<()>(
+            Operation::Toolchain(ToolchainOperation::CompilerConsole),
+            Err(error),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "toolchain-failure-v1; operation=compiler-console; source-role=none; raw-os-error=5; end"
+            )
+        );
+        assert!(rendered.lines().nth(1).unwrap().ends_with(&detail));
+    }
+}
+
+#[test]
 fn compiler_marker_keeps_original_operation_and_raw_code_through_secondary_failure() {
     use context::{
         CompilerDirectoryRole::*, CompilerOperation::*, compiler_context, with_secondary,

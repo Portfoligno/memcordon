@@ -914,12 +914,16 @@ struct CompilerConsole(bool);
 impl CompilerConsole {
     fn allocate_if_detached() -> io::Result<Self> {
         use super::console_calibration::parent_console;
+        use super::operation_context::{ConsoleApi, console_error};
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Console::{
             AllocConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
         };
 
-        if parent_console()?.is_some() {
+        if parent_console()
+            .map_err(|error| console_error(ConsoleApi::ProcessListBefore, error))?
+            .is_some()
+        {
             return Ok(Self(false));
         }
         let streams = || {
@@ -936,10 +940,17 @@ impl CompilerConsole {
         }
         // SAFETY: this fixture has no attached console; no caller memory is passed.
         if unsafe { AllocConsole() } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(console_error(
+                ConsoleApi::Allocate,
+                io::Error::last_os_error(),
+            ));
         }
         let owner = Self(true);
-        if parent_console()?.is_none() || streams() != before {
+        if parent_console()
+            .map_err(|error| console_error(ConsoleApi::ProcessListAfter, error))?
+            .is_none()
+            || streams() != before
+        {
             return Err(io::Error::other(
                 "compiler fixture console attachment or original standard handles differ",
             ));
@@ -948,10 +959,11 @@ impl CompilerConsole {
     }
 
     fn release(&mut self) -> io::Result<()> {
+        use super::operation_context::{ConsoleApi, console_error};
         use windows_sys::Win32::System::Console::FreeConsole;
         // SAFETY: release only this process's newly acquired attachment.
         if self.0 && unsafe { FreeConsole() } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(console_error(ConsoleApi::Free, io::Error::last_os_error()));
         }
         self.0 = false;
         Ok(())
@@ -961,6 +973,25 @@ impl CompilerConsole {
 impl Drop for CompilerConsole {
     fn drop(&mut self) {
         let _ = self.release();
+    }
+}
+
+/// Use the real fixture path and refuse to count an already attached child.
+pub(super) fn detached_console_probe() -> serde_json::Value {
+    let result = match CompilerConsole::allocate_if_detached() {
+        Ok(mut console) if console.0 => console.release(),
+        Ok(_) => return serde_json::json!({"state":"unexpected-inherited-console"}),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => {
+            serde_json::json!({"state":"allocated-and-released","stdio_unchanged_at_attach":true})
+        }
+        Err(error) => {
+            let detail = super::operation_context::console_failure_detail(&error);
+            serde_json::json!({"state":"failed","api":detail.map(|(api, _)| api),
+                "raw_os_error":detail.and_then(|(_, raw)| raw)})
+        }
     }
 }
 

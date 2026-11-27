@@ -723,6 +723,36 @@ fn post_grant_refusal_needs_the_same_native_job_owner_and_terminal_retirement() 
 }
 
 #[test]
+fn runtime_console_calibration_trigger_needs_exact_original_stage_code_and_known_api() {
+    use memcordon_ci::windows_consumer_readiness::reduced_console_api_win32_5;
+    let marker = "memcordon-test-fixture: toolchain-failure-v1; operation=compiler-console; source-role=none; raw-os-error=5; end";
+    for api in [
+        "GetConsoleProcessList-before",
+        "AllocConsole",
+        "GetConsoleProcessList-after",
+        "FreeConsole",
+    ] {
+        let stderr = format!("{marker}\r\nAccess is denied. (os error 5); console-api={api}\r\n");
+        assert_eq!(reduced_console_api_win32_5(stderr.as_bytes()), Some(api));
+    }
+    for stderr in [
+        format!("{marker}\nAccess is denied. (os error 5)\n"),
+        format!("{marker}\nAccess is denied.; console-api=AttachConsole\n"),
+        format!(
+            "{marker}\nAccess is denied.; console-api=AllocConsole\n{}\n",
+            marker
+        ),
+        format!("{marker}\nAccess is denied.; console-api=AllocConsole; extra\n"),
+        format!(
+            "{}\nAccess is denied.; console-api=AllocConsole\n",
+            marker.replace("raw-os-error=5", "raw-os-error=6")
+        ),
+    ] {
+        assert_eq!(reduced_console_api_win32_5(stderr.as_bytes()), None);
+    }
+}
+
+#[test]
 fn console_calibration_needs_owned_settled_processes_and_exact_detachment() {
     use memcordon_ci::windows_consumer_readiness::classify_reduced_console_pair;
     use serde_json::json;
