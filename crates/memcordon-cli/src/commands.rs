@@ -81,7 +81,8 @@ pub(crate) fn windows_recovery(args: memcordon::invocation::WindowsRecoveryArgs)
                         println!("{}",serde_json::json!({"schema_version":2,
                             "provider_response":response,"frontend_delivery":delivery,"provider_request":request,"terminal_authority_json":null}));
                     }
-                    return Err("authenticated provider denied recovery authority".to_owned());
+                    // Identify the response variant, never its provider-supplied detail.
+                    return Err("authenticated provider denied recovery authority (recovery-attempt-unavailable)".to_owned());
                 }
                 let authority=response.terminal_authority_json().map_err(|error|error.to_string())?;
                 let value=serde_json::json!({
