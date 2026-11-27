@@ -909,6 +909,61 @@ fn compile(
     )
 }
 
+struct CompilerConsole(bool);
+
+impl CompilerConsole {
+    fn allocate_if_detached() -> io::Result<Self> {
+        use super::console_calibration::parent_console;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            AllocConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        if parent_console()?.is_some() {
+            return Ok(Self(false));
+        }
+        let streams = || {
+            // SAFETY: these are the three supported standard-handle selectors.
+            [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+                .map(|kind| unsafe { GetStdHandle(kind) })
+        };
+        let before = streams();
+        if before
+            .iter()
+            .any(|h| h.is_null() || *h == INVALID_HANDLE_VALUE)
+        {
+            return Err(io::Error::other("compiler fixture standard handle absent"));
+        }
+        // SAFETY: this fixture has no attached console; no caller memory is passed.
+        if unsafe { AllocConsole() } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owner = Self(true);
+        if parent_console()?.is_none() || streams() != before {
+            return Err(io::Error::other(
+                "compiler fixture console attachment or original standard handles differ",
+            ));
+        }
+        Ok(owner)
+    }
+
+    fn release(&mut self) -> io::Result<()> {
+        use windows_sys::Win32::System::Console::FreeConsole;
+        // SAFETY: release only this process's newly acquired attachment.
+        if self.0 && unsafe { FreeConsole() } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.0 = false;
+        Ok(())
+    }
+}
+
+impl Drop for CompilerConsole {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 pub(super) fn execute(
     descriptor: &Descriptor,
     transcript: &mut Transcript,
@@ -1058,6 +1113,12 @@ pub(super) fn execute(
             && inputs.target == "x86_64-pc-windows-msvc",
         spawn_trace: None,
     };
+    // Allocate in the fixture, outside the debug family. Rustc and the bundled
+    // linker can both inherit; DEBUG_PROCESS still observes their entire family.
+    let mut compiler_console = context(
+        Stage(Op::CompilerConsole),
+        CompilerConsole::allocate_if_detached(),
+    )?;
     context(
         Stage(Op::CompileLibrary),
         compile(
@@ -1142,6 +1203,7 @@ pub(super) fn execute(
     {
         return Err(io::Error::other("loaded DLL products differ"));
     }
+    context(Stage(Op::CompilerConsole), compiler_console.release())?;
     transcript.event(
         "toolchain-test-child-dll-complete",
         None,

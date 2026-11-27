@@ -70,7 +70,7 @@ fn drain(pipe: &mut File, capture: &mut Vec<u8>, cutoff: Instant) -> io::Result<
     }
 }
 
-fn parent_console() -> io::Result<Option<u32>> {
+pub(super) fn parent_console() -> io::Result<Option<u32>> {
     let mut processes = [0u32; 64];
     // SAFETY: this is a live writable array for a bounded console observation.
     let count = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
