@@ -70,8 +70,8 @@ fn await_marker(owner: &mut FrontendOwner, marker: &Path) {
 fn report_read_and_decode_errors_still_retire_live_fixture_identities() {
     for mode in ["missing-report", "malformed-report"] {
         let (mut owner, marker, directory) = launch(mode);
-        let mut spec = SCENARIOS[0];
-        spec.outer_bound = Duration::from_millis(500);
+        await_marker(&mut owner, &marker);
+        let spec = SCENARIOS[0];
         let started = clock().unwrap();
         let mut observation = Observation::new(spec);
         let result = run_frontend(
