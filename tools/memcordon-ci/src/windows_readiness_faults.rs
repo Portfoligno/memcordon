@@ -256,6 +256,46 @@ fn verify_frontend_loss_exit(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+const RECOVERY_MAX_ATTEMPTS: usize = 96;
+
+#[cfg(any(windows, test))]
+fn recovery_poll_delay(ordinal: usize, remaining: std::time::Duration) -> std::time::Duration {
+    let shift = u32::try_from(ordinal.min(4)).unwrap_or(4);
+    let backoff_millis = 100u64.saturating_mul(1u64 << shift);
+    std::time::Duration::from_millis(backoff_millis)
+        .min(std::time::Duration::from_secs(1))
+        .min(remaining)
+}
+
+#[cfg(any(windows, test))]
+fn format_recovery_exhaustion_error(
+    attempts: usize,
+    deadline_expired: bool,
+    last_detail: Option<&str>,
+) -> String {
+    let reason = if deadline_expired {
+        "within its owned deadline"
+    } else {
+        "before reaching its owned deadline (attempt cap exhausted)"
+    };
+    let mut message = format!(
+        "public recovery could not prove bound retirement {reason} after {attempts} attempts"
+    );
+    if let Some(detail) = last_detail {
+        let trimmed = detail.trim();
+        if !trimmed.is_empty() {
+            let mut end = trimmed.len().min(240);
+            while end > 0 && !trimmed.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.push_str(": ");
+            message.push_str(&trimmed[..end]);
+        }
+    }
+    message
+}
+
 #[cfg(windows)]
 mod native {
     use super::*;
@@ -1384,7 +1424,10 @@ mod native {
             .ok_or_else(|| CiError::Message("loss recovery cutoff overflow".into()))?
             .min(deadlines.cleanup_deadline_unix_millis);
         let mut recovered_output = None;
-        for ordinal in 0..16 {
+        let mut attempts = 0usize;
+        let mut deadline_expired = false;
+        let mut last_detail: Option<String> = None;
+        for ordinal in 0..RECOVERY_MAX_ATTEMPTS {
             let started_unix_millis = unix_millis()?;
             let budget = recovery_deadline
                 .saturating_duration_since(Instant::now())
@@ -1393,8 +1436,10 @@ mod native {
                     recovery_deadline_unix_millis.saturating_sub(started_unix_millis),
                 ));
             if budget.is_zero() {
+                deadline_expired = true;
                 break;
             }
+            attempts = ordinal + 1;
             let mut recovery = CommandSpec::new(&config.cli.path, &config.output_directory, budget)
                 .args([
                     OsString::from("windows-recover"),
@@ -1511,8 +1556,16 @@ mod native {
                         recovered_output = Some(output);
                         break;
                     }
+                    let stderr_text = String::from_utf8_lossy(&output.stderr);
+                    let trimmed = stderr_text.trim();
+                    last_detail = Some(if trimmed.is_empty() {
+                        format!("exit status {native_status}")
+                    } else {
+                        trimmed.to_owned()
+                    });
                 }
                 Err(error) => {
+                    last_detail = Some(error.to_string());
                     retain(
                         &directory.join(format!("recovery-{ordinal}.failure.txt")),
                         error.to_string().as_bytes(),
@@ -1520,15 +1573,22 @@ mod native {
                     )?;
                 }
             }
-            if Instant::now() >= recovery_deadline {
+            let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                deadline_expired = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            let delay = recovery_poll_delay(ordinal, remaining);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
         }
         let recovered = recovered_output.ok_or_else(|| {
-            CiError::Message(
-                "public recovery could not prove bound retirement within its owned deadline".into(),
-            )
+            CiError::Message(format_recovery_exhaustion_error(
+                attempts,
+                deadline_expired,
+                last_detail.as_deref(),
+            ))
         })?;
         retain(
             &directory.join("recovery.stdout.json"),
@@ -1712,7 +1772,8 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessMember, select_demand_workload_indices, select_frontend_subject,
+        ProcessMember, RECOVERY_MAX_ATTEMPTS, format_recovery_exhaustion_error,
+        recovery_poll_delay, select_demand_workload_indices, select_frontend_subject,
         verify_frontend_loss_exit,
     };
 
@@ -1840,5 +1901,42 @@ mod tests {
         assert!(verify_frontend_loss_exit(126, Some(0)).is_err());
         assert!(verify_frontend_loss_exit(126, None).is_err());
         assert!(verify_frontend_loss_exit(1, Some(126)).is_err());
+    }
+
+    #[test]
+    fn recovery_poll_delay_backs_off_and_covers_full_window() {
+        use std::time::Duration;
+        let window = Duration::from_secs(90);
+        assert_eq!(recovery_poll_delay(0, window), Duration::from_millis(100));
+        assert_eq!(recovery_poll_delay(1, window), Duration::from_millis(200));
+        assert_eq!(recovery_poll_delay(2, window), Duration::from_millis(400));
+        assert_eq!(recovery_poll_delay(3, window), Duration::from_millis(800));
+        assert_eq!(recovery_poll_delay(4, window), Duration::from_secs(1));
+        assert_eq!(recovery_poll_delay(20, window), Duration::from_secs(1));
+        assert_eq!(
+            recovery_poll_delay(4, Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(recovery_poll_delay(0, Duration::ZERO), Duration::ZERO);
+
+        let total_sleep: Duration = (0..RECOVERY_MAX_ATTEMPTS.saturating_sub(1))
+            .map(|ordinal| recovery_poll_delay(ordinal, window))
+            .sum();
+        assert!(total_sleep >= window);
+    }
+
+    #[test]
+    fn recovery_exhaustion_error_distinguishes_deadline_from_attempt_cap() {
+        let deadline = format_recovery_exhaustion_error(
+            90,
+            true,
+            Some("authenticated provider denied recovery authority (recovery-attempt-unavailable)"),
+        );
+        assert!(deadline.contains("within its owned deadline after 90 attempts"));
+        assert!(deadline.contains("recovery-attempt-unavailable"));
+
+        let capped = format_recovery_exhaustion_error(16, false, None);
+        assert!(capped.contains("attempt cap exhausted"));
+        assert!(capped.contains("after 16 attempts"));
     }
 }
