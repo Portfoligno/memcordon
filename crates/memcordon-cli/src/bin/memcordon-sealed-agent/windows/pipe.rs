@@ -1568,6 +1568,26 @@ fn write_frame_detailed_observed_until<T: Serialize>(
     )
 }
 
+/// Queue a complete frame without waiting for the peer to consume it.
+pub(super) fn write_frame_undrained_until<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+    cutoff: std::time::Instant,
+) -> Result<(), String> {
+    let transport = SynchronousIoDeadline::start(cutoff)
+        .map_err(|detail| frame_write_error(FrameWritePhase::Serialize, 0, 0, None, detail))
+        .map_err(|error| error.to_string())?;
+    super::frame_write::complete_frame_using(
+        value,
+        |bytes| native_frame_write(handle, bytes),
+        &mut |_| {},
+        frame_write_error,
+        || Ok(()),
+        || transport.finish(),
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn native_frame_write(handle: HANDLE, bytes: &[u8]) -> Result<usize, (Option<u32>, usize, String)> {
     let requested = u32::try_from(bytes.len()).expect("bounded frame segment");
     let mut written = 0u32;

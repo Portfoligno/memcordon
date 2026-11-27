@@ -2922,7 +2922,17 @@ fn relay_protocol(
                 }
                 _ => return Err("invalid request during a Windows sealed attempt".to_owned()),
             };
-            pipe::write_frame(launcher, &launcher_request)?;
+            if matches!(launcher_request, WindowsLauncherRequestV4::Cancel { .. }) {
+                // A live launcher can be waiting for us to read its response.
+                // Queue Cancel, then return to polling instead of draining here.
+                pipe::write_frame_undrained_until(
+                    launcher,
+                    &launcher_request,
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )?;
+            } else {
+                pipe::write_frame(launcher, &launcher_request)?;
+            }
         }
         pipe::wait_poll_interval();
     }
