@@ -33,6 +33,11 @@ verifies the caller token, resource limits and inherited streams, and retains an
 external guardian before release. Commands, native UTF-16 argv, environment and
 working directory retain their actual native values.
 
+The installed launcher service starts the workload without an attached console.
+Standard input, output and error use pipes, not console handles. Cancellation
+through the sealed boundary does not depend on console control events reaching
+the workload.
+
 Current public/private transport is 4, durable records 5, terminal receipts and
 retirement proofs 3, and capability owners 2. Only those current formats are
 accepted. Recovery authenticates current records and native resources; no previous

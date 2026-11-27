@@ -1,4 +1,5 @@
 use super::*;
+use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
 #[path = "target_readback.rs"]
 mod target_readback;
@@ -103,6 +104,35 @@ pub(crate) fn terminate_held_target_if_live(process: HANDLE, status: u32) -> Res
 #[cfg(test)]
 #[path = "../../../../../tests/sealed_agent/windows_target_retirement.rs"]
 mod target_retirement_tests;
+
+fn target_creation_flags(object_security: TargetObjectSecurity) -> u32 {
+    CREATE_SUSPENDED
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_UNICODE_ENVIRONMENT
+        | CREATE_NEW_PROCESS_GROUP
+        | match object_security {
+            // The workload uses explicit stdio pipes, not a Windows console.
+            TargetObjectSecurity::LauncherService => DETACHED_PROCESS,
+            TargetObjectSecurity::NestedCanaryCreator => 0,
+        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_launcher_service_workloads_are_created_detached() {
+        assert_eq!(
+            target_creation_flags(TargetObjectSecurity::LauncherService),
+            0x0008_060c
+        );
+        assert_eq!(
+            target_creation_flags(TargetObjectSecurity::NestedCanaryCreator),
+            0x0008_0604
+        );
+    }
+}
 
 impl SuspendedTarget {
     pub fn terminate_if_live(&self, status: u32) -> Result<(), String> {
@@ -418,6 +448,7 @@ impl SuspendedTarget {
             &process_source_before,
         )
         .map_err(|error| TargetCreateError::from(error.to_string()))?;
+        let creation_flags = target_creation_flags(object_security);
         let created = if matches!(
             certification_mutant,
             Some(
@@ -432,10 +463,7 @@ impl SuspendedTarget {
                     &raw const process_attributes,
                     &raw const thread_attributes,
                     1,
-                    CREATE_SUSPENDED
-                        | EXTENDED_STARTUPINFO_PRESENT
-                        | CREATE_UNICODE_ENVIRONMENT
-                        | CREATE_NEW_PROCESS_GROUP,
+                    creation_flags,
                     environment.as_ptr().cast::<c_void>(),
                     current_directory.as_ptr(),
                     &raw const startup.StartupInfo,
@@ -451,10 +479,7 @@ impl SuspendedTarget {
                     &raw const process_attributes,
                     &raw const thread_attributes,
                     1,
-                    CREATE_SUSPENDED
-                        | EXTENDED_STARTUPINFO_PRESENT
-                        | CREATE_UNICODE_ENVIRONMENT
-                        | CREATE_NEW_PROCESS_GROUP,
+                    creation_flags,
                     environment.as_ptr().cast::<c_void>(),
                     current_directory.as_ptr(),
                     &raw const startup.StartupInfo,
