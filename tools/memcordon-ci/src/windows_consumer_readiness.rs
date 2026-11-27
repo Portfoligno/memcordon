@@ -2837,6 +2837,7 @@ pub fn classify_reduced_console_pair(record: &serde_json::Value) -> Option<&'sta
     };
     let baseline = &record["baseline"];
     let detached = &record["detached"];
+    let new_console = &record["new_console"];
     if record["state"] != "complete"
         || record["desktop_closed"] != true
         || [
@@ -2849,11 +2850,40 @@ pub fn classify_reduced_console_pair(record: &serde_json::Value) -> Option<&'sta
         .any(|field| record["same_held_inputs"][field] != true)
         || !settled(baseline)
         || !settled(detached)
+        || !settled(new_console)
         || baseline["flags"] != 0x0008_0604
         || detached["flags"] != 0x0008_060c
-        || (baseline["pid"] == detached["pid"] && baseline["birth"] == detached["birth"])
+        || new_console["flags"] != 0x0008_0614
+        || [
+            (baseline, detached),
+            (baseline, new_console),
+            (detached, new_console),
+        ]
+        .into_iter()
+        .any(|(left, right)| left["pid"] == right["pid"] && left["birth"] == right["birth"])
     {
         return None;
+    }
+    // A consoleless parent (the installed launcher service) forces a
+    // console-subsystem target to allocate its own console host. Inherited
+    // and detached legs cannot exercise that allocation.
+    if baseline["native_status"].as_u64() == Some(0)
+        && baseline["snapshot_matches"].as_bool() == Some(true)
+        && detached["native_status"].as_u64() == Some(0)
+        && detached["snapshot_matches"].as_bool() == Some(true)
+    {
+        return Some(
+            match (
+                new_console["native_status"].as_u64(),
+                new_console["snapshot_matches"].as_bool(),
+            ) {
+                (Some(0xc000_0142), Some(false)) if new_console["stdout_bytes"] == 0 => {
+                    "new-console-allocation-reproduces-fixture-startup"
+                }
+                (Some(0), Some(true)) => "fixture-baseline-did-not-reproduce",
+                _ => "inconclusive",
+            },
+        );
     }
     Some(
         match (
@@ -6344,6 +6374,8 @@ pub(crate) mod native {
                         | "baseline-run"
                         | "detached-create"
                         | "detached-run"
+                        | "new_console-create"
+                        | "new_console-run"
                         | "desktop-retirement"
                 )
             ) {

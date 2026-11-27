@@ -4995,7 +4995,7 @@ fn node_2460() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-package"));
     values.insert(text("timeout-minutes"), Value::Number(5.into()));
-    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json"));
+    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -5458,7 +5458,7 @@ fn node_2422() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-package"));
     values.insert(text("timeout-minutes"), Value::Number(5.into()));
-    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json"));
+    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -5901,7 +5901,7 @@ fn node_2386() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-package"));
     values.insert(text("timeout-minutes"), Value::Number(5.into()));
-    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json"));
+    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -6332,7 +6332,7 @@ fn node_2350() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-package"));
     values.insert(text("timeout-minutes"), Value::Number(5.into()));
-    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json"));
+    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -6763,7 +6763,7 @@ fn node_2314() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-package"));
     values.insert(text("timeout-minutes"), Value::Number(5.into()));
-    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json"));
+    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 
@@ -7194,7 +7194,7 @@ fn node_2278() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(text("id"), text("test-tools-package"));
     values.insert(text("timeout-minutes"), Value::Number(5.into()));
-    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json"));
+    values.insert(text("run"), text("tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json"));
     Value::Mapping(values)
 }
 

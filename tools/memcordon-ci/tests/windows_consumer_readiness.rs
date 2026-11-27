@@ -736,6 +736,9 @@ fn console_calibration_needs_owned_settled_processes_and_exact_detachment() {
         "detached":{"flags":0x8060c,"pid":42,"birth":101,
             "natural_exit":true,"suspended_token_and_image_verified":true,
             "job_empty_verified":true,"native_status":0,"snapshot_matches":true},
+        "new_console":{"flags":0x80614,"pid":43,"birth":102,
+            "natural_exit":true,"suspended_token_and_image_verified":true,
+            "job_empty_verified":true,"native_status":0,"snapshot_matches":true},
     });
     assert_eq!(
         classify_reduced_console_pair(&record),
@@ -750,6 +753,9 @@ fn console_calibration_needs_owned_settled_processes_and_exact_detachment() {
         ("/detached/suspended_token_and_image_verified", json!(false)),
         ("/detached/flags", json!(0x8040c)),
         ("/baseline/pid", json!(0)),
+        ("/new_console/flags", json!(0x80604)),
+        ("/new_console/natural_exit", json!(false)),
+        ("/new_console/pid", json!(0)),
     ] {
         let mut wrong = record.clone();
         *wrong.pointer_mut(field).unwrap() = value;
@@ -762,6 +768,38 @@ fn console_calibration_needs_owned_settled_processes_and_exact_detachment() {
         classify_reduced_console_pair(&record),
         Some("detachment-did-not-resolve-fixture-startup"),
     );
+}
+
+#[test]
+fn console_calibration_separates_new_console_allocation_from_inherited_console() {
+    use memcordon_ci::windows_consumer_readiness::classify_reduced_console_pair;
+    use serde_json::json;
+    let settled = |flags: u32, pid: u32, status: u32, matches: bool, stdout: usize| {
+        json!({"flags":flags,"pid":pid,"birth":100 + pid,
+            "natural_exit":true,"suspended_token_and_image_verified":true,
+            "job_empty_verified":true,"native_status":status,"snapshot_matches":matches,
+            "stdout_bytes":stdout})
+    };
+    let mut record = json!({
+        "state":"complete","desktop_closed":true,
+        "same_held_inputs":{"reduced_primary":true,"desktop":true,"stdio_endpoints":true,"creation_job":true},
+        "baseline":settled(0x80604, 41, 0, true, 1161),
+        "detached":settled(0x8060c, 42, 0, true, 1161),
+        "new_console":settled(0x80614, 43, 0xc000_0142, false, 0),
+    });
+    assert_eq!(
+        classify_reduced_console_pair(&record),
+        Some("new-console-allocation-reproduces-fixture-startup"),
+    );
+    record["new_console"] = settled(0x80614, 43, 0, true, 1161);
+    assert_eq!(
+        classify_reduced_console_pair(&record),
+        Some("fixture-baseline-did-not-reproduce"),
+    );
+    record["new_console"] = settled(0x80614, 43, 0xc000_0142, false, 7);
+    assert_eq!(classify_reduced_console_pair(&record), Some("inconclusive"));
+    record.as_object_mut().unwrap().remove("new_console");
+    assert_eq!(classify_reduced_console_pair(&record), None);
 }
 
 #[test]

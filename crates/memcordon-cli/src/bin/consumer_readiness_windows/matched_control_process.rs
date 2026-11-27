@@ -27,6 +27,16 @@ pub(super) fn live(cutoff: Instant) -> io::Result<()> {
 fn last() -> io::Error {
     io::Error::last_os_error()
 }
+
+/// Console policy for one diagnostic calibration leg. `NewConsole` models a
+/// console-subsystem child created by a consoleless parent (for example the
+/// installed launcher service), which must allocate its own console host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsolePolicy {
+    Inherit,
+    Detached,
+    NewConsole,
+}
 #[derive(Debug)]
 struct SettlementFailure {
     primary: io::Error,
@@ -402,7 +412,7 @@ impl Process {
     pub fn create_with_console(
         caller: Arc<Caller>,
         launch: Launch<'_>,
-        console: Option<(&[u16], bool)>,
+        console: Option<(&[u16], ConsolePolicy)>,
     ) -> io::Result<Self> {
         if console.is_some_and(|(desktop, _)| {
             desktop.is_empty() || desktop.contains(&0) || launch.job.is_none()
@@ -446,11 +456,13 @@ impl Process {
         cwd.push(0);
         let mut creation_flags =
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
-        let mut desktop = console.map(|(desktop, detached)| {
+        let mut desktop = console.map(|(desktop, policy)| {
             creation_flags |= CREATE_NEW_PROCESS_GROUP;
-            if detached {
-                creation_flags |= DETACHED_PROCESS;
-            }
+            creation_flags |= match policy {
+                ConsolePolicy::Inherit => 0,
+                ConsolePolicy::Detached => DETACHED_PROCESS,
+                ConsolePolicy::NewConsole => CREATE_NEW_CONSOLE,
+            };
             desktop.iter().copied().chain(Some(0)).collect::<Vec<_>>()
         });
         for handle in stdio {

@@ -6,7 +6,7 @@ use super::{
     fixture_environment,
     matched_control_broker::hold_image,
     matched_control_io::Pipe,
-    matched_control_process::{Caller, Image, Job, Launch, Process, live},
+    matched_control_process::{Caller, ConsolePolicy, Image, Job, Launch, Process, live},
 };
 use serde_json::{Value, json};
 use std::{
@@ -243,18 +243,20 @@ pub(super) fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
         let desktop = Desktop::create(&challenge_sha256, &sid.sid, caller.token())?;
         evidence["desktop"] = desktop.evidence().clone();
         let pair = (|| -> io::Result<()> {
-            for (name, detached) in [("baseline", false), ("detached", true)] {
-                evidence["stage"] = json!(if detached {
-                    "detached-create"
-                } else {
-                    "baseline-create"
-                });
-                // Share one absolute cutoff without letting the first child
-                // consume the second child's allowance.
-                let leg_work = if detached {
+            let legs = [
+                ("baseline", ConsolePolicy::Inherit),
+                ("detached", ConsolePolicy::Detached),
+                ("new_console", ConsolePolicy::NewConsole),
+            ];
+            for (index, (name, policy)) in legs.into_iter().enumerate() {
+                evidence["stage"] = json!(format!("{name}-create"));
+                // Share one absolute cutoff without letting an earlier child
+                // consume a later child's allowance.
+                let remaining = u32::try_from(legs.len() - index).unwrap_or(u32::MAX);
+                let leg_work = if remaining == 1 {
                     work
                 } else {
-                    Instant::now() + work.saturating_duration_since(Instant::now()) / 2
+                    Instant::now() + work.saturating_duration_since(Instant::now()) / remaining
                 };
                 caller.verify_unchanged(leg_work)?;
                 if parent_console()?.is_some() != console.is_some() {
@@ -278,13 +280,9 @@ pub(super) fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
                         work: leg_work,
                         cleanup,
                     },
-                    Some((desktop.name(), detached)),
+                    Some((desktop.name(), policy)),
                 )?;
-                evidence["stage"] = json!(if detached {
-                    "detached-run"
-                } else {
-                    "baseline-run"
-                });
+                evidence["stage"] = json!(format!("{name}-run"));
                 let leg = leg(
                     &mut process,
                     &mut stdout.read,

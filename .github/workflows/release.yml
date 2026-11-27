@@ -4792,7 +4792,7 @@ jobs:
       - &shared_step_123
         id: test-tools-package
         timeout-minutes: 5
-        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json
+        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture target/ci/native/release/memcordon-linux-readiness-fixture target/ci-preparation/test-tools.json
       - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
@@ -4906,7 +4906,7 @@ jobs:
       - &shared_step_124
         id: test-tools-package
         timeout-minutes: 5
-        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json
+        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture target/ci-preparation/test-tools.json
       - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
@@ -5091,7 +5091,7 @@ jobs:
       - &shared_step_136
         id: test-tools-package
         timeout-minutes: 5
-        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json
+        run: tar -czf target/test-tools.tar.gz target/ci-runtime/current target/ci/native/CACHEDIR.TAG target/ci/native/release/memcordon-test-fixture.exe target/ci-preparation/test-tools.json
       - id: test-tools-upload
         uses: *action_0
         timeout-minutes: 6
