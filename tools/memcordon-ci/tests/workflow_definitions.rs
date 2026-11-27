@@ -107,7 +107,17 @@ fn backend_original_failure_carriers_precede_the_full_installed_artifact() {
 }
 
 fn expected_listener_carriers(prefix: &str) -> Vec<String> {
-    let mut paths = Vec::new();
+    let mut paths = [
+        "windows-assessment.json",
+        "windows-lease-owner.json",
+        "windows-original-deadlines.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/native-invocation.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/native-loss-action.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/live-observation.json",
+        "windows-installed/W-RETIREMENT/frontend-loss/native-exit.json",
+    ]
+    .map(|relative| format!("{prefix}/{relative}"))
+    .to_vec();
     for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
         for name in [
             "result.callback-failure.json",
