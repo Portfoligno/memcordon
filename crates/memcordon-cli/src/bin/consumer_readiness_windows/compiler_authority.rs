@@ -293,6 +293,16 @@ pub(super) fn select() -> io::Result<(OwnedHandle, OwnedHandle, CompilerAuthorit
         ));
     }
     let reduced = unsafe { OwnedHandle::from_raw_handle(reduced.cast()) };
+    // The elevated default DACL can rely on Administrators for access to
+    // objects created without an explicit descriptor. That SID is now
+    // deny-only. On the private derived token, grant the measured user access
+    // to newly created objects without changing the owner or existing ACEs.
+    super::native_fixture_default_dacl::prepare_reduced(
+        primary.as_raw_handle(),
+        reduced.as_raw_handle(),
+        &source.token.user_sid,
+    )
+    .map_err(|e| qualification_stage(ReducedDefaultDacl, e))?;
     let selected =
         observe(reduced.as_raw_handle()).map_err(|e| qualification_stage(ReducedInventory, e))?;
     validate_compiler_authority_reduction(&source, &selected)

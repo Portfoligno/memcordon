@@ -186,3 +186,66 @@ fn original_ace_bound_is_enforced_before_append_and_idempotent_at_the_bound() {
     let full = acl(&full);
     assert_eq!(fixture::plan(Some(&full)).unwrap(), full);
 }
+
+#[test]
+fn reduced_user_grant_preserves_every_original_ace_and_is_idempotent() {
+    let user = sid([0, 0, 0, 0, 0, 5], &[21, 1, 2, 3, 500]);
+    let original = ordinary_sample();
+    let planned = fixture::plan_principal(Some(&original), &user).unwrap();
+    let grant = ace(0, 0, GENERIC_ALL, &user);
+    assert_eq!(&planned[..2], &original[..2]);
+    assert_eq!(&planned[6..original.len()], &original[6..]);
+    assert_eq!(&planned[original.len()..], grant);
+    assert_eq!(
+        usize::from(u16::from_le_bytes([planned[2], planned[3]])),
+        original.len() + grant.len()
+    );
+    assert_eq!(
+        u16::from_le_bytes([planned[4], planned[5]]),
+        u16::from_le_bytes([original[4], original[5]]) + 1
+    );
+    assert_eq!(
+        fixture::plan_principal(Some(&planned), &user).unwrap(),
+        planned
+    );
+    assert_eq!(
+        fixture::plan(Some(&original)).unwrap(),
+        fixture::plan_principal(Some(&original), fixture::RESTRICTED_CODE_SID).unwrap()
+    );
+}
+
+#[test]
+fn reduced_user_conflicts_and_malformed_principals_refuse() {
+    let user = sid([0, 0, 0, 0, 0, 5], &[21, 1, 2, 3, 500]);
+    let exact = ace(0, 0, GENERIC_ALL, &user);
+    for aces in [
+        vec![ace(1, 0, GENERIC_ALL, &user)],
+        vec![ace(0, 0x10, GENERIC_ALL, &user)],
+        vec![ace(0, 0, GENERIC_READ_EXECUTE, &user), exact.clone()],
+        vec![exact.clone(), exact],
+    ] {
+        assert_eq!(
+            fixture::plan_principal(Some(&acl(&aces)), &user)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+    let original = ordinary_sample();
+    let mut extra = user.clone();
+    extra.extend_from_slice(&[0; std::mem::size_of::<u32>()]);
+    let mut wrong_revision = user.clone();
+    wrong_revision[0] = 2;
+    for principal in [&[][..], &user[..user.len() - 1], &extra, &wrong_revision] {
+        assert_eq!(
+            fixture::plan_principal(Some(&original), principal)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(
+        fixture::plan_principal(None, &user).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+}

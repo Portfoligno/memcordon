@@ -976,25 +976,6 @@ impl Drop for CompilerConsole {
     }
 }
 
-/// Use the real fixture path and refuse to count an already attached child.
-pub(super) fn detached_console_probe() -> serde_json::Value {
-    let result = match CompilerConsole::allocate_if_detached() {
-        Ok(mut console) if console.0 => console.release(),
-        Ok(_) => return serde_json::json!({"state":"unexpected-inherited-console"}),
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(()) => {
-            serde_json::json!({"state":"allocated-and-released","stdio_unchanged_at_attach":true})
-        }
-        Err(error) => {
-            let detail = super::operation_context::console_failure_detail(&error);
-            serde_json::json!({"state":"failed","api":detail.map(|(api, _)| api),
-                "raw_os_error":detail.and_then(|(_, raw)| raw)})
-        }
-    }
-}
-
 pub(super) fn execute(
     descriptor: &Descriptor,
     transcript: &mut Transcript,

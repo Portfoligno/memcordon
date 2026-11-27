@@ -26,6 +26,7 @@ pub enum CompilerQualificationStage {
     SourceValidation,
     AdministratorsSid,
     CreateRestrictedToken,
+    ReducedDefaultDacl,
     ReducedInventory,
     AuthorityReduction,
     FrontendSetup,

@@ -6300,7 +6300,7 @@ pub(crate) mod native {
             ));
         }
         let cwd = PathBuf::from(OsString::from_wide(&request.current_directory));
-        run_console_calibration(config, input, &cwd, snapshot, deadline, Some(request))
+        run_console_calibration(config, input, &cwd, snapshot, deadline, request)
     }
 
     fn run_console_calibration(
@@ -6309,7 +6309,7 @@ pub(crate) mod native {
         cwd: &Path,
         snapshot: &[u8],
         deadline: Instant,
-        startup_request: Option<&memcordon_core::WindowsLaunchRequestV2>,
+        startup_request: &memcordon_core::WindowsLaunchRequestV2,
     ) -> Result<serde_json::Value> {
         use descriptor::gate_precondition::{
             CompilerAuthoritySnapshot, sha256, validate_compiler_authority_reduction,
@@ -6317,7 +6317,6 @@ pub(crate) mod native {
         use serde_json::{Value, json};
         use std::os::windows::ffi::OsStrExt;
         const CAPTURE: usize = 8 * 1024;
-        let runtime = startup_request.is_none();
         let budget = provision_budget(deadline)?.min(Duration::from_secs(8));
         if budget < Duration::from_secs(4) {
             return Ok(json!({"state":"unavailable","stage":"deadline","diagnostic_only":true}));
@@ -6356,11 +6355,7 @@ pub(crate) mod native {
             .stdin(std::process::Stdio::null())
             .args([
                 "consumer-readiness-windows",
-                if runtime {
-                    "reduced-compiler-runtime-console-calibration"
-                } else {
-                    "reduced-compiler-console-calibration"
-                },
+                "reduced-compiler-console-calibration",
             ])
             .args([
                 &config.fixture.sha256,
@@ -6383,12 +6378,7 @@ pub(crate) mod native {
         memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
             .map_err(CiError::Message)?;
         let mut record: Value = serde_json::from_slice(&output.stdout)?;
-        let format = if runtime {
-            "memcordon.windows-fixture-runtime-console-calibration"
-        } else {
-            "memcordon.windows-fixture-console-calibration"
-        };
-        if record["format"] != format
+        if record["format"] != "memcordon.windows-fixture-console-calibration"
             || record["revision"] != 1
             || record["fixture_sha256"] != config.fixture.sha256
             || record["selected_sha256"] != selected_sha256
@@ -6410,9 +6400,6 @@ pub(crate) mod native {
             "stdio":"fixture-owned pipes",
         });
         if record["state"] == "unavailable" {
-            if runtime {
-                return Ok(record);
-            }
             if matches!(
                 record["stage"].as_str(),
                 Some(
@@ -6445,32 +6432,16 @@ pub(crate) mod native {
                     .collect::<Vec<_>>(),
             )
         };
-        let (current_directory, environment, arguments) = match startup_request {
-            Some(request) => (
-                request.current_directory.clone(),
-                request.environment.clone(),
-                request.command.arguments.clone(),
-            ),
-            None => (
-                cwd.as_os_str().encode_wide().collect(),
-                fixture_environment::entries()?,
-                [
-                    "consumer-readiness-windows",
-                    "reduced-compiler-detached-console-probe",
-                ]
-                .map(|argument| argument.encode_utf16().collect())
-                .to_vec(),
-            ),
-        };
-        let environment = memcordon_core::encode_windows_environment_block(&environment)
-            .map_err(|error| CiError::Message(error.into()))?;
+        let environment =
+            memcordon_core::encode_windows_environment_block(&startup_request.environment)
+                .map_err(|error| CiError::Message(error.into()))?;
         let program: Vec<_> = config.fixture.path.as_os_str().encode_wide().collect();
         let argv_sha256 = sha256(&serde_json::to_vec(
             &std::iter::once(program)
-                .chain(arguments)
+                .chain(startup_request.command.arguments.iter().cloned())
                 .collect::<Vec<_>>(),
         )?);
-        if record["cwd_sha256"] != wide_digest(&current_directory)
+        if record["cwd_sha256"] != wide_digest(&startup_request.current_directory)
             || record["environment_sha256"] != wide_digest(&environment)
             || record["argv_sha256"] != argv_sha256
             || record["fixture_identity"]["file_index"]
@@ -6480,9 +6451,6 @@ pub(crate) mod native {
             return Err(CiError::Message(
                 "fixture console calibration launch inputs differ".into(),
             ));
-        }
-        if runtime {
-            return Ok(record);
         }
         let interpretation = super::classify_reduced_console_pair(&record).ok_or_else(|| {
             CiError::Message("fixture console calibration native pair differs".into())
@@ -13690,14 +13658,14 @@ pub(crate) mod native {
                         .lock()
                         .map_err(|_| CiError::Message("fixture ownership poisoned".into()))?;
                     let root = held.first().ok_or_else(|| {
-                        CiError::Message("console calibration original root hold absent".into())
+                        CiError::Message("console diagnostic original root hold absent".into())
                     })?;
                     crate::windows_original_gate_failure::retired_family(
                         held.iter().map(|process| process.has_exited()),
                     )?;
                     if root.native_exit_status()? != Some(2) {
                         return Err(CiError::Message(
-                            "console calibration original root status differs".into(),
+                            "console diagnostic original root status differs".into(),
                         ));
                     }
                     root.identity
@@ -13708,38 +13676,18 @@ pub(crate) mod native {
                         .map_err(|_| CiError::Message("guardian ownership poisoned".into()))?;
                     if guardians.len() != 1 || !guardians[0].has_retired()? {
                         return Err(CiError::Message(
-                            "console calibration original guardian not retired".into(),
+                            "console diagnostic original guardian not retired".into(),
                         ));
                     }
                 }
                 let deadline = work_deadline.min(cleanup_deadline);
                 provision_budget(deadline)?;
-                let selected = crate::windows_native_files::hold_artifact(
-                    &config.output_directory.join(REDUCED_COMPILER_SELECTED),
-                    None,
-                    COMPILER_AUTHORITY_BYTES as u64,
-                )?;
-                let calibration = run_console_calibration(
-                    config,
-                    input,
-                    &config.output_directory,
-                    &selected.bytes,
-                    deadline,
-                    None,
-                )
-                .unwrap_or_else(|error| {
-                    json!({
-                        "state":"unavailable","stage":"controller","diagnostic_only":true,
-                        "reason":crate::command::bounded_excerpt(error.to_string().as_bytes()),
-                    })
-                });
                 let value = json!({
                     "state":"fixture-reached-runtime-console","diagnostic_only":true,
                     "acceptance_authority":false,"case":input.key,"target":config.target,
                     "original":{"api":api,"raw_os_error":5,"stderr_sha256":stderr_sha256,
                         "pid":root.pid,"birth":root.birth,"native_status":2,
                         "held_family_and_guardian_retired":true},
-                    "runtime_console_calibration":calibration,
                 });
                 // The pre-main 0xc0000142 comparison and this post-main diagnostic
                 // cannot both qualify. Use the existing bounded artifact carrier.
@@ -13750,7 +13698,7 @@ pub(crate) mod native {
                 Ok(())
             })();
             if let Err(error) = diagnostic {
-                eprintln!("optional reduced runtime console calibration unavailable: {error}");
+                eprintln!("optional reduced runtime console diagnostic unavailable: {error}");
             }
         }
         // A known application result is not a failed intrinsic contract once

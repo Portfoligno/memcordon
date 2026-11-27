@@ -296,25 +296,48 @@ pub(super) fn snapshot(token: HANDLE) -> io::Result<Snapshot> {
 }
 
 pub(super) fn prepare(source: HANDLE, restricted: HANDLE) -> io::Result<()> {
-    if source == restricted {
+    prepare_planned(source, restricted, |_, before| {
+        require_restricted_code(restricted)?;
+        policy::plan(before.default_acl())
+    })
+}
+
+/// `user` is the measured binary user SID from the qualified compiler source.
+pub(super) fn prepare_reduced(source: HANDLE, derived: HANDLE, user: &[u8]) -> io::Result<()> {
+    prepare_planned(source, derived, |source_before, before| {
+        if before.envelope().user_sid != source_before.envelope().user_sid {
+            return Err(io::Error::other(
+                "fixture source and reduced token users differ",
+            ));
+        }
+        policy::plan_principal(before.default_acl(), user)
+    })
+}
+
+/// Change only a private derived token, then verify both token objects.
+fn prepare_planned(
+    source: HANDLE,
+    derived: HANDLE,
+    planner: impl FnOnce(&Snapshot, &Snapshot) -> io::Result<Vec<u8>>,
+) -> io::Result<()> {
+    if source == derived {
         return Err(io::Error::other(
             "fixture source and derived tokens must be distinct",
         ));
     }
     let source_before = snapshot(source)?;
-    let before = snapshot(restricted)?;
+    let before = snapshot(derived)?;
     if source_before.stable.token_id == before.stable.token_id {
         return Err(io::Error::other(
             "fixture preparation cannot mutate the original token object",
         ));
     }
-    require_restricted_code(restricted)?;
-    let expected = policy::plan(before.default_acl.as_deref())?;
+    let expected = planner(&source_before, &before)?;
     let changed = before.default_acl.as_deref() != Some(expected.as_slice());
     if changed {
-        set_private_default_acl(restricted, &expected)?;
+        set_private_default_acl(derived, &expected)?;
     }
-    let after = snapshot(restricted)?;
+    let after = snapshot(derived)?;
     let source_after = snapshot(source)?;
     if before.stable != after.stable
         || after.default_acl.as_deref() != Some(expected.as_slice())
@@ -333,7 +356,7 @@ pub(super) fn prepare(source: HANDLE, restricted: HANDLE) -> io::Result<()> {
 }
 
 /// The caller owns an unshared, freshly derived token and checked ACL bytes.
-pub(super) fn set_private_default_acl(token: HANDLE, expected: &[u8]) -> io::Result<()> {
+fn set_private_default_acl(token: HANDLE, expected: &[u8]) -> io::Result<()> {
     // Native ACL storage must be aligned and live through synchronous copy.
     let mut storage = vec![0usize; expected.len().div_ceil(size_of::<usize>())];
     // SAFETY: the planner's bytes fit the aligned backing allocation.

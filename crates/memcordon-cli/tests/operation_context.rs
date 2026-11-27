@@ -121,10 +121,6 @@ fn compiler_console_api_detail_preserves_the_existing_marker() {
     ] {
         let detail = format!("console-api={label}");
         let error = context::console_error(api, io::Error::from_raw_os_error(5));
-        assert_eq!(
-            context::console_failure_detail(&error),
-            Some((label, Some(5)))
-        );
         let rendered = context::<()>(
             Operation::Toolchain(ToolchainOperation::CompilerConsole),
             Err(error),

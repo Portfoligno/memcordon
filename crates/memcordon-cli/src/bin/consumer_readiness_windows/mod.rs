@@ -2,7 +2,6 @@
 mod compiler_authority;
 mod console_calibration;
 mod console_calibration_desktop;
-mod console_calibration_token;
 mod controller_gate_access;
 mod controller_gate_control_publication;
 mod controller_gate_diagnostic;
@@ -1512,20 +1511,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             return Ok(0);
         }
         Some("reduced-compiler-console-calibration") => {
-            return console_calibration::run(args, false);
-        }
-        Some("reduced-compiler-runtime-console-calibration") => {
-            return console_calibration::run(args, true);
-        }
-        Some("reduced-compiler-detached-console-probe") => {
-            if args.next().is_some() {
-                return Err(io::Error::other("extra detached console probe arguments"));
-            }
-            io::stdout().write_all(
-                &serde_json::to_vec(&toolchain::detached_console_probe())
-                    .map_err(io::Error::other)?,
-            )?;
-            return Ok(0);
+            return console_calibration::run(args);
         }
         Some(which @ ("reduced-compiler-snapshot" | "reduced-compiler-source-snapshot")) => {
             if args.next().is_some() {

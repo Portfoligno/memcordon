@@ -104,7 +104,7 @@ fn set_private_acl(token: HANDLE, bytes: &[u8]) {
     );
 }
 
-fn user_acl(token: HANDLE) -> Vec<u8> {
+fn binary_user_sid(token: HANDLE) -> Vec<u8> {
     let user = query(token, TokenUser).unwrap();
     assert!(user.length >= size_of::<TOKEN_USER>());
     // SAFETY: fixed native header admitted in the aligned query.
@@ -120,7 +120,13 @@ fn user_acl(token: HANDLE) -> Vec<u8> {
     pointer_range(&user, sid.cast(), length).unwrap();
     // SAFETY: admitted complete OS-returned SID is live in user.
     assert_eq!(unsafe { GetLengthSid(sid) } as usize, length);
-    let ace_length = u16::try_from(8 + length).unwrap();
+    // SAFETY: full SID range was admitted above; preserve its exact bytes.
+    unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec()
+}
+
+fn user_acl(token: HANDLE) -> Vec<u8> {
+    let sid = binary_user_sid(token);
+    let ace_length = u16::try_from(8 + sid.len()).unwrap();
     let total = u16::try_from(8 + usize::from(ace_length)).unwrap();
     let mut acl = vec![2, 0];
     acl.extend_from_slice(&total.to_le_bytes());
@@ -128,8 +134,7 @@ fn user_acl(token: HANDLE) -> Vec<u8> {
     acl.extend_from_slice(&[0, 0, 0, 0]);
     acl.extend_from_slice(&ace_length.to_le_bytes());
     acl.extend_from_slice(&GENERIC_ALL.to_le_bytes());
-    // SAFETY: full SID range was admitted above; preserve its exact bytes.
-    acl.extend_from_slice(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) });
+    acl.extend_from_slice(&sid);
     assert_eq!(acl.len(), usize::from(total));
     policy::plan(Some(&acl)).unwrap();
     acl
@@ -371,6 +376,45 @@ fn event_rc_grants(raw: &[u8]) -> usize {
     // inventory. Every declared ACE above remains bounded and validated.
     assert!(offset <= raw.len());
     found
+}
+
+#[test]
+fn private_reduced_fixture_default_dacl_changes_only_the_derived_acl() {
+    let mut current = std::ptr::null_mut();
+    // SAFETY: query and duplicate only; the process token cannot be adjusted.
+    assert_ne!(
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut current,
+            )
+        },
+        0
+    );
+    let current = owned(current);
+    let process_before = snapshot(current.as_raw_handle()).unwrap();
+    let source = duplicate(current.as_raw_handle(), TokenPrimary);
+    let original = policy::plan(Some(&[2, 0, 8, 0, 0, 0, 0, 0])).unwrap();
+    set_private_acl(source.as_raw_handle(), &original);
+    let source_before = snapshot(source.as_raw_handle()).unwrap();
+    let derived = duplicate(source.as_raw_handle(), TokenPrimary);
+    let before = snapshot(derived.as_raw_handle()).unwrap();
+    assert_eq!(before.default_acl.as_deref(), Some(original.as_slice()));
+
+    let user = binary_user_sid(source.as_raw_handle());
+    prepare_reduced(source.as_raw_handle(), derived.as_raw_handle(), &user).unwrap();
+    let after = snapshot(derived.as_raw_handle()).unwrap();
+    assert_eq!(after.stable, before.stable);
+    assert_eq!(
+        after.default_acl,
+        Some(policy::plan_principal(Some(&original), &user).unwrap())
+    );
+    prepare_reduced(source.as_raw_handle(), derived.as_raw_handle(), &user).unwrap();
+    assert_eq!(snapshot(derived.as_raw_handle()).unwrap(), after);
+    assert!(prepare_reduced(source.as_raw_handle(), source.as_raw_handle(), &user).is_err());
+    assert_eq!(snapshot(source.as_raw_handle()).unwrap(), source_before);
+    assert_eq!(snapshot(current.as_raw_handle()).unwrap(), process_before);
 }
 
 #[test]

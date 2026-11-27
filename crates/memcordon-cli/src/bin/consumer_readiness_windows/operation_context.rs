@@ -333,11 +333,6 @@ pub fn console_error(api: ConsoleApi, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), ConsoleFailure(api, error))
 }
 
-pub fn console_failure_detail(error: &io::Error) -> Option<(&'static str, Option<i32>)> {
-    let failure = error.get_ref()?.downcast_ref::<ConsoleFailure>()?;
-    Some((failure.0.label(), failure.1.raw_os_error()))
-}
-
 fn compiler_failure(original: &io::Error) -> Option<&CompilerFailure> {
     let mut cause: &(dyn std::error::Error + 'static) = original;
     for _ in 0..8 {
