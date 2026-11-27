@@ -3514,18 +3514,30 @@ pub fn recover_attempt_for_caller(
                     if !guardian_receipt_binds_record(&guardian, &record)? {
                         return Err("exact recovery pending checked closure: guardian receipt does not bind original record".to_owned());
                     }
-                    if let Some(blocker) = frozen_manifest_owner_blocker(&record)? {
-                        return Err(format!("exact recovery pending checked closure: {blocker}"));
-                    }
-                    super::process::retire_handed_off_guardian(
+                    if !reconcile_extinct_local_worker_before_recovery(
+                        &path,
                         attempt_id,
-                        &guardian.guardian_identity,
-                    )?;
-                    stage_recovered_closure(
+                        nonce,
+                        request_sha256,
+                        caller,
+                        &guardian,
                         &mut record,
-                        &caller.current_boot_identity,
-                        Some(&guardian),
-                    )?;
+                    )? {
+                        if let Some(blocker) = frozen_manifest_owner_blocker(&record)? {
+                            return Err(format!(
+                                "exact recovery pending checked closure: {blocker}"
+                            ));
+                        }
+                        super::process::retire_handed_off_guardian(
+                            attempt_id,
+                            &guardian.guardian_identity,
+                        )?;
+                        stage_recovered_closure(
+                            &mut record,
+                            &caller.current_boot_identity,
+                            Some(&guardian),
+                        )?;
+                    }
                 } else {
                     if record.job_closure_contract.is_some() {
                         return Ok(None);
@@ -3738,7 +3750,61 @@ fn frozen_manifest_owner_blocker(
     Ok(None)
 }
 
-fn worker_thread_is_extinct(expected: WindowsWorkerThreadIdentityV1) -> Result<bool, String> {
+/// Supervisor-owned reconciliation for an extinct per-attempt worker thread in
+/// the current launcher process. Verifies exact worker identity extinction,
+/// drains any in-flight durable-state publication on the attempt's local writer
+/// lane and reloads the durable record, and only then retires the leaked active
+/// Job registration after proving the Job has zero active processes.
+/// Returns `Ok(true)` if the post-drain durable record already has a terminal
+/// outbox. Fails closed if any check is uncertain.
+fn reconcile_extinct_local_worker_before_recovery(
+    path: &Path,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
+    guardian: &memcordon_core::WindowsGuardianReceiptV2,
+    record: &mut WindowsAttemptRecordV1,
+) -> Result<bool, String> {
+    // SAFETY: GetCurrentProcess returns the current launcher service pseudo-handle.
+    let current_process = super::process::process_identity(unsafe {
+        windows_sys::Win32::System::Threading::GetCurrentProcess()
+    })?;
+    if record.worker_identity.as_ref() != Some(&current_process) {
+        return Ok(false);
+    }
+    let Some(worker_thread) = record.worker_thread_identity else {
+        return Ok(false);
+    };
+    if !worker_thread_is_extinct(worker_thread)? {
+        return Ok(false);
+    }
+    super::attempt_store::wait_for_pending(attempt_id)?;
+    let refreshed_bytes = read_record_bounded(path).map_err(|error| error.to_string())?;
+    let refreshed: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&refreshed_bytes).map_err(|error| error.to_string())?;
+    authenticate(&refreshed, attempt_id)?;
+    if !authenticate_recovery_owner(&refreshed, nonce, request_sha256, caller)? {
+        return Err("reloaded recovery record boot identity changed".to_owned());
+    }
+    if !guardian_receipt_binds_record(guardian, &refreshed)? {
+        return Err(
+            "exact recovery pending checked closure: guardian receipt does not bind reloaded record"
+                .to_owned(),
+        );
+    }
+    *record = refreshed;
+    if record.terminal_response_json.is_some() {
+        return Ok(true);
+    }
+    let _ =
+        super::launcher_service::retire_extinct_worker_job_registration(attempt_id, worker_thread)?;
+    Ok(false)
+}
+
+pub(super) fn worker_thread_is_extinct(
+    expected: WindowsWorkerThreadIdentityV1,
+) -> Result<bool, String> {
     if expected.thread_id == 0 || expected.creation_time_100ns == 0 {
         return Err("worker thread identity is invalid".to_owned());
     }

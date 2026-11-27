@@ -511,6 +511,13 @@ pub(super) fn ensure_no_quarantined_writer() -> Result<(), WriterRegistryCheckEr
     Ok(())
 }
 
+pub(super) fn lane_is_absent(attempt_id: &str) -> Result<bool, String> {
+    let lanes = LANES
+        .try_lock()
+        .map_err(|_| "attempt writer registry unavailable".to_owned())?;
+    Ok(!lanes.contains_key(attempt_id))
+}
+
 /// Called before the existing retirement authority removes the record.
 /// A quarantined lane remains charged because an in-flight publish may survive.
 pub(super) fn retire(attempt_id: &str) -> Result<(), String> {

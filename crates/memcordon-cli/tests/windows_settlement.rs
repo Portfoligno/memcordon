@@ -133,3 +133,34 @@ fn failed_recovery_poison_prevents_new_writers() {
     assert!(gate.enter().is_err());
     assert!(gate.settle_until(Instant::now(), || Ok(true)).is_err());
 }
+
+#[test]
+fn extinct_owned_attempt_lease_is_reclaimed_only_when_predicate_proves_retirement() {
+    let gate = SettlementGate::default();
+    let leaked = gate
+        .enter_owned((42, 999), Some("attempt-1".to_owned()))
+        .unwrap();
+    std::mem::forget(leaked);
+    let blocked = gate
+        .settle_until_reclaiming(Instant::now(), || Ok(true), |_, _| false)
+        .expect_err("unconfirmed extinct lease must remain blocked");
+    assert!(blocked.contains("last-exclusive-would-block=true"));
+    let _exclusive = gate
+        .settle_until_reclaiming(
+            Instant::now(),
+            || Ok(true),
+            |owner, attempt| owner == (42, 999) && attempt == "attempt-1",
+        )
+        .unwrap();
+}
+
+#[test]
+fn unscoped_lease_without_attempt_id_is_never_reclaimed() {
+    let gate = SettlementGate::default();
+    let leaked = gate.enter_owned((42, 999), None).unwrap();
+    std::mem::forget(leaked);
+    let blocked = gate
+        .settle_until_reclaiming(Instant::now(), || Ok(true), |_, _| true)
+        .expect_err("unscoped lease must never be reclaimed");
+    assert!(blocked.contains("last-exclusive-would-block=true"));
+}

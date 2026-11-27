@@ -719,6 +719,7 @@ pub(super) fn observe_injected_fault(fault: WindowsSealedFault) {
 
 struct ActiveJob {
     attempt_id: String,
+    worker_thread: memcordon_core::WindowsWorkerThreadIdentityV1,
     job: JobView,
     authenticated_primary: OwnedHandle,
 }
@@ -915,6 +916,63 @@ pub(super) fn attempt_job_registration_is_absent(attempt_id: &str) -> Result<boo
         .lock()
         .map_err(|_| "active Job registry is poisoned".to_owned())?;
     Ok(!jobs.iter().any(|active| active.attempt_id == attempt_id))
+}
+
+/// Supervisor-owned cleanup for an active Job registration whose owning worker
+/// thread exited abnormally without running stack destructors. Fails closed
+/// unless the exact registered worker thread is proved extinct and the Job has
+/// zero active processes.
+pub(super) fn retire_extinct_worker_job_registration(
+    attempt_id: &str,
+    expected_worker_thread: memcordon_core::WindowsWorkerThreadIdentityV1,
+) -> Result<bool, String> {
+    if !super::record::worker_thread_is_extinct(expected_worker_thread)? {
+        return Ok(false);
+    }
+    let mut jobs = ACTIVE_JOBS
+        .lock()
+        .map_err(|_| "active Job registry is poisoned".to_owned())?;
+    let Some(index) = jobs
+        .iter()
+        .position(|active| active.attempt_id == attempt_id)
+    else {
+        return Ok(true);
+    };
+    if jobs[index].worker_thread != expected_worker_thread {
+        return Ok(false);
+    }
+    if jobs[index].job.active_processes()? != 0 {
+        return Ok(false);
+    }
+    let active = jobs.remove(index);
+    drop(jobs);
+    let token_result = active.authenticated_primary.close_for_retirement();
+    let job_result = active.job.0.close_for_retirement();
+    token_result?;
+    job_result.map(|()| true)
+}
+
+fn enter_settlement_for_attempt(
+    attempt_id: &str,
+) -> Result<super::settlement::SettlementReadLease<'static>, String> {
+    let thread = super::record::current_worker_thread_identity()?;
+    SETTLEMENT.enter_owned(
+        (thread.thread_id, thread.creation_time_100ns),
+        Some(attempt_id.to_owned()),
+    )
+}
+
+fn can_reclaim_extinct_settlement_lease(
+    (thread_id, creation_time_100ns): (u32, u64),
+    attempt_id: &str,
+) -> bool {
+    let expected = memcordon_core::WindowsWorkerThreadIdentityV1 {
+        thread_id,
+        creation_time_100ns,
+    };
+    super::record::worker_thread_is_extinct(expected).unwrap_or(false)
+        && attempt_job_registration_is_absent(attempt_id).unwrap_or(false)
+        && super::attempt_store::lane_is_absent(attempt_id).unwrap_or(false)
 }
 
 static SETTLEMENT: LazyLock<super::settlement::SettlementGate> = LazyLock::new(Default::default);
@@ -1260,7 +1318,7 @@ fn handle_control(
             && !challenge.is_empty()
             && caller.is_consistent() =>
         {
-            let _settlement = SETTLEMENT.enter()?;
+            let _settlement = enter_settlement_for_attempt(&attempt_id)?;
             let response = match super::record::recover_attempt_for_caller(
                 &attempt_id,
                 &nonce,
@@ -1389,33 +1447,43 @@ fn handle_control(
             let mut admission_snapshot = None;
             let mut admission_unavailable = None;
             let mut writer_observation = settlement_observation::Observation::default();
-            let settlement = SETTLEMENT.settle_until(deadline, || {
-                terminate_active_jobs(deadline)?;
-                let empty = super::record::admissions_empty()?;
-                let observed = if !empty {
-                    Some(super::record::admission_blocker_observation(deadline))
-                } else {
-                    None
-                };
-                let empty = writer_observation.observe(empty, deadline, || {
-                    let snapshot = super::attempt_store::lifecycle_snapshot(deadline);
-                    let names = observed.as_ref().map(|value|value.writer_tokens.as_slice()).unwrap_or_default();
-                    let diagnostic = super::writer_lifecycle::diagnostic(&snapshot, names);
-                    settlement_observation::WriterStatus::LocalSnapshot {
-                        detail:serde_json::to_string(&diagnostic).unwrap_or_else(|_| "{\"state\":\"serialization-unavailable\",\"retirement_proof\":false}".into()),
-                        snapshot: Box::new(snapshot),
-                    }
-                });
-                if let Some(observed) = observed {
-                    if observed.unavailable.is_none() {
-                        admission_snapshot = Some(observed);
-                        admission_unavailable = None;
+            let settlement = SETTLEMENT.settle_until_reclaiming(
+                deadline,
+                || {
+                    terminate_active_jobs(deadline)?;
+                    let empty = super::record::admissions_empty()?;
+                    let observed = if !empty {
+                        Some(super::record::admission_blocker_observation(deadline))
                     } else {
-                        admission_unavailable = Some(observed);
+                        None
+                    };
+                    let empty = writer_observation.observe(empty, deadline, || {
+                        let snapshot = super::attempt_store::lifecycle_snapshot(deadline);
+                        let names = observed
+                            .as_ref()
+                            .map(|value| value.writer_tokens.as_slice())
+                            .unwrap_or_default();
+                        let diagnostic = super::writer_lifecycle::diagnostic(&snapshot, names);
+                        settlement_observation::WriterStatus::LocalSnapshot {
+                            detail: serde_json::to_string(&diagnostic).unwrap_or_else(|_| {
+                                "{\"state\":\"serialization-unavailable\",\"retirement_proof\":false}"
+                                    .into()
+                            }),
+                            snapshot: Box::new(snapshot),
+                        }
+                    });
+                    if let Some(observed) = observed {
+                        if observed.unavailable.is_none() {
+                            admission_snapshot = Some(observed);
+                            admission_unavailable = None;
+                        } else {
+                            admission_unavailable = Some(observed);
+                        }
                     }
-                }
-                Ok(empty)
-            });
+                    Ok(empty)
+                },
+                can_reclaim_extinct_settlement_lease,
+            );
             let result = match &settlement {
                 Ok(_) => converge_package_cleanup(deadline),
                 Err(error) => {
@@ -1517,7 +1585,7 @@ fn handle_control(
             && caller_process_identity.creation_time_100ns != 0
             && !caller_token_sha256.is_empty() =>
         {
-            let _settlement = SETTLEMENT.enter()?;
+            let _settlement = enter_settlement_for_attempt(&attempt_id)?;
             if let Some(error) = terminalization_error {
                 let retained = super::record::replay_relay_failure_evidence(
                     (&attempt_id, &nonce, &request_sha256),
@@ -1684,7 +1752,7 @@ fn handle_control(
             {
                 return Err("membership request has an invalid binding".to_owned());
             }
-            let mut _settlement = Some(SETTLEMENT.enter()?);
+            let mut _settlement = Some(enter_settlement_for_attempt(&attempt_id)?);
             let inside_active_job = ACTIVE_JOBS
                 .lock()
                 .map_err(|_| "active Job registry is poisoned".to_owned())?
@@ -2678,11 +2746,13 @@ fn launch_attempt(
     super::process::verify_not_inheritable(active_handle.raw())?;
     let active_job_handle = active_handle.raw() as usize as u64;
     let active_primary = super::process::duplicate_owned(primary_token.raw())?;
+    let worker_thread = super::record::current_worker_thread_identity()?;
     ACTIVE_JOBS
         .lock()
         .map_err(|_| "active Job registry is poisoned".to_owned())?
         .push(ActiveJob {
             attempt_id: request.attempt_id.clone(),
+            worker_thread,
             job: JobView(active_handle),
             authenticated_primary: active_primary,
         });
