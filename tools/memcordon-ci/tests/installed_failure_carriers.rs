@@ -37,6 +37,7 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
             .unwrap();
         expected.push(path);
     }
+    let row_identity_count = expected.len();
     for case in ["C-IO/empty-message", "W-JOINT/restricted"] {
         for file in [
             "result.callback-failure.json",
@@ -191,7 +192,13 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         selected.iter().collect::<BTreeSet<_>>().len(),
         selected.len()
     );
-    assert_eq!(fs::read(&selected[0]).unwrap(), b"original");
+    for path in &selected[..row_identity_count] {
+        assert_eq!(fs::read(path).unwrap(), b"original row identity");
+    }
+    assert_eq!(
+        fs::read(&selected[row_identity_count]).unwrap(),
+        b"original"
+    );
 }
 
 #[cfg(unix)]
