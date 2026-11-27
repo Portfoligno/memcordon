@@ -14,13 +14,17 @@ use memcordon_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdInfo,
-    FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+    FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdInfo, FileRenameInfo, FileRenameInfoEx,
+    FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
     VOLUME_NAME_NT,
 };
@@ -572,8 +576,10 @@ impl WindowsAttemptRecordV1 {
         checkpoint(PublicationPhase::CreateStaging)?;
         let mut staged_file = fs::OpenOptions::new()
             .write(true)
+            .access_mode(GENERIC_WRITE_ACCESS | DELETE_ACCESS | SYNCHRONIZE_ACCESS)
             .create_new(true)
-            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            // NTFS flushes metadata changed by write-through requests, including rename.
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
             .open(&staged)
             .map_err(publication_io_error)?;
         let split = bytes.len() / 2;
@@ -587,9 +593,9 @@ impl WindowsAttemptRecordV1 {
             .map_err(publication_io_error)?;
         checkpoint(PublicationPhase::Flush)?;
         staged_file.sync_all().map_err(publication_io_error)?;
-        drop(staged_file);
         checkpoint(PublicationPhase::Rename)?;
-        replace_atomically(&staged, path)?;
+        replace_attempt_record_atomically(&staged_file, &staged, path)?;
+        drop(staged_file);
         checkpoint(PublicationPhase::AfterRename)?;
         checkpoint(PublicationPhase::Readback)?;
         let committed = read_record_bounded(path).map_err(publication_io_error)?;
@@ -6440,23 +6446,42 @@ fn read_record_bounded_with_limit_and_security(
     maximum: usize,
     security: Option<&super::security::SecurityDescriptor>,
 ) -> io::Result<Vec<u8>> {
-    use std::io::Read;
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || metadata.len() > maximum as u64
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid attempt record file",
-        ));
+    use std::os::windows::fs::OpenOptionsExt;
+    read_record_bounded_from_open(maximum, security, || {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })
+}
+
+fn read_record_bounded_from_open(
+    maximum: usize,
+    security: Option<&super::security::SecurityDescriptor>,
+    mut open: impl FnMut() -> io::Result<fs::File>,
+) -> io::Result<Vec<u8>> {
+    if let Some(bytes) = read_open_record_bounded(open()?, maximum, security)? {
+        return Ok(bytes);
     }
+    // POSIX replacement may detach the opened file before we inspect its link
+    // count. Reopen the name once, without accepting an unlinked or multiply
+    // linked image or retrying any publication.
+    read_open_record_bounded(open()?, maximum, security)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "attempt record was detached during both reads",
+        )
+    })
+}
+
+fn read_open_record_bounded(
+    file: fs::File,
+    maximum: usize,
+    security: Option<&super::security::SecurityDescriptor>,
+) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
     let mut standard = FILE_STANDARD_INFO::default();
     // SAFETY: output describes the exact already-open file, preventing a
     // pathname substitution between link/size inspection and the bounded read.
@@ -6471,10 +6496,23 @@ fn read_record_bounded_with_limit_and_security(
     {
         return Err(io::Error::last_os_error());
     }
+    if standard.NumberOfLinks == 0 {
+        return Ok(None);
+    }
     if standard.NumberOfLinks != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "attempt record has multiple links",
+        ));
+    }
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > maximum as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid attempt record file",
         ));
     }
     if let Some(security) = security {
@@ -6506,7 +6544,7 @@ fn read_record_bounded_with_limit_and_security(
     bytes.truncate(length);
     memcordon_core::validate_record_json_structure(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 fn provider_incarnation() -> Result<&'static str, String> {
@@ -6675,28 +6713,106 @@ fn observe_held_process_liveness(
     })
 }
 
-pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
+const POSIX_REPLACE_RENAME_FLAGS: u32 = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+const LEGACY_REPLACE_RENAME_FLAGS: u32 = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
 
-    let source_path = source;
-    let destination_path = destination;
-    let source = source_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both paths are live, NUL-terminated UTF-16 buffers and the flags
-    // request an atomic same-volume replacement flushed before return.
+struct PosixReplaceRenameInformation {
+    words: Vec<usize>,
+    backing_bytes: u32,
+}
+
+impl PosixReplaceRenameInformation {
+    fn new(destination_path: &Path) -> Result<Self, String> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let destination = destination_path
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        if destination.is_empty() || destination.contains(&0) {
+            return Err(
+                "atomic replacement destination is empty or contains an embedded NUL".into(),
+            );
+        }
+        let destination_name_bytes = destination
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                "atomic replacement destination length is not representable".to_owned()
+            })?;
+        // FileName is a variable-length tail. Its byte count excludes the NUL;
+        // the buffer includes it, at least sizeof(FILE_RENAME_INFO), and padding.
+        let prefix_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let terminated_tail_bytes = destination
+            .len()
+            .checked_add(1)
+            .and_then(|units| units.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| {
+                "atomic replacement terminated destination length overflowed".to_owned()
+            })?;
+        let meaningful_bytes = prefix_bytes
+            .checked_add(terminated_tail_bytes)
+            .map(|bytes| bytes.max(std::mem::size_of::<FILE_RENAME_INFO>()))
+            .ok_or_else(|| "atomic replacement rename information length overflowed".to_owned())?;
+        let aligned_words = meaningful_bytes
+            .checked_add(std::mem::size_of::<usize>() - 1)
+            .map(|value| value / std::mem::size_of::<usize>())
+            .ok_or_else(|| "atomic replacement aligned rename information overflowed".to_owned())?;
+        let backing_bytes = aligned_words
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                "atomic replacement aligned rename information is not representable".to_owned()
+            })?;
+        let mut layout = Self {
+            words: vec![0_usize; aligned_words],
+            backing_bytes,
+        };
+        let rename = layout.words.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: the native-word allocation is fully zero initialized and
+        // covers the declared structure, the complete destination, one
+        // explicit UTF-16 NUL, and native alignment padding.
+        unsafe {
+            (*rename).Anonymous.Flags = POSIX_REPLACE_RENAME_FLAGS;
+            (*rename).RootDirectory = ptr::null_mut();
+            (*rename).FileNameLength = destination_name_bytes;
+            let filename = layout
+                .words
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(prefix_bytes)
+                .cast::<u16>();
+            ptr::copy_nonoverlapping(destination.as_ptr(), filename, destination.len());
+            *filename.add(destination.len()) = 0;
+        }
+        Ok(layout)
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut FILE_RENAME_INFO {
+        self.words.as_mut_ptr().cast()
+    }
+}
+
+fn replace_attempt_record_atomically(
+    source_file: &fs::File,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut information = PosixReplaceRenameInformation::new(destination)?;
+    let rename = information.as_mut_ptr();
+    // SAFETY: the same CREATE_NEW staging handle remains live and carries
+    // DELETE access. The live, aligned buffer includes the UTF-16 NUL and
+    // padding. POSIX replacement can supersede a destination held open by
+    // snapshot readers that shared DELETE access.
     if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        SetFileInformationByHandle(
+            source_file.as_raw_handle() as _,
+            FileRenameInfoEx,
+            rename.cast(),
+            information.backing_bytes,
         )
     } == 0
     {
@@ -6705,18 +6821,71 @@ pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), Strin
         let error = std::io::Error::last_os_error();
         let native_error = error.raw_os_error();
         let original = publication_io_error(error);
-        Err(replacement_failure_context(
+        return Err(replacement_failure_context(
+            "SetFileInformationByHandle(FileRenameInfoEx)",
+            POSIX_REPLACE_RENAME_FLAGS,
             &original,
             native_error,
-            source_path,
-            destination_path,
-        ))
-    } else {
-        Ok(())
+            source,
+            destination,
+        ));
     }
+    // A failed final flush is an unconfirmed publication, not an uncommitted
+    // rename. Do not retry or roll back an already-visible mutation.
+    if let Err(error) = source_file.sync_all() {
+        let native_error = error.raw_os_error();
+        let original = publication_io_error(error);
+        return Err(replacement_failure_context(
+            "FlushFileBuffers",
+            POSIX_REPLACE_RENAME_FLAGS,
+            &format!("{original}; rename-committed=true"),
+            native_error,
+            source,
+            destination,
+        ));
+    }
+    Ok(())
+}
+
+// Other Windows state files continue to use their existing replacement policy.
+pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let source_name = wide(source);
+    let destination_name = wide(destination);
+    // SAFETY: both paths are live, NUL-terminated UTF-16 buffers.
+    if unsafe {
+        MoveFileExW(
+            source_name.as_ptr(),
+            destination_name.as_ptr(),
+            LEGACY_REPLACE_RENAME_FLAGS,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        let native_error = error.raw_os_error();
+        let original = publication_io_error(error);
+        return Err(replacement_failure_context(
+            "MoveFileExW",
+            LEGACY_REPLACE_RENAME_FLAGS,
+            &original,
+            native_error,
+            source,
+            destination,
+        ));
+    }
+    Ok(())
 }
 
 fn replacement_failure_context(
+    api: &'static str,
+    flags: u32,
     original: &str,
     native_error: Option<i32>,
     source: &Path,
@@ -6791,8 +6960,8 @@ fn replacement_failure_context(
             serde_json::json!({"thread":"unknown","error":thread_error})
         }
     };
-    let context = serde_json::json!({"format_revision":1,"api":"MoveFileExW","native_error":native_error,
-        "flags":MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH,
+    let context = serde_json::json!({"format_revision":1,"api":api,"native_error":native_error,
+        "flags":flags,
         "source":path_facts(source),"destination":path_facts(destination),
         "same_parent":source.parent()==destination.parent(),
         "process":unsafe {GetCurrentProcessId()},"thread":unsafe {GetCurrentThreadId()},
@@ -6801,9 +6970,12 @@ fn replacement_failure_context(
     if message.len() <= MAX_TERMINALIZATION_DETAIL_BYTES * 3 / 4 {
         message
     } else {
-        format!(
-            "{original}; replacement-context={{\"revision\":1,\"api\":\"MoveFileExW\",\"omitted\":\"context exceeds existing carrier allocation\"}}"
-        )
+        let omitted = serde_json::json!({
+            "revision": 1,
+            "api": api,
+            "omitted": "context exceeds existing carrier allocation",
+        });
+        format!("{original}; replacement-context={omitted}")
     }
 }
 

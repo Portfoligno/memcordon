@@ -4,6 +4,7 @@ use std::{io, sync::Mutex};
 
 pub const STREAM_BOUND: usize = 16 * 1024;
 const RECORD_BOUND: usize = 32 * 1024;
+const FAILURE_STDERR_BOUND: usize = STREAM_BOUND / 16;
 
 /// Even an invariant/poison failure must not drop the newly acquired witness.
 /// The callback executes once; an unexpected second owner remains retained too.
@@ -55,8 +56,19 @@ impl Trace {
         self.output = Some(output);
     }
     pub fn failure(&self) -> Option<io::Error> {
-        self.output.as_ref().filter(|output| !output.status.success()).map(|output| io::Error::other(format!(
-            "positive live guardian association query failed; operation=__observe-windows-guardian; nested-status={:?}; diagnostic-extension=guardian-query.json", output.status.code())))
+        self.output
+            .as_ref()
+            .filter(|output| !output.status.success())
+            .map(|output| {
+                let prefix_len = output.stderr.len().min(FAILURE_STDERR_BOUND);
+                let nested_stderr = String::from_utf8_lossy(&output.stderr[..prefix_len]);
+                io::Error::other(format!(
+                    "positive live guardian association query failed; operation=__observe-windows-guardian; nested-status={:?}; nested-stderr-bytes={}; nested-stderr-truncated={}; nested-stderr={nested_stderr:?}; diagnostic-extension=guardian-query.json",
+                    output.status.code(),
+                    output.stderr.len(),
+                    prefix_len != output.stderr.len(),
+                ))
+            })
     }
     pub fn snapshot(&self) -> io::Result<Option<Snapshot>> {
         if self.guardian.is_none() {

@@ -93,6 +93,32 @@ fn lane(record: &WindowsAttemptRecordV1) -> Result<Arc<Lane>, String> {
     Ok(lane)
 }
 
+fn candidate_observation_phase(
+    record: &WindowsAttemptRecordV1,
+) -> memcordon_core::AttemptObservationPhaseV1 {
+    if record.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::Executing
+        || record.terminal_seed.is_some()
+        || record.terminal_response_json.is_some()
+        || record.terminal_disposition.is_some()
+    {
+        memcordon_core::AttemptObservationPhaseV1::Terminalizing
+    } else if record.cleanup_state.termination_requested
+        || record.cleanup_state.active_processes_zero
+        || record.cleanup_state.guardian_reaped
+        || record.cleanup_state.final_handles_closed
+    {
+        memcordon_core::AttemptObservationPhaseV1::Cleaning
+    } else if record.target_released {
+        memcordon_core::AttemptObservationPhaseV1::Monitoring
+    } else if record.resume_attempted {
+        memcordon_core::AttemptObservationPhaseV1::ResumeAttempted
+    } else if record.authorization_unix_millis.is_some() {
+        memcordon_core::AttemptObservationPhaseV1::AuthorizedBeforeResume
+    } else {
+        memcordon_core::AttemptObservationPhaseV1::BeforeAuthorization
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn new_lane(
     publish: impl FnMut(&mut WindowsAttemptRecordV1, u64) -> Result<(), String> + Send + 'static,
@@ -131,9 +157,8 @@ fn new_lane_observed(
                     break;
                 }
                 let _capture = super::diagnostics::AttemptDiagnosticScope::enter();
-                super::diagnostics::set_phase(
-                    memcordon_core::AttemptObservationPhaseV1::Terminalizing,
-                );
+                let observed_phase = candidate_observation_phase(&next.record);
+                super::diagnostics::set_phase(observed_phase);
                 super::writer_observation::stage_weak(
                     &worker_observation,
                     super::writer_lifecycle::Stage::PublicationStarted,
@@ -159,8 +184,7 @@ fn new_lane_observed(
                             operation: memcordon_core::FailureOperationV1::StoreRecord,
                             code: memcordon_core::FailureCodeV1::UnexpectedProviderFailure,
                             native_code: None,
-                            observed_phase:
-                                memcordon_core::AttemptObservationPhaseV1::Terminalizing,
+                            observed_phase,
                             safe_detail: memcordon_core::SafeDiagnosticDetailV1::ProviderMessage {
                                 id: memcordon_core::SafeMessageIdV1::CommitNotConfirmed,
                             },

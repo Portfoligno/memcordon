@@ -284,3 +284,19 @@ fn post_cleanup_handoff_drains_before_loading_and_submitting_next_revision() {
     );
     assert!(!lane.quarantined.load(Ordering::Acquire));
 }
+
+#[test]
+fn writer_failure_reports_candidate_observation_phase_instead_of_always_terminalizing() {
+    let lane = new_lane(|_, _| Err("simulated mark_released rename failure".to_string())).unwrap();
+    let (completion, done) = mpsc::sync_channel(1);
+    let mut released = snapshot();
+    released.record.target_released = true;
+    released.completion = Some(completion);
+    try_submit(&lane, released).unwrap();
+    assert!(done.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+    let event = take_failure(&lane).unwrap();
+    assert_eq!(
+        event.observed_phase,
+        memcordon_core::AttemptObservationPhaseV1::Monitoring
+    );
+}

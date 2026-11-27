@@ -31,14 +31,11 @@ fn output(code: i32, stdout: &[u8], stderr: &[u8]) -> memcordon_testkit::Observe
 fn actual_nested_failure_preserves_distinct_status_streams_and_source_binding() {
     let binding = serde_json::json!({"case":{"family":"W-ENVELOPE","scenario":"restricted"},"source_commit":"original-source","challenge_sha256":"original-challenge"});
     let trace = Mutex::new(query::Trace::new(binding.clone()));
+    let nested_stderr = b"error[MCCLI-WINDOWS-LIVE-GUARDIAN]: original refusal";
     query::update(&trace, |trace| {
         trace.guardian(serde_json::json!({"process_id":20,"creation_time_100ns":200}));
         trace.stage("returned-output");
-        trace.captured(output(
-            27,
-            b"distinct nested stdout",
-            b"error[MCCLI-WINDOWS-LIVE-GUARDIAN]: original refusal",
-        ));
+        trace.captured(output(27, b"distinct nested stdout", nested_stderr));
     });
     let (failure, snapshot) = query::update(&trace, |trace| {
         (
@@ -48,6 +45,9 @@ fn actual_nested_failure_preserves_distinct_status_streams_and_source_binding() 
     });
     assert!(failure.starts_with("positive live guardian association query failed"));
     assert!(failure.contains("nested-status=Some(27)"));
+    assert!(failure.contains(&format!("nested-stderr-bytes={}", nested_stderr.len())));
+    assert!(failure.contains("nested-stderr-truncated=false"));
+    assert!(failure.contains(std::str::from_utf8(nested_stderr).unwrap()));
     assert!(!failure.contains("nested-status=Some(1)"));
     let record: serde_json::Value = serde_json::from_slice(&snapshot.record).unwrap();
     assert_eq!(record["binding"], binding);
@@ -89,6 +89,22 @@ fn absent_output_is_not_empty_capture_and_retention_failure_cannot_change_status
         )
         .is_err()
     );
+}
+
+#[test]
+fn failure_stderr_is_bounded_lossy_and_single_line() {
+    let mut trace = query::Trace::new(serde_json::json!({}));
+    let mut stderr = b"refusal\n\xff".to_vec();
+    stderr.resize(query::STREAM_BOUND, b'x');
+    stderr.extend_from_slice(b"not-in-summary");
+    trace.captured(output(27, b"stdout-not-in-summary", &stderr));
+    let failure = trace.failure().unwrap().to_string();
+    assert!(failure.contains(&format!("nested-stderr-bytes={}", stderr.len())));
+    assert!(failure.contains("nested-stderr-truncated=true"));
+    assert!(failure.contains("refusal\\n\u{fffd}"));
+    assert!(!failure.contains('\n'));
+    assert!(!failure.contains("not-in-summary"));
+    assert!(failure.len() < 2 * 1024);
 }
 
 #[test]

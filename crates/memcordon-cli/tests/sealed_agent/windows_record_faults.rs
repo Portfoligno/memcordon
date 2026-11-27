@@ -942,8 +942,8 @@ fn stale_revision_original_replacement_and_staging_collision_never_publish() {
 
 #[test]
 fn native_rename_sharing_failure_retains_typed_code_and_original() {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("attempt.json");
     let mut committed = observed_record();
@@ -958,29 +958,6 @@ fn native_rename_sharing_failure_retains_typed_code_and_original() {
         .unwrap();
     let mut candidate = committed.clone();
     candidate.record_revision += 1;
-    let probe = directory.path().join("native-replacement-probe");
-    fs::write(&probe, b"replacement probe").unwrap();
-    let probe_name: Vec<u16> = probe
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let destination_name: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: both names are live terminated UTF-16 buffers. The retained
-    // destination handle excludes delete sharing throughout both operations.
-    let replaced = unsafe {
-        MoveFileExW(
-            probe_name.as_ptr(),
-            destination_name.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    let expected_code = std::io::Error::last_os_error().raw_os_error().unwrap();
-    assert_eq!(replaced, 0);
     let mut reached_rename = false;
     assert!(
         candidate
@@ -999,7 +976,7 @@ fn native_rename_sharing_failure_retains_typed_code_and_original() {
     assert_eq!(
         event.native_code,
         Some(memcordon_core::NativeFailureCodeV1::Win32(
-            u32::try_from(expected_code).unwrap()
+            ERROR_SHARING_VIOLATION
         ))
     );
     assert_eq!(
@@ -1013,6 +990,109 @@ fn native_rename_sharing_failure_retains_typed_code_and_original() {
     assert_eq!(after, before);
     let retained: WindowsAttemptRecordV1 = serde_json::from_slice(&after).unwrap();
     authenticate(&retained, &retained.attempt_id).unwrap();
+}
+
+#[test]
+fn posix_rename_succeeds_while_shared_delete_reader_holds_previous_record() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attempt.json");
+    let mut committed = observed_record();
+    let target = WindowsProcessIdentityV1 {
+        process_id: 2,
+        creation_time_100ns: 2,
+    };
+    committed.guardian_identity = Some(committed.caller_process_identity.clone());
+    committed.target_identity = Some(target.clone());
+    terminal_fixture::bind_owner_manifest(&mut committed, &target);
+    committed.worker_identity = Some(committed.caller_process_identity.clone());
+    committed.worker_thread_identity = Some(current_worker_thread_identity().unwrap());
+    committed.state = WindowsAttemptStateV1::Authorized;
+    committed.authorization_unix_millis = Some(1);
+    committed.resume_attempted = true;
+    committed.publish_at(&path, 0, |_| Ok(())).unwrap();
+    let before = read_record_bounded(&path).unwrap();
+
+    // Reproduce `read_record_bounded` during `await_live_guardian_release`:
+    // the snapshot reader opens `attempt.json` with default Rust sharing
+    // (`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`).
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+    };
+    let mut concurrent_reader = open().unwrap();
+    let mut preinspection_reader = Some(open().unwrap());
+
+    let _capture = super::super::diagnostics::AttemptDiagnosticScope::enter();
+    let mut candidate = committed.clone();
+    candidate.target_released = true;
+    candidate.record_revision += 1;
+    candidate.publish_at(&path, 1, |_| Ok(())).unwrap();
+
+    let mut journal = memcordon_core::WindowsCausalDiagnosticsV1::default();
+    super::super::diagnostics::merge_into(&mut journal);
+    assert!(!journal.loss.persistence_failure_observed);
+
+    // The old handle remains readable, but the bounded reader must reopen if
+    // the replacement detached the file before its one-link inspection.
+    let mut opens = 0;
+    let reopened =
+        read_record_bounded_from_open(memcordon_core::WINDOWS_MAX_FRAME_BYTES, None, || {
+            opens += 1;
+            preinspection_reader.take().map_or_else(open, Ok)
+        })
+        .unwrap();
+    assert_eq!(opens, 2);
+    let after = read_record_bounded(&path).unwrap();
+    assert_eq!(reopened, after);
+
+    let mut reader_bytes = Vec::new();
+    concurrent_reader.read_to_end(&mut reader_bytes).unwrap();
+    assert_eq!(reader_bytes, before);
+
+    let published: WindowsAttemptRecordV1 = serde_json::from_slice(&after).unwrap();
+    authenticate(&published, &published.attempt_id).unwrap();
+    assert_eq!(published.record_revision, 2);
+    assert!(published.target_released);
+}
+
+#[test]
+fn replacement_rename_info_encodes_real_utf16_tail_and_aligned_length() {
+    for name in ["x", "C:\\state\\révision-🚀.json"] {
+        let mut information = PosixReplaceRenameInformation::new(Path::new(name)).unwrap();
+        let rename = information.as_mut_ptr();
+        let expected: Vec<u16> = name.encode_utf16().collect();
+        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let backing = information.backing_bytes as usize;
+        assert_eq!(
+            rename.align_offset(std::mem::align_of::<FILE_RENAME_INFO>()),
+            0
+        );
+        assert_eq!(
+            backing,
+            information.words.len() * std::mem::size_of::<usize>()
+        );
+        assert!(backing >= std::mem::size_of::<FILE_RENAME_INFO>());
+        assert!(backing >= offset + (expected.len() + 1) * std::mem::size_of::<u16>());
+        // SAFETY: the layout owns the initialized header and the asserted tail.
+        unsafe {
+            assert_eq!((*rename).Anonymous.Flags, POSIX_REPLACE_RENAME_FLAGS);
+            assert!((*rename).RootDirectory.is_null());
+            assert_eq!(
+                (*rename).FileNameLength as usize,
+                std::mem::size_of_val(expected.as_slice())
+            );
+            let tail = rename.cast::<u8>().add(offset).cast::<u16>();
+            assert_eq!(std::slice::from_raw_parts(tail, expected.len()), expected);
+            assert_eq!(*tail.add(expected.len()), 0);
+        }
+    }
+    assert!(PosixReplaceRenameInformation::new(Path::new("")).is_err());
+    assert!(PosixReplaceRenameInformation::new(Path::new("a\0b")).is_err());
 }
 
 #[test]
@@ -1047,12 +1127,22 @@ fn replacement_diagnostics_fit_original_carrier_and_preserve_native_cause() {
     let long_name = "界😀".repeat(MAX_TERMINALIZATION_DETAIL_BYTES);
     let source = PathBuf::from("C:\\missing-publication-source").join(&long_name);
     let destination = PathBuf::from("C:\\missing-publication-destination").join(long_name);
-    let message = replacement_failure_context(&original, Some(5), &source, &destination);
+    let message = replacement_failure_context(
+        "SetFileInformationByHandle(FileRenameInfoEx)",
+        POSIX_REPLACE_RENAME_FLAGS,
+        &original,
+        Some(5),
+        &source,
+        &destination,
+    );
     assert!(message.starts_with(&original));
     assert!(message.len() <= MAX_TERMINALIZATION_DETAIL_BYTES * 3 / 4);
     let (_, json) = message.split_once("; replacement-context=").unwrap();
     let context: serde_json::Value = serde_json::from_str(json).unwrap();
-    assert_eq!(context["api"], "MoveFileExW");
+    assert_eq!(
+        context["api"],
+        "SetFileInformationByHandle(FileRenameInfoEx)"
+    );
     assert!(context.get("omitted").is_some() || context["source"]["truncated"] == true);
     let mut journal = memcordon_core::WindowsCausalDiagnosticsV1::default();
     super::super::diagnostics::merge_into(&mut journal);
