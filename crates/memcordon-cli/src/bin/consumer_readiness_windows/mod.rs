@@ -2207,7 +2207,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             Case::EmptyStreams | Case::NativeArgv | Case::ApplicationExit => {}
             Case::CapacityCompletion => capacity_completion(&descriptor, &mut transcript)?,
             Case::DeadlineDemand | Case::HeldDemand => {
-                let mut child = child_command()?
+                let mut child = churn_child_command()?
                     .arg("cohort-leaf")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
