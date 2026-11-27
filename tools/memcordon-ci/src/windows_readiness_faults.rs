@@ -140,6 +140,7 @@ pub(crate) fn observe_launcher_service_status() -> std::io::Result<serde_json::V
     .map_err(std::io::Error::other)
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessMember {
     pid: u32,
@@ -148,6 +149,7 @@ struct ProcessMember {
     exited: bool,
 }
 
+#[cfg(any(windows, test))]
 fn select_demand_workload_indices(
     census: &[ProcessMember],
     wrapped_wrapper: Option<(u32, u64)>,
@@ -212,6 +214,7 @@ fn select_demand_workload_indices(
     Ok((root_index, child_index))
 }
 
+#[cfg(any(windows, test))]
 fn select_frontend_subject(
     candidates: &[ProcessMember],
     expected_parent_pid: Option<u32>,
@@ -239,6 +242,7 @@ fn select_frontend_subject(
     Ok(index)
 }
 
+#[cfg(any(windows, test))]
 fn verify_frontend_loss_exit(
     subject_status: u32,
     wrapper_status: Option<i32>,
