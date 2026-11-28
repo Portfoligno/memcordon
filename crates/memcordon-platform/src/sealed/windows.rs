@@ -2705,13 +2705,16 @@ fn read_exact_until(
 
 fn encode_command(command: &CommandSpec) -> Result<NativeWindowsCommandV1, String> {
     let program = command.program().encode_wide().collect::<Vec<_>>();
+    if program.is_empty() || program.contains(&0) {
+        return Err("Windows program is empty or contains NUL".to_owned());
+    }
     let arguments = command
         .arguments()
         .iter()
         .map(|value| value.encode_wide().collect())
-        .collect();
-    if program.is_empty() || program.contains(&0) {
-        return Err("Windows program is empty or contains NUL".to_owned());
+        .collect::<Vec<Vec<u16>>>();
+    if arguments.iter().any(|argument| argument.contains(&0)) {
+        return Err("Windows argument contains NUL".to_owned());
     }
     Ok(NativeWindowsCommandV1 { program, arguments })
 }
@@ -3195,6 +3198,43 @@ fn missing_provider_message(detail: &str) -> String {
 }
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod encode_command_tests {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    use super::{CommandSpec, encode_command};
+
+    #[test]
+    fn rejects_an_argument_with_an_interior_nul() {
+        let argument = OsString::from_wide(&[0x61, 0, 0x62]);
+        let command = CommandSpec::new("program.exe").args([OsString::from("valid"), argument]);
+
+        assert_eq!(
+            encode_command(&command).unwrap_err(),
+            "Windows argument contains NUL"
+        );
+    }
+
+    #[test]
+    fn preserves_an_empty_argument() {
+        let command = CommandSpec::new("program.exe").args([""]);
+
+        assert_eq!(
+            encode_command(&command).unwrap().arguments,
+            [Vec::<u16>::new()]
+        );
+    }
+
+    #[test]
+    fn preserves_an_isolated_surrogate_in_an_argument() {
+        let units = [0x61, 0xd800, 0x62];
+        let command = CommandSpec::new("program.exe").args([OsString::from_wide(&units)]);
+
+        assert_eq!(encode_command(&command).unwrap().arguments, [units]);
+    }
 }
 
 #[cfg(test)]
