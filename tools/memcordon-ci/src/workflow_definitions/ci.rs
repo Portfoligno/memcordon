@@ -115,8 +115,8 @@ fn node_1090() -> Value {
     values.push(node_1091());
     values.push(node_1092());
     values.extend(node_1094());
-    values.push(node_1095());
     values.push(node_1096());
+    values.push(auxiliary_source_fetch());
     values.push(node_1098());
     values.push(node_1100());
     values.push(node_1101());
@@ -183,6 +183,7 @@ fn node_1090() -> Value {
     values.push(node_1208());
     values.push(node_1210());
     values.push(node_1211());
+    values.push(initialize_auxiliary_target(true));
     values.push(node_1212());
     values.push(node_1213());
     values.push(node_1215());
@@ -2398,15 +2399,33 @@ fn node_1097() -> Value {
     Value::Mapping(values)
 }
 
-fn node_1095() -> Value {
+fn auxiliary_source_fetch() -> Value {
+    let mut fetch = node_950();
+    fetch["if"] = text("steps.public-source-seed-restore.outputs.cache-hit != 'true'");
+    fetch
+}
+
+fn initialize_auxiliary_target(windows: bool) -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("name"),
         text("Initialize genuine auxiliary Cargo target"),
     );
     values.insert(
+        text("if"),
+        text(if windows {
+            "runner.os == 'Windows'"
+        } else {
+            "runner.os != 'Windows'"
+        }),
+    );
+    values.insert(
         text("run"),
-        text("rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target"),
+        text(if windows {
+            "./target/ci-runtime/current/memcordon-ci.exe ci initialize-auxiliary-target"
+        } else {
+            "./target/ci-runtime/current/memcordon-ci ci initialize-auxiliary-target"
+        }),
     );
     values.insert(text("timeout-minutes"), Value::Number(2.into()));
     Value::Mapping(values)
@@ -9251,8 +9270,8 @@ fn node_379() -> Value {
     values.push(node_380());
     values.push(node_381());
     values.extend(node_383());
-    values.push(node_384());
     values.push(node_385());
+    values.push(auxiliary_source_fetch());
     values.push(node_387());
     values.push(node_389());
     values.push(node_390());
@@ -9319,6 +9338,8 @@ fn node_379() -> Value {
     values.push(node_497());
     values.push(node_499());
     values.push(node_500());
+    values.push(initialize_auxiliary_target(false));
+    values.push(initialize_auxiliary_target(true));
     values.push(node_501());
     values.push(node_502());
     values.push(node_504());
@@ -12531,20 +12552,6 @@ fn node_386() -> Value {
         text("restore-keys"),
         text("mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-"),
     );
-    Value::Mapping(values)
-}
-
-fn node_384() -> Value {
-    let mut values = serde_yaml::Mapping::new();
-    values.insert(
-        text("name"),
-        text("Initialize genuine auxiliary Cargo target"),
-    );
-    values.insert(
-        text("run"),
-        text("rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target"),
-    );
-    values.insert(text("timeout-minutes"), Value::Number(2.into()));
     Value::Mapping(values)
 }
 

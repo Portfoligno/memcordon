@@ -97,6 +97,7 @@ enum CiCommand {
         #[arg(long, conflicts_with = "check", required_unless_present = "check")]
         write: bool,
     },
+    InitializeAuxiliaryTarget,
     DriverBootstrap,
     DriverImageProbe,
     DriverCleanup,
@@ -364,6 +365,9 @@ fn run() -> Result<()> {
             }
             CiCommand::Workflows { check: _, write } => {
                 memcordon_ci::workflow_definitions::run(&root, write)
+            }
+            CiCommand::InitializeAuxiliaryTarget => {
+                memcordon_ci::cache_restore::initialize_auxiliary_target(&root)
             }
             CiCommand::DriverBootstrap => memcordon_ci::driver_cache::bootstrap(&root),
             CiCommand::DriverImageProbe => memcordon_ci::driver_cache::image_probe(&root),

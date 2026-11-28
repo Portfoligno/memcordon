@@ -1,12 +1,17 @@
 //! Actual host-network observations for the current installed lifetime.
 use crate::{CiError, Result};
 use memcordon_core::DiagnosticSha256;
+use serde_json::{Map, Value, json};
 use sha2::Digest;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 /// Read host configuration without entering or changing any namespace.
 #[cfg(target_os = "linux")]
 pub fn snapshot() -> Result<serde_json::Value> {
-    use std::{collections::BTreeMap, fs, os::unix::fs::MetadataExt, path::Path};
+    use std::{fs, os::unix::fs::MetadataExt};
     let namespace = fs::metadata("/proc/self/ns/net")?;
     let mut facts = BTreeMap::new();
     for path in [
@@ -112,6 +117,136 @@ fn network_configuration(snapshot: &serde_json::Value) -> Result<serde_json::Val
     Ok(configuration)
 }
 
+fn observed_provenance(link: &Value) -> Option<&Value> {
+    let proof = link.get("provenance")?;
+    (proof["state"].as_str() == Some("observed")).then_some(proof)
+}
+
+fn observed_identity(proof: &Value) -> Option<&Value> {
+    let identity = proof.get("identity")?;
+    if identity["path"].as_str()?.is_empty()
+        || identity["device"].as_u64().is_none()
+        || identity["inode"].as_u64().is_none()
+        || identity["ifindex"].as_u64()? == 0
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+fn path_leaf_is(path: &Value, expected: &str) -> bool {
+    path.as_str()
+        .and_then(|path| Path::new(path).file_name())
+        .is_some_and(|leaf| leaf == expected)
+}
+
+struct AccelerationCandidate<'a> {
+    kind: &'static str,
+    link: &'a str,
+    vf_identity: &'a Value,
+    master_identity: &'a Value,
+}
+
+fn acceleration_candidate<'a>(
+    kind: &'static str,
+    link: &'a str,
+    vf: &'a Value,
+    present: &'a Map<String, Value>,
+    absent: &'a Map<String, Value>,
+) -> Option<(&'a str, AccelerationCandidate<'a>)> {
+    let vf_proof = observed_provenance(vf)?;
+    let vf_identity = observed_identity(vf_proof)?;
+    let master = vf_proof["master"]["name"].as_str()?;
+    let attached = present.get(master)?;
+    let detached = absent.get(master)?;
+    let attached_proof = observed_provenance(attached)?;
+    let detached_proof = observed_provenance(detached)?;
+    let master_identity = observed_identity(attached_proof)?;
+    let uppers = vf_proof["uppers"].as_object()?;
+    let address = vf["address"].as_array()?;
+    if !path_leaf_is(&vf_proof["device"]["subsystem"], "pci")
+        || !path_leaf_is(&attached_proof["device"]["subsystem"], "vmbus")
+        || !path_leaf_is(&attached_proof["device"]["driver"], "hv_netvsc")
+        || observed_identity(detached_proof)? != master_identity
+        || &vf_proof["master"]["identity"] != master_identity
+        || uppers.len() != 1
+        || uppers.get(master) != Some(master_identity)
+        || !vf_proof["lowers"].as_object()?.is_empty()
+        || !address
+            .iter()
+            .all(|byte| byte.as_u64().is_some_and(|byte| u8::try_from(byte).is_ok()))
+        || !address.iter().any(|byte| {
+            byte.as_u64()
+                .and_then(|byte| u8::try_from(byte).ok())
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+        })
+        || vf["address"] != attached["address"]
+        || attached_proof["lowers"].as_object()?.get(link) != Some(vf_identity)
+        || detached_proof["lowers"].as_object()?.contains_key(link)
+    {
+        return None;
+    }
+    Some((
+        master,
+        AccelerationCandidate {
+            kind,
+            link,
+            vf_identity,
+            master_identity,
+        },
+    ))
+}
+
+fn acceleration_churn<'a>(before: &'a Value, after: &'a Value) -> (Vec<Value>, BTreeSet<&'a str>) {
+    let (Some(left), Some(right)) = (before["links"].as_object(), after["links"].as_object())
+    else {
+        return (Vec::new(), BTreeSet::new());
+    };
+    let mut by_master = BTreeMap::<_, Vec<_>>::new();
+    for (kind, present, absent) in [("removed", left, right), ("added", right, left)] {
+        for (link, vf) in present {
+            if !absent.contains_key(link)
+                && let Some((master, candidate)) =
+                    acceleration_candidate(kind, link, vf, present, absent)
+            {
+                by_master.entry(master).or_default().push(candidate);
+            }
+        }
+    }
+    let mut churn = Vec::new();
+    let mut suppressed = BTreeSet::new();
+    for (master, candidates) in by_master {
+        // Reconstruct the entire post-change master using only independently
+        // proven lower deltas. Any other difference invalidates the whole group.
+        let mut expected = left[master].clone();
+        let lowers = expected["provenance"]["lowers"]
+            .as_object_mut()
+            .expect("candidate requires observed lowers in both snapshots");
+        for candidate in &candidates {
+            if candidate.kind == "added" {
+                lowers.insert(candidate.link.to_owned(), candidate.vf_identity.clone());
+            } else {
+                lowers.remove(candidate.link);
+            }
+        }
+        if expected != right[master] {
+            continue;
+        }
+        suppressed.insert(master);
+        for candidate in candidates {
+            suppressed.insert(candidate.link);
+            churn.push(json!({
+                "kind": candidate.kind,
+                "link": candidate.link,
+                "master": master,
+                "vf_identity": candidate.vf_identity,
+                "master_identity": candidate.master_identity,
+            }));
+        }
+    }
+    (churn, suppressed)
+}
+
 /// Compare captured configuration while retaining raw snapshots separately.
 pub fn host_network_configuration_unchanged(
     before: &serde_json::Value,
@@ -127,7 +262,7 @@ pub fn host_network_comparison(
 ) -> Result<serde_json::Value> {
     let before = network_configuration(before)?;
     let after = network_configuration(after)?;
-    let acceleration_churn: Vec<serde_json::Value> = Vec::new();
+    let (acceleration_churn, suppressed_links) = acceleration_churn(&before, &after);
     let mut changes = Vec::new();
     let mut omitted = 0_usize;
     let summarize = |value: Option<&serde_json::Value>| -> Result<serde_json::Value> {
@@ -147,7 +282,7 @@ pub fn host_network_comparison(
         .into_iter()
         .flat_map(|map| map.keys())
         .chain(after.as_object().into_iter().flat_map(|map| map.keys()))
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     for key in keys {
         if before.get(key) == after.get(key) {
             continue;
@@ -168,11 +303,11 @@ pub fn host_network_comparison(
                         .into_iter()
                         .flat_map(|map| map.keys()),
                 )
-                .collect::<std::collections::BTreeSet<_>>();
+                .collect::<BTreeSet<_>>();
             for member in members {
                 let left = before.get(key).and_then(|map| map.get(member));
                 let right = after.get(key).and_then(|map| map.get(member));
-                if left == right {
+                if left == right || (key == "links" && suppressed_links.contains(member.as_str())) {
                     continue;
                 }
                 if changes.len() < 128 {
@@ -189,7 +324,7 @@ pub fn host_network_comparison(
     }
     Ok(
         serde_json::json!({"format":"memcordon.host-network-comparison","revision":1,
-        "unchanged":before==after,"acceleration_churn":acceleration_churn,"changes":changes,"omitted_changes":omitted}),
+        "unchanged":changes.is_empty() && omitted == 0,"acceleration_churn":acceleration_churn,"changes":changes,"omitted_changes":omitted}),
     )
 }
 #[cfg(unix)]

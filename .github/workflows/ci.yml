@@ -1610,9 +1610,6 @@ jobs:
         timeout-minutes: 5
         id: acquire_node_383_3
         if: ${{ !cancelled() && steps.acquire_node_383_2.outcome == 'failure' }}
-      - name: Initialize genuine auxiliary Cargo target
-        run: rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target
-        timeout-minutes: 2
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -1625,6 +1622,11 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
           restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - name: Acquire locked public workspace sources
+        run: rustup run 1.97.1 cargo fetch --locked
+        timeout-minutes: 25
+        id: public-source-fetch
+        if: steps.public-source-seed-restore.outputs.cache-hit != 'true'
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -2109,6 +2111,14 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
+      - name: Initialize genuine auxiliary Cargo target
+        if: runner.os != 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci ci initialize-auxiliary-target
+        timeout-minutes: 2
+      - name: Initialize genuine auxiliary Cargo target
+        if: runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci initialize-auxiliary-target
+        timeout-minutes: 2
       - id: workspace-fetch-request
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci ci cache-requests workspace-fetch
@@ -4639,9 +4649,6 @@ jobs:
         timeout-minutes: 5
         id: acquire_node_1094_3
         if: ${{ !cancelled() && steps.acquire_node_1094_2.outcome == 'failure' }}
-      - name: Initialize genuine auxiliary Cargo target
-        run: rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target
-        timeout-minutes: 2
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -4654,6 +4661,11 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
           restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - name: Acquire locked public workspace sources
+        run: rustup run 1.97.1 cargo fetch --locked
+        timeout-minutes: 25
+        id: public-source-fetch
+        if: steps.public-source-seed-restore.outputs.cache-hit != 'true'
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -5138,6 +5150,10 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
+      - name: Initialize genuine auxiliary Cargo target
+        if: runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci initialize-auxiliary-target
+        timeout-minutes: 2
       - id: windows-fixture-native-request
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci.exe ci cache-requests windows-fixture-native
@@ -5294,9 +5310,6 @@ jobs:
         timeout-minutes: 5
         id: acquire_node_1094_3
         if: ${{ !cancelled() && steps.acquire_node_1094_2.outcome == 'failure' }}
-      - name: Initialize genuine auxiliary Cargo target
-        run: rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target
-        timeout-minutes: 2
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -5309,6 +5322,11 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
           restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - name: Acquire locked public workspace sources
+        run: rustup run 1.97.1 cargo fetch --locked
+        timeout-minutes: 25
+        id: public-source-fetch
+        if: steps.public-source-seed-restore.outputs.cache-hit != 'true'
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -5793,6 +5811,10 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci.exe ci workflows --check
+      - name: Initialize genuine auxiliary Cargo target
+        if: runner.os == 'Windows'
+        run: ./target/ci-runtime/current/memcordon-ci.exe ci initialize-auxiliary-target
+        timeout-minutes: 2
       - name: Collect isolated ordinary RC access-failure feasibility
         id: access-failure-calibration
         run: ./target/ci-runtime/current/memcordon-ci.exe ci access-failure-probe --output target/ci/reports/access-failure-calibration.json

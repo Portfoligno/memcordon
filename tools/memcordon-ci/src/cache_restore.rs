@@ -431,6 +431,46 @@ pub(crate) fn cargo_marker_present(target: &Path) -> Result<bool> {
     Ok(bytes == SIGNATURE)
 }
 
+/// Initialize the auxiliary target without cleaning any shared cache contents.
+pub fn initialize_auxiliary_target(root: &Path) -> Result<()> {
+    let target = root.canonicalize()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    if target.canonicalize()? != target {
+        return Err(CiError::Message("unsafe auxiliary Cargo target".into()));
+    }
+    if cargo_marker_present(&target)? {
+        return Ok(());
+    }
+
+    // The source seed already creates target/ci-cargo-home. Cargo will not tag
+    // an existing unmarked target, so ask it to create a fresh one beside it.
+    let staging = tempfile::tempdir_in(&target)?;
+    let fresh = staging.path().join("cargo-target");
+    let pins = crate::config::toolchains(root)?;
+    rustup_cargo(
+        root,
+        &pins.stable,
+        [
+            "clean",
+            "--locked",
+            "--offline",
+            "--package",
+            "memcordon-ci",
+        ],
+        Duration::from_secs(90),
+    )
+    .arg("--target-dir")
+    .arg(&fresh)
+    .run()?;
+    if !cargo_marker_present(&fresh)? {
+        return Err(CiError::Message(
+            "Cargo did not generate a target tag".into(),
+        ));
+    }
+    std::fs::hard_link(fresh.join("CACHEDIR.TAG"), target.join("CACHEDIR.TAG"))?;
+    Ok(())
+}
+
 pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Result<()> {
     prepare_partition(root, purpose, shard, None, mode)
 }
