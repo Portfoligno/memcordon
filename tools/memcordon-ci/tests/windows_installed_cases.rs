@@ -627,6 +627,7 @@ fn sampling_result() -> InstalledCaseResult {
         }),
         workload_cleanup: Ok(()),
         package_cleanup: Ok(()),
+        sampling_execution: None,
     }
 }
 
@@ -778,6 +779,7 @@ fn complete_installed_assessment()
         public_smoke_after: Ok(()),
         package_upgrade: Ok(()),
         package_uninstall: Ok(()),
+        unrecorded_operation_failure: None,
     }
 }
 
@@ -810,6 +812,111 @@ fn native_suite_failure_is_foregrounded_over_unrun_public_smoke() {
     assert!(
         summary.contains(r#"capacity suite: Err("capacity attempt token snapshot missing")"#),
         "{summary}"
+    );
+}
+
+#[test]
+fn sampling_callback_failure_is_foregrounded_over_skipped_recovery_and_later_uninstall() {
+    use memcordon_ci::windows_causal_acceptance::{
+        CleanupFailure, SamplingCommandOutcome, SamplingExecutionEvidence, SamplingOutputEvidence,
+        SamplingReadinessDeadlineEvidence,
+    };
+    use memcordon_ci::windows_installed_cases::InstalledWindowsAssessment;
+
+    let mut assessment = complete_installed_assessment();
+    assessment.cases.truncate(1);
+    let case = &mut assessment.cases[0];
+    case.behavior = Err(CaseFailure {
+        reason: "trusted fixture readiness was not observed before deadline".into(),
+    });
+    case.collection = Err(CollectionFailure {
+        reason: "case output was not collected".into(),
+    });
+    case.workload_cleanup = Err(CleanupFailure {
+        reason: "native fixture family retirement is unknown".into(),
+    });
+    case.package_cleanup = Err(CleanupFailure {
+        reason: "package uninstall timed out".into(),
+    });
+    case.sampling_execution = Some(SamplingExecutionEvidence {
+        outcome: SamplingCommandOutcome::ReadinessDeadline,
+        observed_status: None,
+        termination_status: Some(137),
+        command_cleanup_succeeded: Some(true),
+        complete_capture: true,
+        output: Some(SamplingOutputEvidence {
+            stdout_bytes: 12,
+            stderr_bytes: 0,
+            readiness_marker_lines: 0,
+            parsed_readiness_members: None,
+        }),
+        readiness_at_deadline: Some(SamplingReadinessDeadlineEvidence {
+            stdout_bytes: 0,
+            stderr_bytes: Some(0),
+            parsed_readiness_members: None,
+        }),
+    });
+    assessment.retained_state_recovery = Err("retained-state recovery was not executed".into());
+    assessment.public_smoke_after = Err("postrecovery smoke was not executed".into());
+    assessment.package_uninstall = Err("package uninstall timed out".into());
+    let wire = serde_json::to_vec_pretty(&assessment).unwrap();
+    let assessment: InstalledWindowsAssessment = serde_json::from_slice(&wire).unwrap();
+    let case = &assessment.cases[0];
+    assert_eq!(
+        case.sampling_execution.as_ref().unwrap().outcome,
+        SamplingCommandOutcome::ReadinessDeadline
+    );
+    assert_eq!(
+        case.sampling_execution
+            .as_ref()
+            .unwrap()
+            .command_cleanup_succeeded,
+        Some(true)
+    );
+    assert!(case.collection.is_err());
+    assert!(case.workload_cleanup.is_err());
+    assert!(case.package_cleanup.is_err());
+    assert!(!assessment.accepted());
+    let summary = assessment.failure_summary();
+    assert!(
+        summary.contains(
+            r#"first failed stage: sampling-population behavior: "trusted fixture readiness was not observed before deadline";"#
+        ),
+        "{summary}"
+    );
+    assert!(summary.contains(r#"uninstall: Err("package uninstall timed out")"#));
+}
+
+#[test]
+fn ordered_case_summary_excludes_copied_uninstall_and_preserves_unassessed_stops() {
+    use memcordon_ci::windows_causal_acceptance::CleanupFailure;
+    use memcordon_ci::windows_installed_cases::InstalledOperationStage;
+
+    let mut assessment = complete_installed_assessment();
+    assessment.package_uninstall = Err("uninstall timed out".into());
+    for case in &mut assessment.cases {
+        case.package_cleanup = Err(CleanupFailure {
+            reason: "uninstall timed out".into(),
+        });
+    }
+    assert!(
+        assessment
+            .failure_summary()
+            .contains(r#"first failed stage: uninstall: "uninstall timed out";"#)
+    );
+    assessment.cases[1].workload_cleanup = Err(CleanupFailure {
+        reason: "retirement not proved".into(),
+    });
+    assessment.retained_state_recovery = Err("retained-state recovery was not executed".into());
+    assert!(assessment.failure_summary().contains(
+        r#"first failed stage: guardian-loss-after-release fixture retirement: "retirement not proved";"#
+    ));
+    assessment.cases.truncate(1);
+    assessment.unrecorded_operation_failure = Some(InstalledOperationStage::PostCaseQuiescence);
+    assert!(
+        assessment
+            .failure_summary()
+            .contains("first failed stage: post-case quiescence: see original operation error;")
     );
 }
 

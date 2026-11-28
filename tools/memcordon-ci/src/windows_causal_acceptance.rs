@@ -243,7 +243,303 @@ pub struct InstalledCaseResult {
     pub collection: std::result::Result<CollectedFailure, CollectionFailure>,
     pub workload_cleanup: std::result::Result<(), CleanupFailure>,
     pub package_cleanup: std::result::Result<(), CleanupFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_execution: Option<SamplingExecutionEvidence>,
 }
+
+/// Diagnostic-only projection of the original command owner result. No stream
+/// bytes, paths, process identities, or cleanup error strings enter this field.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingExecutionEvidence {
+    pub outcome: SamplingCommandOutcome,
+    /// Status observed before cleanup, not the status reaped after termination.
+    pub observed_status: Option<i32>,
+    pub termination_status: Option<i32>,
+    /// Command-boundary cleanup, not independent fixture-family retirement.
+    pub command_cleanup_succeeded: Option<bool>,
+    /// True only when the command owner supplied both complete bounded streams.
+    pub complete_capture: bool,
+    /// The command owner's capture, which may include bytes read during cleanup.
+    pub output: Option<SamplingOutputEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_at_deadline: Option<SamplingReadinessDeadlineEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SamplingCommandOutcome {
+    Exited,
+    ReadinessDeadline,
+    CallbackFailed,
+    Deadline,
+    Cancelled,
+    OutputLimit,
+    SpawnFailed,
+    WaitFailed,
+    CaptureFailed,
+    ApplicationEnded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingOutputEvidence {
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    /// Includes a possible final partial record in a bounded snapshot.
+    pub readiness_marker_lines: usize,
+    /// Structural readiness parsed from this capture, not matched native identities.
+    pub parsed_readiness_members: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingReadinessDeadlineEvidence {
+    pub stdout_bytes: usize,
+    /// None means the existing reader buffer could not be inspected immediately.
+    pub stderr_bytes: Option<usize>,
+    pub parsed_readiness_members: Option<usize>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(crate) struct FixtureReadinessDeadline(pub SamplingReadinessDeadlineEvidence);
+
+#[cfg(any(windows, test))]
+impl std::fmt::Display for FixtureReadinessDeadline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("trusted fixture readiness was not observed before deadline")
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::error::Error for FixtureReadinessDeadline {}
+
+#[cfg(any(windows, test))]
+impl SamplingExecutionEvidence {
+    pub(crate) fn from_execution(
+        execution: &std::result::Result<
+            memcordon_testkit::ObservedOutput,
+            memcordon_testkit::ProcessTestError,
+        >,
+    ) -> Self {
+        use memcordon_testkit::ProcessTestError as Error;
+
+        let mut evidence = Self {
+            outcome: SamplingCommandOutcome::Exited,
+            observed_status: None,
+            termination_status: None,
+            command_cleanup_succeeded: None,
+            complete_capture: false,
+            output: None,
+            readiness_at_deadline: None,
+        };
+        let output = match execution {
+            Ok(output) => {
+                evidence.observed_status = output.status.code();
+                evidence.complete_capture = true;
+                Some((&output.stdout, &output.stderr))
+            }
+            Err(Error::Callback {
+                error,
+                stdout,
+                stderr,
+                capture_complete,
+                observed_status,
+                termination,
+                cleanup,
+            }) => {
+                let deadline = error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<FixtureReadinessDeadline>());
+                evidence.outcome = if let Some(deadline) = deadline {
+                    evidence.readiness_at_deadline = Some(deadline.0.clone());
+                    SamplingCommandOutcome::ReadinessDeadline
+                } else {
+                    SamplingCommandOutcome::CallbackFailed
+                };
+                evidence.observed_status = observed_status.and_then(|status| status.code());
+                evidence.termination_status = termination.and_then(|status| status.code());
+                evidence.command_cleanup_succeeded = Some(cleanup.is_ok());
+                evidence.complete_capture = *capture_complete;
+                Some((stdout, stderr))
+            }
+            Err(Error::Timeout {
+                stdout,
+                stderr,
+                cleanup,
+                observation,
+                ..
+            }) => {
+                evidence.outcome = SamplingCommandOutcome::Deadline;
+                evidence.observed_status =
+                    observation.observed_status.and_then(|status| status.code());
+                evidence.command_cleanup_succeeded = Some(cleanup.is_ok());
+                Some((stdout, stderr))
+            }
+            Err(Error::Cancelled {
+                stdout,
+                stderr,
+                cleanup,
+                termination,
+                observation,
+            }) => {
+                evidence.outcome = SamplingCommandOutcome::Cancelled;
+                evidence.observed_status =
+                    observation.observed_status.and_then(|status| status.code());
+                evidence.termination_status = termination.and_then(|status| status.code());
+                evidence.command_cleanup_succeeded = Some(cleanup.is_ok());
+                Some((stdout, stderr))
+            }
+            Err(Error::OutputLimit {
+                stdout,
+                stderr,
+                cleanup,
+                termination,
+            }) => {
+                evidence.outcome = SamplingCommandOutcome::OutputLimit;
+                evidence.termination_status = termination.and_then(|status| status.code());
+                evidence.command_cleanup_succeeded = Some(cleanup.is_ok());
+                Some((stdout, stderr))
+            }
+            Err(
+                error @ (Error::Spawn(_)
+                | Error::Wait(_)
+                | Error::Output(_)
+                | Error::ApplicationEnded { .. }),
+            ) => {
+                evidence.outcome = match error {
+                    Error::Spawn(_) => SamplingCommandOutcome::SpawnFailed,
+                    Error::Wait(_) => SamplingCommandOutcome::WaitFailed,
+                    Error::Output(_) => SamplingCommandOutcome::CaptureFailed,
+                    _ => SamplingCommandOutcome::ApplicationEnded,
+                };
+                None
+            }
+        };
+        evidence.output = output.map(|(stdout, stderr)| SamplingOutputEvidence {
+            stdout_bytes: stdout.len(),
+            stderr_bytes: stderr.len(),
+            readiness_marker_lines: stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| line.starts_with(INVENTORY_READINESS_MARKER))
+                .count(),
+            parsed_readiness_members: parse_fixture_readiness(stdout).ok().map(|rows| rows.len()),
+        });
+        evidence
+    }
+}
+
+#[cfg(test)]
+mod sampling_execution_tests {
+    use super::*;
+    use memcordon_testkit::ProcessTestError;
+    use std::{io, process::ExitStatus};
+
+    fn exit_status(code: u8) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(i32::from(code) << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(u32::from(code))
+        }
+    }
+
+    #[test]
+    fn readiness_deadline_uses_completed_owner_capture_without_exporting_raw_output() {
+        let stdout = b"MEMCORDON-INVENTORY-READY:{\"kind\":\"inventory-root-ready\",\"ordinal\":null,\"pid\":875431,\"birth\":987654321}\n".to_vec();
+        let stderr = b"private stderr contents".to_vec();
+        let (stdout_bytes, stderr_bytes) = (stdout.len(), stderr.len());
+        let evidence =
+            SamplingExecutionEvidence::from_execution(&Err(ProcessTestError::Callback {
+                error: io::Error::other(FixtureReadinessDeadline(
+                    SamplingReadinessDeadlineEvidence {
+                        stdout_bytes: 0,
+                        stderr_bytes: None,
+                        parsed_readiness_members: None,
+                    },
+                )),
+                stdout,
+                stderr,
+                capture_complete: true,
+                observed_status: None,
+                termination: Some(exit_status(137)),
+                cleanup: Ok(()),
+            }));
+        assert_eq!(evidence.outcome, SamplingCommandOutcome::ReadinessDeadline);
+        assert_eq!(evidence.observed_status, None);
+        assert_eq!(evidence.termination_status, Some(137));
+        assert_eq!(evidence.command_cleanup_succeeded, Some(true));
+        assert!(evidence.complete_capture);
+        assert_eq!(
+            evidence.readiness_at_deadline,
+            Some(SamplingReadinessDeadlineEvidence {
+                stdout_bytes: 0,
+                stderr_bytes: None,
+                parsed_readiness_members: None,
+            })
+        );
+        assert_eq!(
+            evidence.output,
+            Some(SamplingOutputEvidence {
+                stdout_bytes,
+                stderr_bytes,
+                readiness_marker_lines: 1,
+                parsed_readiness_members: Some(1),
+            })
+        );
+        let wire = serde_json::to_string(&evidence).unwrap();
+        for omitted in [
+            "private stderr",
+            "inventory-root-ready",
+            "875431",
+            "987654321",
+        ] {
+            assert!(!wire.contains(omitted), "{wire}");
+        }
+        assert!(wire.len() < 512, "{wire}");
+    }
+
+    #[test]
+    fn callback_failure_and_spawn_failure_do_not_invent_complete_readiness_or_cleanup() {
+        let execution =
+            SamplingExecutionEvidence::from_execution(&Err(ProcessTestError::Callback {
+                error: io::Error::other("unrelated confidential callback failure"),
+                stdout: b"MEMCORDON-INVENTORY-READY:{".to_vec(),
+                stderr: Vec::new(),
+                capture_complete: false,
+                observed_status: Some(exit_status(23)),
+                termination: None,
+                cleanup: Err("confidential cleanup detail".into()),
+            }));
+        assert_eq!(execution.outcome, SamplingCommandOutcome::CallbackFailed);
+        assert_eq!(execution.observed_status, Some(23));
+        assert_eq!(execution.termination_status, None);
+        assert_eq!(execution.command_cleanup_succeeded, Some(false));
+        assert!(!execution.complete_capture);
+        assert_eq!(execution.readiness_at_deadline, None);
+        let output = execution.output.as_ref().unwrap();
+        assert_eq!(output.readiness_marker_lines, 1);
+        assert_eq!(output.parsed_readiness_members, None);
+        assert!(
+            !serde_json::to_string(&execution)
+                .unwrap()
+                .contains("confidential")
+        );
+
+        let spawn = SamplingExecutionEvidence::from_execution(&Err(ProcessTestError::Spawn(
+            io::Error::other("spawn failed"),
+        )));
+        assert_eq!(spawn.outcome, SamplingCommandOutcome::SpawnFailed);
+        assert_eq!(spawn.output, None);
+        assert_eq!(spawn.command_cleanup_succeeded, None);
+    }
+}
+
 impl InstalledCaseResult {
     pub fn accepted(&self) -> bool {
         self.behavior.is_ok()
@@ -314,8 +610,9 @@ struct InventoryReadiness {
     pid: u32,
     birth: u128,
 }
+const INVENTORY_READINESS_MARKER: &[u8] = b"MEMCORDON-INVENTORY-READY:";
+
 pub fn parse_fixture_readiness(stdout: &[u8]) -> Result<Vec<FixtureProcessIdentityV1>> {
-    const MARKER: &[u8] = b"MEMCORDON-INVENTORY-READY:";
     if stdout.len() > MAX_STREAM_BYTES {
         return Err(failure(
             "inventory fixture readiness stream exceeds byte bound",
@@ -326,7 +623,7 @@ pub fn parse_fixture_readiness(stdout: &[u8]) -> Result<Vec<FixtureProcessIdenti
     let mut process_identities = BTreeSet::new();
     let mut root_count = 0;
     for line in stdout.split(|byte| *byte == b'\n') {
-        let Some(value) = line.strip_prefix(MARKER) else {
+        let Some(value) = line.strip_prefix(INVENTORY_READINESS_MARKER) else {
             continue;
         };
         let value: InventoryReadiness = serde_json::from_slice(value)?;

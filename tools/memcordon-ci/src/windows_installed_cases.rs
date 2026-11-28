@@ -786,31 +786,89 @@ pub struct InstalledWindowsAssessment {
     pub public_smoke_after: std::result::Result<(), String>,
     pub package_upgrade: std::result::Result<(), String>,
     pub package_uninstall: std::result::Result<(), String>,
+    /// Original operation stop when no result field describes that stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecorded_operation_failure: Option<InstalledOperationStage>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstalledOperationStage {
+    FreshSetup,
+    BeforeUpgradeObservation,
+    AfterUpgradeObservation,
+    CurrentSetup,
+    LossLeasePublication,
+    PostCaseQuiescence,
+    PostRecoveryQuiescence,
+}
+
+impl InstalledOperationStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FreshSetup => "fresh package setup",
+            Self::BeforeUpgradeObservation => "before-upgrade lease observation",
+            Self::AfterUpgradeObservation => "after-upgrade lease observation",
+            Self::CurrentSetup => "current package setup",
+            Self::LossLeasePublication => "native loss lease publication",
+            Self::PostCaseQuiescence => "post-case quiescence",
+            Self::PostRecoveryQuiescence => "postrecovery quiescence",
+        }
+    }
 }
 
 impl InstalledWindowsAssessment {
     pub fn failure_summary(&self) -> String {
-        // Stages in execution order: the first recorded failure is foregrounded
-        // so a native suite failure is never hidden behind unrun later stages.
-        let stages = [
+        let before_cases = [
             ("upgrade", &self.package_upgrade),
             ("positive readiness", &self.positive_suite),
             ("native loss suite", &self.loss_suite),
             ("capacity suite", &self.capacity_suite),
             ("refusal suite", &self.refusal_suite),
             ("public smoke before", &self.public_smoke_before),
+        ];
+        let after_cases = [
             ("retained-state recovery", &self.retained_state_recovery),
             ("public smoke after", &self.public_smoke_after),
             ("uninstall", &self.package_uninstall),
         ];
-        let first = stages
-            .iter()
-            .find_map(|(stage, result)| {
-                result
-                    .as_ref()
-                    .err()
-                    .map(|error| format!("{stage}: {error:?}"))
+        let stage_error = |(stage, result): (&str, &std::result::Result<(), String>)| {
+            result
+                .as_ref()
+                .err()
+                .map(|error| format!("{stage}: {error:?}"))
+        };
+        let first = self
+            .unrecorded_operation_failure
+            .map(|stage| format!("{}: see original operation error", stage.name()))
+            .or_else(|| before_cases.into_iter().find_map(stage_error))
+            .or_else(|| {
+                self.cases.iter().find_map(|case| {
+                    // Per-case package cleanup is copied from the later uninstall.
+                    [
+                        (
+                            "behavior",
+                            case.behavior.as_ref().err().map(|error| &error.reason),
+                        ),
+                        (
+                            "collection",
+                            case.collection.as_ref().err().map(|error| &error.reason),
+                        ),
+                        (
+                            "fixture retirement",
+                            case.workload_cleanup
+                                .as_ref()
+                                .err()
+                                .map(|error| &error.reason),
+                        ),
+                    ]
+                    .into_iter()
+                    .find_map(|(phase, error)| {
+                        error.map(|error| format!("{} {phase}: {error:?}", case.case.name()))
+                    })
+                })
             })
+            .or_else(|| after_cases.into_iter().find_map(stage_error))
             .unwrap_or_else(|| "none recorded; case or suite evidence rejected".to_owned());
         format!(
             "actual installed Windows case or retirement failed; first failed stage: {first}; positive readiness: {:?}; native loss suite: {:?}; capacity suite: {:?}; refusal suite: {:?}; public smoke before: {:?}; upgrade: {:?}; uninstall: {:?}",
@@ -1598,11 +1656,15 @@ mod native {
         let deadline = work_deadline.min(Instant::now() + Duration::from_secs(90));
         loop {
             let stdout = snapshot.stdout()?;
+            let mut parsed_readiness_members = None;
             let ready = match case {
-                InstalledCase::SamplingPopulation => acceptance::parse_fixture_readiness(&stdout)
-                    .is_ok_and(|family| {
-                        family.len() == acceptance::WINDOWS_CAUSAL_CONCURRENT_CHILDREN + 1
-                    }),
+                InstalledCase::SamplingPopulation => {
+                    parsed_readiness_members = acceptance::parse_fixture_readiness(&stdout)
+                        .ok()
+                        .map(|family| family.len());
+                    parsed_readiness_members
+                        == Some(acceptance::WINDOWS_CAUSAL_CONCURRENT_CHILDREN + 1)
+                }
                 InstalledCase::GuardianLossAfterRelease | InstalledCase::GuardianLossLifetime => {
                     let marker = b"MEMCORDON-GUARDIAN-LOSS-READY:";
                     let records = stdout
@@ -1669,6 +1731,15 @@ mod native {
                 return Ok(family);
             }
             if Instant::now() >= deadline {
+                if case == InstalledCase::SamplingPopulation {
+                    return Err(io::Error::other(acceptance::FixtureReadinessDeadline(
+                        acceptance::SamplingReadinessDeadlineEvidence {
+                            stdout_bytes: stdout.len(),
+                            stderr_bytes: snapshot.try_stderr_len(),
+                            parsed_readiness_members,
+                        },
+                    )));
+                }
                 return Err(io::Error::other(
                     "trusted fixture readiness was not observed before deadline",
                 ));
@@ -1701,6 +1772,7 @@ mod native {
             package_cleanup: Err(CleanupFailure {
                 reason: "package uninstall has not run".to_owned(),
             }),
+            sampling_execution: None,
         };
         let operation = (|| -> Result<()> {
             let baseline = quiescent(config)?;
@@ -1818,6 +1890,11 @@ mod native {
                     Ok(())
                 },
             );
+            if case == InstalledCase::SamplingPopulation {
+                assessment.sampling_execution = Some(
+                    acceptance::SamplingExecutionEvidence::from_execution(&execution),
+                );
+            }
             let (stdout, stderr, status, timed_out, execution_error) = match execution {
                 Ok(output) => (
                     output.stdout,
@@ -2027,12 +2104,14 @@ mod native {
             public_smoke_after: Err("postrecovery smoke was not executed".to_owned()),
             package_upgrade: Err("upgrade was not executed".to_owned()),
             package_uninstall: Err("uninstall was not executed".to_owned()),
+            unrecorded_operation_failure: None,
         };
         let mut current_upgrade_started = false;
         let mut fresh_install_started = false;
         let mut fresh = config.clone();
         fresh.output_directory = config.output_directory.join("selected-fresh-lifetime");
         fs::create_dir(&fresh.output_directory)?;
+        let mut unrecorded_stage = Some(InstalledOperationStage::FreshSetup);
         let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || -> std::result::Result<(), String> {
                 observer(lease_event(
@@ -2066,6 +2145,7 @@ mod native {
                     verify_file(component).map_err(|error| error.to_string())?;
                 }
                 drop(quiescent(&fresh).map_err(|error| error.to_string())?);
+                unrecorded_stage = Some(InstalledOperationStage::BeforeUpgradeObservation);
                 observer(lease_event(
                     WindowsLeasePhase::BeforeCurrentUpgrade,
                     config,
@@ -2075,6 +2155,10 @@ mod native {
                 .map_err(|error| error.to_string())?;
                 current_upgrade_started = true;
                 assessment.package_upgrade = package(config, "upgrade", deadlines.work);
+                unrecorded_stage = assessment
+                    .package_upgrade
+                    .is_ok()
+                    .then_some(InstalledOperationStage::AfterUpgradeObservation);
                 observer(lease_event(
                     WindowsLeasePhase::AfterCurrentUpgrade,
                     config,
@@ -2083,6 +2167,7 @@ mod native {
                 ))
                 .map_err(|error| error.to_string())?;
                 assessment.package_upgrade.clone()?;
+                unrecorded_stage = Some(InstalledOperationStage::CurrentSetup);
                 let current_verify = package(config, "verify", deadlines.work);
                 observer(lease_event(
                     WindowsLeasePhase::AfterCurrentVerify,
@@ -2107,6 +2192,7 @@ mod native {
                     )
                     .map_err(|error| error.to_string())?;
                 }
+                unrecorded_stage = None;
                 assessment.positive_suite =
                     crate::windows_consumer_readiness::run_installed_with_failure_subject(
                         config,
@@ -2119,8 +2205,10 @@ mod native {
                 assessment.readiness =
                     crate::windows_readiness_policy::assess_suite(&assessment.positive_cases);
                 assessment.positive_suite.clone()?;
+                unrecorded_stage = Some(InstalledOperationStage::LossLeasePublication);
                 crate::windows_readiness_faults::publish_original_lease(config, deadlines)
                     .map_err(|error| error.to_string())?;
+                unrecorded_stage = None;
                 assessment.loss_suite = crate::windows_readiness_faults::run_until(
                     config,
                     &config.output_directory.join("windows-readiness-input.json"),
@@ -2163,7 +2251,10 @@ mod native {
                             "cannot establish fixture quiescence for later cases".to_owned()
                         );
                     }
+                    unrecorded_stage = (case.behavior.is_ok() && case.collection.is_ok())
+                        .then_some(InstalledOperationStage::PostCaseQuiescence);
                     drop(quiescent(config).map_err(|error| error.to_string())?);
+                    unrecorded_stage = None;
                     if case.behavior.is_err() || case.collection.is_err() {
                         return Err(
                             "required installed native case failed; stopping later cases"
@@ -2173,7 +2264,9 @@ mod native {
                 }
                 assessment.retained_state_recovery = recover_retained_state(config, deadlines);
                 assessment.retained_state_recovery.clone()?;
+                unrecorded_stage = Some(InstalledOperationStage::PostRecoveryQuiescence);
                 drop(quiescent(config).map_err(|error| error.to_string())?);
+                unrecorded_stage = None;
                 assessment.public_smoke_after = smoke(
                     config,
                     &config.output_directory.join("smoke-after.json"),
@@ -2245,6 +2338,7 @@ mod native {
         if let Err(error) = operation {
             // Some setup and quiescence checks have no dedicated assessment field.
             // Report the operation error without borrowing another stage's result.
+            assessment.unrecorded_operation_failure = unrecorded_stage;
             eprintln!("installed Windows operation stopped: {error}");
         }
         match serde_json::to_vec_pretty(&assessment) {

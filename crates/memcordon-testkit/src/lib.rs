@@ -295,6 +295,10 @@ impl OutputSnapshot {
             .map(|bytes| bytes.clone())
             .map_err(|_| io::Error::other("stderr snapshot lock poisoned"))
     }
+    /// Inspect the current bounded stderr length without blocking the reader.
+    pub fn try_stderr_len(&self) -> Option<usize> {
+        self.stderr.try_lock().ok().map(|bytes| bytes.len())
+    }
 }
 
 impl OutputReader {
