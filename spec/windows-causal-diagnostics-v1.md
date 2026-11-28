@@ -92,9 +92,11 @@ its charge after the workload admission lease disappears. Only a confirmed local
 retirement or a dead prior owner permits releasing that charge. Cleanup submits
 diagnostic snapshots without waiting for disk completion.
 
-The effective writer concurrency is one. Each active attempt reserves 80 MiB
-within a 128 MiB installation record-state budget. One installation-wide retained
-reader can reserve another 48 MiB before reading. Its durable reservation and
+Installation-wide writer concurrency is bounded at two active attempts, each
+owning at most one writer lane. Each active attempt reserves 80 MiB within a
+208 MiB installation record-state budget (two 80 MiB active attempts plus one
+48 MiB retained reader); a third active attempt is refused before admission.
+One installation-wide retained reader can reserve that 48 MiB before reading. Its durable reservation and
 native mutex follow the decoded snapshot and, for terminal replay, serialization,
 delivery and acknowledgment. The payload is released immediately after delivery;
 the reservation remains until acknowledgment handling completes. Immutable outbox backing is

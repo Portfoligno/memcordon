@@ -2712,6 +2712,10 @@ fn storage_phase<E: std::fmt::Display>(tag: &'static str) -> impl FnOnce(E) -> S
 pub fn reserve_admission(attempt_id: &str, request_sha256: &str) -> Result<AdmissionLease, String> {
     validate_attempt_id(attempt_id)?;
     validate_attempt_id(request_sha256)?;
+    // Sweep before taking the budget guard: each expiry acquires the retained
+    // reader guard and then the budget guard (RecordReaderReservation). Taking
+    // budget first would invert that installation-wide order; with zero-timeout
+    // native mutexes, concurrent readers would then refuse each other.
     sweep_expired_diagnostics()?;
     let _budget = super::attempt_store::PublicationGuard::acquire(&digest(
         b"installation-attempt-storage-budget-v1",
@@ -2869,6 +2873,18 @@ struct StorageRoots {
     admissions: PathBuf,
 }
 
+/// Installation-wide bound on concurrently active attempts, each owning at most
+/// one writer lane; see spec/windows-causal-diagnostics-v1.md.
+pub(super) const MAX_ACTIVE_ATTEMPTS: usize = 2;
+/// Record-sized images charged to each active attempt (80 MiB).
+const IMAGES_PER_ACTIVE_ATTEMPT: u64 = 5;
+/// Record-sized images charged to the installation-wide retained reader (48 MiB).
+const IMAGES_PER_READER: u64 = 3;
+/// `2 x 80 MiB + 48 MiB = 208 MiB` installation record-state budget.
+const RECORD_STATE_BUDGET: u64 = (MAX_ACTIVE_ATTEMPTS as u64 * IMAGES_PER_ACTIVE_ATTEMPT
+    + IMAGES_PER_READER)
+    * memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64;
+
 /// Returns the charged reservation in bytes after every bound check passes.
 fn enforce_storage_reservation_at(
     roots: &StorageRoots,
@@ -2876,11 +2892,9 @@ fn enforce_storage_reservation_at(
     reserving_reader: bool,
     observe_writer: bool,
 ) -> Result<u64, String> {
-    const RECORD_STATE_BUDGET: u64 = 128 * 1024 * 1024;
-    const IMAGES_PER_ACTIVE_ATTEMPT: u64 = 5;
     let record_bound = memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64;
     let mut reserved = if reserving_reader {
-        3 * record_bound
+        IMAGES_PER_READER * record_bound
     } else {
         0
     };
@@ -2899,14 +2913,14 @@ fn enforce_storage_reservation_at(
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().ends_with(".reader.json"))
             {
-                reserved += 3 * record_bound;
+                reserved += IMAGES_PER_READER * record_bound;
             }
             if admission.workload_reservation && active.insert(admission.attempt_id) {
                 reserved = reserved
                     .checked_add(record_bound * IMAGES_PER_ACTIVE_ATTEMPT)
                     .ok_or_else(|| "attempt storage reservation overflow".to_owned())?;
             }
-            if reserved > RECORD_STATE_BUDGET {
+            if reserved > RECORD_STATE_BUDGET || active.len() > MAX_ACTIVE_ATTEMPTS {
                 return Err("installation attempt storage reservation exhausted".to_owned());
             }
         }
@@ -2916,7 +2930,7 @@ fn enforce_storage_reservation_at(
             .checked_add(record_bound * IMAGES_PER_ACTIVE_ATTEMPT)
             .ok_or_else(|| "attempt storage reservation overflow".to_owned())?;
     }
-    if reserved > RECORD_STATE_BUDGET {
+    if reserved > RECORD_STATE_BUDGET || active.len() > MAX_ACTIVE_ATTEMPTS {
         return Err("installation attempt storage reservation exhausted".to_owned());
     }
     let mut retained_payloads = active.len();
@@ -2955,9 +2969,15 @@ fn enforce_storage_reservation_at(
             let identity = record_attempt_id(&path)?;
             if !active.contains(&identity) {
                 // Directory-enumeration metadata; does not open the entry.
-                let metadata = entry
-                    .metadata()
-                    .map_err(storage_phase("quota/retained-entry-metadata"))?;
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    // Retired concurrently after enumeration: nothing remains
+                    // to charge, and a vanished entry cannot exceed a bound.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(storage_phase("quota/retained-entry-metadata")(error));
+                    }
+                };
                 if !metadata.is_file() || metadata.len() > record_bound {
                     return Err("retained record exceeds authenticated record bound".to_owned());
                 }

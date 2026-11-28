@@ -15,10 +15,11 @@ mod publication_wait;
 mod writer_queue_tests;
 
 // Owner, working and both queued snapshots share immutable outbox backing.
-// Five record-sized slots cover the bounded writer phases documented in
-// spec/windows-causal-diagnostics-v1.md; independent readers reserve three more.
-// Remaining installation capacity charges retained files by their actual bytes.
-const MAX_WRITER_LANES: usize = 1;
+// Five record-sized slots (80 MiB) cover the bounded writer phases documented in
+// spec/windows-causal-diagnostics-v1.md. At most two active attempts, one lane
+// each, share the 208 MiB installation budget with one retained reader's three
+// slots (48 MiB). Retained files consume their actual bytes within that budget.
+const MAX_WRITER_LANES: usize = super::record::MAX_ACTIVE_ATTEMPTS;
 const PENDING_SNAPSHOTS: usize = 2;
 const COMMIT_OBSERVATION_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -73,9 +74,7 @@ fn lane(record: &WindowsAttemptRecordV1) -> Result<Arc<Lane>, String> {
     if let Some(lane) = lanes.get(&record.attempt_id) {
         return Ok(Arc::clone(lane));
     }
-    if lanes.len() >= MAX_WRITER_LANES {
-        return Err("attempt writer capacity exhausted".to_owned());
-    }
+    admit_writer_lane(&lanes)?;
     super::record::reserve_writer_admission(&record.attempt_id, &record.request_sha256)?;
     let observation = super::writer_observation::get(&record.attempt_id);
     let lane = new_lane_observed(
@@ -91,6 +90,14 @@ fn lane(record: &WindowsAttemptRecordV1) -> Result<Arc<Lane>, String> {
         );
     }
     Ok(lane)
+}
+
+/// Refuse a new distinct lane once every installation writer lane is owned.
+fn admit_writer_lane(lanes: &BTreeMap<String, Arc<Lane>>) -> Result<(), String> {
+    if lanes.len() >= MAX_WRITER_LANES {
+        return Err("attempt writer capacity exhausted".to_owned());
+    }
+    Ok(())
 }
 
 fn candidate_observation_phase(

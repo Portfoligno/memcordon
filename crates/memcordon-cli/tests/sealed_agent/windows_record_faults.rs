@@ -1444,6 +1444,55 @@ fn active_admission_attempt_entries_are_charged_without_being_opened() {
 }
 
 #[test]
+fn two_active_attempts_and_one_reader_fill_the_exact_installation_budget() {
+    let attempts = tempfile::tempdir().unwrap();
+    let quarantine = tempfile::tempdir().unwrap();
+    let admissions = tempfile::tempdir().unwrap();
+    let roots = StorageRoots {
+        attempts: attempts.path().to_owned(),
+        quarantine: quarantine.path().to_owned(),
+        admissions: admissions.path().to_owned(),
+    };
+    let record_bound = memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64;
+    let image = record_bound * 5;
+    let live = digest(b"live-admitted-attempt");
+    let next = digest(b"next-admitted-attempt");
+    let third = digest(b"third-distinct-attempt");
+    write_workload_admission(admissions.path(), &live);
+    write_workload_admission(admissions.path(), &next);
+    let _live_record = unopenable_entry(&attempts.path().join(&live).with_extension("json"));
+    let _live_stage = unopenable_entry(&attempts.path().join(&live).with_extension("json.new"));
+    let _next_record = unopenable_entry(&attempts.path().join(&next).with_extension("json"));
+    assert_eq!(2 * image + 3 * record_bound, RECORD_STATE_BUDGET);
+    assert_eq!(RECORD_STATE_BUDGET, 208 * 1024 * 1024);
+
+    // a) Both admitted attempts plus the retained reader hit the exact ceiling.
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, None, true, true).unwrap(),
+        2 * image + 3 * record_bound
+    );
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, Some(&next), true, true).unwrap(),
+        RECORD_STATE_BUDGET
+    );
+    // b) A third distinct active attempt is refused deterministically.
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, Some(&third), false, true).unwrap_err(),
+        "installation attempt storage reservation exhausted"
+    );
+    // c) Any retained byte beyond the full ceiling fails closed.
+    std::fs::write(attempts.path().join(&third).with_extension("json"), b"x").unwrap();
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, None, false, true).unwrap(),
+        2 * image + 1
+    );
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, None, true, true).unwrap_err(),
+        "installation retained attempt storage exhausted"
+    );
+}
+
+#[test]
 fn unadmitted_expired_empty_record_is_still_tombstoned() {
     let attempts = tempfile::tempdir().unwrap();
     let admissions = tempfile::tempdir().unwrap();

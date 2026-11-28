@@ -300,3 +300,19 @@ fn writer_failure_reports_candidate_observation_phase_instead_of_always_terminal
         memcordon_core::AttemptObservationPhaseV1::Monitoring
     );
 }
+
+#[test]
+fn two_distinct_writer_lanes_are_admitted_and_a_third_is_refused() {
+    assert_eq!(MAX_WRITER_LANES, 2);
+    let mut lanes = BTreeMap::new();
+    for ordinal in 0..MAX_WRITER_LANES {
+        admit_writer_lane(&lanes).unwrap();
+        let (lane, _receiver) = frozen_lane();
+        lanes.insert(format!("{ordinal:02}").repeat(32), Arc::new(lane));
+    }
+    assert_eq!(lanes.len(), 2);
+    assert_eq!(
+        admit_writer_lane(&lanes).unwrap_err(),
+        "attempt writer capacity exhausted"
+    );
+}
