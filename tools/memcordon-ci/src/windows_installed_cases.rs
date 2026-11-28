@@ -1910,7 +1910,16 @@ mod native {
                     let snapshot = captured
                         .lock()
                         .map_err(|_| CiError::Message("output observer poisoned".into()))?;
-                    let (stdout, stderr) = if let Some(snapshot) = snapshot.as_ref() {
+                    // The shared snapshot is drained when the command owner joins its
+                    // readers; the sampling case's owned callback capture is the raw copy.
+                    let owned = if case == InstalledCase::SamplingPopulation {
+                        acceptance::owned_callback_streams(&error)
+                    } else {
+                        None
+                    };
+                    let (stdout, stderr) = if let Some((stdout, stderr)) = owned {
+                        (stdout.to_vec(), stderr.to_vec())
+                    } else if let Some(snapshot) = snapshot.as_ref() {
                         (snapshot.stdout()?, snapshot.stderr()?)
                     } else {
                         (Vec::new(), Vec::new())

@@ -849,6 +849,7 @@ fn sampling_callback_failure_is_foregrounded_over_skipped_recovery_and_later_uni
             stderr_bytes: 0,
             readiness_marker_lines: 0,
             parsed_readiness_members: None,
+            observed_birth_timeline: None,
         }),
         readiness_at_deadline: Some(SamplingReadinessDeadlineEvidence {
             stdout_bytes: 0,

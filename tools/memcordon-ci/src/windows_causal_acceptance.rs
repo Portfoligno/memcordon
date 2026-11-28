@@ -290,6 +290,84 @@ pub struct SamplingOutputEvidence {
     pub readiness_marker_lines: usize,
     /// Structural readiness parsed from this capture, not matched native identities.
     pub parsed_readiness_members: Option<usize>,
+    /// Relative native process-birth distribution of the announced members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_birth_timeline: Option<SamplingBirthTimeline>,
+}
+
+/// Number of fixed-width relative buckets retained in compact evidence.
+pub const SAMPLING_BIRTH_BUCKETS: usize = 24;
+/// Bucket width in native process-birth ticks (100 ns units): ten seconds.
+pub const SAMPLING_BIRTH_BUCKET_TICKS: u128 = 100_000_000;
+const SAMPLING_BIRTH_TICKS_PER_MILLISECOND: u128 = 10_000;
+
+/// Native process-birth spacing of members announced in the completed capture.
+/// Births are measured only between the members' own native creation times and
+/// are relative to the earliest announced birth. They are neither announcement
+/// times, proof that a member was alive at any instant, nor a spawn-rate
+/// measurement. No identities or absolute timestamps enter this projection.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingBirthTimeline {
+    /// Distinct announced native births, including the root.
+    pub observed_births: usize,
+    /// Whole milliseconds between the earliest and latest announced birth.
+    pub birth_span_ms: u64,
+    /// Announced births per ten-second bucket from the earliest birth; trailing
+    /// empty buckets are omitted. At most `SAMPLING_BIRTH_BUCKETS` entries.
+    pub births_per_10s: Vec<usize>,
+    /// Announced births at or after the final bucket boundary.
+    pub births_after_window: usize,
+}
+
+impl SamplingBirthTimeline {
+    /// Derive from complete (newline-terminated) readiness records only.
+    /// Malformed, duplicated, rootless or over-bound streams yield `None`.
+    #[cfg(any(windows, test))]
+    fn from_readiness(stdout: &[u8]) -> Option<Self> {
+        let complete = &stdout[..stdout.iter().rposition(|byte| *byte == b'\n')? + 1];
+        let rows = parse_fixture_readiness(complete).ok()?;
+        let earliest = rows.iter().map(|row| row.birth).min()?;
+        let latest = rows.iter().map(|row| row.birth).max()?;
+        let mut births_per_10s = vec![0_usize; SAMPLING_BIRTH_BUCKETS];
+        let mut births_after_window = 0;
+        for row in &rows {
+            let bucket = (row.birth - earliest) / SAMPLING_BIRTH_BUCKET_TICKS;
+            match usize::try_from(bucket)
+                .ok()
+                .and_then(|bucket| births_per_10s.get_mut(bucket))
+            {
+                Some(count) => *count += 1,
+                None => births_after_window += 1,
+            }
+        }
+        while births_per_10s.last() == Some(&0) {
+            births_per_10s.pop();
+        }
+        Some(Self {
+            observed_births: rows.len(),
+            birth_span_ms: u64::try_from(
+                (latest - earliest) / SAMPLING_BIRTH_TICKS_PER_MILLISECOND,
+            )
+            .unwrap_or(u64::MAX),
+            births_per_10s,
+            births_after_window,
+        })
+    }
+}
+
+/// Raw streams owned by a failed original callback command. The shared output
+/// snapshot is drained by the reader join, so these bytes are the only raw copy.
+#[cfg(any(windows, test))]
+pub(crate) fn owned_callback_streams(
+    error: &memcordon_testkit::ProcessTestError,
+) -> Option<(&[u8], &[u8])> {
+    match error {
+        memcordon_testkit::ProcessTestError::Callback { stdout, stderr, .. } => {
+            Some((stdout, stderr))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -425,6 +503,7 @@ impl SamplingExecutionEvidence {
                 .filter(|line| line.starts_with(INVENTORY_READINESS_MARKER))
                 .count(),
             parsed_readiness_members: parse_fixture_readiness(stdout).ok().map(|rows| rows.len()),
+            observed_birth_timeline: SamplingBirthTimeline::from_readiness(stdout),
         });
         evidence
     }
@@ -490,6 +569,12 @@ mod sampling_execution_tests {
                 stderr_bytes,
                 readiness_marker_lines: 1,
                 parsed_readiness_members: Some(1),
+                observed_birth_timeline: Some(SamplingBirthTimeline {
+                    observed_births: 1,
+                    birth_span_ms: 0,
+                    births_per_10s: vec![1],
+                    births_after_window: 0,
+                }),
             })
         );
         let wire = serde_json::to_string(&evidence).unwrap();
@@ -502,6 +587,139 @@ mod sampling_execution_tests {
             assert!(!wire.contains(omitted), "{wire}");
         }
         assert!(wire.len() < 512, "{wire}");
+    }
+
+    fn leaf_readiness_stream(births: &[u128]) -> Vec<u8> {
+        let mut stdout = Vec::new();
+        for (index, birth) in births.iter().enumerate() {
+            let record = if index == 0 {
+                serde_json::json!({"kind":"inventory-root-ready","ordinal":null,"pid":700,"birth":birth})
+            } else {
+                serde_json::json!({"kind":"inventory-leaf-ready","ordinal":index - 1,"pid":700 + index,"birth":birth})
+            };
+            stdout.extend_from_slice(INVENTORY_READINESS_MARKER);
+            stdout.extend_from_slice(record.to_string().as_bytes());
+            stdout.push(b'\n');
+        }
+        stdout
+    }
+
+    #[test]
+    fn birth_timeline_separates_steady_slowing_and_stopped_birth_distributions() {
+        const BASE: u128 = 133_000_000_000_000_000;
+        const SECOND: u128 = 10_000_000;
+        let timeline = |offsets: &[u128]| {
+            let births = offsets
+                .iter()
+                .map(|offset| BASE + offset)
+                .collect::<Vec<_>>();
+            SamplingBirthTimeline::from_readiness(&leaf_readiness_stream(&births)).unwrap()
+        };
+        // Root plus 30 leaves: three per second for ten seconds.
+        let steady = (0..31).map(|index| index * SECOND / 3).collect::<Vec<_>>();
+        assert_eq!(timeline(&steady).births_per_10s, vec![30, 1]);
+        // Root plus 20 leaves: births become sparser each ten seconds.
+        let slowing = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 29,
+        ]
+        .map(|second| second * SECOND);
+        assert_eq!(timeline(&slowing).births_per_10s, vec![10, 5, 6]);
+        // Root plus 8 leaves, then nothing more is announced.
+        let stopped = (0..9).map(|index| index * SECOND).collect::<Vec<_>>();
+        let stopped = timeline(&stopped);
+        assert_eq!(stopped.observed_births, 9);
+        assert_eq!(stopped.birth_span_ms, 8_000);
+        assert_eq!(stopped.births_per_10s, vec![9]);
+        assert_eq!(stopped.births_after_window, 0);
+    }
+
+    #[test]
+    fn birth_timeline_is_bounded_relative_and_omits_native_identities() {
+        const BASE: u128 = 133_123_456_789_012_345;
+        const SECOND: u128 = 10_000_000;
+        // Full family spread past the retained window.
+        let births = (0..=WINDOWS_CAUSAL_CONCURRENT_CHILDREN as u128)
+            .map(|index| BASE + index * SECOND)
+            .collect::<Vec<_>>();
+        let stdout = leaf_readiness_stream(&births);
+        let evidence =
+            SamplingExecutionEvidence::from_execution(&Err(ProcessTestError::Callback {
+                error: io::Error::other(FixtureReadinessDeadline(
+                    SamplingReadinessDeadlineEvidence {
+                        stdout_bytes: stdout.len(),
+                        stderr_bytes: Some(0),
+                        parsed_readiness_members: Some(births.len()),
+                    },
+                )),
+                stdout,
+                stderr: Vec::new(),
+                capture_complete: true,
+                observed_status: None,
+                termination: Some(exit_status(1)),
+                cleanup: Ok(()),
+            }));
+        let timeline = evidence.output.unwrap().observed_birth_timeline.unwrap();
+        assert_eq!(timeline.observed_births, births.len());
+        assert_eq!(timeline.births_per_10s.len(), SAMPLING_BIRTH_BUCKETS);
+        assert_eq!(timeline.births_per_10s.iter().sum::<usize>(), 240);
+        assert_eq!(timeline.births_after_window, births.len() - 240);
+        assert_eq!(
+            timeline.birth_span_ms,
+            u64::try_from(WINDOWS_CAUSAL_CONCURRENT_CHILDREN).unwrap() * 1_000
+        );
+        let wire = serde_json::to_string(&timeline).unwrap();
+        assert!(wire.len() < 256, "{wire}");
+        for omitted in ["133123456789012345", "700", "pid", "ordinal"] {
+            assert!(!wire.contains(omitted), "{wire}");
+        }
+    }
+
+    #[test]
+    fn birth_timeline_ignores_partial_tail_and_rejects_unreliable_streams() {
+        let mut stdout = leaf_readiness_stream(&[100, 50_000_000, 150_000_000]);
+        let complete = SamplingBirthTimeline::from_readiness(&stdout).unwrap();
+        assert_eq!(complete.births_per_10s, vec![2, 1]);
+        stdout.extend_from_slice(b"MEMCORDON-INVENTORY-READY:{\"kind\":\"inventory-leaf-r");
+        assert_eq!(
+            SamplingBirthTimeline::from_readiness(&stdout),
+            Some(complete)
+        );
+        // No complete record, a leaf without the root, and duplicate births yield no timeline.
+        assert_eq!(SamplingBirthTimeline::from_readiness(b""), None);
+        assert_eq!(
+            SamplingBirthTimeline::from_readiness(b"MEMCORDON-INVENTORY-READY:{"),
+            None
+        );
+        let rootless = leaf_readiness_stream(&[100, 200])
+            .split(|byte| *byte == b'\n')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(&b'\n');
+        assert_eq!(SamplingBirthTimeline::from_readiness(&rootless), None);
+        let mut duplicate = leaf_readiness_stream(&[100]);
+        duplicate.extend_from_slice(&duplicate.clone());
+        assert_eq!(SamplingBirthTimeline::from_readiness(&duplicate), None);
+    }
+
+    #[test]
+    fn only_callback_errors_expose_owned_raw_streams_for_sampling() {
+        let callback = ProcessTestError::Callback {
+            error: io::Error::other("callback"),
+            stdout: b"owned stdout".to_vec(),
+            stderr: b"owned stderr".to_vec(),
+            capture_complete: true,
+            observed_status: None,
+            termination: None,
+            cleanup: Ok(()),
+        };
+        assert_eq!(
+            owned_callback_streams(&callback),
+            Some((&b"owned stdout"[..], &b"owned stderr"[..]))
+        );
+        assert_eq!(
+            owned_callback_streams(&ProcessTestError::Spawn(io::Error::other("spawn"))),
+            None
+        );
     }
 
     #[test]
