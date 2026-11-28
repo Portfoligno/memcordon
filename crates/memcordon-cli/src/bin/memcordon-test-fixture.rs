@@ -3,6 +3,8 @@ use std::fs;
 #[cfg(windows)]
 use std::io::Read;
 use std::io::{self, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -16,6 +18,11 @@ mod fixture_identity_snapshot;
 #[cfg(windows)]
 #[path = "consumer_readiness_windows/mod.rs"]
 mod consumer_readiness_windows;
+
+// A consoleless Windows parent must prevent each child from allocating its
+// own console. This does not change inheritance of redirected stdio handles.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("memcordon-test-fixture: {}", message.as_ref());
@@ -650,6 +657,8 @@ fn spawn_tree(mut args: impl Iterator<Item = OsString>) {
     let mut children: Vec<Child> = Vec::new();
     for _ in 0..breadth {
         let mut command = Command::new(&executable);
+        #[cfg(windows)]
+        command.creation_flags(DETACHED_PROCESS);
         if depth == 0 {
             if mode == "allocate" {
                 command.args(["allocate", "--bytes", "16MiB", "--hold", "30s"]);
@@ -811,6 +820,7 @@ fn windows_execution_family(mode: &str, args: impl Iterator<Item = OsString>) {
             let ordinal = wave * width + offset;
             let mut command = Command::new(&executable);
             command
+                .creation_flags(DETACHED_PROCESS)
                 .arg("windows-execution-leaf")
                 .arg(ordinal.to_string())
                 .arg("0");
@@ -1128,6 +1138,7 @@ fn windows_inventory_capacity(args: impl Iterator<Item = OsString>) {
     let mut children = Vec::with_capacity(count);
     for ordinal in 0..count {
         let child = Command::new(&executable)
+            .creation_flags(DETACHED_PROCESS)
             .arg("windows-inventory-leaf")
             .arg(ordinal.to_string())
             .arg("240000")
