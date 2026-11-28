@@ -1281,10 +1281,10 @@ fn serve(listener: PipeListener, first: OwnedHandle) -> Result<(), String> {
                     .ok_or("launcher connection already retired")?
                     .close_checked()?;
                 drop(connection.take());
-                if let Ok(mut guard) = watcher_slot_worker.lock()
-                    && let Some(mut dup) = guard.take()
-                {
-                    dup.close_checked()?;
+                if let Ok(mut guard) = watcher_slot_worker.lock() {
+                    if let Some(mut dup) = guard.take() {
+                        dup.close_checked()?;
+                    }
                 }
                 Ok(())
             })
