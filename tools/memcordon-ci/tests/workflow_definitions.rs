@@ -174,6 +174,20 @@ fn expected_listener_carriers(prefix: &str) -> Vec<String> {
         "{prefix}/windows-installed/windows-reduced-compiler-qualification.json"
     ));
     for name in [
+        "attempt-0.json",
+        "attempt-1.json",
+        "overlap-held-guardian.json",
+        "overlap-live-association.json",
+        "overlap-held-native-child.json",
+        "attempt-1/W-CAPACITY/bounded-concurrency/result.callback-failure.json",
+        "attempt-1/W-CAPACITY/bounded-concurrency/result.failed-frontend.json",
+        "attempt-1/W-CAPACITY/bounded-concurrency/result.stderr.bin",
+    ] {
+        paths.push(format!(
+            "{prefix}/windows-installed/W-CAPACITY/bounded-concurrency/{name}"
+        ));
+    }
+    for name in [
         "package-uninstall.stdout.bin",
         "package-uninstall.stderr.bin",
         "package-uninstall.capture.json",

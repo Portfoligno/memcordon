@@ -6821,6 +6821,33 @@ fn package_authority_can_only_query_and_synchronize_service_processes() {
 }
 
 #[test]
+fn service_peers_receive_synchronize_for_record_liveness_observation() {
+    // record::observe_process_liveness opens reservation owners with
+    // PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE (0x00101000).
+    let control = service_process_sddl(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME).unwrap();
+    let launcher = service_process_sddl(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
+    let control_sid = service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME).unwrap();
+    let launcher_sid = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
+
+    assert_eq!(
+        launcher
+            .matches(&format!("(A;;0x00101040;;;{control_sid})"))
+            .count(),
+        1
+    );
+    assert_eq!(launcher.matches(&format!(";;;{control_sid})")).count(), 1);
+    assert!(!launcher.contains(&format!("(A;;0x00001040;;;{control_sid})")));
+    assert_eq!(
+        control
+            .matches(&format!("(A;;0x00101000;;;{launcher_sid})"))
+            .count(),
+        1
+    );
+    assert_eq!(control.matches(&format!(";;;{launcher_sid})")).count(), 1);
+    assert!(!control.contains(&format!("(A;;0x00001000;;;{launcher_sid})")));
+}
+
+#[test]
 fn guardian_slots_can_only_query_the_actual_launcher_service_process() {
     let launcher = service_process_sddl(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
 

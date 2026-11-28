@@ -1739,22 +1739,29 @@ pub(crate) fn service_process_sddl(service_name: &str) -> Result<String, String>
             // Clients authenticate the control image with
             // PROCESS_QUERY_LIMITED_INFORMATION. Both AU and RC ACEs are
             // required because a restricted token must pass both access
-            // checks. Administrators receive only query and synchronize so the
+            // checks. The launcher additionally receives SYNCHRONIZE because
+            // record liveness observation opens writer/reader reservation
+            // owners (which include this control process after it publishes
+            // a retention tombstone) with QUERY_LIMITED | SYNCHRONIZE.
+            // Administrators receive only query and synchronize so the
             // package transaction can pin shutdown. No client receives
             // terminate, write, or duplicate rights.
             Ok(format!(
-                "O:LSD:P(D;;WDWO;;;OW)(A;;GA;;;SY)(A;;GA;;;{control})(A;;0x00001000;;;{launcher})(A;;0x00001000;;;AU)(A;;0x00001000;;;RC)(A;;0x00101000;;;BA)"
+                "O:LSD:P(D;;WDWO;;;OW)(A;;GA;;;SY)(A;;GA;;;{control})(A;;0x00101000;;;{launcher})(A;;0x00001000;;;AU)(A;;0x00001000;;;RC)(A;;0x00101000;;;BA)"
             ))
         }
         memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME => {
             let launcher = service_sid(service_name)?;
             let control = service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
-            // The control service needs exactly PROCESS_DUP_HANDLE and
+            // The control service needs PROCESS_DUP_HANDLE and
             // PROCESS_QUERY_LIMITED_INFORMATION to broker authenticated
-            // handles to the launcher. Every restricted guardian slot needs
-            // only process query access to authenticate this launcher peer.
+            // handles to the launcher, plus SYNCHRONIZE because admission
+            // reservation scans observe the launcher-owned writer reservation
+            // with QUERY_LIMITED | SYNCHRONIZE (a non-blocking zero-timeout
+            // wait). Every restricted guardian slot needs only process query
+            // access to authenticate this launcher peer.
             let mut sddl = format!(
-                "O:SYD:P(A;;GA;;;SY)(A;;GA;;;{launcher})(A;;0x00001040;;;{control})(A;;0x00101000;;;BA)"
+                "O:SYD:P(A;;GA;;;SY)(A;;GA;;;{launcher})(A;;0x00101040;;;{control})(A;;0x00101000;;;BA)"
             );
             for index in 0..memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT {
                 let slot = service_sid(&guardian_slot_name(index)?)?;

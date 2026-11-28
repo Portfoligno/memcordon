@@ -7,17 +7,21 @@ use windows_sys::Win32::System::Threading::{
 
 #[test]
 fn guardian_refusal_facts_are_closed_bounded_and_phase_specific() {
-    assert_eq!(
-        process_open_failure(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)).unwrap(),
-        ProcessLiveness::PidAbsent {
-            raw_os_error: ERROR_INVALID_PARAMETER as i32
-        }
-    );
-    assert!(process_open_failure(io::Error::from_raw_os_error(5)).is_err());
     let expected = WindowsProcessIdentityV1 {
         process_id: u32::MAX,
         creation_time_100ns: u64::MAX,
     };
+    assert_eq!(
+        process_open_failure(
+            &expected,
+            io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
+        )
+        .unwrap(),
+        ProcessLiveness::PidAbsent {
+            raw_os_error: ERROR_INVALID_PARAMETER as i32
+        }
+    );
+    assert!(process_open_failure(&expected, io::Error::from_raw_os_error(5)).is_err());
     let observations = [
         ProcessLiveness::PidAbsent {
             raw_os_error: ERROR_INVALID_PARAMETER as i32,
@@ -374,4 +378,20 @@ fn original_native_process_observations_distinguish_live_birth_mismatch_and_sign
             wait_status: WAIT_OBJECT_0
         }
     );
+}
+
+#[test]
+fn process_open_failure_names_the_expected_peer_and_native_code() {
+    let expected = WindowsProcessIdentityV1 {
+        process_id: 4242,
+        creation_time_100ns: 133_700_000_000,
+    };
+    let detail = process_open_failure(&expected, io::Error::from_raw_os_error(5)).unwrap_err();
+    assert!(detail.starts_with("process liveness open failed; "));
+    assert!(detail.contains("; expected-pid=4242; "));
+    assert!(detail.contains("; expected-birth=133700000000; "));
+    assert!(detail.contains("; raw-os-error=5; "));
+    assert!(detail.contains("(os error 5)"));
+    let synthetic = process_open_failure(&expected, io::Error::other("synthetic")).unwrap_err();
+    assert!(synthetic.contains("; raw-os-error=none; synthetic"));
 }

@@ -544,6 +544,15 @@ mod native {
                 {
                     break;
                 }
+                // The owned first attempt waits on the completion gate, so an
+                // exited worker can never reach held completion. Stop polling
+                // now; the unconditional signal/join below surfaces its own
+                // error as the primary failure.
+                if first.is_finished() {
+                    return Err(CiError::Message(
+                        "first capacity attempt exited before held natural completion".into(),
+                    ));
+                }
                 if std::time::Instant::now() >= deadline {
                     return Err(CiError::Message(
                         "first capacity attempt did not reach held natural completion".into(),

@@ -143,6 +143,35 @@ fn finite_original_carriers_survive_newer_files_within_the_same_count_bound() {
         fs::write(&path, b"redacted group-privilege-reduced evidence").unwrap();
         expected.push(path);
     }
+    let capacity = producer_output.join("W-CAPACITY/bounded-concurrency");
+    let candidate = capacity.join("attempt-1/W-CAPACITY/bounded-concurrency");
+    for path in [
+        "attempt-0.json",
+        "attempt-1.json",
+        "overlap-held-guardian.json",
+        "overlap-live-association.json",
+        "overlap-held-native-child.json",
+    ]
+    .map(|leaf| capacity.join(leaf))
+    .into_iter()
+    .chain(
+        [
+            "result.callback-failure.json",
+            "result.failed-frontend.json",
+            "result.stderr.bin",
+        ]
+        .map(|leaf| candidate.join(leaf)),
+    ) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"original capacity overlap carrier").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        expected.push(path);
+    }
     for name in [
         "package-uninstall.stdout.bin",
         "package-uninstall.stderr.bin",

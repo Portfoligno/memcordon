@@ -1290,7 +1290,50 @@ fn pretarget_phase(code: &str) -> memcordon_core::BoundarySetupPhase {
         "MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS" => {
             memcordon_core::BoundarySetupPhase::ProviderConnection
         }
+        // Launch admission (package lease, provider-state checks, and the
+        // durable admission reservation) is provider-side state, not caller
+        // envelope capture.
+        code if code.starts_with(ADMISSION_CODE_PREFIX) => {
+            memcordon_core::BoundarySetupPhase::ProviderConnection
+        }
         _ => memcordon_core::BoundarySetupPhase::CallerEnvelopeCapture,
+    }
+}
+
+const ADMISSION_CODE_PREFIX: &str = "MCSEALED-WINDOWS-ADMISSION-";
+
+/// Closed set of fallible launch-admission sites in the control service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionSite {
+    PackageLease,
+    AttemptsEmpty,
+    DiagnosticState,
+    RecoveryClear,
+    Reserve,
+}
+
+impl AdmissionSite {
+    fn code(self) -> &'static str {
+        match self {
+            Self::PackageLease => "MCSEALED-WINDOWS-ADMISSION-PACKAGE-LEASE",
+            Self::AttemptsEmpty => "MCSEALED-WINDOWS-ADMISSION-ATTEMPTS-EMPTY",
+            Self::DiagnosticState => "MCSEALED-WINDOWS-ADMISSION-DIAGNOSTIC-STATE",
+            Self::RecoveryClear => "MCSEALED-WINDOWS-ADMISSION-RECOVERY-CLEAR",
+            Self::Reserve => "MCSEALED-WINDOWS-ADMISSION-RESERVE",
+        }
+    }
+}
+
+/// Preserves an existing stable `MCSEALED-WINDOWS-*` code (for example
+/// `PACKAGE-BUSY`) and otherwise tags the error with its admission site.
+fn admission_error(site: AdmissionSite, error: String) -> String {
+    let already_coded = error
+        .split_once(':')
+        .is_some_and(|(code, _)| code.starts_with("MCSEALED-WINDOWS-"));
+    if already_coded {
+        error
+    } else {
+        format!("{}: {error}", site.code())
     }
 }
 
@@ -1443,16 +1486,28 @@ fn launch_client_inner(
         // Package mutation and launch admission share one cross-process
         // serialization point. The durable admission is established before
         // releasing it, closing the check-to-mutation race.
-        let package_lease = super::package::PackageLease::acquire()?;
-        if diagnostic_dispatch && !super::record::attempts_empty()? {
-            return Err("loader diagnostic requires fresh isolated support provider state".into());
+        // Every fallible step is tagged with a stable admission site so an
+        // unprefixed native error is never reported as caller-envelope capture.
+        let package_lease = super::package::PackageLease::acquire()
+            .map_err(|error| admission_error(AdmissionSite::PackageLease, error))?;
+        if diagnostic_dispatch
+            && !super::record::attempts_empty()
+                .map_err(|error| admission_error(AdmissionSite::AttemptsEmpty, error))?
+        {
+            return Err(admission_error(
+                AdmissionSite::DiagnosticState,
+                "loader diagnostic requires fresh isolated support provider state".to_owned(),
+            ));
         }
-        if !super::record::recovery_clear()? {
+        if !super::record::recovery_clear()
+            .map_err(|error| admission_error(AdmissionSite::RecoveryClear, error))?
+        {
             return Err(
                 "MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS: provider quarantine is not empty".to_owned(),
             );
         }
-        let admission = super::record::reserve_admission(&attempt_id, &request_sha256)?;
+        let admission = super::record::reserve_admission(&attempt_id, &request_sha256)
+            .map_err(|error| admission_error(AdmissionSite::Reserve, error))?;
         if diagnostic_dispatch {
             _diagnostic_package_lease = Some(package_lease);
         } else {
@@ -3181,4 +3236,67 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod admission_error_tests {
+    use super::{AdmissionSite, admission_error, pretarget_phase, stable_error_code};
+    use memcordon_core::BoundarySetupPhase;
+
+    const SITES: [AdmissionSite; 5] = [
+        AdmissionSite::PackageLease,
+        AdmissionSite::AttemptsEmpty,
+        AdmissionSite::DiagnosticState,
+        AdmissionSite::RecoveryClear,
+        AdmissionSite::Reserve,
+    ];
+
+    #[test]
+    fn unprefixed_admission_errors_receive_a_stable_admission_code() {
+        for site in SITES {
+            let error = admission_error(site, "Access is denied. (os error 5)".to_owned());
+            assert_eq!(stable_error_code(&error), site.code());
+            assert_eq!(
+                pretarget_phase(stable_error_code(&error)),
+                BoundarySetupPhase::ProviderConnection
+            );
+            assert!(error.ends_with("Access is denied. (os error 5)"));
+        }
+    }
+
+    #[test]
+    fn unprefixed_errors_containing_colons_are_still_tagged() {
+        let error = admission_error(
+            AdmissionSite::Reserve,
+            "staged attempt writer admission unavailable: os error 2".to_owned(),
+        );
+        assert_eq!(
+            stable_error_code(&error),
+            "MCSEALED-WINDOWS-ADMISSION-RESERVE"
+        );
+    }
+
+    #[test]
+    fn existing_stable_codes_are_preserved() {
+        let original = "MCSEALED-WINDOWS-PACKAGE-BUSY: another package mutation is active";
+        let error = admission_error(AdmissionSite::PackageLease, original.to_owned());
+        assert_eq!(error, original);
+        assert_eq!(stable_error_code(&error), "MCSEALED-WINDOWS-PACKAGE-BUSY");
+    }
+
+    #[test]
+    fn unrelated_and_unprefixed_codes_keep_their_existing_phases() {
+        assert_eq!(
+            pretarget_phase("MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS"),
+            BoundarySetupPhase::ProviderConnection
+        );
+        assert_eq!(
+            pretarget_phase("MCSEALED-WINDOWS-APPCONTAINER-UNSUPPORTED"),
+            BoundarySetupPhase::CredentialTransitionPolicy
+        );
+        assert_eq!(
+            pretarget_phase(stable_error_code("Access is denied. (os error 5)")),
+            BoundarySetupPhase::CallerEnvelopeCapture
+        );
+    }
 }

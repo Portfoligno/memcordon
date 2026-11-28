@@ -6775,13 +6775,16 @@ fn observe_process_liveness(expected: WindowsProcessIdentityV1) -> Result<Proces
     };
     if raw.is_null() {
         let error = std::io::Error::last_os_error();
-        return process_open_failure(error);
+        return process_open_failure(&expected, error);
     }
     let handle = OwnedHandle::new(raw)?;
     observe_held_process_liveness(handle.raw(), expected)
 }
 
-fn process_open_failure(error: std::io::Error) -> Result<ProcessLiveness, String> {
+fn process_open_failure(
+    expected: &WindowsProcessIdentityV1,
+    error: std::io::Error,
+) -> Result<ProcessLiveness, String> {
     match error
         .raw_os_error()
         .and_then(|value| u32::try_from(value).ok())
@@ -6789,7 +6792,16 @@ fn process_open_failure(error: std::io::Error) -> Result<ProcessLiveness, String
         Some(ERROR_INVALID_PARAMETER) => Ok(ProcessLiveness::PidAbsent {
             raw_os_error: error.raw_os_error().expect("matched native code"),
         }),
-        _ => Err(error.to_string()),
+        // Name the exact peer and native code so an open refusal (for
+        // example a missing SYNCHRONIZE grant) is self-identifying.
+        _ => Err(format!(
+            "process liveness open failed; expected-pid={}; expected-birth={}; raw-os-error={}; {error}",
+            expected.process_id,
+            expected.creation_time_100ns,
+            error
+                .raw_os_error()
+                .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+        )),
     }
 }
 

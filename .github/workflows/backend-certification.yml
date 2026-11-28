@@ -2924,6 +2924,14 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/windows-reduced-compiler-qualification.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-0.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/overlap-held-guardian.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/overlap-live-association.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/overlap-held-native-child.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.failed-frontend.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stdout.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.capture.json
@@ -3376,6 +3384,14 @@ jobs:
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/windows-reduced-compiler-qualification.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-0.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/overlap-held-guardian.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/overlap-live-association.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/overlap-held-native-child.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.callback-failure.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.failed-frontend.json
+            target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stdout.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.stderr.bin
             target/ci/windows-installed/${{ matrix.channel }}/cases/windows-installed/package-uninstall.capture.json

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RELATIVE_PATHS: [&str; 40] = [
+pub const RELATIVE_PATHS: [&str; 48] = [
     // The retained assessment names the failing case family/scenario pair and
     // each lease-bound loss phase; it is the first identity of the row.
     "windows-assessment.json",
@@ -48,6 +48,17 @@ pub const RELATIVE_PATHS: [&str; 40] = [
     "windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.group-privilege-reduced-control.json",
     "windows-installed/W-TOOLCHAIN/group-privilege-reduced/result.reduced-startup-comparison.json",
     "windows-installed/windows-reduced-compiler-qualification.json",
+    // Bounded-concurrency overlap carriers: both retained attempt records,
+    // the held first association, and the overlapping candidate's frontend
+    // failure, so compact failure artifacts identify an admission refusal.
+    "windows-installed/W-CAPACITY/bounded-concurrency/attempt-0.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/attempt-1.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/overlap-held-guardian.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/overlap-live-association.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/overlap-held-native-child.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.callback-failure.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.failed-frontend.json",
+    "windows-installed/W-CAPACITY/bounded-concurrency/attempt-1/W-CAPACITY/bounded-concurrency/result.stderr.bin",
 ];
 
 /// These exact leaves are already written by bounded package/recovery capture.
