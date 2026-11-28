@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use memcordon_core::{
@@ -1151,6 +1152,110 @@ pub(crate) fn pipe_startup_error(error: PipePreparationError) -> (u32, String) {
     (phase, error.to_string())
 }
 
+struct WatchedConnectionWorker {
+    thread: std::thread::JoinHandle<()>,
+    completed: Arc<AtomicBool>,
+    control_connection: Arc<Mutex<Option<OwnedHandle>>>,
+}
+
+struct ConnectionWorkerWatcher {
+    state: Mutex<Vec<WatchedConnectionWorker>>,
+    notify: Condvar,
+}
+
+static CONNECTION_WORKER_WATCHER: OnceLock<Arc<ConnectionWorkerWatcher>> = OnceLock::new();
+
+fn take_watched_control_connection(slot: &Mutex<Option<OwnedHandle>>) -> Option<OwnedHandle> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match slot.try_lock() {
+            Ok(mut guard) => return guard.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return poisoned.into_inner().take();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+fn watch_connection_worker(
+    thread: std::thread::JoinHandle<()>,
+    completed: Arc<AtomicBool>,
+    control_connection: Arc<Mutex<Option<OwnedHandle>>>,
+) {
+    let watcher = CONNECTION_WORKER_WATCHER.get_or_init(|| {
+        let watcher = Arc::new(ConnectionWorkerWatcher {
+            state: Mutex::new(Vec::new()),
+            notify: Condvar::new(),
+        });
+        let loop_watcher = Arc::clone(&watcher);
+        let _ = std::thread::Builder::new()
+            .name("launcher-worker-watch".to_owned())
+            .spawn(move || {
+                loop {
+                    let mut pending = loop_watcher
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while pending.is_empty() {
+                        pending = loop_watcher
+                            .notify
+                            .wait(pending)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    let mut index = 0;
+                    let mut abnormal = Vec::new();
+                    while index < pending.len() {
+                        if pending[index].completed.load(Ordering::Acquire) {
+                            pending.swap_remove(index);
+                            continue;
+                        }
+                        let handle = pending[index].thread.as_raw_handle() as HANDLE;
+                        // SAFETY: `JoinHandle` owns the native Win32 thread handle for the
+                        // lifetime of the entry; a zero-timeout wait only checks whether the
+                        // worker thread has already terminated.
+                        let status = unsafe { WaitForSingleObject(handle, 0) };
+                        if status == WAIT_OBJECT_0 {
+                            let entry = pending.swap_remove(index);
+                            if !entry.completed.load(Ordering::Acquire) {
+                                abnormal.push(entry);
+                            }
+                            continue;
+                        }
+                        index += 1;
+                    }
+                    drop(pending);
+                    for entry in abnormal {
+                        if let Some(dup) =
+                            take_watched_control_connection(&entry.control_connection)
+                        {
+                            pipe::disconnect(dup.raw());
+                            drop(dup);
+                        }
+                        drop(entry);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            });
+        watcher
+    });
+    let mut pending = watcher
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.push(WatchedConnectionWorker {
+        thread,
+        completed,
+        control_connection,
+    });
+    watcher.notify.notify_one();
+}
+
 fn serve(listener: PipeListener, first: OwnedHandle) -> Result<(), String> {
     let mut first = Some(first);
     while !super::service::stop_requested() {
@@ -1162,7 +1267,12 @@ fn serve(listener: PipeListener, first: OwnedHandle) -> Result<(), String> {
         if super::service::stop_requested() {
             break;
         }
-        std::thread::spawn(move || {
+        let watcher_connection = super::process::duplicate_owned(connection.raw()).ok();
+        let watcher_slot = Arc::new(Mutex::new(watcher_connection));
+        let watcher_slot_worker = Arc::clone(&watcher_slot);
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_worker = Arc::clone(&completed);
+        let worker = std::thread::spawn(move || {
             let raw = connection.raw();
             let mut connection = Some(connection);
             let response_written = handle_control(raw, &mut || {
@@ -1171,6 +1281,11 @@ fn serve(listener: PipeListener, first: OwnedHandle) -> Result<(), String> {
                     .ok_or("launcher connection already retired")?
                     .close_checked()?;
                 drop(connection.take());
+                if let Ok(mut guard) = watcher_slot_worker.lock()
+                    && let Some(mut dup) = guard.take()
+                {
+                    dup.close_checked()?;
+                }
                 Ok(())
             })
             .map_err(|error| {
@@ -1185,7 +1300,13 @@ fn serve(listener: PipeListener, first: OwnedHandle) -> Result<(), String> {
             } else {
                 pipe::disconnect(raw);
             }
+            drop(connection);
+            if let Ok(mut guard) = watcher_slot_worker.lock() {
+                drop(guard.take());
+            }
+            completed_worker.store(true, Ordering::Release);
         });
+        watch_connection_worker(worker, completed, watcher_slot);
     }
     Ok(())
 }
