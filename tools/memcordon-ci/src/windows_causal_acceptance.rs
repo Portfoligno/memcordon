@@ -378,6 +378,10 @@ pub struct SamplingReadinessDeadlineEvidence {
     /// None means the existing reader buffer could not be inspected immediately.
     pub stderr_bytes: Option<usize>,
     pub parsed_readiness_members: Option<usize>,
+    /// Matching fixture-image processes observed just after the readiness cutoff.
+    /// None means the best-effort native census did not complete successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_fixture_image_processes: Option<usize>,
 }
 
 #[cfg(any(windows, test))]
@@ -541,6 +545,7 @@ mod sampling_execution_tests {
                         stdout_bytes: 0,
                         stderr_bytes: None,
                         parsed_readiness_members: None,
+                        live_fixture_image_processes: Some(257),
                     },
                 )),
                 stdout,
@@ -561,6 +566,7 @@ mod sampling_execution_tests {
                 stdout_bytes: 0,
                 stderr_bytes: None,
                 parsed_readiness_members: None,
+                live_fixture_image_processes: Some(257),
             })
         );
         assert_eq!(
@@ -650,6 +656,7 @@ mod sampling_execution_tests {
                         stdout_bytes: stdout.len(),
                         stderr_bytes: Some(0),
                         parsed_readiness_members: Some(births.len()),
+                        live_fixture_image_processes: None,
                     },
                 )),
                 stdout,

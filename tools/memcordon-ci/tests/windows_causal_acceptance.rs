@@ -1,7 +1,28 @@
 use memcordon_ci::windows_causal_acceptance::{
-    FixtureProcessIdentityV1, WINDOWS_CAUSAL_CONCURRENT_CHILDREN, parse_fixture_readiness,
-    validate_fixture_family,
+    FixtureProcessIdentityV1, SamplingReadinessDeadlineEvidence,
+    WINDOWS_CAUSAL_CONCURRENT_CHILDREN, parse_fixture_readiness, validate_fixture_family,
 };
+
+#[test]
+fn sampling_deadline_evidence_distinguishes_zero_from_unavailable_inventory() {
+    let earlier = serde_json::json!({
+        "stdout_bytes": 1024,
+        "stderr_bytes": 0,
+        "parsed_readiness_members": 156,
+    });
+    let mut evidence: SamplingReadinessDeadlineEvidence =
+        serde_json::from_value(earlier.clone()).unwrap();
+    assert_eq!(evidence.live_fixture_image_processes, None);
+    assert_eq!(serde_json::to_value(&evidence).unwrap(), earlier);
+
+    evidence.live_fixture_image_processes = Some(0);
+    let wire = serde_json::to_value(&evidence).unwrap();
+    assert_eq!(wire["live_fixture_image_processes"], serde_json::json!(0));
+    assert_eq!(
+        serde_json::from_value::<SamplingReadinessDeadlineEvidence>(wire).unwrap(),
+        evidence
+    );
+}
 
 #[test]
 fn inventory_readiness_rejects_duplicate_ordinals_and_malformed_records() {

@@ -855,6 +855,7 @@ fn sampling_callback_failure_is_foregrounded_over_skipped_recovery_and_later_uni
             stdout_bytes: 0,
             stderr_bytes: Some(0),
             parsed_readiness_members: None,
+            live_fixture_image_processes: Some(257),
         }),
     });
     assessment.retained_state_recovery = Err("retained-state recovery was not executed".into());
@@ -886,6 +887,7 @@ fn sampling_callback_failure_is_foregrounded_over_skipped_recovery_and_later_uni
         "{summary}"
     );
     assert!(summary.contains(r#"uninstall: Err("package uninstall timed out")"#));
+    assert!(summary.contains("sampling readiness deadline live fixture-image processes: 257"));
 }
 
 #[test]

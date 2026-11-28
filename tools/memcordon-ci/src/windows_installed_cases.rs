@@ -870,8 +870,20 @@ impl InstalledWindowsAssessment {
             })
             .or_else(|| after_cases.into_iter().find_map(stage_error))
             .unwrap_or_else(|| "none recorded; case or suite evidence rejected".to_owned());
+        let live_fixture_image_processes = self.cases.iter().find_map(|case| {
+            case.sampling_execution
+                .as_ref()?
+                .readiness_at_deadline
+                .as_ref()?
+                .live_fixture_image_processes
+        });
+        let sampling_diagnostic = live_fixture_image_processes
+            .map(|count| {
+                format!("; sampling readiness deadline live fixture-image processes: {count}")
+            })
+            .unwrap_or_default();
         format!(
-            "actual installed Windows case or retirement failed; first failed stage: {first}; positive readiness: {:?}; native loss suite: {:?}; capacity suite: {:?}; refusal suite: {:?}; public smoke before: {:?}; upgrade: {:?}; uninstall: {:?}",
+            "actual installed Windows case or retirement failed; first failed stage: {first}; positive readiness: {:?}; native loss suite: {:?}; capacity suite: {:?}; refusal suite: {:?}; public smoke before: {:?}; upgrade: {:?}; uninstall: {:?}{sampling_diagnostic}",
             self.positive_suite,
             self.loss_suite,
             self.capacity_suite,
@@ -1737,6 +1749,12 @@ mod native {
                             stdout_bytes: stdout.len(),
                             stderr_bytes: snapshot.try_stderr_len(),
                             parsed_readiness_members,
+                            // The readiness deadline is already expired. Use the
+                            // census that does not wait for candidate retirement.
+                            live_fixture_image_processes:
+                                memcordon_testkit::windows_processes_for_image(fixture)
+                                    .ok()
+                                    .map(|processes| processes.len()),
                         },
                     )));
                 }
