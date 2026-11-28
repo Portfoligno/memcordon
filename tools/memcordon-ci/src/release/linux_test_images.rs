@@ -312,6 +312,69 @@ fn path(value: &Path) -> Result<RootRelativePath> {
     .map_err(CiError::Message)
 }
 
+fn gcc_path(output: String, name: &str, required: bool) -> Result<Option<PathBuf>> {
+    let candidate = Path::new(output.trim());
+    if candidate == Path::new(name) && !required {
+        return Ok(None); // GCC echoes the unqualified name when no file was found.
+    }
+    if !candidate.is_absolute() || !candidate.is_file() {
+        return Err(CiError::Message(format!(
+            "native compiler did not resolve its linker SDK member {name}"
+        )));
+    }
+    Ok(Some(candidate.to_path_buf()))
+}
+
+fn gcc_linker_members(mut query: impl FnMut(&str) -> Result<String>) -> Result<BTreeSet<PathBuf>> {
+    // This Rust fixture uses GCC as a linker driver, not as a C/C++ frontend.
+    // Ask that driver for its helpers rather than walking installed compiler
+    // versions (or copying cc1, LTO frontends, headers, and unrelated libraries).
+    let mut members = BTreeSet::new();
+    for (argument, name, required) in [
+        ("-print-prog-name=collect2", "collect2", true),
+        ("-print-prog-name=as", "as", true),
+        ("-print-prog-name=ld", "ld", true),
+        ("-print-prog-name=lto-wrapper", "lto-wrapper", true),
+        (
+            "-print-file-name=liblto_plugin.so",
+            "liblto_plugin.so",
+            true,
+        ),
+        ("-print-file-name=specs", "specs", false),
+    ] {
+        if let Some(member) = gcc_path(query(argument)?, name, required)? {
+            if name == "collect2" {
+                // GCC may pass collect2 the plugin in its program directory
+                // even when -print-file-name reports the library-directory alias.
+                let plugin = member.with_file_name("liblto_plugin.so");
+                if plugin.try_exists()? {
+                    members.insert(plugin);
+                }
+            }
+            members.insert(member);
+        }
+    }
+    Ok(members)
+}
+
+fn gcc_library_directories(search: &str, libraries: &mut Vec<PathBuf>) -> Result<()> {
+    for directory in search
+        .lines()
+        .find_map(|line| line.strip_prefix("libraries: ="))
+        .ok_or_else(|| CiError::Message("native compiler SDK library catalogue absent".into()))?
+        .split(':')
+    {
+        let source = Path::new(directory);
+        if source.is_absolute() && source.is_dir() {
+            let canonical = std::fs::canonicalize(source)?;
+            if !libraries.contains(&canonical) {
+                libraries.push(canonical);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn materialize_until(
     payload: &MaterializedPayload,
     workspace: &Path,
@@ -388,42 +451,19 @@ pub fn materialize_until(
     for executable in ["/usr/bin/cc", "/usr/bin/as", "/usr/bin/ld"] {
         runtime.host_member(Path::new(executable))?;
     }
-    let gcc = Path::new("/usr/lib/gcc").join(machine);
-    if gcc.is_dir() {
-        runtime.tree(
-            &gcc,
-            gcc.strip_prefix("/")
-                .map_err(|e| CiError::Message(e.to_string()))?,
-            &payload.distribution.target,
-        )?;
+    let gcc_query = |arguments: &[&str]| {
+        let output = CommandSpec::new("/usr/bin/cc", workspace, Duration::from_secs(30))
+            .bounded_until(deadline)
+            .cleared_environment()
+            .args(arguments.iter().copied())
+            .run()?;
+        String::from_utf8(output).map_err(|e| CiError::Message(e.to_string()))
+    };
+    // Use the same explicit program search prefix as the isolated compiler.
+    for member in gcc_linker_members(|argument| gcc_query(&["-B", "/usr/bin/", argument]))? {
+        runtime.host_member(&member)?;
     }
-    if gcc.is_dir() {
-        for version in std::fs::read_dir(&gcc)? {
-            let directory = version?.path();
-            if directory.is_dir() {
-                libraries.push(directory);
-            }
-        }
-    }
-    let search = CommandSpec::new("/usr/bin/cc", workspace, Duration::from_secs(30))
-        .bounded_until(deadline)
-        .arg("-print-search-dirs")
-        .run()?;
-    let search = std::str::from_utf8(&search).map_err(|e| CiError::Message(e.to_string()))?;
-    for directory in search
-        .lines()
-        .find_map(|line| line.strip_prefix("libraries: ="))
-        .ok_or_else(|| CiError::Message("native compiler SDK library catalogue absent".into()))?
-        .split(':')
-    {
-        let source = Path::new(directory);
-        if source.is_absolute() && source.is_dir() {
-            let canonical = std::fs::canonicalize(source)?;
-            if !libraries.contains(&canonical) {
-                libraries.push(canonical);
-            }
-        }
-    }
+    gcc_library_directories(&gcc_query(&["-print-search-dirs"])?, &mut libraries)?;
     for support in [
         "crt1.o",
         "Scrt1.o",
@@ -548,4 +588,76 @@ pub fn materialize_until(
         runtime_source,
         input_source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcc_linker_closure_selects_only_active_driver_members_and_search_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let active = root.path().join("sdk/13");
+        let active_programs = root.path().join("libexec/13");
+        let inactive = root.path().join("sdk/14");
+        let bin = root.path().join("bin");
+        for directory in [&active, &active_programs, &inactive, &bin] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let collect2 = active_programs.join("collect2");
+        let assembler = bin.join("as");
+        let linker = bin.join("target-ld");
+        let wrapper = active_programs.join("lto-wrapper");
+        let plugin = active.join("liblto_plugin.so");
+        let program_plugin = active_programs.join("liblto_plugin.so");
+        let frontend = active_programs.join("cc1");
+        let inactive_collect2 = inactive.join("collect2");
+        for file in [
+            &collect2,
+            &assembler,
+            &linker,
+            &wrapper,
+            &plugin,
+            &program_plugin,
+            &frontend,
+            &inactive_collect2,
+        ] {
+            File::create(file).unwrap();
+        }
+        let selected = gcc_linker_members(|argument| {
+            Ok(match argument {
+                "-print-prog-name=collect2" => &collect2,
+                "-print-prog-name=as" => &assembler,
+                "-print-prog-name=ld" => &linker,
+                "-print-prog-name=lto-wrapper" => &wrapper,
+                "-print-file-name=liblto_plugin.so" => &plugin,
+                "-print-file-name=specs" => return Ok("specs\n".into()),
+                _ => panic!("unexpected driver query {argument}"),
+            }
+            .display()
+            .to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            selected,
+            BTreeSet::from([collect2, assembler, linker, wrapper, plugin, program_plugin])
+        );
+
+        let mut libraries = vec![bin.clone()];
+        let search = format!(
+            "install: {}\nprograms: ={}\nlibraries: ={}:{}:{}\n",
+            active.display(),
+            active_programs.display(),
+            active.display(),
+            active.join(".").display(),
+            bin.display(),
+        );
+        gcc_library_directories(&search, &mut libraries).unwrap();
+        assert_eq!(libraries, [bin, active]);
+    }
+
+    #[test]
+    fn gcc_linker_closure_refuses_unresolved_required_member() {
+        assert!(gcc_linker_members(|_| Ok("collect2\n".into())).is_err());
+    }
 }

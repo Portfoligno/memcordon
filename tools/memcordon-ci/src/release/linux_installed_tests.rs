@@ -430,6 +430,19 @@ fn operation(
         .run()
 }
 
+fn package_uninstall_arguments(cleanup_cutoff_millis: u64) -> Result<[String; 4]> {
+    let nanos = cleanup_cutoff_millis
+        .checked_mul(1_000_000)
+        .filter(|nanos| *nanos != 0)
+        .ok_or_else(|| fail("invalid original native package cleanup cutoff"))?;
+    Ok([
+        "package".into(),
+        "uninstall".into(),
+        "--lease-cleanup-cutoff-nanos".into(),
+        nanos.to_string(),
+    ])
+}
+
 struct Session<'a> {
     root: &'a Path,
     admin: Directory,
@@ -440,18 +453,23 @@ struct Session<'a> {
     source_files: Vec<File>,
     before_network: serde_json::Value,
     cleanup: Instant,
+    cleanup_cutoff_millis: u64,
 }
 impl Session<'_> {
     fn finish(&mut self) -> Result<()> {
         let _retirement = crate::cancellation::retirement_scope(self.cleanup);
         let mut errors = Vec::new();
         if self.installed {
-            let result = operation(
-                self.root,
-                &self.admin.path.join("memcordon-sealed-agent"),
-                &["package", "uninstall"],
-                self.cleanup,
-            );
+            // Pass the original absolute monotonic cutoff, not a new reserve:
+            // the broker may still hold its shared lease while settling.
+            let result = package_uninstall_arguments(self.cleanup_cutoff_millis).and_then(|args| {
+                operation(
+                    self.root,
+                    &self.admin.path.join("memcordon-sealed-agent"),
+                    &args.each_ref().map(String::as_str),
+                    self.cleanup,
+                )
+            });
             if let Err(error) = result {
                 errors.push(format!("owned package uninstall: {error}"));
             }
@@ -610,6 +628,7 @@ pub fn run_privileged(root: &Path, args: &PrivilegedArgs) -> Result<()> {
         source_files: Vec::new(),
         before_network,
         cleanup,
+        cleanup_cutoff_millis: args.cleanup_cutoff_millis,
     };
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         fs::set_permissions(&session.working.path, fs::Permissions::from_mode(0o755)).map_err(
@@ -1365,4 +1384,24 @@ fn retire_tree(
         .map_err(std::io::Error::from)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::package_uninstall_arguments;
+
+    #[test]
+    fn uninstall_uses_the_original_absolute_package_lease_cutoff_in_separate_arguments() {
+        assert_eq!(
+            package_uninstall_arguments(123_456).unwrap(),
+            [
+                "package",
+                "uninstall",
+                "--lease-cleanup-cutoff-nanos",
+                "123456000000",
+            ],
+        );
+        assert!(package_uninstall_arguments(0).is_err());
+        assert!(package_uninstall_arguments(u64::MAX).is_err());
+    }
 }

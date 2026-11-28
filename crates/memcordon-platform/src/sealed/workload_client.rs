@@ -264,12 +264,48 @@ fn persist_observation(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Copy)]
+enum PumpCutoff {
+    Setup(Instant),
+    Return(Instant),
+    Cleanup(Instant),
+}
+
+impl PumpCutoff {
+    fn deadline(self) -> Instant {
+        match self {
+            Self::Setup(deadline) | Self::Return(deadline) | Self::Cleanup(deadline) => deadline,
+        }
+    }
+
+    fn check(self, now: Instant) -> std::io::Result<()> {
+        if now < self.deadline() {
+            return Ok(());
+        }
+        let detail = match self {
+            Self::Setup(_) => {
+                "original workload setup cutoff elapsed before native prepared acknowledgement"
+            }
+            Self::Return(_) => "original workload return cutoff elapsed",
+            Self::Cleanup(_) => "original workload cleanup cutoff elapsed after cancellation",
+        };
+        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, detail))
+    }
+}
+
+fn input_and_response_error(input: Option<&str>, response: std::io::Error) -> String {
+    match input {
+        Some(primary) => format!("{primary}; native response read failed: {response}"),
+        None => response.to_string(),
+    }
+}
+
 struct Pump<'a> {
     stream: &'a UnixStream,
     relay: &'a mut super::private_relay::ByteRelay,
     signal: &'a crate::signal::SignalSource,
     assigned: Option<WorkloadConnectionBinding>,
-    cutoff: Option<Instant>,
+    cutoff: Option<PumpCutoff>,
     return_cutoff: Option<Instant>,
     cleanup_cutoff: Option<Instant>,
     cleanup_allowance: Duration,
@@ -281,11 +317,8 @@ struct Pump<'a> {
 
 impl Pump<'_> {
     fn tick(&mut self) -> std::io::Result<()> {
-        if self.cutoff.is_some_and(|cutoff| Instant::now() >= cutoff) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "original workload return cutoff elapsed",
-            ));
+        if let Some(cutoff) = self.cutoff {
+            cutoff.check(Instant::now())?;
         }
         if self.relay_error.is_none() {
             if let Err(error) = self.relay.step() {
@@ -320,7 +353,7 @@ impl Pump<'_> {
             .return_cutoff
             .map_or(deadline, |original| original.min(deadline));
         self.cleanup_cutoff = Some(deadline);
-        self.cutoff = Some(deadline);
+        self.cutoff = Some(PumpCutoff::Cleanup(deadline));
         self.send(WorkloadFrame {
             kind: WorkloadFrameKind::Cancel,
             binding,
@@ -333,8 +366,13 @@ impl Pump<'_> {
     fn send(&self, frame: WorkloadFrame) -> std::io::Result<()> {
         let mut bytes = Vec::new();
         frame.write(&mut bytes)?;
-        super::native_transport::send_nonblocking(self.stream, &bytes, &[], self.cutoff)
-            .map_err(std::io::Error::other)
+        super::native_transport::send_nonblocking(
+            self.stream,
+            &bytes,
+            &[],
+            self.cutoff.map(PumpCutoff::deadline),
+        )
+        .map_err(std::io::Error::other)
     }
     fn object(
         &mut self,
@@ -378,8 +416,13 @@ impl Read for Pump<'_> {
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    super::native_transport::poll(self.stream, self.relay, self.cutoff, true)
-                        .map_err(std::io::Error::other)?;
+                    super::native_transport::poll(
+                        self.stream,
+                        self.relay,
+                        self.cutoff.map(PumpCutoff::deadline),
+                        true,
+                    )
+                    .map_err(std::io::Error::other)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -599,7 +642,7 @@ pub(crate) fn run_workload_attempt(
         relay: &mut relay,
         signal,
         assigned: None,
-        cutoff: Some(setup_cutoff),
+        cutoff: Some(PumpCutoff::Setup(setup_cutoff)),
         return_cutoff,
         cleanup_cutoff: None,
         cleanup_allowance,
@@ -729,13 +772,13 @@ pub(crate) fn run_workload_attempt(
         }) {
             input_error = Some(format!("input completion delivery failed: {error}"));
         }
-        pump.cutoff = Some(setup_cutoff);
+        pump.cutoff = Some(PumpCutoff::Setup(setup_cutoff));
     }
     let mut output_error = None;
     let mut prepared_native: Option<memcordon_core::result_v3::LinuxNativeExecutionV3> = None;
     let terminal = loop {
-        let frame =
-            WorkloadFrame::read(&mut pump, first.binding).map_err(|error| error.to_string())?;
+        let frame = WorkloadFrame::read(&mut pump, first.binding)
+            .map_err(|error| input_and_response_error(input_error.as_deref(), error))?;
         match frame.kind {
             WorkloadFrameKind::Progress => {}
             WorkloadFrameKind::Rejected => {
@@ -831,7 +874,7 @@ pub(crate) fn run_workload_attempt(
                     pump.cancel(first.binding)
                         .map_err(|error| error.to_string())?;
                 } else {
-                    pump.cutoff = return_cutoff;
+                    pump.cutoff = return_cutoff.map(PumpCutoff::Return);
                     pump.work_cutoff = work_cutoff;
                 }
             }
@@ -1371,4 +1414,49 @@ pub fn acknowledge_workload_attempt(
         return Err("native acknowledgment differs from original locator".into());
     }
     Ok(acknowledgment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PumpCutoff, input_and_response_error};
+    use std::io::{Error, ErrorKind};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pump_cutoff_diagnostic_matches_the_active_phase() {
+        let now = Instant::now();
+        let future = now + Duration::from_secs(30);
+        assert!(PumpCutoff::Setup(future).check(now).is_ok());
+        for (cutoff, expected) in [
+            (
+                PumpCutoff::Setup(now),
+                "original workload setup cutoff elapsed before native prepared acknowledgement",
+            ),
+            (
+                PumpCutoff::Return(now),
+                "original workload return cutoff elapsed",
+            ),
+            (
+                PumpCutoff::Cleanup(now),
+                "original workload cleanup cutoff elapsed after cancellation",
+            ),
+        ] {
+            let error = cutoff.check(now).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn response_read_failure_cannot_hide_an_earlier_input_error() {
+        let response = || Error::new(ErrorKind::TimedOut, "original workload cutoff elapsed");
+        assert_eq!(
+            input_and_response_error(Some("caller bundle has trailing bytes"), response()),
+            "caller bundle has trailing bytes; native response read failed: original workload cutoff elapsed",
+        );
+        assert_eq!(
+            input_and_response_error(None, response()),
+            "original workload cutoff elapsed",
+        );
+    }
 }
