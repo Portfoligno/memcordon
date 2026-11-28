@@ -44,6 +44,98 @@ fn anonymous_control_pipe() -> (OwnedHandle, OwnedHandle) {
     )
 }
 
+fn monitor_wait_event() -> OwnedHandle {
+    // SAFETY: an unnamed, initially unsignaled synchronization handle.
+    OwnedHandle::new(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) }).unwrap()
+}
+
+#[test]
+fn direct_exit_reprobes_held_authority_without_interpreting_cancel_status() {
+    use memcordon_core::*;
+    let _scope = super::super::diagnostics::AttemptDiagnosticScope::enter();
+    super::super::diagnostics::set_phase(AttemptObservationPhaseV1::Monitoring);
+    let (read, _write) = anonymous_control_pipe();
+    let guardian = monitor_wait_event();
+    let frontend = monitor_wait_event();
+    let classify = || {
+        classify_direct_exit(
+            CANCEL_STATUS,
+            guardian.raw(),
+            frontend.raw(),
+            read.raw(),
+            None,
+        )
+    };
+    assert!(matches!(
+        classify(),
+        Ok(TerminalReason::Direct(CANCEL_STATUS))
+    ));
+    // SAFETY: frontend synchronization handle is still owned.
+    assert_ne!(unsafe { SetEvent(frontend.raw()) }, 0);
+    let Err(failure) = classify() else {
+        panic!("frontend loss after the previous live probe was accepted as direct exit");
+    };
+    let failure = LaunchAttemptError::from(failure);
+    assert_eq!(failure.code, "MCSEALED-WINDOWS-AUTHORITY-LOSS");
+    assert_eq!(failure.phase, Some(BoundarySetupPhase::Monitoring));
+    assert!(failure.connection_must_close);
+}
+
+#[test]
+fn direct_exit_preserves_guardian_loss_as_the_observed_cause() {
+    use memcordon_core::*;
+    let _scope = super::super::diagnostics::AttemptDiagnosticScope::enter();
+    super::super::diagnostics::set_phase(AttemptObservationPhaseV1::Monitoring);
+    let (read, _write) = anonymous_control_pipe();
+    let guardian = monitor_wait_event();
+    let frontend = monitor_wait_event();
+    // SAFETY: guardian synchronization handle is still owned.
+    assert_ne!(unsafe { SetEvent(guardian.raw()) }, 0);
+    let Err(failure) = classify_direct_exit(0, guardian.raw(), frontend.raw(), read.raw(), None)
+    else {
+        panic!("guardian loss was accepted as direct exit");
+    };
+    let failure = LaunchAttemptError::from(failure);
+    assert_eq!(
+        failure.job_operation,
+        Some(FailureOperationV1::CheckGuardian)
+    );
+    assert_eq!(failure.phase, Some(BoundarySetupPhase::Monitoring));
+    assert!(!failure.connection_must_close);
+}
+
+#[test]
+fn production_monitor_peer_loss_is_typed_and_records_the_native_original_once() {
+    use memcordon_core::*;
+    let _scope = super::super::diagnostics::AttemptDiagnosticScope::enter();
+    super::super::diagnostics::set_phase(AttemptObservationPhaseV1::Monitoring);
+    let (read, write) = anonymous_control_pipe();
+    drop(write);
+    let Err(failure) = monitor_control_available(read.raw(), None) else {
+        panic!("closed control peer was not retained as a monitor failure");
+    };
+    let failure = LaunchAttemptError::from(failure);
+    assert_eq!(failure.code, "MCSEALED-WINDOWS-AUTHORITY-LOSS");
+    assert_eq!(failure.phase, Some(BoundarySetupPhase::Monitoring));
+    assert!(failure.connection_must_close);
+    let mut journal = WindowsCausalDiagnosticsV1::default();
+    super::super::diagnostics::merge_into(&mut journal);
+    let OriginalFailureV1::Observed { event } = journal.original else {
+        panic!("monitor peer loss had no causal original");
+    };
+    assert_eq!(event.observed_phase, AttemptObservationPhaseV1::Monitoring);
+    assert_eq!(event.operation, FailureOperationV1::ReadControlFrame);
+    assert_eq!(event.code, FailureCodeV1::ControlTransport);
+    assert_eq!(
+        event.native_code,
+        failure
+            .os_code
+            .map(|code| NativeFailureCodeV1::Win32(u32::from_ne_bytes(code.to_ne_bytes())))
+    );
+    assert!(event.native_code.is_some());
+    assert!(journal.secondary.as_slice().is_empty());
+}
+
 #[test]
 fn actual_late_write_loss_preserves_original_and_requires_channel_close() {
     use memcordon_core::*;

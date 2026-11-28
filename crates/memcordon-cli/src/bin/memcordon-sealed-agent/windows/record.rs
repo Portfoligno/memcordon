@@ -6386,7 +6386,16 @@ fn guardian_receipt_binds_record(
 fn guardian_causal_projection(
     record: &WindowsAttemptRecordV1,
 ) -> Result<Option<Box<memcordon_core::WindowsGuardianReceiptV2>>, String> {
-    guardian_causal_projection_if_eligible(record, diagnostic_export_eligible(record), || {
+    if !diagnostic_export_eligible(record) {
+        return Ok(None);
+    }
+    authenticated_guardian_receipt(record)
+}
+
+pub(super) fn authenticated_guardian_receipt(
+    record: &WindowsAttemptRecordV1,
+) -> Result<Option<Box<memcordon_core::WindowsGuardianReceiptV2>>, String> {
+    guardian_causal_projection_if_eligible(record, true, || {
         let path = guardian_receipt_path(&record.attempt_id)?;
         if !path.try_exists().map_err(|error| error.to_string())? {
             return Ok(None);

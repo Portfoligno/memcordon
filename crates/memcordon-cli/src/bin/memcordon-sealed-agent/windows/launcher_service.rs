@@ -113,18 +113,28 @@ enum TerminalCandidate {
     Authoritative(Box<memcordon_core::WindowsTerminalReceiptV3>),
 }
 
-struct LateControlLoss {
+struct ControlLoss {
     operation: memcordon_core::FailureOperationV1,
     native_code: Option<u32>,
     detail: String,
 }
 
 fn observed_late_control_loss(
-    loss: LateControlLoss,
+    loss: ControlLoss,
     selected: Option<WindowsSealedFault>,
 ) -> LaunchAttemptError {
     super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Cleaning);
-    let selected = selected.filter(|fault| {
+    observed_control_loss(
+        loss,
+        postauthorization_transport_fault(selected),
+        memcordon_core::BoundarySetupPhase::Retirement,
+    )
+}
+
+fn postauthorization_transport_fault(
+    fault: Option<WindowsSealedFault>,
+) -> Option<WindowsSealedFault> {
+    fault.filter(|fault| {
         matches!(
             fault,
             WindowsSealedFault::FrontendDisconnectedAfterAuthorization
@@ -132,26 +142,27 @@ fn observed_late_control_loss(
                 | WindowsSealedFault::ControlWorkerKilledAfterAuthorization
                 | WindowsSealedFault::ControlServiceKilledAfterAuthorization
         )
-    });
+    })
+}
+
+fn observed_control_loss(
+    loss: ControlLoss,
+    selected: Option<WindowsSealedFault>,
+    phase: memcordon_core::BoundarySetupPhase,
+) -> LaunchAttemptError {
+    let native_code = loss
+        .native_code
+        .map(|code| i32::from_ne_bytes(code.to_ne_bytes()));
     super::diagnostics::capture_native_with_injected_fault(
         loss.operation,
-        loss.native_code
-            .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
+        native_code,
         memcordon_core::FailureCodeV1::ControlTransport,
         selected,
     );
     LaunchAttemptError {
-        code: "MCSEALED-WINDOWS-AUTHORITY-LOSS",
-        detail: loss.detail,
-        os_code: loss
-            .native_code
-            .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
-        phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
-        connection_must_close: true,
-        mutant_observation: None,
-        loader_qualification: None,
-        terminal_candidate: None,
-        job_operation: None,
+        os_code: native_code,
+        phase: Some(phase),
+        ..LaunchAttemptError::authority_loss_uncaptured(loss.detail)
     }
 }
 
@@ -173,7 +184,7 @@ fn failed_retirement_outcome(
 
 fn retain_late_control_loss(
     pending: &mut Option<LaunchAttemptError>,
-    loss: LateControlLoss,
+    loss: ControlLoss,
     selected: Option<WindowsSealedFault>,
 ) {
     let failure = observed_late_control_loss(loss, selected);
@@ -190,7 +201,7 @@ fn observe_control_delivery(
         Ok(()) => Ok(true),
         Err(error) => {
             let peer_closed = error.peer_closed;
-            let loss = LateControlLoss {
+            let loss = ControlLoss {
                 operation: memcordon_core::FailureOperationV1::DeliverResponse,
                 native_code: error.native_code,
                 detail: format!("{stage} delivery failed: {error}"),
@@ -631,6 +642,10 @@ impl LaunchAttemptError {
     }
 
     fn authority_loss(detail: String) -> Self {
+        Self::authority_loss_uncaptured(detail).captured()
+    }
+
+    fn authority_loss_uncaptured(detail: String) -> Self {
         Self {
             code: "MCSEALED-WINDOWS-AUTHORITY-LOSS",
             detail,
@@ -642,7 +657,6 @@ impl LaunchAttemptError {
             terminal_candidate: None,
             job_operation: None,
         }
-        .captured()
     }
 }
 
@@ -4111,7 +4125,7 @@ fn launch_attempt(
     let (reason, control_connected, peak_memory_bytes) = match monitor_observation {
         Some(observation) => (
             observation.reason,
-            observation.control_connected,
+            true,
             Some(observation.peak_memory_bytes),
         ),
         None => (
@@ -4362,6 +4376,28 @@ fn launch_attempt(
     let guardian_reaped = GuardianReaped;
     cleanup_guard.record.cleanup_state.guardian_reaped = true;
     cleanup_guard.record.store()?;
+    // A guardian already handling authority loss can finish after the last
+    // monitor probe and even after disarm. Reap makes its receipt final.
+    // Never infer guardian cleanup from the target's exit status.
+    if monitor_failure.is_none()
+        && matches!(reason, TerminalReason::Direct(_))
+        && super::record::authenticated_guardian_receipt(&cleanup_guard.record)?.is_some()
+    {
+        super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Cleaning);
+        super::diagnostics::capture_native(
+            memcordon_core::FailureOperationV1::CheckGuardian,
+            None,
+            memcordon_core::FailureCodeV1::GuardianLoss,
+        );
+        monitor_failure = Some(LaunchAttemptError {
+            // No transport fault was observed. The bound cleanup receipt
+            // invalidates application origin, not the control channel.
+            connection_must_close: false,
+            ..LaunchAttemptError::authority_loss_uncaptured(
+                "guardian performed authenticated authority-loss cleanup before disarm".into(),
+            )
+        });
+    }
     // Latch even the last selected retirement failure before freezing its
     // outcome and causal seed. Native closure below is still mandatory.
     cleanup_guard.retain_retirement_fault(
@@ -5184,7 +5220,7 @@ fn wait_for_prepared_acknowledgment(
 
 enum RelayRetirementAcknowledgment {
     Bound,
-    PeerLost(LateControlLoss),
+    PeerLost(ControlLoss),
 }
 
 fn wait_for_relays_retired(
@@ -5199,7 +5235,7 @@ fn wait_for_relays_retired(
         // SAFETY: frontend remains a live synchronization handle.
         let frontend_state = unsafe { WaitForSingleObject(frontend, 0) };
         if frontend_state == WAIT_OBJECT_0 {
-            return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
+            return Ok(RelayRetirementAcknowledgment::PeerLost(ControlLoss {
                 operation: memcordon_core::FailureOperationV1::ReadControlFrame,
                 native_code: None,
                 detail: "held frontend became signaled before relay acknowledgment".into(),
@@ -5215,7 +5251,7 @@ fn wait_for_relays_retired(
         let available = match pipe::frame_available_detailed(connection) {
             Ok(available) => available,
             Err(pipe::FrameAvailabilityError::PeerClosed { code }) => {
-                return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
+                return Ok(RelayRetirementAcknowledgment::PeerLost(ControlLoss {
                     operation: memcordon_core::FailureOperationV1::ReadControlFrame,
                     native_code: Some(code),
                     detail: format!("relay acknowledgment peer closed: native_code={code}"),
@@ -5229,7 +5265,7 @@ fn wait_for_relays_retired(
             let frame = match pipe::read_frame_detailed::<WindowsLauncherRequestV4>(connection) {
                 Ok(frame) => frame,
                 Err(error) if error.peer_closed => {
-                    return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
+                    return Ok(RelayRetirementAcknowledgment::PeerLost(ControlLoss {
                         operation: memcordon_core::FailureOperationV1::ReadControlFrame,
                         native_code: error.native_code,
                         detail: format!("relay acknowledgment peer closed: {error}"),
@@ -5825,8 +5861,109 @@ impl TerminalReason {
 
 struct MonitorObservation {
     reason: TerminalReason,
-    control_connected: bool,
     peak_memory_bytes: u64,
+}
+
+enum MonitorAuthorityLoss {
+    Guardian(super::job::JobObservationError),
+    Control(ControlLoss, Option<WindowsSealedFault>),
+}
+
+impl From<MonitorAuthorityLoss> for LaunchAttemptError {
+    fn from(failure: MonitorAuthorityLoss) -> Self {
+        match failure {
+            MonitorAuthorityLoss::Guardian(error) => error.into(),
+            MonitorAuthorityLoss::Control(loss, selected) => observed_control_loss(
+                loss,
+                selected,
+                memcordon_core::BoundarySetupPhase::Monitoring,
+            ),
+        }
+    }
+}
+
+fn monitor_control_loss(
+    detail: String,
+    native_code: Option<u32>,
+    selected: Option<WindowsSealedFault>,
+) -> MonitorAuthorityLoss {
+    MonitorAuthorityLoss::Control(
+        ControlLoss {
+            operation: memcordon_core::FailureOperationV1::ReadControlFrame,
+            native_code,
+            detail,
+        },
+        selected,
+    )
+}
+
+fn monitor_control_available(
+    connection: HANDLE,
+    selected: Option<WindowsSealedFault>,
+) -> Result<bool, MonitorAuthorityLoss> {
+    pipe::frame_available_detailed(connection).map_err(|error| {
+        let code = match error {
+            pipe::FrameAvailabilityError::Native { code, .. } => {
+                code.map(|code| u32::from_ne_bytes(code.to_ne_bytes()))
+            }
+            pipe::FrameAvailabilityError::PeerClosed { code } => Some(code),
+        };
+        monitor_control_loss(
+            format!("monitor control availability failed: {error}"),
+            code,
+            selected,
+        )
+    })
+}
+
+fn require_monitor_frontend(
+    frontend: HANDLE,
+    selected: Option<WindowsSealedFault>,
+) -> Result<(), MonitorAuthorityLoss> {
+    // SAFETY: this is the held frontend synchronization handle for the attempt.
+    match unsafe { WaitForSingleObject(frontend, 0) } {
+        WAIT_TIMEOUT => Ok(()),
+        WAIT_OBJECT_0 => Err(monitor_control_loss(
+            "held frontend exited while the sealed attempt was active".into(),
+            None,
+            selected,
+        )),
+        status => {
+            let code = (status == WAIT_FAILED).then(|| unsafe { GetLastError() });
+            Err(monitor_control_loss(
+                format!("held frontend wait failed: wait={status}; native_code={code:?}"),
+                code,
+                None,
+            ))
+        }
+    }
+}
+
+fn require_monitor_authority(
+    guardian: HANDLE,
+    frontend: HANDLE,
+    selected: Option<WindowsSealedFault>,
+) -> Result<(), MonitorAuthorityLoss> {
+    if !guardian_is_live(guardian).map_err(MonitorAuthorityLoss::Guardian)? {
+        // Preserve the owned guardian's typed failure and let ordinary
+        // retirement observe any secondary transport failure separately.
+        return Err(MonitorAuthorityLoss::Guardian(guardian_loss_observation()));
+    }
+    require_monitor_frontend(frontend, selected)
+}
+
+fn classify_direct_exit(
+    status: u32,
+    guardian: HANDLE,
+    frontend: HANDLE,
+    connection: HANDLE,
+    selected: Option<WindowsSealedFault>,
+) -> Result<TerminalReason, MonitorAuthorityLoss> {
+    // A target wait can become signaled after the guardian has acted but
+    // before it exits. Recheck the held authority, not the exit code.
+    monitor_control_available(connection, selected)?;
+    require_monitor_authority(guardian, frontend, selected)?;
+    Ok(TerminalReason::Direct(status))
 }
 
 fn terminate_certification_guardian(guardian: &GuardianProcess) -> Result<(), String> {
@@ -5851,10 +5988,10 @@ fn monitor(
     observer: &mut ProcessObserver,
 ) -> Result<MonitorObservation, LaunchAttemptError> {
     let guardian = guardian_owner.raw();
-    let mut direct_status = None;
-    let mut command_exit = None;
+    let frontend = request.remote_frontend_process_handle as usize as HANDLE;
+    let selected = postauthorization_transport_fault(request.certification_fault);
+    let mut direct_exit = None;
     let mut memory_limit_notified = false;
-    let mut control_connected = true;
     let mut next_observation = Instant::now();
     let mut snapshot_offset = 0_usize;
     let mut guardian_loss_injected = false;
@@ -5925,12 +6062,7 @@ fn monitor(
             }
             guardian_loss_injected = true;
         }
-        if !guardian_is_live(guardian)? {
-            // Loss of the owned provider is a provider failure. Returning the
-            // typed observation preserves its causal original through the
-            // launcher's ordinary retirement and public rejection path.
-            return Err(guardian_loss_observation().into());
-        }
+        require_monitor_authority(guardian, frontend, selected)?;
         if !target.desktop_authority_live()? {
             super::diagnostics::capture_native(
                 memcordon_core::FailureOperationV1::CheckDesktopAuthority,
@@ -5954,29 +6086,22 @@ fn monitor(
         {
             break TerminalReason::Memory(peak);
         }
-        if direct_status.is_none() && target.wait_observed(Duration::ZERO)? {
+        if direct_exit.is_none() && target.wait_observed(Duration::ZERO)? {
             let status = target.exit_status_observed()?;
-            direct_status = Some(status);
-            command_exit = Some(Instant::now());
-            if request.launch.policy.lifetime == memcordon_core::WindowsLifetimeV1::Command
-                && request.launch.policy.command_exit_grace_millis == 0
-            {
-                break TerminalReason::Direct(status);
-            }
+            direct_exit = Some((Instant::now(), status));
         }
-        if let (Some(exited), Some(status)) = (command_exit, direct_status) {
-            if request.launch.policy.lifetime == memcordon_core::WindowsLifetimeV1::Command
-                && exited.elapsed()
-                    >= Duration::from_millis(request.launch.policy.command_exit_grace_millis)
-            {
-                break TerminalReason::Direct(status);
-            }
-        }
-        if request.launch.policy.lifetime == memcordon_core::WindowsLifetimeV1::Workload {
-            if let Some(status) = direct_status {
-                if job.active_processes_observed()? == 0 {
-                    break TerminalReason::Direct(status);
+        if let Some((exited, status)) = direct_exit {
+            let ready = match request.launch.policy.lifetime {
+                memcordon_core::WindowsLifetimeV1::Command => {
+                    exited.elapsed()
+                        >= Duration::from_millis(request.launch.policy.command_exit_grace_millis)
                 }
+                memcordon_core::WindowsLifetimeV1::Workload => {
+                    job.active_processes_observed()? == 0
+                }
+            };
+            if ready {
+                break classify_direct_exit(status, guardian, frontend, connection, selected)?;
             }
         }
         let now = unsafe { GetTickCount64() };
@@ -5988,105 +6113,51 @@ fn monitor(
         {
             break TerminalReason::Deadline;
         }
-        if control_connected {
-            let selected_transport_fault = request.certification_fault.filter(|fault| {
-                matches!(
-                    fault,
-                    WindowsSealedFault::ControlWorkerKilledAfterAuthorization
-                        | WindowsSealedFault::ControlServiceKilledAfterAuthorization
-                        | WindowsSealedFault::FrontendDisconnectedAfterAuthorization
-                        | WindowsSealedFault::FrontendKilledAfterAuthorization
-                )
-            });
-            let available = match pipe::frame_available_detailed(connection) {
-                Ok(available) => available,
-                Err(error) => {
-                    let code = match error {
-                        pipe::FrameAvailabilityError::Native { code, .. } => code,
-                        pipe::FrameAvailabilityError::PeerClosed { code } => {
-                            Some(i32::from_ne_bytes(code.to_ne_bytes()))
-                        }
-                    };
-                    super::diagnostics::capture_native_with_injected_fault(
-                        memcordon_core::FailureOperationV1::ReadControlFrame,
-                        code,
-                        memcordon_core::FailureCodeV1::ControlTransport,
-                        selected_transport_fault,
-                    );
+        if monitor_control_available(connection, selected)? {
+            let frame = pipe::read_frame_detailed::<WindowsLauncherRequestV4>(connection).map_err(
+                |error| {
+                    monitor_control_loss(
+                        format!("monitor control frame failed: {error}"),
+                        error.native_code,
+                        selected,
+                    )
+                },
+            )?;
+            match frame {
+                WindowsLauncherRequestV4::Cancel {
+                    schema_version,
+                    attempt_id,
+                    nonce,
+                    request_sha256,
+                    signal,
+                } if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
+                    && attempt_id == request.attempt_id
+                    && nonce == request.launch.nonce
+                    && request_sha256 == request.request_sha256 =>
+                {
                     #[cfg(feature = "test-support")]
-                    if selected_transport_fault.is_some() {
-                        return Err(LaunchAttemptError::authority_loss(
-                            "selected native control-channel loss observed".into(),
-                        ));
+                    if matches!(
+                        selected,
+                        Some(
+                            WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+                                | WindowsSealedFault::FrontendKilledAfterAuthorization
+                        )
+                    ) {
+                        return Err(monitor_control_loss(
+                            "selected frontend cancellation reached native launcher".into(),
+                            None,
+                            selected,
+                        )
+                        .into());
                     }
-                    control_connected = false;
-                    false
+                    break TerminalReason::Interrupted(signal);
                 }
-            };
-            if available {
-                match pipe::read_frame_detailed::<WindowsLauncherRequestV4>(connection) {
-                    Err(error) => {
-                        super::diagnostics::capture_native_with_injected_fault(
-                            memcordon_core::FailureOperationV1::ReadControlFrame,
-                            error
-                                .native_code
-                                .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
-                            memcordon_core::FailureCodeV1::ControlTransport,
-                            selected_transport_fault,
-                        );
-                        #[cfg(feature = "test-support")]
-                        if selected_transport_fault.is_some() {
-                            return Err(LaunchAttemptError::authority_loss(
-                                "selected native control-frame loss observed".into(),
-                            ));
-                        }
-                        control_connected = false;
-                    }
-                    Ok(WindowsLauncherRequestV4::Cancel {
-                        schema_version,
-                        attempt_id,
-                        nonce,
-                        request_sha256,
-                        signal,
-                    }) if schema_version == WINDOWS_CURRENT_PRIVATE_PROTOCOL_VERSION
-                        && attempt_id == request.attempt_id
-                        && nonce == request.launch.nonce
-                        && request_sha256 == request.request_sha256 =>
-                    {
-                        if matches!(
-                            selected_transport_fault,
-                            Some(
-                                WindowsSealedFault::FrontendDisconnectedAfterAuthorization
-                                    | WindowsSealedFault::FrontendKilledAfterAuthorization
-                            )
-                        ) {
-                            super::diagnostics::capture_native_with_injected_fault(
-                                memcordon_core::FailureOperationV1::ReadControlFrame,
-                                None,
-                                memcordon_core::FailureCodeV1::ControlTransport,
-                                selected_transport_fault,
-                            );
-                            #[cfg(feature = "test-support")]
-                            return Err(LaunchAttemptError::authority_loss(
-                                "selected frontend cancellation reached native launcher".into(),
-                            ));
-                        }
-                        break TerminalReason::Interrupted(signal);
-                    }
-                    Ok(_) => {
-                        return Err("invalid control message during target execution"
-                            .to_owned()
-                            .into());
-                    }
+                _ => {
+                    return Err("invalid control message during target execution"
+                        .to_owned()
+                        .into());
                 }
             }
-        }
-        // SAFETY: frontend is a live synchronization handle owned by this attempt.
-        if unsafe {
-            WaitForSingleObject(request.remote_frontend_process_handle as usize as HANDLE, 0)
-        } == WAIT_OBJECT_0
-        {
-            break TerminalReason::Interrupted(15);
         }
         if Instant::now() >= next_observation {
             observer.attempt_poll();
@@ -6113,15 +6184,7 @@ fn monitor(
                         {
                             break 'monitor TerminalReason::Deadline;
                         }
-                        if unsafe {
-                            WaitForSingleObject(
-                                request.remote_frontend_process_handle as usize as HANDLE,
-                                0,
-                            )
-                        } == WAIT_OBJECT_0
-                        {
-                            break 'monitor TerminalReason::Interrupted(15);
-                        }
+                        require_monitor_frontend(frontend, selected)?;
                         let offset = (snapshot_offset + index) % process_ids.len();
                         observer.identity_query_attempted();
                         match super::process::process_identity_for_pid_as_authenticated_caller(
@@ -6158,7 +6221,6 @@ fn monitor(
     };
     Ok(MonitorObservation {
         reason,
-        control_connected,
         peak_memory_bytes: job.peak_memory_observed()?,
     })
 }
