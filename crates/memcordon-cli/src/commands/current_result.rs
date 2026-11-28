@@ -7,6 +7,10 @@ use memcordon_core::execution_facts::{
 use memcordon_core::result_v3::*;
 use memcordon_core::{BoundaryMechanismEvidence, RunOutcome};
 
+#[cfg(all(test, feature = "test-support", not(target_os = "macos")))]
+#[path = "current_result_tests.rs"]
+mod tests;
+
 fn diagnostic_text(value: &str) -> memcordon_core::BoundedText<4096> {
     const LIMIT: usize = 4096;
     let suffix = " [truncated]";
@@ -461,6 +465,7 @@ pub(super) fn success(
                 &resolution.report,
                 rejection,
                 failure.provider_association.clone(),
+                failure.windows_frontend_delivery.as_ref(),
                 execution.wrapper_exit_code(),
             );
         }
@@ -558,6 +563,7 @@ fn rejected(
     policy: &PolicyEnvelopeReport,
     rejection: &memcordon_core::WindowsProviderRejectionV3,
     association: Option<memcordon_core::execution_facts::ProviderAttemptAssociationV1>,
+    frontend_delivery: Option<&memcordon_core::WindowsFrontendDeliveryV3>,
     exit_code: i32,
 ) -> Result<ResultV3, String> {
     if !rejection.is_consistent() {
@@ -594,6 +600,16 @@ fn rejected(
                 };
                 let mut native = native.clone();
                 native.retirement = Some(Box::new(terminal.retirement_proof.clone()));
+                native.frontend_delivery = frontend_delivery
+                    .filter(|delivery| {
+                        rejection_delivery_matches(
+                            rejection,
+                            terminal,
+                            association.as_ref(),
+                            delivery,
+                        )
+                    })
+                    .cloned();
                 native.frontend_provider_association = association;
                 report.release = if native.target_released {
                     ReleaseKnowledgeV3::Released
@@ -663,6 +679,43 @@ fn rejected(
     Ok(report)
 }
 
+fn rejection_delivery_matches(
+    rejection: &memcordon_core::WindowsProviderRejectionV3,
+    terminal: &memcordon_core::WindowsTerminalReceiptV3,
+    association: Option<&memcordon_core::execution_facts::ProviderAttemptAssociationV1>,
+    delivery: &memcordon_core::WindowsFrontendDeliveryV3,
+) -> bool {
+    use sha2::{Digest, Sha256};
+
+    if !delivery.is_consistent()
+        || delivery.attempt_id != terminal.attempt_id
+        || delivery.nonce != terminal.nonce
+        || delivery.request_sha256 != terminal.request_sha256
+        || association.is_none_or(|association| {
+            association.provider.generation.as_str()
+                != terminal.retirement_proof.provider_generation
+                || String::from(association.attempt_id.clone()) != terminal.attempt_id
+                || String::from(association.request_sha256.clone()) != terminal.request_sha256
+        })
+    {
+        return false;
+    }
+    // Match the immutable public Reject authority that the frontend acknowledged,
+    // not a digest of the inner receipt or of the expirable diagnostics.
+    let response = memcordon_core::WindowsProviderResponseV4::Reject {
+        schema_version: memcordon_core::WINDOWS_CURRENT_PUBLIC_PROTOCOL_VERSION,
+        attempt_id: terminal.attempt_id.clone(),
+        nonce: terminal.nonce.clone(),
+        request_sha256: terminal.request_sha256.clone(),
+        rejection: rejection.clone(),
+    };
+    response.terminal_authority_json().is_ok_and(|authority| {
+        String::from(memcordon_core::DiagnosticSha256::from_bytes(
+            Sha256::digest(authority).into(),
+        )) == delivery.terminal_sha256
+    })
+}
+
 pub(super) fn failure(
     args: &ExecutionArgs,
     command: &CommandSpec,
@@ -706,6 +759,7 @@ pub(super) fn failure(
             policy,
             rejection,
             error.provider_association.as_deref().cloned(),
+            error.windows_frontend_delivery.as_ref(),
             exit_code,
         );
     }
