@@ -443,6 +443,108 @@ fn package_uninstall_arguments(cleanup_cutoff_millis: u64) -> Result<[String; 4]
     ])
 }
 
+fn host_network_mismatch(comparison: &serde_json::Value) -> String {
+    use serde_json::{Value, json};
+
+    const MAX_DETAILS: usize = 10;
+    let reported = comparison["changes"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let mut omitted = comparison["omitted_changes"].as_u64().unwrap_or(0)
+        + reported.len().saturating_sub(MAX_DETAILS) as u64;
+    let mut changes = Vec::new();
+    for change in reported.iter().take(MAX_DETAILS) {
+        let path = &change["path"];
+        let before = &change["before"];
+        let after = &change["after"];
+        // Only fixed labels and derived facts can leave the privileged helper.
+        let (field, fields): (_, &[&str]) = match (path[0].as_str(), path[1].as_str()) {
+            (Some("facts"), Some("/proc/sys/net/ipv4/ip_local_port_range")) => {
+                ("ip_local_port_range", &[])
+            }
+            (Some("facts"), Some("/proc/sys/net/ipv4/ip_local_reserved_ports")) => {
+                ("ip_local_reserved_ports", &[])
+            }
+            (Some("facts"), Some("/proc/sys/net/ipv4/ip_nonlocal_bind")) => {
+                ("ip_nonlocal_bind", &[])
+            }
+            (Some("facts"), Some("/proc/sys/net/ipv6/conf/all/disable_ipv6")) => {
+                ("disable_ipv6", &[])
+            }
+            (Some("facts"), Some("/proc/net/route")) => ("ipv4_route", &[]),
+            (Some("facts"), Some("/proc/net/ipv6_route")) => ("ipv6_route", &[]),
+            (Some("facts"), _) => ("facts", &[]),
+            (Some("links"), Some(_)) => (
+                "link",
+                &["address", "flags", "ifindex", "operstate", "provenance"],
+            ),
+            (Some("links"), None) => ("links", &[]),
+            (Some("namespace_device"), _) => ("namespace_device", &[]),
+            (Some("namespace_inode"), _) => ("namespace_inode", &[]),
+            _ => ("other", &[]),
+        };
+        let state = |summary: &Value| match (summary["present"].as_bool(), summary.get("value")) {
+            (Some(false), _) => "missing",
+            (Some(true), Some(Value::Null)) => "null",
+            (Some(true), _) => "present",
+            _ => "unknown",
+        };
+        let mut detail = json!({"field":field, "before":state(before), "after":state(after)});
+        if let (Some(left), Some(right)) = (before.get("value"), after.get("value")) {
+            if field == "ipv6_route"
+                && let (Some(left), Some(right)) = (left.as_array(), right.as_array())
+            {
+                // These are the comparator's normalized rows, without the reference count.
+                let fields = [
+                    "destination",
+                    "prefix",
+                    "source",
+                    "source_prefix",
+                    "next_hop",
+                    "metric",
+                    "usage",
+                    "flags",
+                    "interface",
+                ];
+                detail["differing_positional_fields"] = json!(
+                    fields
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, name)| left
+                            .iter()
+                            .zip(right)
+                            .any(|(before, after)| before[index] != after[index])
+                            .then_some(name))
+                        .collect::<Vec<_>>()
+                );
+                detail["row_count_changed"] = json!(left.len() != right.len());
+            } else if !fields.is_empty() {
+                detail["differing_fields"] = json!(
+                    fields
+                        .iter()
+                        .copied()
+                        .filter(|name| left.get(name) != right.get(name))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        changes.push(detail);
+    }
+    loop {
+        let detail = json!({
+            "format":"memcordon.installed-linux-network-mismatch",
+            "revision":1, "changes":changes, "omitted_changes":omitted,
+        });
+        let message = format!("host network configuration changed\n{detail}");
+        // Native failure reporting keeps the final 1 KiB of helper stderr.
+        // Leave room for the CLI wrapper and omit whole entries, never JSON bytes.
+        if message.len() <= 768 || changes.pop().is_none() {
+            return message;
+        }
+        omitted += 1;
+    }
+}
+
 struct Session<'a> {
     root: &'a Path,
     admin: Directory,
@@ -494,7 +596,7 @@ impl Session<'_> {
         });
         match network {
             Ok(comparison) if comparison["unchanged"] == true => (),
-            Ok(_) => errors.push("host network configuration changed".into()),
+            Ok(comparison) => errors.push(host_network_mismatch(&comparison)),
             Err(error) => errors.push(error.to_string()),
         }
         if errors.is_empty() {
@@ -1388,7 +1490,13 @@ fn retire_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::package_uninstall_arguments;
+    use super::{
+        fail, host_network_mismatch, package_uninstall_arguments, require_successful_output,
+    };
+    use crate::{CiError, release::linux_current_network::host_network_comparison};
+    use memcordon_testkit::ObservedOutput;
+    use serde_json::{Value, json};
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus, time::Duration};
 
     #[test]
     fn uninstall_uses_the_original_absolute_package_lease_cutoff_in_separate_arguments() {
@@ -1403,5 +1511,101 @@ mod tests {
         );
         assert!(package_uninstall_arguments(0).is_err());
         assert!(package_uninstall_arguments(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn network_mismatch_reports_only_redacted_fields_and_counts_omissions() {
+        let route = "00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000005 00000000 80200001 private-device\n";
+        let before = json!({
+            "facts": {
+                "/proc/net/ipv6_route": route.as_bytes(),
+                "/proc/net/route": "private-routing-contents",
+            },
+            "links": {"private-device": {"address": "private-mac", "operstate": "down"}},
+        });
+        let mut after = before.clone();
+        after["facts"]["/proc/net/ipv6_route"] = json!(
+            route
+                .replace("00000005 00000000", "00000006 00000001")
+                .as_bytes()
+        );
+        after["facts"]["/proc/net/route"] = Value::Null;
+        after["links"]["private-device"]["operstate"] = json!("up");
+        for index in 0..200 {
+            after["links"][format!("private-link-{index}")] = json!({"address": "private-mac"});
+        }
+        let comparison = host_network_comparison(&before, &after).unwrap();
+        assert_eq!(comparison["unchanged"], false);
+        assert!(comparison["omitted_changes"].as_u64().unwrap() > 0);
+        let message = host_network_mismatch(&comparison);
+        assert!(!message.contains("private"));
+        assert!(message.len() <= 768);
+        let (failure, report) = message.split_once('\n').unwrap();
+        assert_eq!(failure, "host network configuration changed");
+        let report: Value = serde_json::from_str(report).unwrap();
+        let changes = report["changes"].as_array().unwrap();
+        assert_eq!(
+            changes[0],
+            json!({"field":"ipv6_route","before":"present","after":"present",
+                "differing_positional_fields":["usage"],"row_count_changed":false})
+        );
+        assert_eq!(
+            changes[1],
+            json!({"field":"ipv4_route","before":"present","after":"null"})
+        );
+        assert_eq!(
+            changes[2],
+            json!({"field":"link","before":"present","after":"present","differing_fields":["operstate"]})
+        );
+        assert_eq!(
+            changes[3],
+            json!({"field":"link","before":"missing","after":"present"})
+        );
+        assert_eq!(report["omitted_changes"], 203 - changes.len());
+    }
+
+    #[test]
+    fn installed_result_excerpt_keeps_a_complete_network_mismatch_record() {
+        let mismatch = host_network_mismatch(&json!({
+            "changes": vec![json!({"path":["links","private-device"],
+                                   "before":{"present":false},"after":{"present":true}}); 128],
+            "omitted_changes": 5,
+        }));
+        let (_, report) = mismatch.split_once('\n').unwrap();
+        let retirement = || {
+            fail(format!(
+                "{}; {mismatch}",
+                "other cleanup failure ".repeat(120)
+            ))
+            .context("installed Linux session retirement")
+        };
+        for error in [
+            retirement(),
+            CiError::LaneFailures {
+                primary: Box::new(fail("workload failed")),
+                secondary: Box::new(retirement()),
+            },
+        ] {
+            // Match the helper CLI's display and source-chain writes to stderr.
+            let mut stderr = "installed Linux test: scenario announcement\n".repeat(57);
+            stderr.push_str(&format!("memcordon-ci: {error}\n"));
+            let mut source = std::error::Error::source(&error);
+            while let Some(error) = source {
+                stderr.push_str(&format!("  caused by: {error}\n"));
+                source = error.source();
+            }
+            let capture = ObservedOutput {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+                elapsed: Duration::ZERO,
+            };
+            let failure =
+                require_successful_output("direct installed Linux helper", &capture).unwrap_err();
+            let result = crate::command::bounded_excerpt(format!("{failure}\n").as_bytes());
+            let encoded_report = format!("{report:?}");
+            assert!(result.contains("stderr-truncated=true"));
+            assert!(result.contains(encoded_report.trim_matches('"')));
+        }
     }
 }
