@@ -2704,6 +2704,11 @@ impl Drop for AdmissionLease {
     }
 }
 
+/// Attach a stable admission/storage phase tag to an I/O or decode failure.
+fn storage_phase<E: std::fmt::Display>(tag: &'static str) -> impl FnOnce(E) -> String {
+    move |error| format!("{tag}: {error}")
+}
+
 pub fn reserve_admission(attempt_id: &str, request_sha256: &str) -> Result<AdmissionLease, String> {
     validate_attempt_id(attempt_id)?;
     validate_attempt_id(request_sha256)?;
@@ -2712,7 +2717,8 @@ pub fn reserve_admission(attempt_id: &str, request_sha256: &str) -> Result<Admis
         b"installation-attempt-storage-budget-v1",
     ))?;
     enforce_storage_reservation(Some(attempt_id), false)?;
-    fs::create_dir_all(admissions_root()).map_err(|error| error.to_string())?;
+    fs::create_dir_all(admissions_root())
+        .map_err(storage_phase("reserve-admission/create-admissions-root"))?;
     let path = admissions_root().join(format!("{attempt_id}.json"));
     let mut bytes = serde_json::to_vec(&AdmissionRecordV1 {
         format: AdmissionRecordFormat::Native,
@@ -2722,46 +2728,110 @@ pub fn reserve_admission(attempt_id: &str, request_sha256: &str) -> Result<Admis
         workload_reservation: true,
         owner_process_identities: Vec::new(),
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(storage_phase("reserve-admission/encode-admission"))?;
     bytes.push(b'\n');
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
-        .map_err(|error| error.to_string())?;
+        .map_err(storage_phase("reserve-admission/publish-admission"))?;
     Ok(AdmissionLease { path })
 }
 
+/// Name-only attempt identity of an `attempts/` entry. This never opens the
+/// entry, so it is safe for principals that may list but not open records.
+fn attempt_entry_identity(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let identity = name
+        .strip_suffix(".json.new")
+        .or_else(|| name.strip_suffix(".json"))?;
+    validate_attempt_id(identity).ok()?;
+    Some(identity)
+}
+
+/// Workload-charging attempt identities from the admission namespace, which
+/// both control and launcher may read. Includes control workload admissions
+/// (`<id>.json`) and launcher writer admissions (`<id>.writer.json`).
+fn active_workload_admissions(
+    admissions: &Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut active = std::collections::BTreeSet::new();
+    if !admissions.exists() {
+        return Ok(active);
+    }
+    for entry in fs::read_dir(admissions).map_err(storage_phase("sweep/list-admissions"))? {
+        let entry = entry.map_err(storage_phase("sweep/read-admission-entry"))?;
+        let bytes = read_record_bounded_with_limit(&entry.path(), 4096)
+            .map_err(storage_phase("sweep/read-admission"))?;
+        let admission: AdmissionRecordV1 =
+            serde_json::from_slice(&bytes).map_err(storage_phase("sweep/decode-admission"))?;
+        if admission.workload_reservation {
+            validate_attempt_id(&admission.attempt_id)?;
+            active.insert(admission.attempt_id);
+        }
+    }
+    Ok(active)
+}
+
 fn sweep_expired_diagnostics() -> Result<(), String> {
-    if !attempts_root().exists() {
+    sweep_expired_diagnostics_at(&attempts_root(), &admissions_root(), |path, attempt_id| {
+        let _reader = RecordReaderReservation::acquire(attempt_id, attempt_id)?;
+        let bytes = read_record_bounded(path).map_err(storage_phase("sweep/read-record"))?;
+        let mut record: WindowsAttemptRecordV1 =
+            serde_json::from_slice(&bytes).map_err(storage_phase("sweep/decode-record"))?;
+        drop(bytes);
+        authenticate(&record, attempt_id)?;
+        if !expire_retained_empty_record(&mut record) {
+            return Ok(());
+        }
+        record.store()?;
+        super::attempt_store::retire(attempt_id)
+    })
+}
+
+/// Visit retained attempt records for expiry without ever opening an entry
+/// whose attempt still holds a workload admission. A live attempt's record and
+/// writer stage are owned by the launcher (control may list but not open
+/// them), and its whole storage budget is already charged by its admission.
+fn sweep_expired_diagnostics_at(
+    attempts: &Path,
+    admissions: &Path,
+    mut expire: impl FnMut(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    if !attempts.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(attempts_root()).map_err(|error| error.to_string())? {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if reserved_writer_stage(&path, &admissions_root())? {
+    let active = active_workload_admissions(admissions)?;
+    for entry in fs::read_dir(attempts).map_err(storage_phase("sweep/list-attempts"))? {
+        let path = entry
+            .map_err(storage_phase("sweep/read-attempt-entry"))?
+            .path();
+        if attempt_entry_identity(&path).is_some_and(|identity| active.contains(identity)) {
+            continue;
+        }
+        if reserved_writer_stage(&path, admissions)? {
             continue;
         }
         let attempt_id = record_attempt_id(&path)?;
-        let _reader = RecordReaderReservation::acquire(&attempt_id, &attempt_id)?;
-        let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
-        let mut record: WindowsAttemptRecordV1 =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        drop(bytes);
-        authenticate(&record, &attempt_id)?;
-        if record.diagnostic_retention.tombstone.is_some()
-            || diagnostic_export_eligible(&record)
-            || record.state != WindowsAttemptStateV1::Empty
-        {
-            continue;
-        }
-        record.causal_diagnostics = exportable_journal(&record);
-        record.diagnostic_retention.tombstone =
-            Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
-        record.store()?;
-        super::attempt_store::retire(&attempt_id)?;
+        expire(&path, &attempt_id)?;
     }
     Ok(())
+}
+
+/// Apply the retention-expiry tombstone to an expired, durably empty record.
+/// Returns whether the record changed and must be published and retired.
+fn expire_retained_empty_record(record: &mut WindowsAttemptRecordV1) -> bool {
+    if record.diagnostic_retention.tombstone.is_some()
+        || diagnostic_export_eligible(record)
+        || record.state != WindowsAttemptStateV1::Empty
+    {
+        return false;
+    }
+    record.causal_diagnostics = exportable_journal(record);
+    record.diagnostic_retention.tombstone =
+        Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
+    true
 }
 
 fn enforce_storage_reservation(
@@ -2780,6 +2850,32 @@ fn enforce_storage_reservation_with_writer_observation(
     reserving_reader: bool,
     observe_writer: bool,
 ) -> Result<(), String> {
+    enforce_storage_reservation_at(
+        &StorageRoots {
+            attempts: attempts_root(),
+            quarantine: quarantine_root(),
+            admissions: admissions_root(),
+        },
+        reserving_attempt_id,
+        reserving_reader,
+        observe_writer,
+    )
+    .map(drop)
+}
+
+struct StorageRoots {
+    attempts: PathBuf,
+    quarantine: PathBuf,
+    admissions: PathBuf,
+}
+
+/// Returns the charged reservation in bytes after every bound check passes.
+fn enforce_storage_reservation_at(
+    roots: &StorageRoots,
+    reserving_attempt_id: Option<&str>,
+    reserving_reader: bool,
+    observe_writer: bool,
+) -> Result<u64, String> {
     const RECORD_STATE_BUDGET: u64 = 128 * 1024 * 1024;
     const IMAGES_PER_ACTIVE_ATTEMPT: u64 = 5;
     let record_bound = memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64;
@@ -2789,13 +2885,15 @@ fn enforce_storage_reservation_with_writer_observation(
         0
     };
     let mut active = std::collections::BTreeSet::new();
-    if admissions_root().exists() {
-        for entry in fs::read_dir(admissions_root()).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
+    if roots.admissions.exists() {
+        for entry in
+            fs::read_dir(&roots.admissions).map_err(storage_phase("quota/list-admissions"))?
+        {
+            let entry = entry.map_err(storage_phase("quota/read-admission-entry"))?;
             let bytes = read_record_bounded_with_limit(&entry.path(), 4096)
-                .map_err(|error| error.to_string())?;
+                .map_err(storage_phase("quota/read-admission"))?;
             let admission: AdmissionRecordV1 =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                serde_json::from_slice(&bytes).map_err(storage_phase("quota/decode-admission"))?;
             if entry
                 .path()
                 .file_name()
@@ -2824,14 +2922,15 @@ fn enforce_storage_reservation_with_writer_observation(
     let mut retained_payloads = active.len();
     let mut retained_payload_bytes =
         retained_payloads * memcordon_core::MAX_DIAGNOSTIC_JOURNAL_BYTES;
-    for root in [attempts_root(), quarantine_root()] {
+    for root in [&roots.attempts, &roots.quarantine] {
         if !root.exists() {
             continue;
         }
-        for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
+        let in_attempts = root == &roots.attempts;
+        for entry in fs::read_dir(root).map_err(storage_phase("quota/list-retained"))? {
+            let entry = entry.map_err(storage_phase("quota/read-retained-entry"))?;
             if !observe_writer
-                && root == attempts_root()
+                && in_attempts
                 && entry
                     .file_name()
                     .to_str()
@@ -2839,24 +2938,26 @@ fn enforce_storage_reservation_with_writer_observation(
             {
                 return Err("read-only diagnostic quota observation has a staged writer".into());
             }
-            if root == attempts_root() && reserved_writer_stage(&entry.path(), &admissions_root())?
+            let path = entry.path();
+            // An active attempt's record and writer stage are already charged
+            // all five images by its admission above. Never open them: the
+            // launcher owns these files and control may only list `attempts/`.
+            if in_attempts
+                && attempt_entry_identity(&path).is_some_and(|identity| active.contains(identity))
             {
-                let path = entry.path();
-                let identity = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| name.strip_suffix(".json.new"))
-                    .ok_or("validated writer stage lost its exact filename")?;
-                if !active.contains(identity) {
-                    return Err("staged attempt has no charged active reservation".to_owned());
-                }
-                // The validated writer admission already charges all five
-                // active images; a staging image grants no terminal authority.
                 continue;
             }
-            let identity = record_attempt_id(&entry.path())?;
+            if in_attempts && reserved_writer_stage(&path, &roots.admissions)? {
+                // A validated stage implies a writer admission; reaching here
+                // means that admission was not charged as active.
+                return Err("staged attempt has no charged active reservation".to_owned());
+            }
+            let identity = record_attempt_id(&path)?;
             if !active.contains(&identity) {
-                let metadata = entry.metadata().map_err(|error| error.to_string())?;
+                // Directory-enumeration metadata; does not open the entry.
+                let metadata = entry
+                    .metadata()
+                    .map_err(storage_phase("quota/retained-entry-metadata"))?;
                 if !metadata.is_file() || metadata.len() > record_bound {
                     return Err("retained record exceeds authenticated record bound".to_owned());
                 }
@@ -2878,7 +2979,7 @@ fn enforce_storage_reservation_with_writer_observation(
             }
         }
     }
-    Ok(())
+    Ok(reserved)
 }
 
 pub fn reserve_attempt(attempt_id: &str, request_sha256: &str) -> Result<(), String> {
@@ -6410,8 +6511,10 @@ fn reserved_writer_stage(path: &Path, admissions: &Path) -> Result<bool, String>
         .read(true)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
+        .map_err(storage_phase("writer-stage/open-stage"))?;
+    let metadata = file
+        .metadata()
+        .map_err(storage_phase("writer-stage/stage-metadata"))?;
     if !metadata.is_file()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || metadata.len() > memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64
@@ -6429,7 +6532,8 @@ fn reserved_writer_stage(path: &Path, admissions: &Path) -> Result<bool, String>
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        let error = io::Error::last_os_error();
+        return Err(storage_phase("writer-stage/stage-standard-info")(error));
     }
     if standard.NumberOfLinks != 1 {
         return Err("staged attempt has multiple links".to_owned());

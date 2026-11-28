@@ -1366,6 +1366,120 @@ fn staged_attempt_requires_its_live_exact_writer_reservation() {
     retire_owned_component_writer_for_test(admissions.path(), &attempt_id, true).unwrap();
 }
 
+fn write_workload_admission(admissions: &Path, attempt_id: &str) {
+    let mut bytes = serde_json::to_vec(&AdmissionRecordV1 {
+        format: AdmissionRecordFormat::Native,
+        revision: Default::default(),
+        attempt_id: attempt_id.to_owned(),
+        request_sha256: digest(attempt_id.as_bytes()),
+        workload_reservation: true,
+        owner_process_identities: Vec::new(),
+    })
+    .unwrap();
+    bytes.push(b'\n');
+    std::fs::write(admissions.join(attempt_id).with_extension("json"), bytes).unwrap();
+}
+
+/// Model a launcher-owned entry that a listing principal cannot open: the
+/// returned handle denies every share mode, so any open of the name fails
+/// while directory enumeration still observes it.
+fn unopenable_entry(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap();
+    assert!(std::fs::File::open(path).is_err());
+    file
+}
+
+#[test]
+fn active_admission_attempt_entries_are_charged_without_being_opened() {
+    let attempts = tempfile::tempdir().unwrap();
+    let quarantine = tempfile::tempdir().unwrap();
+    let admissions = tempfile::tempdir().unwrap();
+    let roots = StorageRoots {
+        attempts: attempts.path().to_owned(),
+        quarantine: quarantine.path().to_owned(),
+        admissions: admissions.path().to_owned(),
+    };
+    let live = digest(b"live-admitted-attempt");
+    let next = digest(b"next-admitted-attempt");
+    let image = memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64 * 5;
+    write_workload_admission(admissions.path(), &live);
+    let _record = unopenable_entry(&attempts.path().join(&live).with_extension("json"));
+    let _stage = unopenable_entry(&attempts.path().join(&live).with_extension("json.new"));
+
+    sweep_expired_diagnostics_at(attempts.path(), admissions.path(), |path, _| {
+        panic!("active attempt entry {} must not be opened", path.display())
+    })
+    .unwrap();
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, None, false, true).unwrap(),
+        image
+    );
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, Some(&live), false, true).unwrap(),
+        image
+    );
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, Some(&next), false, true).unwrap(),
+        2 * image
+    );
+    // Read-only quota observation still refuses any staged writer.
+    assert_eq!(
+        enforce_storage_reservation_at(&roots, None, true, false).unwrap_err(),
+        "read-only diagnostic quota observation has a staged writer"
+    );
+
+    // Without the charging admission the same entries remain fail-closed.
+    std::fs::remove_file(admissions.path().join(&live).with_extension("json")).unwrap();
+    assert!(
+        sweep_expired_diagnostics_at(attempts.path(), admissions.path(), |_, _| Ok(())).is_err()
+    );
+    assert!(enforce_storage_reservation_at(&roots, Some(&next), false, true).is_err());
+}
+
+#[test]
+fn unadmitted_expired_empty_record_is_still_tombstoned() {
+    let attempts = tempfile::tempdir().unwrap();
+    let admissions = tempfile::tempdir().unwrap();
+    let mut record = observed_record();
+    record.state = WindowsAttemptStateV1::Empty;
+    record.boot_identity = "prior-boot".to_owned();
+    let path = attempts
+        .path()
+        .join(&record.attempt_id)
+        .with_extension("json");
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    // An unrelated active admission does not hide the retained record.
+    write_workload_admission(admissions.path(), &digest(b"unrelated-live-attempt"));
+
+    let mut visited = Vec::new();
+    sweep_expired_diagnostics_at(attempts.path(), admissions.path(), |path, attempt_id| {
+        let mut retained: WindowsAttemptRecordV1 =
+            serde_json::from_slice(&read_record_bounded(path).unwrap()).unwrap();
+        assert!(expire_retained_empty_record(&mut retained));
+        assert_eq!(
+            retained.diagnostic_retention.tombstone,
+            Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired)
+        );
+        assert!(!expire_retained_empty_record(&mut retained));
+        visited.push(attempt_id.to_owned());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(visited, [record.attempt_id.clone()]);
+
+    let mut active = observed_record();
+    active.boot_identity = "prior-boot".to_owned();
+    assert!(!expire_retained_empty_record(&mut active));
+    assert!(active.diagnostic_retention.tombstone.is_none());
+}
+
 #[test]
 #[ignore = "runs an isolated frozen native publisher"]
 fn native_settlement_reservation_requires_local_writer_retirement() {

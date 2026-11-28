@@ -177,6 +177,22 @@ pub fn planned_attempt_count(key: &CaseKey) -> Option<usize> {
     }
 }
 
+/// Truthful scenario execution disposition. Once a capacity scenario's
+/// attempt(s) have run, its summary must never claim "not executed": a failed
+/// execution records the real failure, and a successful execution stays a
+/// non-accepting failure until post-execution collection and retirement
+/// complete. The original outcome is always returned unchanged.
+pub fn record_execution_outcome(
+    record: &mut CapacityAssessment,
+    outcome: Result<()>,
+) -> Result<()> {
+    record.behavior = Err(match &outcome {
+        Ok(()) => "executed; post-execution inventory pending".to_owned(),
+        Err(error) => format!("executed and failed: {error}"),
+    });
+    outcome
+}
+
 #[cfg(windows)]
 pub(crate) fn run(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
@@ -357,7 +373,8 @@ mod native {
             fs::create_dir_all(&directory)?;
             inventory(config, &directory, 0, record, work_deadline)?;
             if key.scenario == "bounded-concurrency" {
-                overlap(config, &base, &directory, record, work_deadline)?;
+                let outcome = overlap(config, &base, &directory, record, work_deadline);
+                record_execution_outcome(record, outcome)?;
                 inventory(config, &directory, 1, record, work_deadline)?;
                 record.behavior = Ok(());
                 record.collection = Ok(());
@@ -418,14 +435,15 @@ mod native {
                         )
                     });
                 record.attempts.push(attempt);
-                match (result, retained) {
+                let outcome = match (result, retained) {
                     (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
                         primary: Box::new(primary),
                         secondary: Box::new(secondary.context("capacity observation publication")),
                     }),
                     (Err(primary), _) => Err(primary),
                     (Ok(()), retained) => retained,
-                }?;
+                };
+                record_execution_outcome(record, outcome)?;
                 inventory(config, &directory, ordinal + 1, record, work_deadline)?;
             }
             record.behavior = Ok(());
@@ -780,6 +798,38 @@ mod tests {
             );
             fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    #[test]
+    fn executed_capacity_failure_is_never_summarized_as_not_executed() {
+        let mut record = CapacityAssessment {
+            key: required_keys()[1].clone(),
+            behavior: Err("not executed".into()),
+            collection: Err("not collected".into()),
+            retirement: Err("not observed".into()),
+            attempts: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        let error = record_execution_outcome(
+            &mut record,
+            Err(CiError::Message("second capacity attempt refused".into())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("second capacity attempt refused"), "{error}");
+        let behavior = record.behavior.clone().unwrap_err();
+        assert!(behavior.starts_with("executed and failed: "), "{behavior}");
+        assert!(
+            behavior.contains("second capacity attempt refused"),
+            "{behavior}"
+        );
+        assert!(!behavior.contains("not executed"), "{behavior}");
+        assert!(!accepted(std::slice::from_ref(&record)));
+        record_execution_outcome(&mut record, Ok(())).unwrap();
+        let behavior = record.behavior.clone().unwrap_err();
+        assert!(!behavior.contains("not executed"), "{behavior}");
+        assert!(record.collection.is_err() && record.retirement.is_err());
+        assert!(!accepted(std::slice::from_ref(&record)));
     }
 
     #[test]
