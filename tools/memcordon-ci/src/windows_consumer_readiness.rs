@@ -2134,6 +2134,135 @@ pub(crate) fn live_capacity_completion(bytes: &[u8]) -> Result<bool> {
         .any(|event| event.stage == "capacity-live-before-natural-completion"))
 }
 
+#[cfg(any(windows, test))]
+type OverlapProcessId = (u32, u128);
+
+#[cfg(any(windows, test))]
+fn validate_overlap_population(
+    family: &[(OverlapProcessId, std::io::Result<bool>)],
+    wrapper: (OverlapProcessId, std::io::Result<bool>),
+    actual: impl IntoIterator<Item = OverlapProcessId>,
+    retired: impl IntoIterator<Item = OverlapProcessId>,
+) -> Result<()> {
+    let expected: BTreeSet<_> = family
+        .iter()
+        .map(|(id, _)| *id)
+        .chain([wrapper.0])
+        .collect();
+    let expected_pids: BTreeSet<_> = expected.iter().map(|(pid, _)| *pid).collect();
+    let mut actual_count = 0;
+    let actual: BTreeSet<_> = actual.into_iter().inspect(|_| actual_count += 1).collect();
+    let is_live = |exit: &std::io::Result<bool>| matches!(exit, Ok(false));
+    if family.len() == 2
+        && expected_pids.len() == 3
+        && actual_count == 3
+        && actual == expected
+        && family.iter().all(|(_, exit)| is_live(exit))
+        && is_live(&wrapper.1)
+    {
+        return Ok(());
+    }
+
+    let exit_state = |exit: &std::io::Result<bool>| match exit {
+        Ok(false) => "live",
+        Ok(true) => "exited",
+        Err(_) => "query-failed",
+    };
+    let family_states: Vec<_> = family
+        .iter()
+        .take(3)
+        .map(|(id, exit)| (*id, exit_state(exit)))
+        .collect();
+    let wrapper_state = (wrapper.0, exit_state(&wrapper.1));
+    let actual_sample: Vec<_> = actual.iter().take(8).collect();
+    let retired_sample: Vec<_> = retired.into_iter().take(8).collect();
+    Err(CiError::Message(format!(
+        "overlap remaining population differs from independently held first attempt: \
+         expected_count={}, family={family_states:?}, system_frontend={wrapper_state:?}; \
+         actual_count={actual_count}, actual(first 8)={actual_sample:?}; \
+         own_retired(first 8)={retired_sample:?}",
+        family.len() + 1,
+    )))
+}
+
+#[cfg(test)]
+mod overlap_population_tests {
+    use super::{OverlapProcessId, validate_overlap_population};
+
+    const ROOT: OverlapProcessId = (11, 101);
+    const CHILD: OverlapProcessId = (12, 102);
+    const WRAPPER: OverlapProcessId = (13, 103);
+
+    #[test]
+    fn overlap_population_requires_exact_workload_pair_and_wrapper() {
+        let family = [(ROOT, Ok(false)), (CHILD, Ok(false))];
+        for actual in [
+            vec![ROOT, CHILD],
+            vec![ROOT, WRAPPER],
+            vec![ROOT, CHILD, (WRAPPER.0, WRAPPER.1 + 1)],
+            vec![ROOT, CHILD, WRAPPER, (14, 104)],
+            vec![ROOT, CHILD, WRAPPER, WRAPPER],
+        ] {
+            assert!(
+                validate_overlap_population(&family, (WRAPPER, Ok(false)), actual, []).is_err()
+            );
+        }
+        assert!(
+            validate_overlap_population(&family, (WRAPPER, Ok(false)), [WRAPPER, CHILD, ROOT], [])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn overlap_population_rejects_duplicate_expected_roles_even_with_different_births() {
+        let family = [(ROOT, Ok(false)), (CHILD, Ok(false))];
+        for wrapper in [ROOT, (ROOT.0, ROOT.1 + 2)] {
+            assert!(
+                validate_overlap_population(
+                    &family,
+                    (wrapper, Ok(false)),
+                    [ROOT, CHILD, wrapper],
+                    []
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_population_rejects_exited_or_unobservable_holds_and_reports_roles() {
+        let family = [(ROOT, Ok(false)), (CHILD, Ok(true))];
+        let retired_root = (21, 201);
+        let error = validate_overlap_population(
+            &family,
+            (WRAPPER, Err(std::io::Error::other("not logged"))),
+            [ROOT, CHILD, WRAPPER],
+            [retired_root],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("expected_count=3"));
+        assert!(error.contains("actual_count=3"));
+        assert!(error.contains("((12, 102), \"exited\")"));
+        assert!(error.contains("system_frontend=((13, 103), \"query-failed\")"));
+        assert!(error.contains("own_retired(first 8)=[(21, 201)]"));
+        assert!(!error.contains("not logged"));
+
+        let family = [(ROOT, Ok(false)), (CHILD, Ok(true))];
+        assert!(
+            validate_overlap_population(&family, (WRAPPER, Ok(false)), [ROOT, CHILD, WRAPPER], [])
+                .is_err()
+        );
+        let family = [(ROOT, Ok(false)), (CHILD, Ok(false))];
+        for exit in [Ok(true), Err(std::io::Error::other("query failed"))] {
+            assert!(
+                validate_overlap_population(&family, (WRAPPER, exit), [ROOT, CHILD, WRAPPER], [])
+                    .is_err()
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn live_demand_child(
     bytes: &[u8],
@@ -4393,12 +4522,13 @@ pub(crate) mod native {
     use crate::windows_owned_guardian::{
         GuardianAssociationIdentity, GuardianBaseline, HeldGuardian,
     };
+    use memcordon_platform::test_support::ProcessIdentity;
     use memcordon_testkit::WindowsImageProcess;
     use std::fs::{self, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Instant;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -8881,6 +9011,7 @@ pub(crate) mod native {
                 registry_lifetime: RegistryProjectionLifetime::ExecutionOwned,
                 projection_observation: None,
                 private_custody: None,
+                capacity_frontend: None,
             },
             failure_capture,
         )
@@ -8889,7 +9020,10 @@ pub(crate) mod native {
     pub(crate) struct HeldFixtureExclusion {
         pub observation: memcordon_core::WindowsGuardianAttemptObservation,
         pub family: Vec<WindowsImageProcess>,
+        pub frontend_wrapper: WindowsImageProcess,
     }
+
+    pub(crate) type CapacityFrontendObservation = Arc<OnceLock<io::Result<ProcessIdentity>>>;
 
     pub(crate) fn execute_with_baseline(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
@@ -8906,10 +9040,15 @@ pub(crate) mod native {
             baseline,
             excluded,
             excluded_fixture,
+            None,
             Instant::now() + Duration::from_secs(660),
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bounded overlap additionally observes the original spawned frontend"
+    )]
     pub(crate) fn execute_with_baseline_until(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &CaseInput,
@@ -8917,6 +9056,7 @@ pub(crate) mod native {
         baseline: GuardianBaseline,
         excluded: Vec<GuardianAssociationIdentity>,
         excluded_fixture: Option<HeldFixtureExclusion>,
+        capacity_frontend: Option<CapacityFrontendObservation>,
         work_deadline: Instant,
     ) -> Result<()> {
         execute_with_baseline_clocks(
@@ -8935,6 +9075,7 @@ pub(crate) mod native {
                 registry_lifetime: RegistryProjectionLifetime::ExecutionOwned,
                 projection_observation: None,
                 private_custody: None,
+                capacity_frontend,
             },
         )
     }
@@ -8948,6 +9089,7 @@ pub(crate) mod native {
         registry_lifetime: RegistryProjectionLifetime,
         projection_observation: Option<Arc<Mutex<ProjectionObservation>>>,
         private_custody: Option<Arc<crate::windows_private_custody::PrivateFixtureCustody>>,
+        capacity_frontend: Option<CapacityFrontendObservation>,
     }
 
     struct MatchedExecution {
@@ -9219,6 +9361,11 @@ pub(crate) mod native {
                     .family
                     .iter()
                     .any(|process| !matches!(process.has_exited(), Ok(false)))
+                || !matches!(owned.frontend_wrapper.has_exited(), Ok(false))
+                || owned
+                    .family
+                    .iter()
+                    .any(|process| process.identity.pid == owned.frontend_wrapper.identity.pid)
                 || !owned.family.iter().any(|process| {
                     process.identity.pid == root.process_id
                         && process.identity.birth == u128::from(root.creation_time_100ns)
@@ -9596,6 +9743,18 @@ pub(crate) mod native {
             broker.args(original.into_iter().skip(2));
             command = broker;
         }
+        if clocks.capacity_frontend.is_some()
+            && (command.get_program() != std::path::absolute(&config.fixture.path)?.as_os_str()
+                || !command
+                    .get_args()
+                    .take(2)
+                    .eq(["consumer-readiness-windows", "system-frontend"]))
+        {
+            return Err(CiError::Message(
+                "held capacity frontend requires the original fixture system-frontend command"
+                    .into(),
+            ));
+        }
         // Workload inputs are absolute owned paths; ambient controller secrets
         // must never enter the authenticated launch request or its observation.
         command.env_clear();
@@ -9811,6 +9970,8 @@ pub(crate) mod native {
         let broker_observation = Arc::new(Mutex::new(None::<io::Result<(u32, u64)>>));
         let spawn_observation = Arc::clone(&broker_observation);
         let callback_broker = Arc::clone(&broker_observation);
+        let spawn_capacity_frontend = clocks.capacity_frontend.take();
+        let callback_capacity_frontend = spawn_capacity_frontend.clone();
         let argv_path_was_vacant = reduced_compiler_toolchain(&input.key)
             && fs::symlink_metadata(input.descriptor.output_root.join("native-argv.json"))
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
@@ -9822,6 +9983,20 @@ pub(crate) mod native {
             4 * 1024 * 1024,
             move |mut command| {
                 let child = command.spawn()?;
+                if let Some(observation) = &spawn_capacity_frontend {
+                    // Read the birth from this actual Child, not from a PID lookup.
+                    // The overlap controller will retain its exact same-image owner.
+                    observation.get_or_init(|| {
+                        let pid = child.id();
+                        let birth = u128::from(native_child_birth(&child)?);
+                        if pid == 0 || birth == 0 {
+                            return Err(io::Error::other(
+                                "held capacity frontend identity is unavailable",
+                            ));
+                        }
+                        Ok(ProcessIdentity { pid, birth })
+                    });
+                }
                 if matched_spawn {
                     let observed = (|| -> io::Result<(u32, u64)> {
                         provision_budget(work_deadline).map_err(io::Error::other)?;
@@ -9892,6 +10067,21 @@ pub(crate) mod native {
             move |wrapper_pid, mut stdin, _| {
                 let mut application_ended = false;
                 let callback = (|| -> io::Result<()> {
+                    if let Some(observation) = &callback_capacity_frontend {
+                        match observation.get() {
+                            Some(Ok(identity)) if identity.pid == wrapper_pid => {}
+                            Some(Err(error)) => {
+                                return Err(io::Error::other(format!(
+                                    "held capacity frontend native observation failed: {error}"
+                                )));
+                            }
+                            _ => {
+                                return Err(io::Error::other(
+                                    "held capacity frontend native observation differs",
+                                ));
+                            }
+                        }
+                    }
                     if matched_spawn {
                         let mut observed = callback_broker
                             .lock()
@@ -13460,27 +13650,22 @@ pub(crate) mod native {
                 work_deadline,
             )?;
             if let Some(owned) = &excluded_fixture {
-                let expected: BTreeSet<_> = owned
+                let id =
+                    |process: &WindowsImageProcess| (process.identity.pid, process.identity.birth);
+                let expected_family: Vec<_> = owned
                     .family
                     .iter()
-                    .map(|process| (process.identity.pid, process.identity.birth))
+                    .map(|process| (id(process), process.has_exited()))
                     .collect();
-                let actual: BTreeSet<_> = remaining
-                    .iter()
-                    .map(|process| (process.identity.pid, process.identity.birth))
-                    .collect();
-                if expected.len() != owned.family.len()
-                    || actual != expected
-                    || owned
-                        .family
-                        .iter()
-                        .any(|process| !matches!(process.has_exited(), Ok(false)))
-                {
-                    return Err(CiError::Message(
-                        "overlap remaining population differs from independently held first family"
-                            .into(),
-                    ));
-                }
+                validate_overlap_population(
+                    &expected_family,
+                    (
+                        id(&owned.frontend_wrapper),
+                        owned.frontend_wrapper.has_exited(),
+                    ),
+                    remaining.iter().map(id),
+                    held.iter().map(id),
+                )?;
             } else if !remaining.is_empty() {
                 return Err(CiError::Message(
                     "same-image population remains after isolated fixture retirement".into(),
@@ -13574,6 +13759,13 @@ pub(crate) mod native {
                 observed["excluded_held_processes"] = serde_json::json!(owned.family.iter().map(|process|serde_json::json!({
                     "pid":process.identity.pid,"birth":process.identity.birth,"held_live_before_overlap":true,"still_live_at_own_retirement":true,
                 })).collect::<Vec<_>>());
+                observed["excluded_held_frontend_wrapper"] = serde_json::json!({
+                    "role":"system-frontend",
+                    "pid":owned.frontend_wrapper.identity.pid,
+                    "birth":owned.frontend_wrapper.identity.birth,
+                    "held_live_before_overlap":true,
+                    "still_live_at_own_retirement":true,
+                });
             }
             let bytes = serde_json::to_vec(&observed)?;
             let path = report
@@ -14616,6 +14808,7 @@ pub(crate) mod native {
                 registry_lifetime: RegistryProjectionLifetime::ExperimentBorrowed,
                 projection_observation: None,
                 private_custody: Some(Arc::clone(&lanes[1])),
+                capacity_frontend: None,
                 matched: Some(MatchedExecution {
                     provider: Some(Arc::clone(&provider)),
                     plan_path,
@@ -14991,6 +15184,7 @@ pub(crate) mod native {
                                 registry_lifetime: RegistryProjectionLifetime::ExperimentBorrowed,
                                 projection_observation: Some(Arc::clone(&held_observation)),
                                 private_custody: Some(Arc::clone(&private_custody)),
+                                capacity_frontend: None,
                             },
                         )
                     });
@@ -15764,6 +15958,7 @@ pub(crate) mod native {
                             registry_lifetime: RegistryProjectionLifetime::ExecutionOwned,
                             projection_observation: None,
                             private_custody: None,
+                            capacity_frontend: None,
                         },
                     );
                     let captured = (|| -> Result<serde_json::Value> {

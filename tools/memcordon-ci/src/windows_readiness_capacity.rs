@@ -466,8 +466,8 @@ mod native {
         work_deadline: std::time::Instant,
     ) -> Result<()> {
         use crate::windows_consumer_readiness::native::{
-            HeldFixtureExclusion, event_create, execute_with_baseline_until, process_parents,
-            signal,
+            CapacityFrontendObservation, HeldFixtureExclusion, event_create,
+            execute_with_baseline_until, process_parents, signal,
         };
         use crate::windows_owned_guardian::{GuardianAssociationIdentity, GuardianBaseline};
         let baseline = || {
@@ -538,6 +538,8 @@ mod native {
             .join(&first_input.key.scenario);
         let observation_path = first_case_directory.join("live-held-guardian.json");
         let transcript = first_input.descriptor.transcript.clone();
+        let first_frontend = CapacityFrontendObservation::default();
+        let observe_first_frontend = first_frontend.clone();
         let first = std::thread::spawn(move || {
             let result = execute_with_baseline_until(
                 &first_config,
@@ -546,6 +548,7 @@ mod native {
                 first_baseline,
                 Vec::new(),
                 None,
+                Some(observe_first_frontend),
                 work_deadline,
             );
             (first_record, result)
@@ -610,18 +613,49 @@ mod native {
                 .as_u64()
                 .ok_or_else(|| CiError::Message("capacity child birth missing".into()))?;
             let parents = process_parents()?;
-            let first_family: Vec<_> = memcordon_testkit::windows_processes_for_image_until(
+            let wrapper_identity = match first_frontend.get() {
+                Some(Ok(identity)) => *identity,
+                _ => {
+                    return Err(CiError::Message(
+                        "capacity first attempt lacks the original system-frontend identity".into(),
+                    ));
+                }
+            };
+            let mut first_family = Vec::new();
+            let mut frontend_wrapper = None;
+            for process in memcordon_testkit::windows_processes_for_image_until(
                 &config.fixture.path,
                 deadline,
-            )?
-            .into_iter()
-            .filter(|process| {
-                (process.identity.pid == root.process_id
+            )? {
+                // The first owned Child is waiting for its CLI, which cannot
+                // finish while we hold the first workload's completion gate.
+                if process.identity == wrapper_identity {
+                    if frontend_wrapper.replace(process).is_some() {
+                        return Err(CiError::Message(
+                            "capacity first system-frontend native owner repeated".into(),
+                        ));
+                    }
+                } else if (process.identity.pid == root.process_id
                     && process.identity.birth == u128::from(root.creation_time_100ns))
                     || (process.identity.pid == peer_pid
                         && process.identity.birth == u128::from(peer_birth))
-            })
-            .collect();
+                {
+                    first_family.push(process);
+                }
+            }
+            let frontend_wrapper = frontend_wrapper
+                .filter(|wrapper| {
+                    wrapper.identity.pid != root.process_id
+                        && wrapper.identity.pid != peer_pid
+                        && matches!(wrapper.has_exited(), Ok(false))
+                })
+                .ok_or_else(|| {
+                    CiError::Message(format!(
+                        "capacity first system-frontend lacks its distinct live same-image owner: \
+                         pid={}, birth={}",
+                        wrapper_identity.pid, wrapper_identity.birth
+                    ))
+                })?;
             if !observed.is_consistent()
                 || peer["format"] != "memcordon.windows-native-capacity-child"
                 || peer["revision"].as_u64() != Some(1)
@@ -662,7 +696,9 @@ mod native {
                 Some(HeldFixtureExclusion {
                     observation: observed,
                     family: first_family,
+                    frontend_wrapper,
                 }),
+                None,
                 work_deadline,
             )
         })();
