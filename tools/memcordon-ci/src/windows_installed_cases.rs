@@ -790,9 +790,34 @@ pub struct InstalledWindowsAssessment {
 
 impl InstalledWindowsAssessment {
     pub fn failure_summary(&self) -> String {
+        // Stages in execution order: the first recorded failure is foregrounded
+        // so a native suite failure is never hidden behind unrun later stages.
+        let stages = [
+            ("upgrade", &self.package_upgrade),
+            ("positive readiness", &self.positive_suite),
+            ("native loss suite", &self.loss_suite),
+            ("capacity suite", &self.capacity_suite),
+            ("refusal suite", &self.refusal_suite),
+            ("public smoke before", &self.public_smoke_before),
+            ("retained-state recovery", &self.retained_state_recovery),
+            ("public smoke after", &self.public_smoke_after),
+            ("uninstall", &self.package_uninstall),
+        ];
+        let first = stages
+            .iter()
+            .find_map(|(stage, result)| {
+                result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{stage}: {error:?}"))
+            })
+            .unwrap_or_else(|| "none recorded; case or suite evidence rejected".to_owned());
         format!(
-            "actual installed Windows case or retirement failed; positive readiness: {:?}; public smoke before: {:?}; upgrade: {:?}; uninstall: {:?}",
+            "actual installed Windows case or retirement failed; first failed stage: {first}; positive readiness: {:?}; native loss suite: {:?}; capacity suite: {:?}; refusal suite: {:?}; public smoke before: {:?}; upgrade: {:?}; uninstall: {:?}",
             self.positive_suite,
+            self.loss_suite,
+            self.capacity_suite,
+            self.refusal_suite,
             self.public_smoke_before,
             self.package_upgrade,
             self.package_uninstall,

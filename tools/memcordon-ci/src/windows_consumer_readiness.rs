@@ -7190,12 +7190,26 @@ pub(crate) mod native {
                 )?;
             selected.token
         } else {
-            let leaf = if input.expected_token.restricted {
-                "windows-restricted-token.json"
-            } else {
-                "windows-ordinary-token.json"
+            let path = config.output_directory.join(
+                crate::windows_readiness_capacity::token_snapshot_leaf(
+                    input.expected_token.restricted,
+                ),
+            );
+            let describe = || {
+                format!(
+                    "selected native caller token snapshot {} for {}/{}",
+                    path.display(),
+                    input.key.family,
+                    input.key.scenario
+                )
             };
-            serde_json::from_slice(&read(&config.output_directory.join(leaf), 16 * 1024)?)?
+            let bytes = read(
+                &path,
+                crate::windows_readiness_capacity::TOKEN_SNAPSHOT_BYTES,
+            )
+            .map_err(|error| error.context(describe()))?;
+            serde_json::from_slice(&bytes)
+                .map_err(|error| CiError::from(error).context(describe()))?
         };
         if selected != input.expected_token {
             return Err(CiError::Message(

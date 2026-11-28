@@ -2349,6 +2349,114 @@ impl WindowsImageProcess {
     }
 }
 
+/// Win32 `ERROR_INVALID_PARAMETER`, the status `OpenProcess` reports for a
+/// PID whose process object no longer exists.
+pub const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
+
+/// One exact ToolHelp32 process entry, before any process object is owned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolhelpCandidate {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub image_name: String,
+}
+
+/// Disposition of a failed query-only `OpenProcess` on a ToolHelp candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolhelpOpenFailure {
+    /// Win32 87 and the exact entry is absent from a fresh snapshot: the
+    /// candidate exited before ownership. This never establishes retirement
+    /// of any owned process; it only excludes an unowned stale entry.
+    ExitedBeforeOwnership,
+    /// Any other failure, or the exact entry is still enumerated.
+    Propagate,
+}
+
+/// Classify a failed query-only `OpenProcess`. Only Win32 87 on a query-only
+/// open may resample, and only exact-entry absence from the fresh snapshot
+/// excludes the candidate. Access denied and every other status propagate
+/// without resampling; a resample failure propagates as an error.
+pub fn classify_toolhelp_open_failure(
+    raw_os_error: Option<i32>,
+    query_only: bool,
+    candidate: &ToolhelpCandidate,
+    resample: impl FnOnce() -> io::Result<Vec<ToolhelpCandidate>>,
+) -> io::Result<ToolhelpOpenFailure> {
+    if !query_only || raw_os_error != Some(WINDOWS_ERROR_INVALID_PARAMETER) {
+        return Ok(ToolhelpOpenFailure::Propagate);
+    }
+    if resample()?.iter().any(|entry| entry == candidate) {
+        Ok(ToolhelpOpenFailure::Propagate)
+    } else {
+        Ok(ToolhelpOpenFailure::ExitedBeforeOwnership)
+    }
+}
+
+/// Fresh query-only ToolHelp32 resample of entries with one lowercase image
+/// name, bounded by the caller's original census cutoff.
+#[cfg(windows)]
+fn windows_toolhelp_candidates(
+    expected_name: &str,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<Vec<ToolhelpCandidate>> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: a process snapshot has no mutable external buffers.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(windows_process_observation_error(
+            "CreateToolhelp32Snapshot(processes resample)",
+            None,
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: snapshot is a new owned handle and is closed on all exits.
+    let _snapshot_owner = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(snapshot) };
+    // SAFETY: the Windows enumeration API initializes the remaining fields.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+        .expect("Windows process entry size fits u32");
+    // SAFETY: snapshot and entry are valid for enumeration.
+    let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    if !found {
+        return Err(windows_process_observation_error(
+            "Process32FirstW(resample)",
+            None,
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut candidates = Vec::new();
+    while found {
+        if deadline.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original image census cutoff expired during resample",
+            ));
+        }
+        let name_len = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_lowercase();
+        if name == expected_name {
+            candidates.push(ToolhelpCandidate {
+                pid: entry.th32ProcessID,
+                parent_pid: entry.th32ParentProcessID,
+                image_name: name,
+            });
+        }
+        // SAFETY: snapshot and entry remain owned and valid.
+        found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    Ok(candidates)
+}
+
 #[cfg(windows)]
 fn windows_processes_for_image_inner(
     image: &Path,
@@ -2437,7 +2545,42 @@ fn windows_processes_for_image_inner(
             };
             if raw.is_null() {
                 let original = io::Error::last_os_error();
-                // A matching image that cannot be inspected is never interpreted as absent.
+                // A matching image that cannot be inspected is never interpreted
+                // as absent, except a query-only Win32 87 whose exact entry a
+                // fresh snapshot no longer enumerates (exited before ownership).
+                let candidate = ToolhelpCandidate {
+                    pid: entry.th32ProcessID,
+                    parent_pid: entry.th32ParentProcessID,
+                    image_name: name.clone(),
+                };
+                let disposition = classify_toolhelp_open_failure(
+                    original.raw_os_error(),
+                    !fixture_input,
+                    &candidate,
+                    || windows_toolhelp_candidates(&expected_name, deadline),
+                );
+                match disposition {
+                    Ok(ToolhelpOpenFailure::ExitedBeforeOwnership) => {
+                        // SAFETY: snapshot and entry remain held and writable.
+                        found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+                        continue;
+                    }
+                    Ok(ToolhelpOpenFailure::Propagate) => {}
+                    Err(resample) => {
+                        let error = windows_process_observation_error(
+                            "OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)",
+                            Some(entry.th32ProcessID),
+                            original,
+                        );
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{error}; snapshot-parent-pid={}; exited-candidate-resample-failed={resample}; owned-process-identity-established=false; retirement-established=false",
+                                entry.th32ParentProcessID,
+                            ),
+                        ));
+                    }
+                }
                 let error = windows_process_observation_error(
                     "OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)",
                     Some(entry.th32ProcessID),
@@ -3657,5 +3800,73 @@ impl OuterTestBoundary {
 
     pub fn terminate(&self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod toolhelp_open_failure_tests {
+    use super::*;
+
+    fn candidate() -> ToolhelpCandidate {
+        ToolhelpCandidate {
+            pid: 13420,
+            parent_pid: 4096,
+            image_name: "rustc.exe".to_owned(),
+        }
+    }
+
+    #[test]
+    fn invalid_parameter_with_absent_exact_entry_is_excluded() {
+        let mut reused = candidate();
+        reused.parent_pid = 1;
+        let disposition = classify_toolhelp_open_failure(
+            Some(WINDOWS_ERROR_INVALID_PARAMETER),
+            true,
+            &candidate(),
+            || Ok(vec![reused]),
+        )
+        .unwrap();
+        assert_eq!(disposition, ToolhelpOpenFailure::ExitedBeforeOwnership);
+    }
+
+    #[test]
+    fn invalid_parameter_with_present_exact_entry_propagates() {
+        let disposition = classify_toolhelp_open_failure(
+            Some(WINDOWS_ERROR_INVALID_PARAMETER),
+            true,
+            &candidate(),
+            || Ok(vec![candidate()]),
+        )
+        .unwrap();
+        assert_eq!(disposition, ToolhelpOpenFailure::Propagate);
+    }
+
+    #[test]
+    fn other_statuses_and_non_query_opens_propagate_without_resampling() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        for (status, query_only) in [
+            (Some(ERROR_ACCESS_DENIED), true),
+            (None, true),
+            (Some(WINDOWS_ERROR_INVALID_PARAMETER), false),
+        ] {
+            let disposition =
+                classify_toolhelp_open_failure(status, query_only, &candidate(), || {
+                    panic!("only query-only Win32 87 may resample")
+                })
+                .unwrap();
+            assert_eq!(disposition, ToolhelpOpenFailure::Propagate);
+        }
+    }
+
+    #[test]
+    fn resample_failure_propagates() {
+        let error = classify_toolhelp_open_failure(
+            Some(WINDOWS_ERROR_INVALID_PARAMETER),
+            true,
+            &candidate(),
+            || Err(io::Error::other("resample failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "resample failed");
     }
 }

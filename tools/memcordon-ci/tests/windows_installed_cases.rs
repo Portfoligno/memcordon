@@ -789,7 +789,27 @@ fn positive_barrier_error_and_unexecuted_smoke_are_reported_separately() {
     assert!(!assessment.accepted());
     assert_eq!(
         assessment.failure_summary(),
-        r#"actual installed Windows case or retirement failed; positive readiness: Err("original callback failed"); public smoke before: Err("public smoke before was not executed"); upgrade: Ok(()); uninstall: Ok(())"#
+        r#"actual installed Windows case or retirement failed; first failed stage: positive readiness: "original callback failed"; positive readiness: Err("original callback failed"); native loss suite: Ok(()); capacity suite: Ok(()); refusal suite: Ok(()); public smoke before: Err("public smoke before was not executed"); upgrade: Ok(()); uninstall: Ok(())"#
+    );
+}
+
+#[test]
+fn native_suite_failure_is_foregrounded_over_unrun_public_smoke() {
+    let mut assessment = complete_installed_assessment();
+    assessment.capacity_suite = Err("capacity attempt token snapshot missing".into());
+    assessment.refusal_suite = Err("preauthorization refusal suite was not executed".into());
+    assessment.public_smoke_before = Err("public smoke before was not executed".into());
+    assert!(!assessment.accepted());
+    let summary = assessment.failure_summary();
+    assert!(
+        summary.starts_with(
+            r#"actual installed Windows case or retirement failed; first failed stage: capacity suite: "capacity attempt token snapshot missing";"#
+        ),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(r#"capacity suite: Err("capacity attempt token snapshot missing")"#),
+        "{summary}"
     );
 }
 

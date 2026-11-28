@@ -1,9 +1,9 @@
 //! Capacity observations retain each constituent natural attempt and each
 //! authenticated public recovery inventory; bounded samples are not quotas.
-use crate::windows_consumer_readiness::{CaseAssessment, CaseKey};
-#[cfg(windows)]
+use crate::windows_consumer_readiness::{CaseAssessment, CaseKey, TokenObservation};
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +101,67 @@ pub fn accepted(records: &[CapacityAssessment]) -> bool {
                 })
                 && !record.artifacts.is_empty()
         })
+}
+
+/// Bound of the independently observed native caller token snapshot.
+pub const TOKEN_SNAPSHOT_BYTES: usize = 16 * 1024;
+
+/// Leaf name of the native caller token snapshot that the original suite
+/// published at its output root and every gate input reads from its own root.
+pub fn token_snapshot_leaf(restricted: bool) -> &'static str {
+    if restricted {
+        "windows-restricted-token.json"
+    } else {
+        "windows-ordinary-token.json"
+    }
+}
+
+/// Carry the exact original token snapshot bytes from the suite root into a
+/// disjoint attempt root. The bytes are never synthesized from `expected`;
+/// they must parse and equal `expected` before the attempt may consume them,
+/// and publication must create a new file.
+pub fn propagate_token_snapshot(
+    suite_root: &Path,
+    attempt_root: &Path,
+    expected: &TokenObservation,
+    read: impl FnOnce(&Path, usize) -> Result<Vec<u8>>,
+    publish: impl FnOnce(&Path, &[u8]) -> Result<()>,
+) -> Result<PathBuf> {
+    let leaf = token_snapshot_leaf(expected.restricted);
+    if suite_root == attempt_root {
+        return Err(CiError::Message(format!(
+            "capacity attempt root {} is not disjoint from the suite root",
+            attempt_root.display()
+        )));
+    }
+    let source = suite_root.join(leaf);
+    let destination = attempt_root.join(leaf);
+    let bytes = read(&source, TOKEN_SNAPSHOT_BYTES).map_err(|error| {
+        error.context(format!(
+            "original native caller token snapshot {} for capacity attempt {}",
+            source.display(),
+            attempt_root.display()
+        ))
+    })?;
+    let observed: TokenObservation = serde_json::from_slice(&bytes).map_err(|error| {
+        CiError::from(error).context(format!(
+            "original native caller token snapshot {} does not parse",
+            source.display()
+        ))
+    })?;
+    if observed != *expected {
+        return Err(CiError::Message(format!(
+            "original native caller token snapshot {} differs from the capacity base expectation",
+            source.display()
+        )));
+    }
+    publish(&destination, &bytes).map_err(|error| {
+        error.context(format!(
+            "capacity attempt token snapshot publication {}",
+            destination.display()
+        ))
+    })?;
+    Ok(destination)
 }
 
 /// Completeness of these bounded CI samples, never a product concurrency quota.
@@ -220,6 +281,27 @@ mod native {
         Ok(())
     }
 
+    /// Every rebased attempt root receives the suite's original token bytes.
+    fn attempt_token(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        owned: &crate::windows_installed_cases::InstalledWindowsPayload,
+        base: &crate::windows_consumer_readiness::CaseInput,
+    ) -> Result<()> {
+        super::propagate_token_snapshot(
+            &config.output_directory,
+            &owned.output_directory,
+            &base.expected_token,
+            read,
+            |path, bytes| {
+                drop(crate::windows_native_files::publish_owned_file(
+                    path, bytes,
+                )?);
+                Ok(())
+            },
+        )
+        .map(drop)
+    }
+
     fn blank(key: CaseKey) -> CaseAssessment {
         CaseAssessment {
             revision: crate::windows_consumer_readiness::CASE_ASSESSMENT_REVISION,
@@ -287,6 +369,7 @@ mod native {
                 let mut owned = config.clone();
                 owned.output_directory = directory.join(format!("attempt-{ordinal}"));
                 fs::create_dir(&owned.output_directory)?;
+                attempt_token(config, &owned, &base)?;
                 let mut input = base.clone();
                 input.key = key.clone();
                 input.descriptor.challenge =
@@ -383,6 +466,7 @@ mod native {
             let mut owned = config.clone();
             owned.output_directory = directory.join(format!("attempt-{ordinal}"));
             fs::create_dir(&owned.output_directory)?;
+            attempt_token(config, &owned, base)?;
             let mut input = base.clone();
             input.key = record.key.clone();
             input.descriptor.challenge =
@@ -600,5 +684,144 @@ mod native {
             (Err(primary), _) => Err(primary),
             (Ok(()), result) => result,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn token(restricted: bool) -> TokenObservation {
+        TokenObservation {
+            user_sid: vec![1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0],
+            restricted,
+            integrity_rid: 8192,
+            elevated: false,
+            restricting_sids: if restricted {
+                vec![vec![1, 1, 0, 0, 0, 0, 0, 5, 12, 0, 0, 0]]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn bounded_read(path: &Path, bound: usize) -> Result<Vec<u8>> {
+        let bytes = fs::read(path)?;
+        if bytes.len() > bound {
+            return Err(CiError::Message("token snapshot exceeds bound".into()));
+        }
+        Ok(bytes)
+    }
+
+    fn create_new(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?
+            .write_all(bytes)?;
+        Ok(())
+    }
+
+    fn suite(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "memcordon-capacity-token-{name}-{}",
+            std::process::id()
+        ));
+        drop(fs::remove_dir_all(&root));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn serial_and_overlap_attempt_roots_receive_exact_original_bytes() {
+        for restricted in [false, true] {
+            let root = suite(if restricted { "restricted" } else { "ordinary" });
+            let expected = token(restricted);
+            // Pretty-printed original bytes prove byte-for-byte copy, not re-encoding.
+            let original = serde_json::to_vec_pretty(&expected).unwrap();
+            fs::write(root.join(token_snapshot_leaf(restricted)), &original).unwrap();
+            let family = root.join("W-CAPACITY");
+            let mut published = Vec::new();
+            for scenario in ["serial-retirement", "bounded-concurrency"] {
+                for ordinal in 0..2 {
+                    let attempt = family.join(scenario).join(format!("attempt-{ordinal}"));
+                    fs::create_dir_all(&attempt).unwrap();
+                    let path = propagate_token_snapshot(
+                        &root,
+                        &attempt,
+                        &expected,
+                        bounded_read,
+                        create_new,
+                    )
+                    .unwrap();
+                    assert_eq!(path, attempt.join(token_snapshot_leaf(restricted)));
+                    assert_eq!(fs::read(&path).unwrap(), original);
+                    published.push(path);
+                }
+            }
+            let distinct: std::collections::BTreeSet<_> = published.iter().collect();
+            assert_eq!(distinct.len(), published.len());
+            // Create-new semantics: a second propagation into the same root fails.
+            let attempt = family.join("serial-retirement").join("attempt-0");
+            assert!(
+                propagate_token_snapshot(&root, &attempt, &expected, bounded_read, create_new)
+                    .is_err()
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_original_token_fails_with_self_describing_path() {
+        let root = suite("missing");
+        let attempt = root.join("attempt-0");
+        fs::create_dir_all(&attempt).unwrap();
+        let error =
+            propagate_token_snapshot(&root, &attempt, &token(false), bounded_read, create_new)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("windows-ordinary-token.json"), "{error}");
+        assert!(!attempt.join("windows-ordinary-token.json").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mismatched_or_unparseable_original_token_is_never_published() {
+        let root = suite("mismatch");
+        let attempt = root.join("attempt-0");
+        fs::create_dir_all(&attempt).unwrap();
+        let mut other = token(false);
+        other.integrity_rid = 12288;
+        fs::write(
+            root.join("windows-ordinary-token.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            propagate_token_snapshot(&root, &attempt, &token(false), bounded_read, create_new)
+                .is_err()
+        );
+        assert!(!attempt.join("windows-ordinary-token.json").exists());
+        fs::write(root.join("windows-restricted-token.json"), b"not json").unwrap();
+        assert!(
+            propagate_token_snapshot(&root, &attempt, &token(true), bounded_read, create_new)
+                .is_err()
+        );
+        assert!(!attempt.join("windows-restricted-token.json").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn suite_root_is_never_its_own_attempt_root() {
+        let root = suite("same");
+        let original = serde_json::to_vec(&token(false)).unwrap();
+        fs::write(root.join("windows-ordinary-token.json"), &original).unwrap();
+        assert!(
+            propagate_token_snapshot(&root, &root, &token(false), bounded_read, create_new)
+                .is_err()
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }
