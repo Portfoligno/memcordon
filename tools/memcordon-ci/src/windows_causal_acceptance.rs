@@ -299,6 +299,7 @@ pub struct SamplingOutputEvidence {
 pub const SAMPLING_BIRTH_BUCKETS: usize = 24;
 /// Bucket width in native process-birth ticks (100 ns units): ten seconds.
 pub const SAMPLING_BIRTH_BUCKET_TICKS: u128 = 100_000_000;
+#[cfg(any(windows, test))]
 const SAMPLING_BIRTH_TICKS_PER_MILLISECOND: u128 = 10_000;
 
 /// Native process-birth spacing of members announced in the completed capture.
